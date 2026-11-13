@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "revision": 3,
+  "plugins": {
+    "acme.scripted": {
+      "active": "1.0.0",
+      "enabled": true,
+      "source": "local",
+      "installed_at": "2026-03-04T05:06:07Z"
+    }
+  },
+  "pending": [],
+  "failures": {},
+  "pending_failures": [],
+  "boot": null
+}

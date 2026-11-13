@@ -426,7 +426,8 @@ fn dispatch_frame(inner: &Arc<Shared>, frame: Value) -> bool {
         if notification.validate().is_err() {
             return false;
         }
-        // 脚本宿主为单次同步中断发出一条内部通知；其他进程发送该保留方法同样是协议错误。
+        // `$/executionTimeout` 是已移除脚本宿主遗留的保留通知；任何进程发送它都属于
+        // 未实现语义，继续按协议错误拒绝，避免旧脚本帧被误当作可用能力。
         if notification.method == "$/executionTimeout" {
             return false;
         }

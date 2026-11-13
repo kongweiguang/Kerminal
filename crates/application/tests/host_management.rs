@@ -3,7 +3,7 @@
 //! @author kongweiguang
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         Arc,
@@ -18,6 +18,7 @@ use kerminal_application::{
         credentials::{
             CredentialService, CredentialVaultRepository, CredentialVaultSaveMetadata, SecretValue,
         },
+        host_types::{HostConfigurationCatalog, PluginHost, PluginHostService},
         management::{
             CredentialCleanupStatus, HostAuthenticationMode, HostCredentialChange,
             HostCredentialSlot, HostDocumentRevision, HostDraft, HostGroup,
@@ -26,6 +27,7 @@ use kerminal_application::{
             RdpDisplayOptions, RecoverableHostSaveOutcome,
         },
     },
+    plugins::{PluginId, PluginRegistry, PluginRegistryBuilder},
 };
 use kerminal_domain::{
     connections::{
@@ -1537,4 +1539,108 @@ async fn delete_group_rejects_invalid_target_and_host_revision_race() {
             .groups,
         vec![source, destination]
     );
+}
+
+/// 按给定禁用单元冻结内置目录，供协议和插件主机门禁共享同一份启用快照。
+///
+/// @author kongweiguang
+fn registry_with_disabled(disabled: &[&str]) -> Arc<PluginRegistry> {
+    let mut builder = PluginRegistryBuilder::new();
+    builder.register_builtins().expect("内置声明应可注册");
+    let states: BTreeMap<PluginId, bool> = disabled
+        .iter()
+        .map(|id| (PluginId::new(*id).expect("插件 ID 应合法"), false))
+        .collect();
+    Arc::new(
+        builder
+            .freeze_with_builtin_states(&states)
+            .expect("内置状态应可冻结"),
+    )
+}
+
+/// 构造与磁盘格式一致的最小插件主机快照，只用于门禁的身份匹配断言。
+///
+/// @author kongweiguang
+fn plugin_host(provider_id: &str, type_id: &str) -> PluginHost {
+    PluginHost {
+        id: HostId::new(),
+        provider_id: provider_id.to_owned(),
+        type_id: type_id.to_owned(),
+        name: "plugin host".to_owned(),
+        group_id: None,
+        sort_order: 0,
+        configuration_version: 1,
+        configuration: None,
+        runtime_available: false,
+        revision: ConfigRevision::from_sha256("plugin-host-revision".to_owned()),
+    }
+}
+
+/// 禁用 SSH 后只拒绝该协议新建连接，其它协议仍按同一冻结快照放行。
+///
+/// @author kongweiguang
+#[test]
+fn plugin_gating_disables_only_the_configured_protocol() {
+    let repository = MemoryHosts::new(password_host(), SaveDisposition::Commit);
+    let service = HostManagementService::new(Arc::new(repository))
+        .with_plugins(registry_with_disabled(&["kerminal.ssh"]));
+
+    assert!(!service.protocol_enabled(RemoteProtocol::Ssh));
+    for protocol in [
+        RemoteProtocol::Sftp,
+        RemoteProtocol::Telnet,
+        RemoteProtocol::Serial,
+        RemoteProtocol::Rdp,
+    ] {
+        assert!(service.protocol_enabled(protocol));
+    }
+}
+
+/// 插件主机门禁同时核对 provider 与类型，且 PluginHostService 复用同一判定不另建映射。
+///
+/// @author kongweiguang
+#[test]
+fn plugin_gating_matches_provider_and_type_through_host_service() {
+    let repository = MemoryHosts::new(password_host(), SaveDisposition::Commit);
+    let service = HostManagementService::new(Arc::new(repository))
+        .with_plugins(registry_with_disabled(&["kerminal.sftp"]));
+
+    assert!(!service.protocol_enabled(RemoteProtocol::Sftp));
+    assert!(!service.plugin_host_enabled(&plugin_host("kerminal", "sftp")));
+    assert!(service.plugin_host_enabled(&plugin_host("kerminal", "ssh")));
+    // provider 与类型必须同时匹配目录声明，未知组合视为不可用而不是放行。
+    assert!(!service.plugin_host_enabled(&plugin_host("example", "sftp")));
+
+    let plugin_service = PluginHostService::new(
+        HostManagementService::new(Arc::new(MemoryHosts::new(
+            password_host(),
+            SaveDisposition::Commit,
+        ))),
+        Arc::new(HostConfigurationCatalog::new(std::iter::empty()).expect("空目录应有效")),
+    )
+    .with_plugins(registry_with_disabled(&["kerminal.sftp"]));
+    assert!(!plugin_service.host_enabled(&plugin_host("kerminal", "sftp")));
+    assert!(plugin_service.host_enabled(&plugin_host("kerminal", "ssh")));
+}
+
+/// 未注入冻结快照时保持全部可用，保证测试和离线工具无需装配插件系统。
+///
+/// @author kongweiguang
+#[test]
+fn plugin_gating_defaults_to_all_available_without_registry() {
+    let service = HostManagementService::new(Arc::new(MemoryHosts::new(
+        password_host(),
+        SaveDisposition::Commit,
+    )));
+
+    for protocol in [
+        RemoteProtocol::Ssh,
+        RemoteProtocol::Sftp,
+        RemoteProtocol::Telnet,
+        RemoteProtocol::Serial,
+        RemoteProtocol::Rdp,
+    ] {
+        assert!(service.protocol_enabled(protocol));
+    }
+    assert!(service.plugin_host_enabled(&plugin_host("kerminal", "host.sftp")));
 }

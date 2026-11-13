@@ -19,6 +19,7 @@ use kerminal_application::plugins::{
     ContentDescriptor, ContentTypeId, PluginDescriptor, PluginId, PluginRegistryBuilder,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Default)]
 struct FailureSwitches {
@@ -370,4 +371,73 @@ fn page_focus_failure_keeps_a_working_retry(app: &mut TestAppContext) {
 #[gpui_kit::test]
 fn page_activation_failure_keeps_a_working_retry(app: &mut TestAppContext) {
     exercise_page_failure(app, false);
+}
+
+/// 禁用内置内容后只拒绝新建或恢复实例，不删除工作区标签材料；核心终端内容保持可用。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn disabled_content_refuses_open_without_consuming_workspace_materials(app: &mut TestAppContext) {
+    let mut builder = PluginRegistryBuilder::new();
+    builder.register_builtins().expect("内置声明应可注册");
+    let states = BTreeMap::from([(
+        PluginId::new("kerminal.sftp").expect("插件 ID 应合法"),
+        false,
+    )]);
+    let registry = Arc::new(
+        builder
+            .freeze_with_builtin_states(&states)
+            .expect("内置状态应可冻结"),
+    );
+    let (runtime, root, _, _, visual) = fixture_with_configuration_and_services(
+        app,
+        Arc::new(EmptyConfiguration),
+        move |services| services.with_plugins(registry),
+    );
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        window.activate_window();
+        window.focus(&root.read(app).focus_handle.clone(), app);
+    });
+    visual.run_until_parked();
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.workspace_controller = Some(WorkspaceController::from_missing().unwrap());
+            root.workspace_load_pending = false;
+            let before = root
+                .workspace_controller
+                .as_ref()
+                .expect("工作区已就绪")
+                .snapshot()
+                .terminal_tabs
+                .len();
+            let opened = root.open_plugin_tab(
+                &crate::plugins::actions::OpenContentTab {
+                    content_id: "sftpTransfer".into(),
+                    title: "SFTP transfer".into(),
+                    state_version: 1,
+                    state: serde_json::json!({"material": "kept"}),
+                },
+                window,
+                cx,
+            );
+            assert!(opened.is_err(), "禁用内容不能打开新标签");
+            let after = root
+                .workspace_controller
+                .as_ref()
+                .expect("工作区仍保留")
+                .snapshot()
+                .terminal_tabs
+                .len();
+            assert_eq!(before, after, "拒绝打开不得删除或改写工作区材料");
+            let terminal = root.open_plugin_page("terminal", window, cx);
+            assert!(
+                terminal.is_ok(),
+                "核心终端内容仍可打开: {:?}",
+                terminal
+                    .err()
+                    .map(|error| error.public_message().to_owned())
+            );
+        });
+    });
 }

@@ -11,7 +11,7 @@ use kerminal_application::workspace::{
     WorkspacePaneMode, WorkspaceSessionPane, WorkspaceTargetRef, WorkspaceTmuxBinding,
 };
 use kerminal_domain::{
-    connections::RemoteShellDialect,
+    connections::{RemoteProtocol, RemoteShellDialect},
     files::{ContainerRuntime, FileEndpoint, FilePathError, RemotePath},
     operations::{ContainerTarget, TmuxTarget},
     sessions::{SessionOwner, SessionTarget, TerminalSize},
@@ -886,6 +886,11 @@ fn container_file_endpoint(
 
 /// 打开由 Operations 事件明确指定的容器目录；缺少服务或非法路径时给出可见错误。
 ///
+/// 固定项、Operations 事件和迟到旧帧都会进入这里，因此在此集中复核冻结插件视图，
+/// 不能只依赖调用方按钮状态。容器文件经 SSH 执行：有宿主时同时要求 SSH 单元启用且
+/// 导航目录中该 host 仍是 SSH 主机；空 registry 表示测试或离线装配未注入声明，按启用
+/// 处理，与工作区恢复门禁保持一致。失败只写状态，不构造端点或启动远端 I/O。
+///
 /// @author kongweiguang
 pub(super) fn open_container_files(
     root: &mut RootView,
@@ -894,6 +899,43 @@ pub(super) fn open_container_files(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) {
+    let containers_enabled = root.services.plugins.providers().is_empty()
+        || root.services.plugins.is_enabled("kerminal.containers");
+    if !containers_enabled {
+        root.status = Some(crate::locale::text(
+            "容器插件已禁用，请先在插件设置中启用。",
+            "The containers plugin is disabled. Enable it in plugin settings first.",
+        ));
+        cx.notify();
+        return;
+    }
+    if let Some(host_id) = target.host_id.as_ref() {
+        if root
+            .services
+            .hosts
+            .as_ref()
+            .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Ssh))
+        {
+            root.status = Some(crate::locale::text(
+                "SSH 已禁用，请先在插件设置中启用。",
+                "SSH is disabled. Enable it in plugin settings first.",
+            ));
+            cx.notify();
+            return;
+        }
+        let host_available = root
+            .host_navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.read(cx).ssh_host_group_id(host_id).is_some());
+        if !host_available {
+            root.status = Some(crate::locale::text(
+                "SSH 主机已不存在或协议已变化，无法打开容器文件。",
+                "The SSH host no longer exists or its protocol changed; container files cannot be opened.",
+            ));
+            cx.notify();
+            return;
+        }
+    }
     let endpoint = match container_file_endpoint(target, path) {
         Ok(endpoint) => endpoint,
         Err(_) => {

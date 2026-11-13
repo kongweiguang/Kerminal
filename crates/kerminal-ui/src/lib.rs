@@ -20,6 +20,7 @@ mod terminal_metrics;
 mod theme;
 mod ui_backdrop;
 mod ui_button;
+mod ui_motion;
 mod ui_popup;
 mod ui_surface;
 pub mod window_state;
@@ -27,6 +28,12 @@ pub mod window_state;
 #[cfg(test)]
 #[path = "../tests/unit/focus_trap.rs"]
 mod focus_trap_tests;
+
+// 工作台宿主测试的命令服务 fixture 由多棵测试模块树共用；在 crate 根只声明
+// 一次，避免同一文件被重复载入成多个模块（clippy::duplicate_mod）。
+#[cfg(test)]
+#[path = "../tests/support/root_commands_service.rs"]
+pub(crate) mod root_commands_service;
 
 #[cfg(feature = "right-rail-acceptance")]
 pub use features::files::{RightRailSftpTransferItem, RightRailSftpTransferTarget};

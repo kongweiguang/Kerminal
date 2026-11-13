@@ -1,14 +1,10 @@
-//! 声明式清单、平台与权限；安装、启动和开发工具共用同一入口。
+//! 声明式清单、平台与描述性权限；安装、启动和开发工具共用同一入口。
 //! @author kongweiguang
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    str::FromStr,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{ProtocolError, invalid, parse_json, validate_extensions, validate_package_path};
@@ -43,8 +39,9 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub runtime: PluginRuntime,
+    /// 权限字符串仅作为插件能力描述保留，宿主不再据此限制任何宿主方法。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permissions: Vec<Permission>,
+    pub permissions: Vec<String>,
     #[serde(default)]
     pub contributes: Contributions,
     #[serde(default)]
@@ -93,147 +90,6 @@ impl Platform {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum Permission {
-    UiNotify,
-    UiDialog,
-    UiFilePicker,
-    ClipboardRead,
-    ClipboardWrite,
-    OpenExternal,
-    Network(String),
-    HostsRead,
-    TerminalWrite,
-    EventsSubscribe,
-    Secrets,
-    FullAccess,
-}
-
-impl Permission {
-    /// 通配符仅匹配真正的子域，不能扩大到根域或相似后缀。
-    pub fn allows_network_host(&self, host: &str) -> bool {
-        let Self::Network(pattern) = self else {
-            return false;
-        };
-        let host = host.to_ascii_lowercase();
-        let pattern = pattern.to_ascii_lowercase();
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            host.strip_suffix(suffix)
-                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
-        } else {
-            host == pattern
-        }
-    }
-}
-
-impl fmt::Display for Permission {
-    /// 权限始终编码为契约中的短字符串，避免 Rust 枚举表示泄漏到 JSON。
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::UiNotify => "ui.notify",
-            Self::UiDialog => "ui.dialog",
-            Self::UiFilePicker => "ui.file-picker",
-            Self::ClipboardRead => "clipboard.read",
-            Self::ClipboardWrite => "clipboard.write",
-            Self::OpenExternal => "open-external",
-            Self::HostsRead => "hosts.read",
-            Self::TerminalWrite => "terminal.write",
-            Self::EventsSubscribe => "events.subscribe",
-            Self::Secrets => "secrets",
-            Self::FullAccess => "full-access",
-            Self::Network(host) => return write!(formatter, "network:{host}"),
-        };
-        formatter.write_str(value)
-    }
-}
-
-impl FromStr for Permission {
-    type Err = ProtocolError;
-
-    /// 不接受全域通配、端口或 URL，确保网络授权只作用于明确主机。
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let permission = match value {
-            "ui.notify" => Self::UiNotify,
-            "ui.dialog" => Self::UiDialog,
-            "ui.file-picker" => Self::UiFilePicker,
-            "clipboard.read" => Self::ClipboardRead,
-            "clipboard.write" => Self::ClipboardWrite,
-            "open-external" => Self::OpenExternal,
-            "hosts.read" => Self::HostsRead,
-            "terminal.write" => Self::TerminalWrite,
-            "events.subscribe" => Self::EventsSubscribe,
-            "secrets" => Self::Secrets,
-            "full-access" => Self::FullAccess,
-            _ if value.starts_with("network:") => {
-                let host = &value["network:".len()..];
-                if !valid_network_pattern(host) {
-                    return Err(invalid("permissions", "无效的网络主机白名单"));
-                }
-                Self::Network(host.to_ascii_lowercase())
-            }
-            _ => return Err(invalid("permissions", "未知权限")),
-        };
-        Ok(permission)
-    }
-}
-
-impl Serialize for Permission {
-    /// 字符串表示与其他语言 SDK 的权限声明保持一致。
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for Permission {
-    /// 在反序列化边界即拒绝未知权限，防止授权列表被静默缩减。
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-impl JsonSchema for Permission {
-    /// Schema 同时描述固定权限与受约束的网络权限字符串。
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "Permission".into()
-    }
-    /// 由类型提供 schema，编辑器不需要维护另一份权限清单。
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        let label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?";
-        let host = format!(r"{label}(?:\.{label})*");
-        schemars::json_schema!({"type":"string", "anyOf":[
-            {"enum":["ui.notify","ui.dialog","ui.file-picker","clipboard.read","clipboard.write","open-external","hosts.read","terminal.write","events.subscribe","secrets","full-access"]},
-            {"pattern":format!(r"^network:{host}$"), "maxLength":261,
-             "not":{"pattern":r"[^A-Za-z0-9:.-]"}},
-            {"pattern":format!(r"^network:\*\.{host}$"), "maxLength":263,
-             "not":{"pattern":r"[^A-Za-z0-9:.*-]"}}
-        ]})
-    }
-}
-
-/// DNS 标签遵循常见主机写法，不允许把通配符、路径或凭据混入权限。
-fn valid_network_pattern(pattern: &str) -> bool {
-    let host = pattern.strip_prefix("*.").unwrap_or(pattern);
-    !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Activation {
@@ -249,13 +105,6 @@ pub enum PluginRuntime {
         #[serde(flatten)]
         extensions: BTreeMap<String, Value>,
     },
-    Script {
-        main: String,
-        #[serde(default)]
-        activation: Activation,
-        #[serde(flatten)]
-        extensions: BTreeMap<String, Value>,
-    },
     Sidecar {
         main: BTreeMap<Platform, String>,
         #[serde(default)]
@@ -266,7 +115,7 @@ pub enum PluginRuntime {
 }
 
 impl PluginRuntime {
-    /// Sidecar 的权限由执行形态决定，不能伪装成受限脚本。
+    /// Sidecar 的完全访问由执行形态隐含，仅用于界面展示而非授权判断。
     pub fn is_sidecar(&self) -> bool {
         matches!(self, Self::Sidecar { .. })
     }
@@ -282,7 +131,9 @@ pub enum ViewDefinition {
     },
     Webview {
         entry: String,
+        /// 旧清单仍可携带 CSP；宿主不再据此限制网络，仅保留解析兼容。
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(skip)]
         csp: Option<String>,
         #[serde(flatten)]
         extensions: BTreeMap<String, Value>,
@@ -383,15 +234,6 @@ pub fn parse_manifest(
 }
 
 impl PluginManifest {
-    /// Sidecar 的完全访问由运行形态隐含，声明列表无需重复写入。
-    pub fn effective_permissions(&self) -> BTreeSet<Permission> {
-        let mut permissions = self.permissions.iter().cloned().collect::<BTreeSet<_>>();
-        if self.runtime.is_sidecar() {
-            permissions.insert(Permission::FullAccess);
-        }
-        permissions
-    }
-
     /// npm 风格范围由 node-semver 计算，避免把 Cargo 的版本范围当成 npm 语义。
     pub fn supports_host_api(&self, host_api: &str) -> Result<bool, ProtocolError> {
         let range = node_semver::Range::parse(&self.api)
@@ -416,6 +258,45 @@ impl PluginManifest {
             || self.publisher != publisher
         {
             return Err(invalid("manifest.id", "插件 ID 或发布者无效"));
+        }
+        // 身份在宿主侧直接用作 `plugins/<id>` 目录名，与 domain PluginId::parse 共用同一套
+        // 保留名规则：Windows 把设备名视为保留 stem 且只看第一个点前的段（所以 `acme.con`
+        // 仍合法），`state.json` 与 `state-recovery-*.json` 是宿主状态文件的固定命名；
+        // SDK 若不在此拒绝，市场会构建出宿主无法反序列化的条目。
+        let first_segment = self.id.split('.').next().unwrap_or(&self.id);
+        let reserved = matches!(
+            first_segment,
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+                | "conin$"
+                | "conout$"
+        ) || self.id == "state.json"
+            || (self.id.starts_with("state-recovery-") && self.id.ends_with(".json"));
+        if reserved {
+            return Err(invalid(
+                "manifest.id",
+                "插件 ID 与 Windows 设备名或宿主状态文件名冲突",
+            ));
         }
         if publisher == "kerminal" && policy != ManifestPolicy::Official {
             return Err(invalid("manifest.id", "官方命名空间只允许可信官方插件使用"));
@@ -446,36 +327,9 @@ impl PluginManifest {
             validate_package_path(l10n)?;
         }
 
-        let mut permissions = BTreeSet::new();
-        for permission in &self.permissions {
-            if !permissions.insert(permission) {
-                return Err(invalid("manifest.permissions", "权限重复"));
-            }
-            if *permission == Permission::FullAccess && !self.runtime.is_sidecar() {
-                return Err(invalid(
-                    "manifest.permissions",
-                    "只有 Sidecar 可以拥有完全访问",
-                ));
-            }
-        }
+        // 权限只作为展示描述，不参与安装校验，也不再限定运行形态。
         match &self.runtime {
             PluginRuntime::None { extensions } => validate_extensions(extensions, "runtime")?,
-            PluginRuntime::Script {
-                main,
-                activation,
-                extensions,
-            } => {
-                validate_extensions(extensions, "runtime")?;
-                validate_package_path(main)?;
-                if *activation == Activation::Startup
-                    && !permissions.contains(&Permission::EventsSubscribe)
-                {
-                    return Err(invalid(
-                        "runtime.activation",
-                        "脚本启动激活需要 events.subscribe",
-                    ));
-                }
-            }
             PluginRuntime::Sidecar {
                 main, extensions, ..
             } => {
@@ -544,15 +398,10 @@ impl PluginManifest {
                     validate_package_path(file)?;
                 }
                 ViewDefinition::Webview {
-                    entry,
-                    csp,
-                    extensions,
+                    entry, extensions, ..
                 } => {
                     validate_extensions(extensions, "views")?;
                     validate_package_path(entry)?;
-                    if csp.as_ref().is_some_and(|value| !valid_text(value, 2048)) {
-                        return Err(invalid("views.csp", "CSP 无效"));
-                    }
                 }
             }
         }

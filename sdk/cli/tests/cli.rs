@@ -37,10 +37,10 @@ impl Drop for TestProcess {
 }
 
 #[test]
-/// 原生模板经内嵌 esbuild、静态视图生成、宿主校验和归档形成可重复的闭环。
+/// 无后端原生模板经内嵌 esbuild、静态视图生成、宿主校验和归档形成可重复的闭环。
 fn native_template_builds_checks_and_packages() {
     let directory = tempfile::tempdir().unwrap();
-    let created = cli(directory.path(), &["create", "acme.notes"]);
+    let created = cli(directory.path(), &["create", "acme.notes", "--no-backend"]);
     assert!(
         created.status.success(),
         "{}",
@@ -48,13 +48,18 @@ fn native_template_builds_checks_and_packages() {
     );
     let project = directory.path().join("acme.notes");
     assert!(project.join(".github/workflows/release.yml").is_file());
+    assert!(!project.join("src/main.rs").exists());
+    assert!(!project.join("Cargo.toml").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(project.join("kerminal-plugin.json")).unwrap()).unwrap();
+    assert_eq!(manifest["runtime"]["kind"], "none");
     let built = cli(&project, &["build"]);
     assert!(
         built.status.success(),
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    assert!(project.join(".kerminal/build/dist/main.js").is_file());
+    assert!(!project.join(".kerminal/build/dist/main.js").exists());
     assert!(project.join(".kerminal/build/views/panel.json").is_file());
     let checked = cli(&project, &["check"]);
     assert!(
@@ -101,18 +106,26 @@ fn embedded_esbuild_license_is_accessible() {
 }
 
 #[test]
-/// WebView 模板的静态资源也必须进入最终包，不能只验证脚本模板。
+/// WebView 模板的静态资源也必须进入最终包，无后端模式不生成 Rust 后端文件。
 fn webview_template_builds_with_its_resources() {
     let directory = tempfile::tempdir().unwrap();
     assert!(
         cli(
             directory.path(),
-            &["create", "acme.web", "--template", "webview"]
+            &[
+                "create",
+                "acme.web",
+                "--template",
+                "webview",
+                "--no-backend"
+            ]
         )
         .status
         .success()
     );
     let project = directory.path().join("acme.web");
+    assert!(!project.join("src/main.rs").exists());
+    assert!(!project.join("Cargo.toml").exists());
     let output = cli(&project, &["build"]);
     assert!(
         output.status.success(),
@@ -132,18 +145,19 @@ fn webview_template_builds_with_its_resources() {
 }
 
 #[test]
-/// 以当前已检出的 SDK 模拟作者固定版本，验证模板确实使用 SDK、清单版本和独立 target。
+/// 默认模板生成 Rust Sidecar，验证模板确实使用 SDK、清单版本和独立 target。
 fn sidecar_template_builds_with_manifest_identity() {
     let directory = tempfile::tempdir().unwrap();
     assert!(
-        cli(
-            directory.path(),
-            &["create", "acme.sidecar", "--template", "sidecar-rust"]
-        )
-        .status
-        .success()
+        cli(directory.path(), &["create", "acme.sidecar"])
+            .status
+            .success()
     );
     let project = directory.path().join("acme.sidecar");
+    assert!(project.join("src/main.rs").is_file());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(project.join("kerminal-plugin.json")).unwrap()).unwrap();
+    assert_eq!(manifest["runtime"]["kind"], "sidecar");
     let cargo_path = project.join("Cargo.toml");
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../rust")
@@ -187,19 +201,19 @@ fn sidecar_template_builds_with_manifest_identity() {
 }
 
 #[test]
-/// 编译失败不得替换上一份有效视图和脚本，开发模式才可安全继续使用。
+/// 编译失败不得替换上一份有效视图，开发模式才可安全继续使用。
 fn failed_build_keeps_previous_package() {
     let directory = tempfile::tempdir().unwrap();
     assert!(
-        cli(directory.path(), &["create", "acme.notes"])
+        cli(directory.path(), &["create", "acme.notes", "--no-backend"])
             .status
             .success()
     );
     let project = directory.path().join("acme.notes");
     assert!(cli(&project, &["build"]).status.success());
-    let artifact = project.join(".kerminal/build/dist/main.js");
+    let artifact = project.join(".kerminal/build/views/panel.json");
     let previous = fs::read(&artifact).unwrap();
-    fs::write(project.join("src/main.ts"), "const = invalid;").unwrap();
+    fs::write(project.join("src/views.ts"), "const = invalid;").unwrap();
     assert!(!cli(&project, &["build"]).status.success());
     assert_eq!(fs::read(artifact).unwrap(), previous);
     assert!(cli(&project, &["check"]).status.success());
@@ -210,13 +224,13 @@ fn failed_build_keeps_previous_package() {
 fn build_refuses_foreign_owner_marker() {
     let directory = tempfile::tempdir().unwrap();
     assert!(
-        cli(directory.path(), &["create", "acme.notes"])
+        cli(directory.path(), &["create", "acme.notes", "--no-backend"])
             .status
             .success()
     );
     let project = directory.path().join("acme.notes");
     assert!(cli(&project, &["build"]).status.success());
-    let artifact = project.join(".kerminal/build/dist/main.js");
+    let artifact = project.join(".kerminal/build/views/panel.json");
     let before = fs::read(&artifact).unwrap();
     let marker = project.join(".kerminal/build-owner");
     fs::write(&marker, b"foreign marker").unwrap();
@@ -313,13 +327,27 @@ fn archive_rejects_links_traversal_and_case_aliases() {
 }
 
 #[test]
-/// 模板身份和目标目录由协议与无覆盖规则约束，不留部分生成仓库。
+/// 模板身份和目标目录由协议与无覆盖规则约束，旧脚本模板和未知模板明确拒绝。
 fn create_rejects_invalid_ids_and_existing_targets() {
     let directory = tempfile::tempdir().unwrap();
     assert!(
         !cli(directory.path(), &["create", "../escape"])
             .status
             .success()
+    );
+    let legacy = cli(
+        directory.path(),
+        &["create", "acme.legacy", "--template", "sidecar-rust"],
+    );
+    assert!(!legacy.status.success());
+    assert!(String::from_utf8_lossy(&legacy.stderr).contains("--no-backend"));
+    assert!(
+        !cli(
+            directory.path(),
+            &["create", "acme.unknown", "--template", "script"]
+        )
+        .status
+        .success()
     );
     assert!(
         cli(
@@ -382,7 +410,7 @@ fn conformance_verifies_protocol_and_fixture_probes() {
 fn dev_reloads_changed_source_in_an_isolated_root() {
     let directory = tempfile::tempdir().unwrap();
     assert!(
-        cli(directory.path(), &["create", "acme.notes"])
+        cli(directory.path(), &["create", "acme.notes", "--no-backend"])
             .status
             .success()
     );
@@ -425,7 +453,7 @@ fn dev_reloads_changed_source_in_an_isolated_root() {
         thread::sleep(Duration::from_millis(25));
     }
     assert!(ready.is_file(), "dev did not start the desktop fixture");
-    let source = project.join("src/main.ts");
+    let source = project.join("src/views.ts");
     let original = fs::read_to_string(&source).unwrap();
     let reload = control.join("reload.json");
     let mut attempt = 0;

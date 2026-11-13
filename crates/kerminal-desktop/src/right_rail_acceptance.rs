@@ -40,7 +40,10 @@ use gpui_kit::{
     WindowBackgroundAppearance, WindowOptions, component::TitleBar,
 };
 use gpui_pre::{App, Bounds, WindowBounds, px, size};
-use kerminal_application::preferences::{ThemeMode, settings::ToolRailToolId};
+use kerminal_application::{
+    AppResult,
+    preferences::{ThemeMode, settings::ToolRailToolId},
+};
 use kerminal_domain::{files::FileEndpoint, identity::HostId};
 use kerminal_ui::RootView;
 use serde::{Deserialize, Serialize};
@@ -58,6 +61,9 @@ const PANEL_MAX_FRAME_PHASES: usize = 2;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(12);
 const FIXTURE_MANIFEST: &str = ".local/right-rail-fixture/manifest.json";
 const FIXTURE_HOST_ID: &str = "right-rail-fixture";
+const LOCAL_AGENT_HOST_ID: &str = "agent-continuity-local";
+const LOCAL_AGENT_CAPTURE_MODE: &str =
+    "native_local_agent_continuity_same_tab_split_without_fixture";
 const MIN_WINDOW_WIDTH: u32 = 800;
 const MAX_WINDOW_WIDTH: u32 = 3840;
 const MIN_WINDOW_HEIGHT: u32 = 600;
@@ -176,6 +182,7 @@ struct AcceptanceOptions {
     functional_only: bool,
     capture_only: bool,
     sftp_functional_only: bool,
+    agent_continuity_only: bool,
     long_fixture_host_names: bool,
     transfer_restart_prepare: bool,
     transfer_restart_verify: Option<PathBuf>,
@@ -198,6 +205,7 @@ struct RightRailCaptureContext {
     functional_only: bool,
     capture_only: bool,
     sftp_functional_only: bool,
+    agent_continuity_only: bool,
     transfer_restart: Option<functional_transfer_restart::Phase>,
 }
 
@@ -244,6 +252,9 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
             ))
         })?;
     let options = requested_options()?;
+    if options.agent_continuity_only {
+        return run_agent_continuity_only(options);
+    }
     let requested_window_width = options.window_width;
     let requested_window_height = options.window_height;
     let functional_only = options.functional_only;
@@ -348,6 +359,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                     functional_only,
                     capture_only,
                     sftp_functional_only,
+                    agent_continuity_only: false,
                     transfer_restart,
                 },
             )
@@ -358,13 +370,175 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         .block_on(composition.shutdown_until(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT));
     runtime.shutdown();
 
-    ui_result?;
-    shutdown_result?;
+    acceptance_outcome(ui_result, shutdown_result)?;
     if options.transfer_restart_prepare {
         functional_transfer_restart::finish_prepare(&output_directory)?;
     }
     println!("右栏验收截图和报告：{}", output_directory.display());
     Ok(())
+}
+
+/// 仅 Agent 连续性入口：创建全新输出与配置文件后启动同一生产组合根，不读取 fixture manifest、
+/// known_hosts、vault 或 key，也不启动任何网络目标。窗口仍隐藏，结果写入同一报告目录。
+///
+/// @author kongweiguang
+fn run_agent_continuity_only(options: AcceptanceOptions) -> Result<(), Box<dyn Error>> {
+    let requested_output = options.output_directory.as_deref();
+    let output_base = absolute_agent_continuity_output_base(requested_output)?;
+    reject_user_configuration_output_path(&output_base)?;
+    reject_agent_continuity_output_path(&output_base)?;
+    let output_directory = if requested_output.is_some() {
+        create_requested_output_directory(&output_base)?
+    } else {
+        create_unique_output_directory(output_base)?
+    };
+    let config_directory = output_directory.join("config");
+    fs::create_dir(&config_directory)?;
+    let profiles = config_directory.join("profiles");
+    fs::create_dir(&profiles)?;
+    write_local_agent_profile(
+        &profiles.join("agent-continuity-local.toml"),
+        &output_directory,
+    )?;
+    // 组合根与运行时都按环境变量解析配置根；必须在创建 runtime/UI 线程前设置，避免另一线程读取
+    // 旧进程值或用户真实目录。先清除继承的其他 KERMINAL_* 开关，保证 Agent-only 模式不被外部
+    // 并行验收或用户 shell 改写；再移除 fixture manifest，本地分支不会意外回到远程夹具。
+    //
+    // SAFETY: 此处仍位于单线程启动路径，尚未创建 ApplicationRuntime 或 GPUI 线程。
+    clear_inherited_kerminal_environment();
+    unsafe {
+        std::env::set_var("KERMINAL_CONFIG_ROOT", &config_directory);
+        std::env::remove_var("KERMINAL_RIGHT_RAIL_FIXTURE_MANIFEST");
+    }
+    let fixture_host_id = HostId::parse(LOCAL_AGENT_HOST_ID)?;
+    let runtime = ApplicationRuntime::new()?;
+    let mut composition = runtime.block_on(DesktopComposition::build(
+        runtime.handle(),
+        &config_directory,
+    ))?;
+    let requested_bounds_size: Option<(f32, f32)> = None;
+    let ui_result = catch_unwind(AssertUnwindSafe(|| {
+        run_hidden_window(
+            composition.app_services(),
+            RightRailCaptureContext {
+                output_directory: output_directory.clone(),
+                config_directory: config_directory.clone(),
+                fixture_config_source: config_directory.clone(),
+                fixture_manifest_path: None,
+                fixture_host_id,
+                remote_sftp_directory: String::new(),
+                local_files_root: output_directory.join("local-files"),
+                fixture_container_name: String::new(),
+                container_target_port: 0,
+                requested_window_width: options.window_width,
+                requested_window_height: options.window_height,
+                requested_bounds_size,
+                functional_only: true,
+                capture_only: false,
+                sftp_functional_only: false,
+                agent_continuity_only: true,
+                transfer_restart: None,
+            },
+        )
+    }))
+    .unwrap_or_else(|_| Err(io::Error::other("GPUI 本地 Agent 连续性验收事件循环意外终止").into()));
+    let shutdown_result = runtime
+        .block_on(composition.shutdown_until(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT));
+    runtime.shutdown();
+    acceptance_outcome(ui_result, shutdown_result)?;
+    println!("本地 Agent 连续性验收报告：{}", output_directory.display());
+    Ok(())
+}
+
+/// Agent-only 输出在创建前锚定为绝对路径，保证子进程使用同一 config/stage 身份；
+/// 使用 lexical absolute 而不是 canonicalize，避免 Windows `\\?\` 前缀进入 shell 参数和报告，
+/// 同时仍按当前工作目录解析显式相对路径。默认路径与显式路径都经过同一入口。
+///
+/// @author kongweiguang
+fn absolute_agent_continuity_output_base(requested: Option<&Path>) -> Result<PathBuf, io::Error> {
+    let path = requested.map_or_else(
+        || {
+            Path::new("target")
+                .join("acceptance")
+                .join("right-rail-agent-continuity")
+        },
+        Path::to_path_buf,
+    );
+    std::path::absolute(path)
+}
+
+/// TOML 基本字符串需要转义反斜杠、引号和控制字符；输出目录由用户参数或当前目录派生，
+/// 不能假定只含 ASCII 安全字符，否则 Windows 路径会把 profile 写坏。
+///
+/// @author kongweiguang
+fn toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{:04X}", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+/// 只写默认本地 profile：pwsh 7、无登录脚本、无环境明文；固定时间戳避免每轮报告漂移。
+/// 显式把 cwd 指向本轮隔离输出目录：Windows KnownFolder 不服从环境变量重定向，若留给
+/// 默认工作目录，验收 shell 仍可能从真实用户目录启动；这里用 profile 支持的 cwd 收紧起点。
+///
+/// @author kongweiguang
+fn write_local_agent_profile(path: &Path, working_directory: &Path) -> io::Result<()> {
+    let working_directory = working_directory.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agent 连续性输出目录必须是可写入 TOML 的 UTF-8 路径",
+        )
+    })?;
+    let document = format!(
+        concat!(
+            "schema_version = 1\n",
+            "id = \"agent-continuity-local\"\n",
+            "name = \"Agent Continuity Local\"\n",
+            "shell = \"pwsh.exe\"\n",
+            "args = [\"-NoLogo\", \"-NoProfile\"]\n",
+            "env = {{}}\n",
+            "cwd = {}\n",
+            "is_default = true\n",
+            "sort_order = 0\n",
+            "created_at = \"0\"\n",
+            "updated_at = \"0\"\n",
+        ),
+        toml_basic_string(working_directory),
+    );
+    fs::write(path, document)
+}
+
+/// UI 与组合根关闭都要纳入同一结果：仅一侧失败时直接返回该侧原始错误，保留类型和来源链；
+/// 只有两侧同时失败时才构造合并错误，避免先前的 `ui_result?` 吞掉已发生的 shutdown 错误。
+///
+/// @author kongweiguang
+fn acceptance_outcome(
+    ui_result: Result<(), Box<dyn Error>>,
+    shutdown_result: AppResult<()>,
+) -> Result<(), Box<dyn Error>> {
+    match (ui_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(ui), Ok(())) => Err(ui),
+        (Ok(()), Err(shutdown)) => Err(shutdown.into()),
+        (Err(ui), Err(shutdown)) => Err(io::Error::other(format!(
+            "GPUI 右栏验收失败：{ui}；同时组合根关闭失败：{shutdown}"
+        ))
+        .into()),
+    }
 }
 
 /// 解析验收参数并拒绝重复或未知选项，防止把拼错的路径静默交给产品启动流程。
@@ -393,10 +567,27 @@ fn parse_options(
             options.long_fixture_host_names = true;
             continue;
         }
+        if flag == OsStr::new("--agent-continuity-only") {
+            if options.agent_continuity_only
+                || options.capture_only
+                || options.functional_only
+                || options.sftp_functional_only
+                || options.transfer_restart_prepare
+                || options.transfer_restart_verify.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "验收子模式不能重复或混用",
+                ));
+            }
+            options.agent_continuity_only = true;
+            continue;
+        }
         if flag == OsStr::new("--transfer-restart-prepare") {
             if options.capture_only
                 || options.functional_only
                 || options.sftp_functional_only
+                || options.agent_continuity_only
                 || options.transfer_restart_prepare
                 || options.transfer_restart_verify.is_some()
             {
@@ -412,6 +603,7 @@ fn parse_options(
             if options.capture_only
                 || options.functional_only
                 || options.sftp_functional_only
+                || options.agent_continuity_only
                 || options.transfer_restart_prepare
                 || options.transfer_restart_verify.is_some()
             {
@@ -433,6 +625,7 @@ fn parse_options(
             if options.capture_only
                 || options.functional_only
                 || options.sftp_functional_only
+                || options.agent_continuity_only
                 || options.transfer_restart_prepare
                 || options.transfer_restart_verify.is_some()
             {
@@ -448,6 +641,7 @@ fn parse_options(
             if options.functional_only
                 || options.capture_only
                 || options.sftp_functional_only
+                || options.agent_continuity_only
                 || options.transfer_restart_prepare
                 || options.transfer_restart_verify.is_some()
             {
@@ -463,6 +657,7 @@ fn parse_options(
             if options.sftp_functional_only
                 || options.functional_only
                 || options.capture_only
+                || options.agent_continuity_only
                 || options.transfer_restart_prepare
                 || options.transfer_restart_verify.is_some()
             {
@@ -525,7 +720,7 @@ fn parse_options(
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "仅支持 --right-rail-acceptance [--output-dir <新目录>] [--fixture-config-dir <隔离配置目录>] [--fixture-manifest <绝对路径>] [--width <逻辑像素>] [--height <逻辑像素>] [--long-fixture-host-names] [--functional-only | --capture-only | --sftp-functional-only | --transfer-restart-prepare | --transfer-restart-verify <准备阶段目录>]",
+                "仅支持 --right-rail-acceptance [--output-dir <新目录>] [--fixture-config-dir <隔离配置目录>] [--fixture-manifest <绝对路径>] [--width <逻辑像素>] [--height <逻辑像素>] [--long-fixture-host-names] [--functional-only | --capture-only | --sftp-functional-only | --agent-continuity-only | --transfer-restart-prepare | --transfer-restart-verify <准备阶段目录>]",
             ));
         };
         if slot.is_some() {
@@ -541,6 +736,16 @@ fn parse_options(
             ));
         };
         *slot = Some(PathBuf::from(path));
+    }
+    if options.agent_continuity_only
+        && (options.fixture_config_directory.is_some()
+            || options.fixture_manifest.is_some()
+            || options.long_fixture_host_names)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "仅 Agent 连续性验收使用全新本地配置，不接受 fixture 或长主机名选项",
+        ));
     }
     if options.long_fixture_host_names && !options.sftp_functional_only {
         return Err(io::Error::new(
@@ -733,6 +938,59 @@ fn reject_user_configuration_directory(source: &Path) -> Result<(), io::Error> {
         }
     }
     Ok(())
+}
+
+/// Agent-only 入口比通用右栏验收更严格：输出和触发文件不能落在真实主目录或 KnownFolder
+/// 相关环境根下。默认仓库若位于用户目录内也必须直接失败，而不是未经证明地写入用户空间。
+///
+/// @author kongweiguang
+fn reject_agent_continuity_output_path(path: &Path) -> Result<(), io::Error> {
+    let output = resolve_path_identity(path)?;
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(resolve_path_identity(&home)?);
+    }
+    for name in ["USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA"] {
+        if let Some(value) = std::env::var_os(name)
+            && !value.is_empty()
+        {
+            roots.push(resolve_path_identity(Path::new(&value))?);
+        }
+    }
+    for root in roots {
+        if path_starts_with(&output, &root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Agent 连续性输出目录不能位于真实用户目录或 KnownFolder 环境根内：{}",
+                    root.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 只保留本轮将要设置的 `KERMINAL_CONFIG_ROOT`，清除其他继承的 `KERMINAL_*` 开关。
+/// 这些变量可能来自用户 shell 或并行验收，未枚举的开关会改变模式；Agent-only 入口在
+/// 创建 runtime 前清空它们，避免隔离结论依赖调用方是否完整清理环境。
+///
+/// @author kongweiguang
+fn clear_inherited_kerminal_environment() {
+    let inherited = std::env::vars_os()
+        .filter_map(|(name, _)| {
+            let name = name.to_string_lossy();
+            (name.to_ascii_uppercase().starts_with("KERMINAL_")
+                && !name.eq_ignore_ascii_case("KERMINAL_CONFIG_ROOT"))
+            .then_some(std::ffi::OsString::from(name.into_owned()))
+        })
+        .collect::<Vec<_>>();
+    for name in inherited {
+        // SAFETY: 此函数只在创建 ApplicationRuntime/GPUI 线程之前的单线程启动路径调用。
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
 }
 
 /// Prevents output creation inside the active or default user data roots.
@@ -950,6 +1208,7 @@ fn run_hidden_window(
         functional_only,
         capture_only,
         sftp_functional_only,
+        agent_continuity_only,
         transfer_restart,
         ..
     } = capture;
@@ -1030,6 +1289,7 @@ fn run_hidden_window(
                             functional_only,
                             capture_only,
                             sftp_functional_only,
+                            agent_continuity_only,
                             transfer_restart,
                             requested_bounds_size: requested_bounds_size
                                 .map(|size| (size.width.as_f32(), size.height.as_f32())),
@@ -1263,6 +1523,9 @@ async fn capture_right_rail(
     )
     .await?;
     wait_for_window_size(cx, window, requested_bounds_size).await?;
+    if capture.agent_continuity_only {
+        return capture_agent_continuity_only(cx, &root, window, &capture).await;
+    }
     if !matches!(
         &capture.transfer_restart,
         Some(functional_transfer_restart::Phase::Verify(_))
@@ -1349,34 +1612,7 @@ async fn capture_right_rail(
     }
 
     let (window_visible, window_active, window_width, window_height, native_isolation) =
-        window.update(cx, |_, window, _| {
-            let bounds = window.bounds();
-            Ok::<_, io::Error>((
-                window.is_visible(),
-                window.is_window_active(),
-                bounds.size.width.as_f32(),
-                bounds.size.height.as_f32(),
-                isolation::capture()?,
-            ))
-        })??;
-    if !window_width.is_finite()
-        || !window_height.is_finite()
-        || window_width <= 0.0
-        || window_height <= 0.0
-    {
-        return Err(io::Error::other("验收窗口返回无效尺寸").into());
-    }
-    native_isolation.validate_window_state(window_visible, window_active)?;
-    if let Some((requested_width, requested_height)) = requested_bounds_size
-        && ((window_width - requested_width).abs() > 1.0
-            || (window_height - requested_height).abs() > 1.0)
-    {
-        return Err(io::Error::other(format!(
-            "右栏截图期间 GPUI 窗口尺寸偏离请求：请求 {:.0}x{:.0}，实测 {:.0}x{:.0}",
-            requested_width, requested_height, window_width, window_height
-        ))
-        .into());
-    }
+        capture_window_evidence(cx, window, requested_bounds_size).await?;
 
     let report = AcceptanceReport {
         schema_version: 6,
@@ -1412,7 +1648,7 @@ async fn capture_right_rail(
         capture_backend: "native_window_render_to_image",
         config_directory: capture.config_directory.to_string_lossy().into_owned(),
         fixture_config_source: fixture_config_source.to_string_lossy().into_owned(),
-        fixture_host_id: FIXTURE_HOST_ID.to_owned(),
+        fixture_host_id: capture.fixture_host_id.as_str().to_owned(),
         fixture_host_key_policy: "existing_known_hosts_or_automatic_trust_with_best_effort_record",
         window_size_unit: "gpui_logical_pixels",
         window_size_source: if requested_window_width.is_some() || requested_window_height.is_some()
@@ -1436,6 +1672,105 @@ async fn capture_right_rail(
     let bytes = serde_json::to_vec_pretty(&report)?;
     fs::write(output_directory.join("report.json"), bytes)?;
     Ok(())
+}
+
+/// 仅本地 Agent 连续性验收：不采样主题、不访问 fixture 网络目标，只运行生产 Root 连续性用例，
+/// 再按与其他模式相同的窗口/隔离证据格式落盘，避免报告缺少原生窗口事实。
+///
+/// @author kongweiguang
+async fn capture_agent_continuity_only(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+) -> Result<(), Box<dyn Error>> {
+    let mut functional = Vec::new();
+    functional_agent::run_local_agent_continuity_flow(cx, root, window, capture, &mut functional)
+        .await?;
+    window.update(cx, |_, window, app| {
+        root.update(app, |root, root_cx| {
+            root.close_right_rail_acceptance_panels(window, root_cx);
+        });
+    })?;
+    let (window_visible, window_active, window_width, window_height, native_isolation) =
+        capture_window_evidence(cx, window, capture.requested_bounds_size).await?;
+    let report = AcceptanceReport {
+        schema_version: 6,
+        capture_mode: LOCAL_AGENT_CAPTURE_MODE,
+        capture_backend: "native_window_render_to_image",
+        config_directory: capture.config_directory.to_string_lossy().into_owned(),
+        fixture_config_source: capture.config_directory.to_string_lossy().into_owned(),
+        fixture_host_id: capture.fixture_host_id.as_str().to_owned(),
+        fixture_host_key_policy: "not_applicable_local_profile_without_remote_fixture",
+        window_size_unit: "gpui_logical_pixels",
+        window_size_source: if capture.requested_window_width.is_some()
+            || capture.requested_window_height.is_some()
+        {
+            "explicit_logical_dimensions_centered_on_primary_display"
+        } else {
+            "first_run_window_bounds"
+        },
+        requested_window_width: capture.requested_window_width,
+        requested_window_height: capture.requested_window_height,
+        window_visible,
+        window_active,
+        native_isolation,
+        window_width,
+        window_height,
+        functional,
+        themes: Vec::new(),
+        tmux_presentations: Vec::new(),
+        container_presentations: Vec::new(),
+    };
+    let bytes = serde_json::to_vec_pretty(&report)?;
+    fs::write(capture.output_directory.join("report.json"), bytes)?;
+    Ok(())
+}
+
+/// 汇总窗口可见性、活动状态、逻辑尺寸和隔离证据，并在两种捕获模式间共享同一尺寸校验。
+///
+/// @author kongweiguang
+async fn capture_window_evidence(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    requested_bounds_size: Option<(f32, f32)>,
+) -> Result<(bool, bool, f32, f32, isolation::DesktopIsolationEvidence), Box<dyn Error>> {
+    let (window_visible, window_active, window_width, window_height, native_isolation) =
+        window.update(cx, |_, window, _| {
+            let bounds = window.bounds();
+            Ok::<_, io::Error>((
+                window.is_visible(),
+                window.is_window_active(),
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32(),
+                isolation::capture()?,
+            ))
+        })??;
+    if !window_width.is_finite()
+        || !window_height.is_finite()
+        || window_width <= 0.0
+        || window_height <= 0.0
+    {
+        return Err(io::Error::other("验收窗口返回无效尺寸").into());
+    }
+    native_isolation.validate_window_state(window_visible, window_active)?;
+    if let Some((requested_width, requested_height)) = requested_bounds_size
+        && ((window_width - requested_width).abs() > 1.0
+            || (window_height - requested_height).abs() > 1.0)
+    {
+        return Err(io::Error::other(format!(
+            "右栏截图期间 GPUI 窗口尺寸偏离请求：请求 {:.0}x{:.0}，实测 {:.0}x{:.0}",
+            requested_width, requested_height, window_width, window_height
+        ))
+        .into());
+    }
+    Ok((
+        window_visible,
+        window_active,
+        window_width,
+        window_height,
+        native_isolation,
+    ))
 }
 
 /// Opens the actual owning panel before its dialog so layout and target state match the visible production entry point.
@@ -2693,3 +3028,7 @@ fn set_failure(failure: &Mutex<Option<String>>, message: String) {
 #[cfg(test)]
 #[path = "../tests/unit/right_rail_acceptance_args.rs"]
 mod option_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/right_rail_acceptance_outcome.rs"]
+mod outcome_tests;

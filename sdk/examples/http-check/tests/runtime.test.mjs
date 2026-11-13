@@ -1,56 +1,46 @@
 // @author kongweiguang
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import vm from "node:vm";
-import test from "node:test";
 
-/** 在受控 fetch 下运行实际分发脚本，检查权限边界和状态恢复。 */
-async function load(fetch) {
-  const handlers = new Map();
-  const host = { environment: { locale: "zh-CN", theme: "light" }, onRequest(method, handler) { handlers.set(method, handler); } };
-  const script = new vm.Script(await readFile(fileURLToPath(new URL("../dist/main.js", import.meta.url)), "utf8"));
-  script.runInNewContext({ kerminal: host, fetch, AbortController, setTimeout, clearTimeout });
-  return handlers;
-}
+const root = fileURLToPath(new URL("../", import.meta.url));
 
-/** 主机测试和打开共享同一真实响应；非成功状态不会伪装成可用。 */
-test("host test, result tab and refresh", async () => {
-  const urls = [];
-  const handlers = await load(async (url) => { urls.push(url); return { ok: false, status: 503 }; });
-  const params = { host_type: "http-endpoint", config: { url: "https://example.com/health" }, secrets: {} };
-  const tested = await handlers.get("host.test")(params);
-  assert.equal(tested.ok, false);
-  assert.match(tested.message, /503/);
-  const opened = await handlers.get("host.open")(params);
-  assert.equal(opened.tab, "http-result");
-  const restored = handlers.get("view.open")({ instance: "one", view: "http.result", scope: {}, state: opened.state });
-  assert.equal(restored.data.url, params.config.url);
-  const refreshed = await handlers.get("view.action")({ instance: "one", action: "refresh", data: {} });
-  assert.equal(refreshed.patch.ok, false);
-  assert.equal(handlers.get("view.close")({ instance: "one" }).state.message, refreshed.patch.message);
-  assert.deepEqual(urls, [params.config.url, params.config.url, params.config.url]);
-});
-
-/** 域名、端口和凭据校验早于 fetch，绕过表单直接调用也无法扩大权限。 */
-test("rejects unapproved endpoints before network access", async () => {
-  let count = 0;
-  const handlers = await load(async () => { count++; return { ok: true, status: 200 }; });
-  for (const url of ["https://example.com.evil/", "https://user@example.com/", "https://example.com:443/", "http://example.com/"]) {
-    const result = await handlers.get("host.test")({ host_type: "http-endpoint", config: { url }, secrets: {} });
-    assert.equal(result.ok, false);
+/** Sidecar 迁移后仍需保留主机类型、结果标签和目标约束，不能只改清单。 */
+test("manifest and source keep the host form contract", async () => {
+  const manifest = JSON.parse(await readFile(`${root}kerminal-plugin.json`, "utf8"));
+  assert.equal(manifest.runtime.kind, "sidecar");
+  assert.equal(manifest.runtime.main["windows-x86_64"], "bin/sidecar.exe");
+  assert.equal(Object.hasOwn(manifest, "permissions"), false);
+  assert.equal(manifest.contributes.host_types[0].id, "http-endpoint");
+  assert.equal(manifest.contributes.host_types[0].schema, "schemas/host.json");
+  assert.equal(manifest.contributes.tabs[0].id, "http-result");
+  const backend = await readFile(`${root}src/main.rs`, "utf8");
+  for (const method of ["host.test", "host.open", "view.open", "view.action", "view.snapshot", "view.close"]) {
+    assert.match(backend, new RegExp(`"${method.replace(".", "\\.")}"`));
   }
-  assert.equal(count, 0);
+  assert.match(backend, /https:\/\/example\.com/);
+  assert.match(backend, /Duration::from_secs\(10\)/);
+  assert.match(backend, /Policy::none\(\)/);
+  const cargo = await readFile(`${root}Cargo.toml`, "utf8");
+  assert.match(cargo, /reqwest = \{ version = "=0\.12\.28"/);
+  assert.match(cargo, /rustls-tls/);
 });
 
-/** 关闭中的请求即使迟到也不能更新已关闭的实例。 */
-test("ignores a response after its tab closes", async () => {
-  let resolveFetch;
-  const pending = new Promise((resolve) => { resolveFetch = resolve; });
-  const handlers = await load(() => pending);
-  handlers.get("view.open")({ instance: "one", view: "http.result", scope: {} });
-  const result = handlers.get("view.action")({ instance: "one", action: "refresh", data: {} });
-  handlers.get("view.close")({ instance: "one" });
-  resolveFetch({ ok: true, status: 200 });
-  await assert.rejects(result, /stale instance/);
+/** 结果视图保持原结构，重复检查只替换数据而不重建标签。 */
+test("result view remains the frozen native structure", async () => {
+  const view = JSON.parse(await readFile(`${root}views/result.json`, "utf8"));
+  assert.equal(view.schema, 1);
+  const refresh = view.root.children.find((node) => node.type === "button");
+  assert.equal(refresh.action, "refresh");
+  assert.equal(refresh.busy, "$busy");
+});
+
+/** 分发目录不再保留脚本入口；仅保留构建器与资源。 */
+test("script entry and dist output are gone", async () => {
+  const entries = await readdir(`${root}src`);
+  assert.equal(entries.includes("main.ts"), false);
+  assert.equal(entries.includes("main.rs"), true);
+  const rootEntries = await readdir(root);
+  assert.equal(rootEntries.includes("dist"), false);
 });

@@ -788,6 +788,78 @@
             "^x-[\\s\\S]+": {}
           },
           "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9._-]"
+                  },
+                  "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "not": {
+                    "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+                  },
+                  "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "matrix": {
+              "maxLength": 257,
+              "not": {
+                "pattern": "[^A-Za-z0-9_.$-]"
+              },
+              "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+              "type": "string"
+            },
+            "type": {
+              "const": "qrcode",
+              "type": "string"
+            },
+            "visible": {
+              "anyOf": [
+                {
+                  "maxLength": 257,
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_.$-]"
+                  },
+                  "pattern": "^\\$[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "matrix"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "patternProperties": {
+            "^x-[\\s\\S]+": {}
+          },
+          "properties": {
             "description": {
               "type": [
                 "string",
@@ -2303,7 +2375,8 @@
     "PickerMode": {
       "enum": [
         "open",
-        "save"
+        "save",
+        "directory"
       ],
       "type": "string"
     },

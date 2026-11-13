@@ -956,6 +956,11 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 禁用工具在进入 compact 投影前就返回，避免缓存抽屉状态或焦点意图被不存在的入口改写；
+        // 启用判定与右栏、命令面板共享同一冻结目录视图。
+        if !self.tool_rail_tool_enabled(tool) {
+            return;
+        }
         let (compact_panels, compact_active_tool) = self.tool_rail_rendered_compact;
         self.activate_compact_tool_rail_panel(
             tool,
@@ -1021,6 +1026,11 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // sidebar_containers 等调用点可直达 compact 投影，不经过 toggle；在切换抽屉或
+        // active 状态前用同一冻结目录视图拒绝禁用工具，避免留下没有内容的空白抽屉。
+        if !self.tool_rail_tool_enabled(tool) {
+            return;
+        }
         self.sync_tool_rail_active_tab();
         if tool == ToolRailToolId::Snippets
             && !self.return_workspace_before_snippets_rail(window, cx)

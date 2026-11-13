@@ -476,25 +476,13 @@ fn run_application(
             Ok(())
         }
         SingleApplication::PrimaryInstance(primary) => {
-            let (options, _) = plugins::arguments::PluginStartupOptions::current()?;
-            let startup_plugins = Arc::new(plugins::startup::StartupPlugins::load(
-                config_root.as_path(),
-                options,
-            )?);
-            #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
-            let catalogs = if host_list_acceptance {
-                // catalogs() 已登记冻结标记；此处替换为同一迁移输入上追加宿主声明的目录。
-                plugin_performance_acceptance::acceptance_catalogs(&startup_plugins, "zh-CN")?
-            } else {
-                startup_plugins.catalogs("zh-CN")?
-            };
-            #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
-            let catalogs = startup_plugins.catalogs("zh-CN")?;
+            // 迁移只读快照先冻结主机 codec；不能在迁移前 StartupPlugins::load 或写冻结标记。
+            let migration_catalogs = plugin_catalogs::migration_catalogs(config_root.as_path())?;
             let legacy_window_state = bootstrap::legacy_window_state_path(false);
             let migration = bootstrap::migration_service(
                 config_root.as_path(),
                 legacy_window_state.as_deref(),
-                catalogs.1.clone(),
+                migration_catalogs.1.clone(),
             );
             let allow_beta_contract =
                 !crate::config_root::ConfigRoot::points_to_formal_default(config_root.as_path());
@@ -503,6 +491,19 @@ fn run_application(
                 *log_guard = Some(logging::initialize(config_root.as_path()).map_err(|error| {
                     io::Error::other(format!("Kerminal 无法初始化诊断日志：{error}"))
                 })?);
+                let (options, _) = plugins::arguments::PluginStartupOptions::current()?;
+                let startup_plugins = Arc::new(plugins::startup::StartupPlugins::load(
+                    config_root.as_path(),
+                    options,
+                )?);
+                #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
+                let catalogs = if host_list_acceptance {
+                    plugin_performance_acceptance::acceptance_catalogs(&startup_plugins, "zh-CN")?
+                } else {
+                    startup_plugins.catalogs("zh-CN")?
+                };
+                #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
+                let catalogs = startup_plugins.catalogs("zh-CN")?;
                 run_primary_instance(runtime, instance_id, primary, config_root, activation, catalogs, startup_plugins,
                     #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
                     host_list_acceptance)

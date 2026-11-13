@@ -9,7 +9,7 @@ use std::{
 };
 
 use kerminal_plugin_cli::{
-    Result, archive, build, conformance, create, dev, parse_platform, platform_name,
+    Result, archive, asset_url, build, conformance, create, dev, parse_platform, platform_name,
 };
 use kerminal_plugin_protocol::{
     ManifestPolicy, Platform, PluginRuntime, parse_manifest, validate_package,
@@ -41,18 +41,32 @@ fn execute() -> Result<()> {
     }
     if matches!(command, "help" | "--help" | "-h") {
         println!(
-            "kerminal-plugin create <id> [--template native|webview|sidecar-rust] [--out DIR] [--official]\n\
+            "kerminal-plugin create <id> [--template native|webview] [--no-backend] [--out DIR] [--official]\n\
 kerminal-plugin build [--project DIR] [--platform PLATFORM] [--official]\n\
 kerminal-plugin check [DIR|FILE.kplugin] [--platform PLATFORM] [--official]\n\
 kerminal-plugin package [--dir DIR] [--out DIR] [--platform PLATFORM] [--official]\n\
 kerminal-plugin dev [--project DIR] [--kerminal EXE] [--official]\n\
 kerminal-plugin conformance <exe> [--id ID --version VERSION] [--fixture-mode]\n\
+kerminal-plugin asset-url < request.json\n\
 kerminal-plugin --licenses"
         );
         return Ok(());
     }
+    // asset-url 只从 stdin 读批量 JSON，不接受任何选项或位置参数，
+    // 保持纯计算契约：不发网络请求、不读取工作区或凭据。
+    if command == "asset-url" {
+        if arguments.next().is_some() {
+            return Err("asset-url 不接受参数，请求请从 stdin 传入".into());
+        }
+        return asset_url::run();
+    }
     let allowed: &[(&str, bool)] = match command {
-        "create" => &[("--template", true), ("--out", true), ("--official", false)],
+        "create" => &[
+            ("--template", true),
+            ("--no-backend", false),
+            ("--out", true),
+            ("--official", false),
+        ],
         "build" => &[
             ("--project", true),
             ("--platform", true),
@@ -115,7 +129,13 @@ kerminal-plugin --licenses"
             let id = positionals[0].to_str().ok_or("插件 ID 必须是 UTF-8")?;
             let template = option_text(&options, "--template")?.unwrap_or("native");
             let output = option_path(&options, "--out").unwrap_or_else(|| PathBuf::from(id));
-            create::create(id, template, &output, policy)?;
+            create::create(
+                id,
+                template,
+                options.contains_key("--no-backend"),
+                &output,
+                policy,
+            )?;
             println!("已创建 {}", output.display());
         }
         "build" => {

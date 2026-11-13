@@ -125,7 +125,7 @@ fn run_command(arguments: impl IntoIterator<Item = OsString>) -> AppResult<Comma
             .map_err(|_| AppError::invalid("无法解析迁移数据目录"))?,
     };
     let legacy = bootstrap::legacy_window_state_path(explicit_root);
-    let (_, host_types) = plugin_catalogs::offline_catalogs(&root)?;
+    let (_, host_types) = plugin_catalogs::migration_catalogs(&root)?;
     let service = bootstrap::migration_service(&root, legacy.as_deref(), host_types);
     match arguments.action {
         MigrationAction::DryRun => {

@@ -191,9 +191,19 @@ fn constrain_manifest_schema(schema: &mut Value) {
     set_property_schema(
         schema,
         "id",
-        json!({"type":"string",
-        "pattern":r"^[a-z0-9][a-z0-9-]{1,38}\.[a-z0-9][a-z0-9-]{1,62}$",
-        "not":{"pattern":r"[^a-z0-9.-]"}}),
+        // 双重 not 包在 allOf 里：语法拒绝之外，还要镜像 domain PluginId::parse 的保留名
+        // 规则——Windows 保留设备名只看第一个点前的段（`conin$` 等含 $ 的名字其实已被
+        // 语法拒绝，保留在此是为了与 domain 列表一一对应，避免未来放宽语法时漏掉），
+        // `state.json` 与 `state-recovery-*.json` 是宿主状态文件的固定命名。
+        json!({"type":"string", "allOf":[
+        {"not":{"pattern":r"[^a-z0-9.-]"}},
+        {"not":{"anyOf":[
+        {"pattern":r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\.[a-z0-9][a-z0-9-]{1,62})?$"},
+        {"pattern":r"^state\.json$"},
+        {"pattern":r"^state-recovery-[a-z0-9-]*\.json$"}
+        ]}}
+        ],
+        "pattern":r"^[a-z0-9][a-z0-9-]{1,38}\.[a-z0-9][a-z0-9-]{1,62}$"}),
     );
     set_property_schema(
         schema,
@@ -221,17 +231,12 @@ fn constrain_manifest_schema(schema: &mut Value) {
         categories["items"] = local_id_schema(128);
     }
     if let Some(permissions) = schema.pointer_mut("/properties/permissions") {
-        permissions["uniqueItems"] = json!(true);
+        // 权限已退化为展示描述，重复项不再被安装器拒绝，schema 也不应额外收紧。
+        permissions["items"] = json!({"type":"string"});
     }
     if let Some(views) = schema.pointer_mut("/properties/views") {
         views["propertyNames"] = local_id_schema(128);
     }
-    schema["allOf"] = json!([
-        {"if":{"properties":{"runtime":{"required":["kind","activation"],"properties":{"kind":{"const":"script"},"activation":{"const":"startup"}}}}},
-         "then":{"required":["permissions"],"properties":{"permissions":{"contains":{"const":"events.subscribe"}}}}},
-        {"if":{"required":["permissions"],"properties":{"permissions":{"contains":{"const":"full-access"}}}},
-         "then":{"properties":{"runtime":{"properties":{"kind":{"const":"sidecar"}}}}}}
-    ]);
     let Some(definitions) = schema.get_mut("$defs").and_then(Value::as_object_mut) else {
         return;
     };
@@ -265,25 +270,18 @@ fn constrain_manifest_schema(schema: &mut Value) {
         .and_then(Value::as_array_mut)
     {
         for variant in variants {
-            match variant
+            if let Some("sidecar") = variant
                 .pointer("/properties/kind/const")
                 .and_then(Value::as_str)
+                && let Some(main) = variant.pointer_mut("/properties/main")
             {
-                Some("script") => set_property_schema(variant, "main", package_path_schema()),
-                Some("sidecar") => {
-                    if let Some(main) = variant.pointer_mut("/properties/main") {
-                        main["minProperties"] = json!(1);
-                        if let Some(platforms) =
-                            main.get_mut("properties").and_then(Value::as_object_mut)
-                        {
-                            platforms.remove("any");
-                            for path in platforms.values_mut() {
-                                *path = package_path_schema();
-                            }
-                        }
+                main["minProperties"] = json!(1);
+                if let Some(platforms) = main.get_mut("properties").and_then(Value::as_object_mut) {
+                    platforms.remove("any");
+                    for path in platforms.values_mut() {
+                        *path = package_path_schema();
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -295,7 +293,6 @@ fn constrain_manifest_schema(schema: &mut Value) {
         for variant in variants {
             set_property_schema(variant, "file", package_path_schema());
             set_property_schema(variant, "entry", package_path_schema());
-            set_property_schema(variant, "csp", nullable(text_schema(2048)));
         }
     }
 }
@@ -365,6 +362,12 @@ fn constrain_native_view_schema(schema: &mut Value) {
                 "form" => {
                     set_property_schema(variant, "bind", nullable(binding_schema(false)));
                     set_property_schema(variant, "schema", package_path_schema());
+                }
+                // 矩阵只能是实例数据里的只读绑定，静态字面量不进入 Schema；
+                // 具体方阵内容由宿主渲染前校验，Schema 只约束绑定与标签形状。
+                "qrcode" => {
+                    set_property_schema(variant, "matrix", binding_schema(true));
+                    set_property_schema(variant, "label", nullable(text_schema(512)));
                 }
                 _ => {}
             }

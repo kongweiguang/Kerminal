@@ -2,7 +2,11 @@
 //!
 //! @author kongweiguang
 
-use super::{parse_options, read_fixture_manifest_from, resolve_fixture_local_files_root};
+use super::{
+    LOCAL_AGENT_CAPTURE_MODE, absolute_agent_continuity_output_base, parse_options,
+    read_fixture_manifest_from, resolve_fixture_local_files_root, toml_basic_string,
+    write_local_agent_profile,
+};
 use std::ffi::OsString;
 use std::{fs, path::Path};
 
@@ -15,6 +19,7 @@ fn each_submode_accepts_window_options() {
         "--capture-only",
         "--functional-only",
         "--sftp-functional-only",
+        "--agent-continuity-only",
     ] {
         let options =
             parse_options([mode, "--width", "1020", "--height", "720"].map(OsString::from))
@@ -26,6 +31,10 @@ fn each_submode_accepts_window_options() {
         assert_eq!(
             options.sftp_functional_only,
             mode == "--sftp-functional-only"
+        );
+        assert_eq!(
+            options.agent_continuity_only,
+            mode == "--agent-continuity-only"
         );
     }
 }
@@ -39,6 +48,7 @@ fn submodes_reject_duplicates_and_mixed_pairs() {
         "--capture-only",
         "--functional-only",
         "--sftp-functional-only",
+        "--agent-continuity-only",
     ];
     for first in modes {
         for second in modes {
@@ -67,6 +77,7 @@ fn restart_submodes_are_exclusive() {
         "--capture-only",
         "--functional-only",
         "--sftp-functional-only",
+        "--agent-continuity-only",
         "--transfer-restart-prepare",
     ] {
         assert!(parse_options(["--transfer-restart-prepare", other].map(OsString::from)).is_err());
@@ -97,6 +108,94 @@ fn restart_submodes_are_exclusive() {
         ])
         .is_err()
     );
+}
+
+/// 仅 Agent 连续性入口必须使用全新本地配置，不能与 fixture 清单、配置目录或长主机名混用。
+///
+/// @author kongweiguang
+#[test]
+fn agent_continuity_mode_rejects_fixture_inputs_in_any_order() {
+    let manifest = std::env::temp_dir().join("agent-continuity-manifest.json");
+    for arguments in [
+        vec![
+            OsString::from("--agent-continuity-only"),
+            OsString::from("--fixture-config-dir"),
+            OsString::from("fixture-config"),
+        ],
+        vec![
+            OsString::from("--fixture-config-dir"),
+            OsString::from("fixture-config"),
+            OsString::from("--agent-continuity-only"),
+        ],
+        vec![
+            OsString::from("--fixture-manifest"),
+            manifest.into_os_string(),
+            OsString::from("--agent-continuity-only"),
+        ],
+    ] {
+        assert!(parse_options(arguments).is_err());
+    }
+
+    let options = parse_options(["--agent-continuity-only"].map(OsString::from))
+        .expect("standalone local agent mode");
+    assert!(options.agent_continuity_only);
+    assert!(options.fixture_config_directory.is_none());
+    assert!(options.fixture_manifest.is_none());
+    assert_eq!(
+        LOCAL_AGENT_CAPTURE_MODE,
+        "native_local_agent_continuity_same_tab_split_without_fixture"
+    );
+}
+
+/// 本地 Agent 验收配置必须默认选择 pwsh 7、显式不加载用户 profile，并把 PTY 起点限制在
+/// 本轮隔离输出目录；KnownFolder 不服从环境重定向，profile cwd 是能收紧的启动边界。
+///
+/// @author kongweiguang
+#[test]
+fn local_agent_profile_selects_pwsh7_without_profile_and_isolated_cwd() {
+    let directory = tempfile::tempdir().expect("temporary profile directory");
+    let path = directory.path().join("agent-continuity-local.toml");
+    let cwd = directory.path().join("isolated cwd");
+    fs::create_dir(&cwd).expect("temporary working directory");
+    write_local_agent_profile(&path, &cwd).expect("write local agent profile");
+    let document = fs::read_to_string(path).expect("read local agent profile");
+    assert!(document.contains("shell = \"pwsh.exe\""));
+    assert!(document.contains("\"-NoLogo\", \"-NoProfile\""));
+    assert!(document.contains("is_default = true"));
+    assert!(!document.contains("powershell.exe"));
+    assert!(
+        document.contains(&format!(
+            "cwd = {}",
+            toml_basic_string(cwd.to_str().expect("temporary cwd is valid UTF-8"))
+        )),
+        "profile cwd must escape the isolated working directory as a TOML basic string"
+    );
+}
+
+/// Agent-only 默认与显式相对输出都必须在创建前锚定为同一绝对身份；否则子进程会按自己的
+/// cwd 解析 config/stage，导致触发文件写入另一位置。测试不依赖 Windows 盘符字面量。
+///
+/// @author kongweiguang
+#[test]
+fn agent_continuity_output_base_is_absolute_for_default_and_relative_request() {
+    let current = std::env::current_dir().expect("current directory");
+    let default = absolute_agent_continuity_output_base(None).expect("default output base");
+    assert!(default.is_absolute());
+    assert_eq!(
+        default,
+        current
+            .join("target")
+            .join("acceptance")
+            .join("right-rail-agent-continuity")
+    );
+
+    let relative = Path::new("target")
+        .join("acceptance")
+        .join("relative agent run");
+    let resolved =
+        absolute_agent_continuity_output_base(Some(&relative)).expect("relative output base");
+    assert!(resolved.is_absolute());
+    assert_eq!(resolved, current.join(relative));
 }
 
 /// 长名称只允许作用于隔离 SFTP 专项，避免改变其他验收输入或用户配置。

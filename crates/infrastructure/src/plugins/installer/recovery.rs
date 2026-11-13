@@ -1,8 +1,11 @@
-//! 失败变更撤销保留活动版本，只回收本次失败安装独占的包目录。
+//! 失败变更撤销只回收本次遗留的暂存槽；活动目录与用户数据都保持原样。
 //! @author kongweiguang
 
 use super::*;
-use crate::plugins::store::PluginStoreSnapshot;
+use crate::plugins::{
+    layout::{self, LayoutError},
+    store::{PluginStoreSnapshot, layout_error},
+};
 
 /// 失败意图通过 CAS 撤销；清理异常单独回报，不能继续锁住恢复或绕过未知提交围栏。
 pub(super) fn cancel_failed_change(
@@ -36,22 +39,19 @@ pub(super) fn cancel_failed_change(
     next.pending.remove(position);
     next.failures.remove(id);
     next.pending_failures.remove(id);
-    let mut cleanup_warning = None;
+    // 必须先提交状态撤销：若 CAS 结果未知，磁盘上的 pending 可能仍引用暂存槽，
+    // 提前删除会让下次启动只能记 Missing，永久失去重试证据。
     let snapshot = store
-        .publish_and_compare(expected, next.clone(), || {
-            match clean_failed_package(store.root(), &next, pending) {
-                Ok(()) => Ok(()),
-                Err(error @ (PluginStoreError::InvalidState | PluginStoreError::Io(_))) => {
-                    cleanup_warning = Some(AppError::infrastructure_with_source(
-                        "失败操作已取消；插件包残留未清理，重新安装该版本前需人工处理",
-                        error,
-                    ));
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        })
+        .compare_and_swap(expected, next)
         .map_err(store_error)?;
+    let cleanup_warning = match clean_failed_staging(store.root(), pending) {
+        Ok(()) => None,
+        // 状态已经撤销，清理失败只作为可见警告；材料原样保留供读回和人工处理。
+        Err(error) => Some(AppError::infrastructure_with_source(
+            "失败操作已取消；插件暂存残留未清理或清理结果未知，重新安装该版本前需人工处理",
+            error,
+        )),
+    };
     Ok(ExtensionReceipt {
         revision: snapshot.state.revision,
         restart_required: false,
@@ -59,64 +59,24 @@ pub(super) fn cancel_failed_change(
     })
 }
 
-/// 只清理失败安装/更新新发布且已无引用的版本；回退目标与活动/上一版本必须保留。
-fn clean_failed_package(
+/// 只删除失败安装/更新独占的 `.staging/<id>/<uuid>`；活动目录、备份和用户数据不在此撤销。
+fn clean_failed_staging(
     root: &Path,
-    state: &PluginStoreState,
     pending: &PendingPluginChange,
 ) -> Result<(), PluginStoreError> {
-    let (id, version) = match pending {
-        PendingPluginChange::Install { id, to, .. }
-        | PendingPluginChange::Update { id, to, .. } => (id, to),
+    let (id, operation_id) = match pending {
+        PendingPluginChange::Install { id, staged, .. }
+        | PendingPluginChange::Update { id, staged, .. } => (id, staged),
+        // 卸载失败时备份属于未完成事务，恢复门禁会阻止走到这里；不做猜测性删除。
         _ => return Ok(()),
     };
-    if state.plugins.get(id).is_some_and(|installed| {
-        &installed.active == version || installed.previous.as_ref() == Some(version)
-    }) || state.pending.iter().any(|change| {
-        change.plugin_id() == id
-            && match change {
-                PendingPluginChange::Install { to, .. }
-                | PendingPluginChange::Update { to, .. }
-                | PendingPluginChange::Rollback { to, .. } => to == version,
-                _ => false,
-            }
-    }) {
-        return Ok(());
+    let staging = layout::staging_directory(root, id, operation_id).map_err(layout_error)?;
+    match layout::remove_tree_verified(&staging) {
+        Ok(()) => Ok(()),
+        Err(LayoutError::Io(error)) => Err(PluginStoreError::Io(error)),
+        // 危险残留作为可见清理警告保留，不能借此删除链接或未知文件。
+        Err(LayoutError::Unsafe(_)) => Err(PluginStoreError::InvalidState),
+        // 删除结果未知时保留状态与材料，让调用方读回后再决定。
+        Err(error) => Err(layout_error(error)),
     }
-    let mut directory = root.to_path_buf();
-    // 不使用 staged 字符串，也不创建缺失路径；每级都必须位于宿主推导的真实目录内。
-    let version = version.to_string();
-    for segment in ["", "plugins", "packages", id.as_str(), &version] {
-        directory.push(segment);
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && safe_metadata(&metadata) => {}
-            Ok(_) => return Err(PluginStoreError::InvalidState),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(PluginStoreError::Io(error)),
-        }
-    }
-    validate_cleanup_tree(&directory)?;
-    fs::remove_dir_all(directory).map_err(PluginStoreError::Io)
-}
-
-/// 删除前有界清点整棵目录，拒绝链接和重解析点，损坏文件内容本身不妨碍重新安装。
-fn validate_cleanup_tree(root: &Path) -> Result<(), PluginStoreError> {
-    let mut directories = vec![root.to_path_buf()];
-    let mut count = 0usize;
-    while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(directory).map_err(PluginStoreError::Io)? {
-            let entry = entry.map_err(PluginStoreError::Io)?;
-            count += 1;
-            let metadata = fs::symlink_metadata(entry.path()).map_err(PluginStoreError::Io)?;
-            if count > kerminal_plugin_protocol::MAX_PACKAGE_ENTRIES || !safe_metadata(&metadata) {
-                return Err(PluginStoreError::InvalidState);
-            }
-            if metadata.is_dir() {
-                directories.push(entry.path());
-            } else if !metadata.is_file() {
-                return Err(PluginStoreError::InvalidState);
-            }
-        }
-    }
-    Ok(())
 }

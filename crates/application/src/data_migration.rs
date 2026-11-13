@@ -17,23 +17,55 @@ use crate::AppResult;
 )]
 pub enum DataMigrationBlocker {
     MarkerCorrupt,
-    FutureDataFormat { data_format: u32 },
-    UnsupportedDataFormat { data_format: u32 },
-    FutureMigrationContract { migration_contract: u32 },
-    UnsupportedMigrationContract { migration_contract: u32 },
+    FutureDataFormat {
+        data_format: u32,
+    },
+    UnsupportedDataFormat {
+        data_format: u32,
+    },
+    FutureMigrationContract {
+        migration_contract: u32,
+    },
+    UnsupportedMigrationContract {
+        migration_contract: u32,
+    },
     UnknownNonEmptyRoot,
-    PendingLegacyTransaction { relative_path: String },
-    CorruptLegacyTransaction { relative_path: String },
+    PendingLegacyTransaction {
+        relative_path: String,
+    },
+    CorruptLegacyTransaction {
+        relative_path: String,
+    },
     CorruptMigrationJournal,
-    InputConflict { relative_path: String },
-    ManagedDataInvalid { relative_path: String },
+    InputConflict {
+        relative_path: String,
+    },
+    ManagedDataInvalid {
+        relative_path: String,
+    },
     ConfigurationNotMigratable,
     AgentWorkspaceNotMigratable,
     WindowStateNotMigratable,
-    UnsupportedWorkspaceSessionSchema { version: Option<u32> },
-    UnsupportedCommandHistorySchema { schema_version: u32 },
+    UnsupportedWorkspaceSessionSchema {
+        version: Option<u32>,
+    },
+    UnsupportedCommandHistorySchema {
+        schema_version: u32,
+    },
     CorruptCommandHistoryDatabase,
     OrphanedMigrationData,
+    /// 插件目录需要人工恢复；固定类别避免把本机路径或插件内容带进报告。
+    PluginLayoutRecoveryRequired,
+    /// 发现无法归类或不足以安全迁移的插件材料，原文件必须保留。
+    PluginLayoutUnsupportedMaterial,
+    /// 状态文件、清单或目录身份不一致；不覆盖原状态。
+    PluginLayoutStateInvalid {
+        schema: Option<u32>,
+    },
+    /// 残留 staging/backup 等未证明归属的材料，不能盲删。
+    PluginLayoutResidualMaterial,
+    /// 插件包清单或主机 schema 无法安全读取，迁移所需 codec 不完整。
+    PluginLayoutPackageInvalid,
 }
 
 /// 只回报不会单独阻断迁移的范围提示；WAL 会使主库头部版本仅作提示，完整校验留给 apply。
@@ -41,6 +73,60 @@ pub enum DataMigrationBlocker {
 #[serde(rename_all = "camelCase")]
 pub enum DataMigrationNotice {
     SqliteWalPresent,
+    /// 旧插件布局可自动迁移；通知数量固定，不回显插件身份。
+    PluginLayoutLegacyMigration,
+    /// 旧 script 包会原样搬目录并在新协议下显示不支持，避免静默丢失用户数据。
+    PluginLayoutScriptPackages {
+        count: usize,
+    },
+    /// 已存在插件布局 journal，下一次 apply 会按原证据前滚。
+    PluginLayoutMigrationResume,
+}
+
+/// 插件布局与数据格式分开预检，桌面屏障据此决定能否冻结插件目录。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginLayoutReadiness {
+    /// 数据根尚无插件目录或目录为空。
+    #[default]
+    Fresh,
+    /// schema 2 且没有待处理的布局迁移。
+    Current,
+    /// 已知 schema 1，可由迁移入口转换。
+    Legacy,
+    /// 存在可恢复的布局 journal；不得直接进入普通启动。
+    RecoveryPending,
+    /// 未知、混合或证据不足，必须保留现场。
+    Blocked,
+}
+
+impl PluginLayoutReadiness {
+    /// 只有已确认的当前/空布局才允许跳过插件迁移快路径；Fresh 没有待迁移材料。
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::Fresh | Self::Current)
+    }
+}
+
+/// 插件布局迁移回执只报告数量与受控备份相对路径，不包含插件内容。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLayoutReport {
+    pub outcome: PluginLayoutOutcome,
+    pub migrated_plugins: usize,
+    pub removed_previous_versions: usize,
+    pub discarded_pending: usize,
+    /// 迁移事务内使用的备份目录；成功后按证明式清理规则移除。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_relative_path: Option<String>,
+}
+
+/// 区分首次转换、恢复中断事务和重复 apply 的幂等结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PluginLayoutOutcome {
+    AlreadyCurrent,
+    Migrated,
+    Recovered,
 }
 
 /// 描述格式标记与迁移可行性预检；不承诺 SQLite 全面健康，`recovery_pending` 表示可按原 journal 前滚。
@@ -53,6 +139,9 @@ pub struct DataMigrationInspection {
     pub blockers: Vec<DataMigrationBlocker>,
     pub notices: Vec<DataMigrationNotice>,
     pub recovery_pending: bool,
+    /// 插件布局单独分类；旧插件留在旧目录时数据格式也不能被认为已完整当前。
+    #[serde(default)]
+    pub plugin_layout: PluginLayoutReadiness,
 }
 
 /// 标记当前数据代、已知旧数据、干净新根或必须人工处理的安全状态。
@@ -76,6 +165,9 @@ pub struct DataMigrationReport {
     /// 连续恢复旧事务再升级新契约时保留全部恢复目录；旧单路径字段继续指向最后一份。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backup_relative_paths: Vec<String>,
+    /// 本次调用同时完成的插件布局步骤；纯数据迁移或幂等读回时缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_layout: Option<PluginLayoutReport>,
 }
 
 /// 预演仅暴露数量和是否需要更新密文，不包含配置正文、路径或凭据。

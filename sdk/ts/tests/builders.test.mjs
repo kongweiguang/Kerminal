@@ -33,6 +33,8 @@ const samples = {
   icon: { icon: "search" },
   code: { code: "hello", language: "text" },
   progress: { value: "$progress", max: 100 },
+  // 矩阵只接受实例数据里的只读绑定，样本与 Rust 校验保持同一形状。
+  qrcode: { matrix: "$qr", label: "Scan to pair" },
   empty: { title: "No data", icon: "search" },
   notice: { text: "Notice", tone: "warning" },
   input: { bind: "query", placeholder: "Search", on_submit: "search" },
@@ -74,9 +76,20 @@ test("schema rejects invalid native view constraints", () => {
     { schema: 1, root: { type: "table", items: "$items", key: "id", columns: [] } },
     { schema: 1, root: { type: "list", source: "rpc", key: "id", title: "name" } },
     { schema: 1, root: { type: "list", source: "rpc", id: "rows", items: "$items", key: "id", title: "name" } },
+    // 二维码矩阵只能是 $ 开头的只读绑定，静态字面量不得进入 Schema 接受的形状。
+    { schema: 1, root: { type: "qrcode", matrix: "qr" } },
+    // 目录模式是独立枚举值，任意其他字符串不能被当作选择器语义。
+    { schema: 1, root: { type: "path", bind: "path", mode: "folder" } },
   ];
   for (const view of invalid) {
     assert.equal(validateView(view), false, JSON.stringify(view));
+  }
+  // 目录选择与二维码只读绑定必须落在合法一侧，避免只加拒绝而漏掉正向形状。
+  for (const root of [
+    { type: "path", bind: "path", mode: "directory" },
+    { type: "qrcode", matrix: "$qr", label: "Scan to pair" },
+  ]) {
+    assert.equal(validateView({ schema: 1, root }), true, `${root.type}: ${JSON.stringify(validateView.errors)}`);
   }
 });
 
@@ -115,6 +128,22 @@ test("all builder samples pass the Rust view validator, which rejects an unnamed
     await writeFile(viewPath, JSON.stringify(view));
     await assert.rejects(execFileAsync(cargo, args, options),
       (error) => error.code !== 0 && /view\.collection/.test(error.stderr));
+
+    // 类型层只能约束 matrix 为字符串，$ 绑定格式必须交给真实协议入口拒绝；
+    // 这里用构建器产出的同一 JSON 结构验证缺失前缀与目录枚举的边界。
+    view.root = ui.qrcode({ matrix: "qr" });
+    await writeFile(viewPath, JSON.stringify(view));
+    await assert.rejects(execFileAsync(cargo, args, options),
+      (error) => error.code !== 0 && /view\.qrcode/.test(error.stderr));
+
+    view.root = ui.path({ bind: "folder", mode: "directory" });
+    await writeFile(viewPath, JSON.stringify(view));
+    await execFileAsync(cargo, args, options);
+    view.root.mode = "folder";
+    await writeFile(viewPath, JSON.stringify(view));
+    // 非法枚举在反序列化阶段就被拒绝，错误位置不一定带 view.path 前缀。
+    await assert.rejects(execFileAsync(cargo, args, options),
+      (error) => error.code !== 0 && /unknown variant `folder`|view\.path/.test(error.stderr));
   } finally {
     const resolved = await realpath(directory);
     if (dirname(resolved) !== tempRoot || !basename(resolved).startsWith("kerminal-ts-builders-")) {

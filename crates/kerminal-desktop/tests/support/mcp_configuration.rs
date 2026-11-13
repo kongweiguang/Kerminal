@@ -102,7 +102,10 @@ fn controller(
         .with_operations(composition.operations.as_ref().clone())
         .with_commands(composition.commands.as_ref().clone())
         .with_profiles(app.profiles.clone())
-        .with_configuration_validation(app.configuration_validation.clone().unwrap());
+        .with_configuration_validation(app.configuration_validation.clone().unwrap())
+        // 测试控制器复用组合根服务，也必须注入同一冻结插件视图；自行构造时漏掉
+        // 会让 validate_complete 把运行门禁判成不可用，从而与生产启动行为分叉。
+        .with_plugins(app.plugins.clone());
     let token_store: Arc<dyn McpTokenStore> = composition._vault.clone();
     McpRuntimeController::with_preferences(
         Handle::current(),

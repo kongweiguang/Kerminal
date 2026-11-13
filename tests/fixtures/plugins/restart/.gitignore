@@ -1,8 +1,3 @@
-# 两代重启验收使用固定的可执行夹具，而不是本地构建生成物；仅允许这两个入口参与版本追踪。
 # @author kongweiguang
-!/notes-1.0/dist/
-/notes-1.0/dist/*
-!/notes-1.0/dist/main.js
-!/notes-1.1/dist/
-/notes-1.1/dist/*
-!/notes-1.1/dist/main.js
+# 两代夹具由 `kerminal-plugin build` 生成平台二进制；构建产物不进入版本库。
+.kerminal/

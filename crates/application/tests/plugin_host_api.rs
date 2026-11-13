@@ -2,7 +2,7 @@
 //! @author kongweiguang
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     future::Future,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
@@ -31,7 +31,7 @@ use kerminal_domain::{
     preferences::ConfigRevision,
 };
 use kerminal_plugin_protocol::{
-    ConfigurationSchema, ManifestPolicy, Permission, ValidatedPackage, error_code, parse_manifest,
+    ConfigurationSchema, ManifestPolicy, ValidatedPackage, error_code, parse_manifest,
 };
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -316,7 +316,7 @@ fn prepared(id: &str) -> Arc<PreparedPlugin> {
     let manifest = json!({
         "schema": 1, "id": id, "name": {"en":"Example"}, "description": {"en":"Example"},
         "version": "1.0.0", "api": "^1.0", "publisher": "acme",
-        "runtime": {"kind":"script", "main":"main.js"},
+        "runtime": {"kind":"sidecar", "main":{"windows-x86_64":"bin/app.exe","linux-x86_64":"bin/app","macos-x86_64":"bin/app"}},
         "contributes": {"settings": {"schema":"settings.schema.json"}}
     });
     let manifest = parse_manifest(
@@ -771,15 +771,10 @@ async fn view_subscription_uses_trusted_generation_after_process_restart() {
         vec![1, 2]
     );
 }
-/// 同一构造器覆盖脚本与纯声明网页，权限仍交由真实运行服务判断。
-fn webview_runtime(
-    f: &Fixture,
-    declarative: bool,
-    permissions: BTreeSet<Permission>,
-) -> Arc<PluginRuntimeService> {
+/// 同一构造器覆盖 Sidecar 与纯声明网页，权限声明不再参与运行服务装配。
+fn webview_runtime(f: &Fixture, declarative: bool) -> Arc<PluginRuntimeService> {
     let mut prepared_plugin = (*prepared(f.first.as_str())).clone();
     let manifest = &mut Arc::make_mut(&mut prepared_plugin.package).manifest;
-    manifest.permissions.extend(permissions.iter().cloned());
     if declarative {
         manifest.runtime = kerminal_plugin_protocol::PluginRuntime::None {
             extensions: BTreeMap::new(),
@@ -808,7 +803,6 @@ fn webview_runtime(
     PluginRuntimeService::new(
         vec![PluginRuntimeDescriptor {
             prepared: prepared_plugin,
-            permissions,
         }],
         f.process.clone(),
         api,
@@ -821,7 +815,7 @@ fn webview_runtime(
 /// 网页通过真实权限路由拿到独立接收端，不能把进程收到通知当作网页交付成功。
 async fn runtime_routes_webview_subscription_with_verified_generation() {
     let f = fixture();
-    let runtime = webview_runtime(&f, false, BTreeSet::from([Permission::EventsSubscribe]));
+    let runtime = webview_runtime(&f, false);
     let identity = PluginViewIdentity {
         plugin: f.first.clone(),
         view: "editor".into(),
@@ -880,9 +874,68 @@ async fn runtime_routes_webview_subscription_with_verified_generation() {
         .unwrap();
     assert_eq!(error.code, error_code::STALE);
 }
+
 #[tokio::test]
-/// 两页与脚本各占独立槽；取消、空集合及旧序列都不能改写另一页。
-async fn webview_events_isolate_pages_script_and_cleanup() {
+/// 插件启用后不再检查权限声明：所有已实现宿主方法都进入业务分支，未知方法仍无路由。
+async fn known_host_methods_reach_backends_without_permission_declarations() {
+    let f = fixture();
+    let runtime = webview_runtime(&f, false);
+    let identity = PluginViewIdentity {
+        plugin: f.first.clone(),
+        view: "editor".into(),
+        instance: "no-permissions".into(),
+        generation: 1,
+    };
+    runtime
+        .open(
+            identity.clone(),
+            json!({}),
+            None,
+            Instant::now() + Duration::from_secs(2),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    for (method, params) in [
+        ("ui.notify", json!({"message":"hello"})),
+        ("ui.confirm", json!({})),
+        ("ui.pickFile", json!({})),
+        ("clipboard.read", json!({})),
+        ("clipboard.write", json!({"text":"copied"})),
+        ("secrets.get", json!({"slot":"token"})),
+        ("secrets.set", json!({"slot":"token","value":"secret"})),
+        ("secrets.delete", json!({"slot":"token"})),
+        ("hosts.list", json!({})),
+        ("settings.get", json!({})),
+        ("state.get", json!({})),
+        ("state.set", json!({"state":{"enabled":true}})),
+        ("log", json!({"level":"info","message":"hello"})),
+        (
+            "shell.openExternal",
+            json!({"url":"https://example.com/path"}),
+        ),
+        ("terminal.paste", json!({"text":"ls"})),
+    ] {
+        runtime
+            .route_webview(&identity, method, params, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("{method} should reach its backend: {error:?}"));
+    }
+    let unknown = runtime
+        .route_webview(
+            &identity,
+            "unknown.method",
+            json!({}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, error_code::METHOD_NOT_FOUND);
+}
+
+#[tokio::test]
+/// 多个网页各占独立槽；取消、空集合及旧序列都不能改写另一页。
+async fn webview_events_isolate_pages_and_cleanup() {
     let f = fixture();
     let identity = |instance: &str| PluginViewIdentity {
         plugin: f.first.clone(),
@@ -968,15 +1021,15 @@ async fn webview_events_isolate_pages_script_and_cleanup() {
 }
 
 #[tokio::test]
-/// 纯声明网页不需要伪造就绪进程；相同路径仍拒绝缺失权限与不存在的实例。
-async fn declarative_webview_events_use_zero_generation_and_enforce_permissions() {
+/// 纯声明网页不需要伪造就绪进程；未声明权限仍可订阅，不存在的实例仍返回 stale。
+async fn declarative_webview_events_use_zero_generation_without_permission_gate() {
     let f = fixture();
     f.process
         .states
         .lock()
         .unwrap()
         .insert(f.first.clone(), PluginRuntimeState::Idle);
-    let runtime = webview_runtime(&f, true, BTreeSet::from([Permission::EventsSubscribe]));
+    let runtime = webview_runtime(&f, true);
     let identity = PluginViewIdentity {
         plugin: f.first.clone(),
         view: "editor".into(),
@@ -1013,27 +1066,6 @@ async fn declarative_webview_events_use_zero_generation_and_enforce_permissions(
         stream.recv().await.unwrap(),
         Some(json!({"name":"tab.changed","payload":{}}))
     );
-    let denied = webview_runtime(&f, true, BTreeSet::new());
-    denied
-        .open(
-            identity.clone(),
-            json!({}),
-            None,
-            deadline,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let error = denied
-        .subscribe_webview_events(
-            PluginWebViewEventTarget::new(identity.clone(), 0, 1, 1),
-            json!({"names":[]}),
-            CancellationToken::new(),
-            CancellationToken::new(),
-        )
-        .err()
-        .unwrap();
-    assert_eq!(error.code, error_code::PERMISSION_DENIED);
     let mut stale_identity = identity;
     stale_identity.instance = "never-opened".into();
     let error = runtime

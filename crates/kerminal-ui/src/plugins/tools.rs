@@ -2,7 +2,13 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
 
 use gpui_kit::{AnyView, App, EntityId, SharedString, Window, assets::IconName};
 use kerminal_application::{
@@ -148,14 +154,15 @@ pub trait ToolInstance {
     /// 每帧只借用同一视图句柄，不能在此启动后台任务。
     fn view(&self) -> AnyView;
 
-    /// 上下文仅在宿主身份实际变化时通知，已提交的任务仍须绑定原有目标。
+    /// 上下文通常在宿主身份变化时通知；上次通知失败时，同值也会重新确认，
+    /// 已提交的任务仍须绑定原有目标。
     ///
     /// @author kongweiguang
     fn context_changed(&mut self, _context: &ToolContext, _cx: &mut App) -> AppResult<()> {
         Ok(())
     }
 
-    /// 可见和窗口激活由宿主计算，并只在状态改变时通知实例。
+    /// 可见和窗口激活由宿主计算；状态改变时通知，上次失败未确认时即使值回到旧值也会重发。
     fn visibility_changed(
         &mut self,
         _visible: bool,
@@ -206,7 +213,11 @@ pub enum ToolPhase {
 struct HostedTool {
     instance: Box<dyn ToolInstance>,
     context: ToolContext,
+    /// 只记录最近一次成功确认的可见性；失败不写回，避免把未知宿主状态伪装成已隐藏。
     visibility: Option<(bool, bool)>,
+    /// 上下文或可见性回调已发起但尚未成功确认；挂载门禁必须拒绝这类实例。
+    context_unconfirmed: bool,
+    visibility_unconfirmed: bool,
     phase: ToolPhase,
     closing_generation: Option<u64>,
 }
@@ -218,6 +229,13 @@ pub(crate) struct ToolProjection {
     pub(crate) window_active: bool,
 }
 
+/// 投影值相同不代表已经执行过插件生命周期；ticket 用 generation 区分“已暂存”和“已尝试应用”，
+/// 让迟到 effect 在 A→B→A 后按代次失效，而不是靠值相等重新命中旧目标。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionTicket {
+    generation: u64,
+}
+
 /// 工厂可跨线程共享；实例与生命周期状态只保留在该窗口的 UI 线程。
 #[derive(Default)]
 pub struct PluginTools {
@@ -226,34 +244,67 @@ pub struct PluginTools {
     next_generation: u64,
     projection: Option<ToolProjection>,
     projection_generation: u64,
+    /// 最近一次真正发起插件生命周期的投影代次；同一代重复事件只刷新内置活动状态。
+    attempted_projection_generation: Option<u64>,
+    /// 记录真实发起过生命周期的代次序列供回归测试核对。
+    ///
+    /// 生产路径从不读取，但保留为空 Vec 而不是条件编译字段：`src` 中不允许出现
+    /// `#[cfg(test)]` 项，常驻一个空集合的代价远小于为测试另建可变观察通道。
+    #[cfg_attr(not(test), allow(dead_code))]
+    attempted_projection_generations: Vec<u64>,
     builtin_views: BTreeMap<ToolRailToolId, Option<EntityId>>,
 }
 
 impl PluginTools {
     /// 显式重新打开后允许相同布局重新应用一次，取消旧 effect 与采样票据。
     /// 普通绘制不清除此门禁，避免失败工厂随每一帧自动重试。
+    /// attempted 保留旧代次，新代次会自然重新获得一次显式应用机会。
     pub(crate) fn invalidate_projection(&mut self) {
         self.projection = None;
         self.projection_generation = self.projection_generation.wrapping_add(1).max(1);
     }
 
     /// 绘制阶段仅记录变化后的只读投影，实际创建和通知留给 effect 周期。
+    /// 值为投影身份；相同值重复 stage 不递增，但也不代表插件生命周期已经尝试。
     ///
     /// @author kongweiguang
-    pub(crate) fn stage_projection(&mut self, projection: ToolProjection) -> bool {
-        if self.projection.as_ref() == Some(&projection) {
-            return false;
+    pub(crate) fn stage_projection(&mut self, projection: ToolProjection) -> ProjectionTicket {
+        if self.projection.as_ref() != Some(&projection) {
+            self.projection = Some(projection);
+            self.projection_generation = self.projection_generation.wrapping_add(1).max(1);
         }
-        self.projection = Some(projection);
-        self.projection_generation = self.projection_generation.wrapping_add(1).max(1);
-        true
+        ProjectionTicket {
+            generation: self.projection_generation,
+        }
     }
 
     /// 迟到的 effect 不得把工具重定向到已经切换的窗口或标签。
+    /// generation 同时覆盖“值回到旧投影”的情况，A→B→A 的旧 A 票据不会重新命中。
     ///
     /// @author kongweiguang
-    pub(crate) fn projection_is_current(&self, projection: &ToolProjection) -> bool {
-        self.projection.as_ref() == Some(projection)
+    pub(crate) fn projection_is_current(&self, ticket: ProjectionTicket) -> bool {
+        self.projection.is_some() && self.projection_generation == ticket.generation
+    }
+
+    /// 插件生命周期只对尚未尝试的投影代次执行；内置活动更新不受此门禁影响。
+    pub(crate) fn projection_lifecycle_needs_attempt(&self, ticket: ProjectionTicket) -> bool {
+        self.projection_is_current(ticket)
+            && self.attempted_projection_generation != Some(ticket.generation)
+    }
+
+    /// 在回调发起前标记，回调同步重入时同一代不会再调度一次 ensure/visibility。
+    /// 只有 ticket 仍是当前投影时才写，避免迟到的旧 effect 污染新代状态。
+    pub(crate) fn mark_projection_lifecycle_attempted(&mut self, ticket: ProjectionTicket) {
+        if !self.projection_is_current(ticket) {
+            return;
+        }
+        self.attempted_projection_generation = Some(ticket.generation);
+        // 测试需要核对真实发起过生命周期的代次序列；生产不读取该记录。用 `cfg!`
+        // 运行期分支代替条件编译属性，避免在 `src` 中留下 test-only 语句。
+        if cfg!(test) {
+            self.attempted_projection_generations
+                .push(ticket.generation);
+        }
     }
 
     /// 后台订阅只在最近一次真实挂载投影处于活动窗口时抓取画布。
@@ -424,6 +475,8 @@ impl PluginTools {
                 instance,
                 context: context.clone(),
                 visibility: None,
+                context_unconfirmed: false,
+                visibility_unconfirmed: false,
                 phase: ToolPhase::Open,
                 closing_generation: None,
             },
@@ -454,6 +507,8 @@ impl PluginTools {
         let view = entry.instance.view();
         (entry.phase == ToolPhase::Open
             && entry.context == *context
+            && !entry.context_unconfirmed
+            && !entry.visibility_unconfirmed
             && entry.visibility == Some((true, window_active))
             && self
                 .builtin_views
@@ -479,16 +534,35 @@ impl PluginTools {
         if entry.phase != ToolPhase::Open {
             return Err(AppError::conflict("工具实例正在关闭"));
         }
-        if entry.visibility != Some((visible, window_active)) {
+        let desired = Some((visible, window_active));
+        if entry.visibility != desired || entry.visibility_unconfirmed {
+            entry.visibility_unconfirmed = true;
             entry
                 .instance
                 .visibility_changed(visible, window_active, cx)?;
-            entry.visibility = Some((visible, window_active));
+            entry.visibility = desired;
+            entry.visibility_unconfirmed = false;
         }
         Ok(())
     }
 
-    /// 当前宿主变化时同步实例上下文和可见性；后台标签保留自己的上下文，失败时隐藏并保留旧状态供重试。
+    /// 已发起但未成功确认的 Open 工具身份；用于面板隐藏、没有本地按钮时仍给出可定位的恢复提示。
+    pub(crate) fn unconfirmed_tools(&self) -> Vec<ToolRailToolId> {
+        self.instances
+            .iter()
+            .filter(|(_, entry)| {
+                entry.phase == ToolPhase::Open
+                    && (entry.context_unconfirmed || entry.visibility_unconfirmed)
+            })
+            .map(|(key, _)| key.tool)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// 当前宿主变化时同步实例上下文和可见性；后台标签保留自己的上下文。
+    /// 失败只记录未确认并保留最后成功状态，不回写伪造的隐藏值，挂载门禁据此拒绝旧视图。
+    /// 新代次或显式重试会重新确认；真实关闭不依赖可见性是否已确认。
     ///
     /// @author kongweiguang
     pub fn sync_visibility(
@@ -512,10 +586,17 @@ impl PluginTools {
                 InstanceScope::NoTab => context.active_tab().is_none(),
                 InstanceScope::Tab(tab) => context.active_tab() == Some(tab),
             };
+            let prior_context_unconfirmed = entry.context_unconfirmed;
+            let prior_visibility_unconfirmed = entry.visibility_unconfirmed;
             let mut context_ready = true;
-            if matches_context && entry.context != *context {
+            // 上下文不一致或上次未确认时必须重试；成功才提交新上下文。
+            if matches_context && (entry.context != *context || prior_context_unconfirmed) {
+                entry.context_unconfirmed = true;
                 match entry.instance.context_changed(context, cx) {
-                    Ok(()) => entry.context = context.clone(),
+                    Ok(()) => {
+                        entry.context = context.clone();
+                        entry.context_unconfirmed = false;
+                    }
                     Err(error) => {
                         context_ready = false;
                         if first_error.is_none() {
@@ -525,14 +606,19 @@ impl PluginTools {
                 }
             }
             let next = (active_keys.contains(key) && context_ready, window_active);
-            if entry.visibility == Some(next) {
-                continue;
-            }
-            match entry.instance.visibility_changed(next.0, next.1, cx) {
-                Ok(()) => entry.visibility = Some(next),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+            // 上次可见性通知失败时必须重发；上下文失败已在当次把目标可见性收敛为隐藏，
+            // 后续换代不重复发送同一个已确认的隐藏值。
+            if entry.visibility != Some(next) || prior_visibility_unconfirmed {
+                entry.visibility_unconfirmed = true;
+                match entry.instance.visibility_changed(next.0, next.1, cx) {
+                    Ok(()) => {
+                        entry.visibility = Some(next);
+                        entry.visibility_unconfirmed = false;
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
                     }
                 }
             }
@@ -706,6 +792,12 @@ impl PluginTools {
         Ok(InstanceKey { tool, scope })
     }
 }
+
+/// 测试专用读取入口放在 `tests/unit`：子模块可以访问父模块私有字段，
+/// `src` 只保留条件编译的子模块引用，避免为测试暴露生产 API。
+#[cfg(test)]
+#[path = "../../tests/unit/plugins_tools_test_support.rs"]
+mod test_support;
 
 /// 内置工具的唯一显示目录；呈现层、工具按钮与自定义器共用这些语义。
 pub(crate) fn builtin_presentation(tool: ToolRailToolId) -> Option<ToolPresentation> {

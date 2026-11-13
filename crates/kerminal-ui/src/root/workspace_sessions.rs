@@ -8,6 +8,7 @@ use gpui_kit::{AppContext as _, Context, SharedString};
 use kerminal_application::{
     AppError, AppResult, PublicErrorCode,
     connections::management::HostManagementService,
+    plugins::PluginRegistry,
     preferences::ProfileService,
     workspace::{
         WorkspaceContainerRuntime, WorkspacePaneMode, WorkspaceSessionLoad, WorkspaceSessionPane,
@@ -394,6 +395,8 @@ impl RootView {
         let services = self.services.clone();
         let executor = services.executor.clone();
         let resolve_cancellation = cancellation.clone();
+        // 冻结启用视图在投递前捕获，恢复期间插件启停变化不会让同一批 pane 部分创建。
+        let plugins = services.plugins.clone();
 
         cx.spawn(async move |this, cx| {
             let profiles = services.profiles.clone();
@@ -405,6 +408,7 @@ impl RootView {
                         resolve_cancellation.run_until_cancelled(resolve_workspace_open_target(
                             &profiles,
                             hosts.as_ref(),
+                            &plugins,
                             &pane_for_task,
                             &resolve_cancellation,
                         ));
@@ -1113,6 +1117,7 @@ pub(super) fn workspace_restore_failure_for_code(code: PublicErrorCode) -> Works
 async fn resolve_workspace_open_target(
     profiles: &ProfileService,
     hosts: Option<&HostManagementService>,
+    plugins: &PluginRegistry,
     pane: &WorkspaceSessionPane,
     cancel: &CancellationToken,
 ) -> Result<(WorkspaceTerminalOpenKind, SessionTarget), (WorkspaceRestoreFailure, AppError)> {
@@ -1141,6 +1146,12 @@ async fn resolve_workspace_open_target(
                 AppError::unsupported("容器终端不能恢复为 tmux attach"),
             ));
         }
+        // 容器 exec 经 SSH 会话执行，入口归属 containers 单元；恢复前先按冻结视图拒绝，
+        // 避免禁用后仅凭保存的容器目标重开远端资源。已有本地容器会话的关闭/回收不走这里。
+        container_restore_gate(
+            frozen_unit_enabled(plugins, "kerminal.ssh"),
+            frozen_unit_enabled(plugins, "kerminal.containers"),
+        )?;
         let runtime = match runtime {
             WorkspaceContainerRuntime::Docker => ContainerRuntime::Docker,
             WorkspaceContainerRuntime::Podman => ContainerRuntime::Podman,
@@ -1170,6 +1181,9 @@ async fn resolve_workspace_open_target(
 
     let target = resolve_workspace_target(profiles, hosts, pane, cancel).await?;
     if let Some(binding) = pane.tmux_binding.as_ref() {
+        // 只有 tmux 单元启用才重开 attach；本地目标不触发 SSH 门禁，远端仍由上面的
+        // resolve_workspace_target 负责。禁用时保留原标签和状态供重新启用后重试。
+        tmux_restore_gate(frozen_unit_enabled(plugins, "kerminal.tmux"))?;
         let (host_id, profile_id) = match pane.target.as_ref() {
             Some(WorkspaceTargetRef::Local { profile_id }) => (
                 None,
@@ -1279,6 +1293,98 @@ fn container_exec_command(
     Ok(command)
 }
 
+/// 协议禁用时把恢复目标归入现有不可用类别；原标签、布局和持久材料仍由工作区保留。
+///
+/// 与“主机缺失”区分开，避免把插件启停误判成配置被删除；调用方仍按原失败项展示重试。
+///
+/// @author kongweiguang
+pub(in crate::root) fn workspace_protocol_disabled(
+    protocol: RemoteProtocol,
+) -> (WorkspaceRestoreFailure, AppError) {
+    let message = match protocol {
+        RemoteProtocol::Ssh => "工作区 SSH 协议已禁用，原标签和状态仍保留",
+        RemoteProtocol::Sftp => "工作区 SFTP 协议已禁用，原标签和状态仍保留",
+        RemoteProtocol::Telnet => "工作区 Telnet 协议已禁用，原标签和状态仍保留",
+        RemoteProtocol::Serial => "工作区 Serial 协议已禁用，原标签和状态仍保留",
+        RemoteProtocol::Rdp => "工作区 RDP 协议已禁用，原标签和状态仍保留",
+    };
+    (
+        WorkspaceRestoreFailure::UnavailableTarget(WorkspaceTargetUnavailableReason::UnknownKind),
+        AppError::unsupported(message),
+    )
+}
+
+/// 插件单元禁用时沿用不可用目标分类；文案明确原标签和状态仍保留，重新启用后可按原目标重试。
+///
+/// 复用同一失败映射风格，避免容器/tmux 启停被误报成目标配置被删除。
+///
+/// @author kongweiguang
+pub(in crate::root) fn workspace_unit_disabled(
+    message: &'static str,
+) -> (WorkspaceRestoreFailure, AppError) {
+    (
+        WorkspaceRestoreFailure::UnavailableTarget(WorkspaceTargetUnavailableReason::UnknownKind),
+        AppError::unsupported(message),
+    )
+}
+
+/// 冻结启用视图查询；空目录代表独立界面/测试尚未装配插件服务，沿用原有放行行为。
+///
+/// 生产组合根始终注入完整内置快照，因此禁用后的拒绝只依赖真实冻结状态，不会因
+/// 测试装配缺省而放宽。
+///
+/// @author kongweiguang
+fn frozen_unit_enabled(plugins: &PluginRegistry, unit: &str) -> bool {
+    plugins.providers().is_empty() || plugins.is_enabled(unit)
+}
+
+/// 容器恢复要求 SSH 与 containers 单元同时启用；先判 SSH，使错误指向真正缺失的传输能力。
+///
+/// 只拦截新建/重开/恢复，已有本地容器会话的关闭与回收不经过目标解析。
+///
+/// @author kongweiguang
+fn container_restore_gate(
+    ssh_enabled: bool,
+    containers_enabled: bool,
+) -> Result<(), (WorkspaceRestoreFailure, AppError)> {
+    if !ssh_enabled {
+        return Err(workspace_unit_disabled(
+            "工作区 SSH 协议已禁用，原标签和状态仍保留",
+        ));
+    }
+    if !containers_enabled {
+        return Err(workspace_unit_disabled(
+            "工作区容器能力已禁用，原标签和状态仍保留",
+        ));
+    }
+    Ok(())
+}
+
+/// tmux 绑定只在 tmux 单元启用时恢复；远端 SSH 门禁仍由目标解析负责，这里不重复。
+///
+/// @author kongweiguang
+fn tmux_restore_gate(tmux_enabled: bool) -> Result<(), (WorkspaceRestoreFailure, AppError)> {
+    if tmux_enabled {
+        Ok(())
+    } else {
+        Err(workspace_unit_disabled(
+            "工作区 tmux 能力已禁用，原标签和状态仍保留",
+        ))
+    }
+}
+
+/// 只在冻结视图明确禁用时阻断恢复；未注入插件服务的测试与离线宿主保持原行为。
+fn ensure_workspace_protocol_enabled(
+    hosts: Option<&HostManagementService>,
+    protocol: RemoteProtocol,
+) -> Result<(), (WorkspaceRestoreFailure, AppError)> {
+    if hosts.is_some_and(|hosts| !hosts.protocol_enabled(protocol)) {
+        Err(workspace_protocol_disabled(protocol))
+    } else {
+        Ok(())
+    }
+}
+
 /// 显式 local 引用解析独立本地主机；只有无引用目标可使用默认 Profile，避免模板修改改变已保存主机。
 /// 缺失 host 时保留可恢复失败，不能悄悄切换其它默认目标。
 async fn resolve_workspace_target(
@@ -1352,16 +1458,20 @@ async fn resolve_workspace_target(
             }
             Ok(SessionTarget::Local(target))
         }
-        WorkspaceTargetRef::Ssh { host_id } => Ok(SessionTarget::Ssh(SshSessionTarget {
-            host_id: host_id.clone(),
-            working_directory: pane
-                .current_cwd
-                .as_ref()
-                .or(pane.cwd.as_ref())
-                .map(PathBuf::from),
-            command: pane.remote_command.clone().map(SshInitialCommand::Shell),
-        })),
+        WorkspaceTargetRef::Ssh { host_id } => {
+            ensure_workspace_protocol_enabled(hosts, RemoteProtocol::Ssh)?;
+            Ok(SessionTarget::Ssh(SshSessionTarget {
+                host_id: host_id.clone(),
+                working_directory: pane
+                    .current_cwd
+                    .as_ref()
+                    .or(pane.cwd.as_ref())
+                    .map(PathBuf::from),
+                command: pane.remote_command.clone().map(SshInitialCommand::Shell),
+            }))
+        }
         WorkspaceTargetRef::Telnet { host_id } => {
+            ensure_workspace_protocol_enabled(hosts, RemoteProtocol::Telnet)?;
             let host = load_workspace_host(hosts, host_id).await?;
             if host.protocol != RemoteProtocol::Telnet {
                 return Err((
@@ -1377,6 +1487,7 @@ async fn resolve_workspace_target(
             }))
         }
         WorkspaceTargetRef::Serial { host_id } => {
+            ensure_workspace_protocol_enabled(hosts, RemoteProtocol::Serial)?;
             let host = load_workspace_host(hosts, host_id).await?;
             if host.protocol != RemoteProtocol::Serial {
                 return Err((

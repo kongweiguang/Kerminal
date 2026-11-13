@@ -102,24 +102,17 @@ fn translates_labels_and_keeps_data_when_locale_changes() {
     assert_eq!(projection.text("$name"), "draft");
 }
 
-/// 链接按有效权限及宿主相同规则判定，不能通过自定义协议或 URL 用户凭据绕过。
+/// 插件启用后不再检查权限集合；合法 HTTPS 直接放行，自定义协议、缺失主机和用户凭据仍拒绝。
 #[test]
-fn external_links_require_permission_and_https_without_credentials() {
+fn external_links_allow_https_without_credentials_without_permission_set() {
     use super::allowed_external_url;
-    use kerminal_plugin_protocol::Permission;
-    use std::collections::BTreeSet;
 
-    let none = BTreeSet::new();
-    let allowed = BTreeSet::from([Permission::OpenExternal]);
-    let full = BTreeSet::from([Permission::FullAccess]);
-    assert!(allowed_external_url(&none, "https://example.com").is_none());
     assert_eq!(
-        allowed_external_url(&allowed, "https://example.com/docs")
+        allowed_external_url("https://example.com/docs")
             .unwrap()
             .as_str(),
         "https://example.com/docs"
     );
-    assert!(allowed_external_url(&full, "https://example.com").is_some());
     for url in [
         "http://example.com",
         "file:///private",
@@ -129,7 +122,7 @@ fn external_links_require_permission_and_https_without_credentials() {
         "https:///",
         "not-a-url",
     ] {
-        assert!(allowed_external_url(&allowed, url).is_none(), "{url}");
+        assert!(allowed_external_url(url).is_none(), "{url}");
     }
 }
 

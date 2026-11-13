@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+use std::collections::BTreeSet;
+
 use gpui_kit::{Context, FocusHandle, Window};
 use kerminal_application::{
     preferences::ToolRailToolId,
@@ -85,10 +87,12 @@ impl RootView {
                     context,
                 })
         });
+        let disabled_tools = self.quick_open_disabled_tools();
         QuickOpenOpenContext {
             workspace,
             terminal,
             terminal_binding,
+            disabled_tools,
             plugin_commands: {
                 let context = self.capture_plugin_command_context();
                 super::plugin_commands::plugin_commands(
@@ -106,6 +110,26 @@ impl RootView {
                 .collect()
             },
         }
+    }
+
+    /// 命令面板打开时从冻结插件目录导出禁用工具身份，供动作映射隐藏入口。
+    /// 复用右栏的集中门禁，SSH 依赖导致的隐藏（tmux、容器、端口、服务器信息）与图标、
+    /// 快捷键保持一致；搜索实体只接收纯身份集合，不持有目录或运行时。
+    /// 片段/工作流内容由 commands 单元门禁、历史由 logs 单元门禁，
+    /// 两者显式并入同一集合，让查询和后续选择只读这一份冻结启用视图；
+    /// 空目录代表离线测试未装配插件服务，两个判定都按启用处理。
+    ///
+    /// @author kongweiguang
+    fn quick_open_disabled_tools(&self) -> BTreeSet<ToolRailToolId> {
+        let mut disabled = super::tool_panels::disabled_tool_rail_tools(&self.services.plugins);
+        if !super::tool_panels::commands_content_enabled(&self.services.plugins) {
+            disabled.insert(ToolRailToolId::Snippets);
+        }
+        if !super::tool_panels::tool_rail_tool_enabled(&self.services.plugins, ToolRailToolId::Logs)
+        {
+            disabled.insert(ToolRailToolId::Logs);
+        }
+        disabled
     }
 
     /// 将 typed 选择还原为现有操作；终端动作沿用打开面板时捕获的 binding，禁止失效后转投。
@@ -482,6 +506,8 @@ impl RootView {
     }
 
     /// 历史命令仅作为待编辑文本插入，并用打开时 context version 原子拒绝旧候选；FIFO 接管同一 work Box。
+    /// logs 单元在面板打开后可能被停用，确认时必须按当前启用视图拒绝，
+    /// 不能把历史文本写进已关闭命令能力的宿主；禁用只更新现有状态栏。
     ///
     /// @author kongweiguang
     fn insert_quick_open_history(
@@ -491,6 +517,14 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.tool_rail_tool_enabled(ToolRailToolId::Logs) {
+            self.set_quick_open_status(
+                "命令历史已禁用，未插入文本。",
+                "Command history is disabled; no text was inserted.",
+                cx,
+            );
+            return;
+        }
         let Some(origin) = origin.filter(|origin| {
             origin.context.prompt_line_empty
                 && origin.context.availability == TerminalCommandAvailability::Available
@@ -548,6 +582,8 @@ impl RootView {
     }
 
     /// 打开片段工具后按稳定 ID 导航；同一 Window 沿宿主入口传递，不绕过编辑器保护。
+    /// commands 单元可能在面板打开后被停用，确认时先复核启用视图；
+    /// 否则 `ensure_tool_panel_visible` 会静默返回，却仍按旧候选打开编辑器。
     ///
     /// @author kongweiguang
     fn open_quick_open_snippet(
@@ -556,6 +592,14 @@ impl RootView {
         cx_window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.commands_content_enabled() {
+            self.set_quick_open_status(
+                "命令片段功能已禁用，未打开编辑器。",
+                "Snippets are disabled; the editor was not opened.",
+                cx,
+            );
+            return;
+        }
         self.ensure_tool_panel_visible(ToolRailToolId::Snippets, cx_window, cx);
         let Some(commands) = self.commands_view.clone() else {
             self.set_quick_open_status(
@@ -570,9 +614,18 @@ impl RootView {
     }
 
     /// 工作流选择沿当前 Window 打开既有宿主，继续使用 versioned editor 的脏状态转场。
+    /// 与片段共用 commands 单元门禁，禁用时只更新状态而不触发宿主切换或编辑器加载。
     ///
     /// @author kongweiguang
     fn open_quick_open_workflow(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.commands_content_enabled() {
+            self.set_quick_open_status(
+                "工作流功能已禁用，未打开编辑器。",
+                "Workflows are disabled; the editor was not opened.",
+                cx,
+            );
+            return;
+        }
         self.ensure_tool_panel_visible(ToolRailToolId::Snippets, window, cx);
         let Some(commands) = self.commands_view.clone() else {
             self.set_quick_open_status(
@@ -616,6 +669,10 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 搜索导航等程序化入口不经过快捷键；禁用工具即使仍保留持久槽位也不能打开抽屉。
+        if !self.tool_rail_tool_enabled(tool) {
+            return;
+        }
         self.sync_tool_rail_active_tab();
         if tool == ToolRailToolId::Snippets && self.center_panel == CenterPanel::Commands {
             self.open_snippets_content(window, cx);

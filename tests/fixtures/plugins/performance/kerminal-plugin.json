@@ -8,7 +8,16 @@
   "publisher": "acme",
   "license": "MIT",
   "categories": ["productivity"],
-  "runtime": {"kind": "script", "main": "main.js", "activation": "on-demand"},
+  "runtime": {
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/sidecar.exe",
+      "linux-x86_64": "bin/sidecar",
+      "macos-x86_64": "bin/sidecar",
+      "macos-aarch64": "bin/sidecar"
+    },
+    "activation": "on-demand"
+  },
   "permissions": [],
   "contributes": {"tabs": [{"id": "notes-editor", "title": "Performance", "view": "notes.editor", "state_version": 1}]},
   "views": {"notes.editor": {"kind": "native", "file": "views/renderer.json"}}

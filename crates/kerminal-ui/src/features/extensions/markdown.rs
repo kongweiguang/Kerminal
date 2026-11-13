@@ -1,8 +1,6 @@
 //! 扩展详情中的 README 是不可信文本，禁止加载内嵌资源。
 //! @author kongweiguang
 
-use std::collections::BTreeSet;
-
 use gpui_kit::{
     AnyElement, IntoElement,
     base::{
@@ -10,7 +8,6 @@ use gpui_kit::{
         markdown_ast,
     },
 };
-use kerminal_plugin_protocol::Permission;
 
 struct StripUnsafe {
     block: bool,
@@ -42,7 +39,6 @@ impl MarkdownPlugin for StripUnsafe {
 
 /// README 外链交由系统浏览器打开，并复用已有 HTTPS URL 校验。
 pub(super) fn render_readme(id: String, text: String) -> AnyElement {
-    let permissions = BTreeSet::from([Permission::OpenExternal]);
     TextView::markdown(id, text)
         .markdown_extensions(
             MarkdownExtensions::default()
@@ -50,9 +46,7 @@ pub(super) fn render_readme(id: String, text: String) -> AnyElement {
                 .plugin(StripUnsafe { block: true }),
         )
         .on_link_click(move |url, _, _, cx| {
-            if let Some(url) =
-                crate::plugins::external::view::allowed_external_url(&permissions, url)
-            {
+            if let Some(url) = crate::plugins::external::view::allowed_external_url(url) {
                 cx.open_url(url.as_str());
             }
         })

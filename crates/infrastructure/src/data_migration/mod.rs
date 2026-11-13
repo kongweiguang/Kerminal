@@ -9,6 +9,7 @@ mod journal;
 mod marker;
 mod offline_guard;
 mod operational_state;
+pub mod plugins;
 mod profile_hosts;
 mod profile_import;
 mod sqlite;
@@ -125,7 +126,14 @@ impl DataMigrationRepository for FileDataMigrationRepository {
     /// @author kongweiguang
     fn migrate(&self) -> AppResult<DataMigrationReport> {
         self.ensure_host_types()?;
-        if let Some(fast) = inspection::inspect_current_fast_path(&self.root)? {
+        // 插件布局迁移与数据 marker 不是同一格式代：旧插件目录必须先迁移，不能走 guide-only 快路径。
+        let plugin_gate = plugins::inspect(&self.root)?;
+        if !plugin_gate.blockers.is_empty() {
+            return Err(AppError::conflict("用户数据迁移预检存在阻断项"));
+        }
+        let plugin_settled =
+            plugin_gate.readiness().is_settled() && !plugin_gate.requires_migration();
+        if plugin_settled && let Some(fast) = inspection::inspect_current_fast_path(&self.root)? {
             if fast.readiness == DataMigrationReadiness::Current
                 && !fast.recovery_pending
                 && let Some(report) = self.migrate_current_guide_only()?
@@ -141,7 +149,8 @@ impl DataMigrationRepository for FileDataMigrationRepository {
             self.legacy_window_state.as_deref(),
             self.host_types.as_deref(),
         )?;
-        if initial.readiness == DataMigrationReadiness::Current
+        if plugin_settled
+            && initial.readiness == DataMigrationReadiness::Current
             && !initial.recovery_pending
             && let Some(report) = self.migrate_current_guide_only()?
         {
@@ -154,34 +163,23 @@ impl DataMigrationRepository for FileDataMigrationRepository {
             .storage
             .lock()
             .map_err(|_| AppError::infrastructure("用户数据迁移存储锁不可用"))?;
+        // 锁内重检后由 transaction 先完成插件布局，再按重检结果执行数据迁移；marker 最后。
         let inspection = inspection::inspect_root(
             &self.root,
             self.legacy_window_state.as_deref(),
             self.host_types.as_deref(),
         )?;
-        match inspection.readiness {
-            DataMigrationReadiness::Current if !inspection.recovery_pending => {
-                Ok(already_current_report())
-            }
-            DataMigrationReadiness::Blocked => {
-                Err(AppError::conflict("用户数据迁移预检存在阻断项"))
-            }
-            DataMigrationReadiness::Fresh
-            | DataMigrationReadiness::Legacy
-            | DataMigrationReadiness::Current => {
-                if self.legacy_instance_check
-                    && inspection.readiness != DataMigrationReadiness::Fresh
-                {
-                    offline_guard::ensure_legacy_instance_stopped()?;
-                }
-                transaction::apply_locked(
-                    &self.root,
-                    &self.legacy_window_state,
-                    inspection,
-                    self.host_types.as_deref(),
-                )
-            }
+        if inspection.readiness == DataMigrationReadiness::Blocked {
+            return Err(AppError::conflict("用户数据迁移预检存在阻断项"));
         }
+        if self.legacy_instance_check && inspection.readiness != DataMigrationReadiness::Fresh {
+            offline_guard::ensure_legacy_instance_stopped()?;
+        }
+        transaction::apply_locked(
+            &self.root,
+            &self.legacy_window_state,
+            self.host_types.as_deref(),
+        )
     }
 
     /// 预演仅读取两个指定根并复用实际规划，随机密钥仅在内存中生成并随计划清除。
@@ -288,6 +286,11 @@ impl FileDataMigrationRepository {
             .storage
             .lock()
             .map_err(|_| AppError::infrastructure("用户数据迁移存储锁不可用"))?;
+        // 快路径在锁内也必须重检插件布局，避免预检后出现待迁移或恢复材料。
+        let plugin_gate = plugins::inspect(&self.root)?;
+        if !plugin_gate.blockers.is_empty() || plugin_gate.requires_migration() {
+            return Ok(None);
+        }
         let Some(current) = inspection::inspect_current_fast_path(&self.root)? else {
             return Ok(None);
         };
@@ -313,5 +316,6 @@ fn already_current_report() -> DataMigrationReport {
         resumed: false,
         backup_relative_path: None,
         backup_relative_paths: Vec::new(),
+        plugin_layout: None,
     }
 }

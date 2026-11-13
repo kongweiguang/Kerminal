@@ -17,6 +17,10 @@ mod services;
 mod ssh_tools;
 mod terminal_tools;
 
+#[cfg(test)]
+#[path = "../tests/unit/agent_scoped_split_targets.rs"]
+mod agent_scoped_split_targets;
+
 pub use runtime_control::McpRuntimeController;
 pub use server::{McpServer, McpServerConfig, McpServerHandle};
 pub use services::{McpServices, McpServicesValidationError};

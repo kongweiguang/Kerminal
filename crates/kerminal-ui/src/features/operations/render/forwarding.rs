@@ -286,6 +286,7 @@ impl OperationsView {
             self.tool_rail_target.as_ref(),
             self.host_target.as_ref(),
         );
+        let data_opacity = self.fixed_data_entrance_opacity();
         if self.section_selection.is_fixed() && selected_host.is_none() {
             let (hint_zh, hint_en) =
                 super::super::forward_unavailable_hint(self.tool_rail_container_target.as_ref());
@@ -1031,7 +1032,9 @@ impl OperationsView {
             row = row.child(actions);
             sessions = sessions.child(row);
         }
-        body = body.child(sessions);
+        body = body.child(sessions.when(data_opacity < 1.0, |sessions| {
+            sessions.opacity(data_opacity)
+        }));
 
         section_page(
             crate::locale::text("SSH 隧道", "SSH tunnels"),

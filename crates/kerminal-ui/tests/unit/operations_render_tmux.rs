@@ -8,7 +8,7 @@ use super::{
     SectionPhase,
     tmux::{
         TmuxHeaderTone, TmuxPanelPresentation, default_tmux_session_name, sort_tmux_panel_sessions,
-        tmux_detach_shortcut, tmux_header_status, tmux_header_tone,
+        tmux_data_entrance_applies, tmux_detach_shortcut, tmux_header_status, tmux_header_tone,
         tmux_panel_session_matches_current, tmux_quickref_copy_text, tmux_ssh_host_display_label,
         tmux_tool_rail_feedback_visible, tmux_tool_rail_header_status,
         tmux_tool_rail_quickref_toggle, tmux_tool_rail_session_status,
@@ -145,6 +145,33 @@ fn quickref_toggle_accepts_the_entire_row_and_keyboard_without_swallowing_childr
     visual.simulate_event(KeyUpEvent { keystroke });
     visual.run_until_parked();
     visual.update(|_, cx| assert!(!view.read(cx).expanded));
+}
+
+/// 只有已确认可用的会话数据参与入场；不可用说明和已落位数据必须立即完整显示。
+///
+/// 同目标刷新把旧可用快照换成 capability unavailable 时，未结束的旧入场不能把
+/// “tmux 不可用”状态一起压暗。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_data_entrance_only_covers_confirmed_available_sessions() {
+    let available = TmuxCapability {
+        target_ref: "local".to_owned(),
+        available: true,
+        version: Some("tmux 3.2a".to_owned()),
+        reason: None,
+    };
+    let unavailable = TmuxCapability {
+        target_ref: "local".to_owned(),
+        available: false,
+        version: None,
+        reason: Some("tmux command was not found".to_owned()),
+    };
+
+    assert!(tmux_data_entrance_applies(Some(&available), 0.94));
+    assert!(!tmux_data_entrance_applies(Some(&available), 1.0));
+    assert!(!tmux_data_entrance_applies(Some(&unavailable), 0.94));
+    assert!(!tmux_data_entrance_applies(None, 0.94));
 }
 
 /// 就绪状态不占正文，未绑定与目标不匹配时保留各自的可执行原因。

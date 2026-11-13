@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::{AppError, AppResult};
+use crate::{AppError, AppResult, plugins::PluginRegistry};
 
 use super::{
     AgentWorkspaceDocument, AgentWorkspaceDocumentContent, AgentWorkspaceDocumentKind,
@@ -55,8 +55,12 @@ pub(super) struct WorkspaceSnapshotInput<'a> {
 ///
 /// provider 文件在写入前先读取并合并现有用户内容；context 则由运行态快照重建。
 /// 快照目标可独立于首选绑定指定，记录输出时保留来源会话但不隐式改绑。
+/// 传入插件启用视图时只保留当前可用的工具提示；None 用于离线装配和纯模板测试。
 ///
 /// @author kongweiguang
+// 聚合写入、快照与插件启用视图属于同一次事务装配，扁平参数显式保留调用顺序，
+// 再包一层分组类型会掩盖 journal 提交顺序，故保留现有签名。
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn compose_workspace_documents(
     repository: &dyn AgentWorkspaceRepository,
     session_write: SessionDocumentWrite<'_>,
@@ -64,6 +68,7 @@ pub(super) async fn compose_workspace_documents(
     endpoint: &str,
     agent_terminal: Option<&SessionInfo>,
     snapshot: WorkspaceSnapshotInput<'_>,
+    plugins: Option<&PluginRegistry>,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> AppResult<Vec<AgentWorkspaceDocument>> {
     let SessionDocumentWrite {
@@ -100,7 +105,7 @@ pub(super) async fn compose_workspace_documents(
         repository,
         session,
         AgentWorkspaceDocumentKind::AgentInstructions,
-        &agent_instructions(session, endpoint),
+        &agent_instructions_with(session, endpoint, plugins),
         cancellation.clone(),
     )
     .await?;
@@ -116,7 +121,7 @@ pub(super) async fn compose_workspace_documents(
                     repository,
                     session,
                     AgentWorkspaceDocumentKind::ClaudeInstructions,
-                    &claude_instructions(endpoint),
+                    &claude_instructions(endpoint, plugins),
                     cancellation.clone(),
                 )
                 .await?,
@@ -370,40 +375,105 @@ fn ensure_toml_table<'a>(parent: &'a mut Table, key: &str) -> AppResult<&'a mut 
 }
 
 /// 所有 provider 使用唯一 live 上下文入口与保留的运行态工具；审批仍由 host 决定。
-fn agent_instructions(session: &AgentSession, endpoint: &str) -> String {
+///
+/// 模板行按插件启用视图裁剪：SSH、SFTP 与 Agent 单元关闭时，对应句子整体移除，
+/// 终端核心提示保留；保留的句子维持历史模板顺序，全启用时与 HEAD 文本逐字一致。
+///
+/// @author kongweiguang
+fn agent_instructions_with(
+    session: &AgentSession,
+    endpoint: &str,
+    plugins: Option<&PluginRegistry>,
+) -> String {
     let id = session.agent_session_id.as_str();
+    let ssh_enabled = unit_enabled(plugins, crate::plugins::capabilities::SSH_UNIT);
+    let sftp_enabled = unit_enabled(plugins, crate::plugins::capabilities::SFTP_UNIT);
+    let agents_enabled = unit_enabled(plugins, crate::plugins::capabilities::AGENTS_UNIT);
+    let mut bullets = vec![
+        "- This session has global Kerminal runtime access. Its preferred terminal is context only, not an authorization boundary.".to_owned(),
+        "- Before using Kerminal, read `session.toml` and `context/mcp-endpoint.json`, `context/target-binding.json`, `context/terminal-snapshot.json`, and `context/workspace-snapshot.json`.".to_owned(),
+    ];
+    if agents_enabled {
+        bullets.push(format!(
+            "- Refresh live state with `kerminal.agent.target_context`, passing `agentSessionId = \"{id}\"`."
+        ));
+    }
+    bullets.extend([
+        "- Use `kerminal.help` for tool discovery; `topic = \"config\"` returns configuration rules.".to_owned(),
+        format!(
+            "- The session endpoint is `{endpoint}`. Use its MCP tools directly; the MCP host owns approval and audit policy."
+        ),
+        "- External MCP defaults to background execution. A visible Tab is never required. When a preferred target is stale or missing, report that state and do not substitute another terminal.".to_owned(),
+    ]);
+    // SSH 与传输原本共用一段说明；按历史模板顺序分别追加，禁用时整句省略，
+    // 避免裁剪后改变全启用文本的相对顺序。
+    let mut runtime_segments = Vec::new();
+    if ssh_enabled {
+        runtime_segments.push("Run non-interactive server commands with `ssh.command`.");
+    }
+    if sftp_enabled {
+        runtime_segments.push(
+            "For local/remote file transfers use `sftp.transfer.enqueue`, then query `sftp.transfer.list` until completion.",
+        );
+    }
+    if ssh_enabled {
+        runtime_segments.push(
+            "Container and tmux commands use `ssh.command`; their former dedicated MCP tools are unavailable.",
+        );
+    }
+    if !runtime_segments.is_empty() {
+        bullets.push(format!("- {}", runtime_segments.join(" ")));
+    }
+    let mut terminal_line = "- For a new interactive shell, call `terminal.create`, then use its explicit `sessionId` for read/write and close it after the task.".to_owned();
+    if agents_enabled {
+        terminal_line.push_str(
+            " For target-bound work, refresh `kerminal.agent.target_context` first; ordinary Tab changes do not rebind this session.",
+        );
+    }
+    bullets.push(terminal_line);
+    bullets.push(
+        "- Keep custom text outside the managed block below; Kerminal updates only this marked block.".to_owned(),
+    );
     format!(
-        r#"{BLOCK_START}
-# Kerminal Agent session
-
-- This session has global Kerminal runtime access. Its preferred terminal is context only, not an authorization boundary.
-- Before using Kerminal, read `session.toml` and `context/mcp-endpoint.json`, `context/target-binding.json`, `context/terminal-snapshot.json`, and `context/workspace-snapshot.json`.
-- Refresh live state with `kerminal.agent.target_context`, passing `agentSessionId = "{id}"`.
-- Use `kerminal.help` for tool discovery; `topic = "config"` returns configuration rules.
-- The session endpoint is `{endpoint}`. Use its MCP tools directly; the MCP host owns approval and audit policy.
-- External MCP defaults to background execution. A visible Tab is never required. When a preferred target is stale or missing, report that state and do not substitute another terminal.
-- Run non-interactive server commands with `ssh.command`. For local/remote file transfers use `sftp.transfer.enqueue`, then query `sftp.transfer.list` until completion. Container and tmux commands use `ssh.command`; their former dedicated MCP tools are unavailable.
-- For a new interactive shell, call `terminal.create`, then use its explicit `sessionId` for read/write and close it after the task. For target-bound work, refresh `kerminal.agent.target_context` first; ordinary Tab changes do not rebind this session.
-- Keep custom text outside the managed block below; Kerminal updates only this marked block.
-{BLOCK_END}
-"#
+        "{BLOCK_START}\n# Kerminal Agent session\n\n{}\n{BLOCK_END}\n",
+        bullets.join("\n")
     )
 }
 
 /// Claude 复用同一目标上下文规则，避免 provider 文档保留已移除工具造成循环重试。
-fn claude_instructions(endpoint: &str) -> String {
-    format!(
-        r#"{BLOCK_START}
-@AGENTS.md
+///
+/// Agent 单元关闭时同时移除“刷新目标上下文”提示；其余 host 策略与 endpoint
+/// 说明不依赖该工具，保持原样以免改写 provider 交接契约。
+///
+/// @author kongweiguang
+fn claude_instructions(endpoint: &str, plugins: Option<&PluginRegistry>) -> String {
+    let agents_enabled = unit_enabled(plugins, crate::plugins::capabilities::AGENTS_UNIT);
+    let mut section: Vec<String> = Vec::new();
+    if agents_enabled {
+        section.push(
+            "- Follow `AGENTS.md` and refresh the live target with `kerminal.agent.target_context` before using a preferred terminal.".to_owned(),
+        );
+    }
+    section.extend([
+        "- MCP host policy owns confirmation, approval, permissions, hooks, and audit. Kerminal adds no second prompt.".to_owned(),
+        format!(
+            "- Use the session scoped Kerminal endpoint `{endpoint}`. A stale preferred target never falls back to another Tab."
+        ),
+    ]);
+    // 段落标题只在仍有说明行时出现，避免生成空章节。
+    let claude_section = if section.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Claude Code\n\n{}\n", section.join("\n"))
+    };
+    format!("{BLOCK_START}\n@AGENTS.md\n{claude_section}{BLOCK_END}\n")
+}
 
-## Claude Code
-
-- Follow `AGENTS.md` and refresh the live target with `kerminal.agent.target_context` before using a preferred terminal.
-- MCP host policy owns confirmation, approval, permissions, hooks, and audit. Kerminal adds no second prompt.
-- Use the session scoped Kerminal endpoint `{endpoint}`. A stale preferred target never falls back to another Tab.
-{BLOCK_END}
-"#
-    )
+/// 未注入 registry 时按全部启用处理，与 MCP 目录的离线缺省语义一致。
+///
+/// @author kongweiguang
+fn unit_enabled(plugins: Option<&PluginRegistry>, unit: &str) -> bool {
+    plugins.is_none_or(|registry| registry.is_enabled(unit))
 }
 
 /// 序列化一个固定路径的 JSON context 文件，避免调用者传入路径或暴露绝对目录。
@@ -642,3 +712,7 @@ fn lifecycle_status(status: SessionLifecycle) -> &'static str {
 #[cfg(test)]
 #[path = "../../tests/unit/agent_workspace_documents.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/agent_template_plugin_gating.rs"]
+mod plugin_gating_tests;

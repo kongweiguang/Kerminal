@@ -19,7 +19,14 @@ use crate::{
     },
 };
 
-use super::{agent_instructions, codex_config};
+use super::{agent_instructions_with, codex_config};
+
+/// 测试复用生产模板入口，不在 src 暴露 test-only 包装。
+///
+/// @author kongweiguang
+fn agent_instructions(session: &AgentSession, endpoint: &str) -> String {
+    agent_instructions_with(session, endpoint, None)
+}
 
 struct CodexConfigRepository {
     session_id: AgentSessionId,

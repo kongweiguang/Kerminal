@@ -1,4 +1,4 @@
-//! 插件主机类型表单的隔离原生验收：真实脚本插件、生产面板表单、host.test/save/open 与结果 Tab。
+//! 插件主机类型表单的隔离原生验收：受监督 Sidecar 插件、生产面板表单、host.test/save/open 与结果 Tab。
 //! 入口只由显式环境变量触发；正常启动和发行构建不注册菜单或可发现命令。
 //!
 //! @author kongweiguang
@@ -19,7 +19,7 @@ use gpui_kit::{
 use gpui_pre::{Bounds, WindowBounds, px, size};
 use kerminal_application::preferences::ThemeMode;
 use kerminal_domain::identity::HostId;
-use kerminal_plugin_protocol::PluginRuntime;
+use kerminal_plugin_protocol::{Platform, PluginRuntime};
 use kerminal_ui::{AppServices, QuitIntent, RootView, RootViewEvent};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -93,7 +93,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("主机表单验收只允许 http-check 一个开发插件").into());
     }
     let prepared = startup.enabled[0].clone();
-    let plugin_hash = script_plugin_digest(&prepared)?;
+    let plugin_hash = plugin_digest(&prepared)?;
     let catalogs = startup.catalogs("zh-CN")?;
     let migration = bootstrap::migration_service(&config, None, catalogs.1.clone());
     bootstrap::run_after_migration(&migration, false, |_| ())
@@ -170,8 +170,8 @@ fn options_from_env() -> Result<Options, io::Error> {
     })
 }
 
-/// 只对真实脚本宿主计算清单、资源和入口脚本摘要，不能用包目录名冒充执行内容。
-fn script_plugin_digest(
+/// 只对真实 Sidecar 计算清单、资源和当前平台入口摘要，不能用包目录名冒充执行内容。
+fn plugin_digest(
     prepared: &kerminal_application::external_contributions::PreparedPlugin,
 ) -> Result<String, Box<dyn Error>> {
     let mut digest = Sha256::new();
@@ -181,11 +181,15 @@ fn script_plugin_digest(
         digest.update(path.as_bytes());
         digest.update(bytes.as_ref());
     }
-    if let PluginRuntime::Script { main, .. } = &prepared.package.manifest.runtime {
-        digest.update(fs::read(prepared.directory.join(main))?);
-    } else {
-        return Err(io::Error::other("主机表单验收只支持脚本宿主").into());
-    }
+    let PluginRuntime::Sidecar { main, .. } = &prepared.package.manifest.runtime else {
+        return Err(io::Error::other("主机表单验收只支持 Sidecar 插件").into());
+    };
+    let platform =
+        Platform::current().ok_or_else(|| io::Error::other("当前平台无法核对 Sidecar 入口"))?;
+    let main = main
+        .get(&platform)
+        .ok_or_else(|| io::Error::other("主机表单验收插件未声明当前平台 Sidecar"))?;
+    digest.update(fs::read(prepared.directory.join(main))?);
     Ok(format!("{:x}", digest.finalize()))
 }
 

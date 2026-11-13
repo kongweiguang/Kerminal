@@ -8,8 +8,16 @@
   "publisher": "kerminal",
   "license": "MIT",
   "categories": ["network"],
-  "runtime": {"kind": "script", "main": "dist/main.js", "activation": "on-demand"},
-  "permissions": ["network:example.com"],
+  "runtime": {
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/sidecar.exe",
+      "linux-x86_64": "bin/sidecar",
+      "macos-x86_64": "bin/sidecar",
+      "macos-aarch64": "bin/sidecar"
+    },
+    "activation": "on-demand"
+  },
   "contributes": {
     "host_types": [{"id": "http-endpoint", "title": "%host.title%", "schema": "schemas/host.json"}],
     "tabs": [{"id": "http-result", "title": "%result.title%", "view": "http.result", "state_version": 1}]

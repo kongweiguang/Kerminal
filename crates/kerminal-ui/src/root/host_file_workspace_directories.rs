@@ -5,55 +5,6 @@
 use super::*;
 
 impl RootView {
-    /// 加号是明确的新建意图，允许从同一路径开始独立浏览；按目标打开入口仍负责去重。
-    pub(in crate::root) fn new_host_directory_tab(
-        &mut self,
-        owner: &TabId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let initial = self.workspace_files.tabs.get(owner).and_then(|runtime| {
-            let WorkspaceSessionTab::FileWorkspace { state, .. } = &runtime.tab else {
-                return None;
-            };
-            state
-                .active_item_id
-                .as_ref()
-                .and_then(|active| {
-                    state.items.iter().find(|entry| {
-                        entry.id() == active && matches!(entry, FileWorkspaceItem::Directory { .. })
-                    })
-                })
-                .or_else(|| {
-                    state
-                        .items
-                        .iter()
-                        .find(|entry| matches!(entry, FileWorkspaceItem::Directory { .. }))
-                })
-                .map(|entry| entry.path().to_owned())
-        });
-        let Some(path) = initial else { return };
-        let item_id = TabId::new();
-        let result = self.update_host_file_state(owner, |state| {
-            state.items.push(FileWorkspaceItem::Directory {
-                id: item_id.clone(),
-                path,
-            });
-            state.active_item_id = Some(item_id);
-            Ok(())
-        });
-        match result {
-            Ok(()) => {
-                self.activate_host_file_workspace(owner, window, cx);
-                self.persist_workspace_snapshot(cx);
-            }
-            Err(error) => {
-                self.status = Some(error.public_message().into());
-                cx.notify();
-            }
-        }
-    }
-
     /// 显式目录入口才新增目录标签，普通下钻沿 FilesPane 原导航更新路径。
     pub(in crate::root) fn open_directory_in_host_workspace(
         &mut self,

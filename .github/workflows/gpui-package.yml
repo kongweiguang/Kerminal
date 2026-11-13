@@ -116,7 +116,7 @@ jobs:
           elif [[ -n "$KERMINAL_GPUI_UPDATER_PUBLIC_KEY" ]]; then
             python packaging/updater_key.py
           fi
-          cargo --locked build --release --package kerminal-desktop --package kerminal-plugin-host --package kerminal-plugin-cli --target "$PACKAGE_TARGET"
+          cargo --locked build --release --package kerminal-desktop --package kerminal-plugin-cli --target "$PACKAGE_TARGET"
           if [[ "$SIGNED_CANDIDATE" == "true" ]]; then
             BINARY_PATH="target/$PACKAGE_TARGET/release/kerminal"
             if [[ "$PACKAGE_TARGET" == *-windows-* ]]; then BINARY_PATH+=".exe"; fi

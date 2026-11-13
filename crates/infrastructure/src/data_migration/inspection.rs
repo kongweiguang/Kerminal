@@ -14,14 +14,15 @@ use kerminal_application::{
     connections::host_types::HostConfigurationCatalog,
     data_migration::{
         DataMigrationBlocker, DataMigrationInspection, DataMigrationNotice, DataMigrationReadiness,
+        PluginLayoutReadiness,
     },
 };
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    FileEdit, agents, configuration, marker, operational_state, transaction, vault, window_state,
-    workspace,
+    FileEdit, agents, configuration, marker, operational_state, plugins, transaction, vault,
+    window_state, workspace,
 };
 
 mod legacy_transactions;
@@ -38,19 +39,35 @@ pub(super) fn inspect_root(
     legacy_window_state: Option<&Path>,
     host_types: Option<&HostConfigurationCatalog>,
 ) -> AppResult<DataMigrationInspection> {
+    let plugin = plugins::inspect(root)?;
+    let plugin_layout = plugin.readiness();
+    let plugin_migration = plugin.requires_migration();
     if !path_exists_without_following(root)? {
         return Ok(inspection(
             DataMigrationReadiness::Fresh,
             None,
             None,
             vec![],
-            vec![],
+            plugin.notices,
             false,
+            plugin_layout,
         ));
     }
     let root_meta = fs::symlink_metadata(root).map_err(io_error("检查用户数据根失败"))?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Ok(blocked(DataMigrationBlocker::UnknownNonEmptyRoot));
+    }
+    // 插件布局未知、混合或残留必须先保留现场；不能继续读取 marker 后把它当成 current。
+    if !plugin.blockers.is_empty() {
+        return Ok(inspection(
+            DataMigrationReadiness::Blocked,
+            None,
+            None,
+            plugin.blockers,
+            plugin.notices,
+            plugin_migration,
+            plugin_layout,
+        ));
     }
 
     let marker_read = marker::read_marker(root)?;
@@ -70,17 +87,21 @@ pub(super) fn inspect_root(
                 blockers.push(blocker);
             }
             inspect_current_workspace(root, &mut blockers)?;
+            let readiness = if blockers.is_empty() && !plugin_migration {
+                DataMigrationReadiness::Current
+            } else if blockers.is_empty() {
+                DataMigrationReadiness::Legacy
+            } else {
+                DataMigrationReadiness::Blocked
+            };
             return Ok(inspection(
-                if blockers.is_empty() {
-                    DataMigrationReadiness::Current
-                } else {
-                    DataMigrationReadiness::Blocked
-                },
+                readiness,
                 Some(marker::CURRENT_DATA_FORMAT),
                 Some(marker::CURRENT_MIGRATION_CONTRACT),
                 blockers,
-                vec![],
-                journal_scan.recovery_pending,
+                plugin.notices,
+                journal_scan.recovery_pending || plugin_migration,
+                plugin_layout,
             ));
         }
         marker::MarkerRead::PreviousSupported(contract) => {
@@ -92,7 +113,7 @@ pub(super) fn inspect_root(
             {
                 blockers.push(DataMigrationBlocker::CorruptMigrationJournal);
             }
-            if !journal_scan.recovery_pending && blockers.is_empty() {
+            if !journal_scan.recovery_pending && !plugin_migration && blockers.is_empty() {
                 match collect_plan(root, legacy_window_state, host_types) {
                     Ok(edits) => {
                         if let Err(blocker) = validate_edits(root, &edits) {
@@ -111,8 +132,9 @@ pub(super) fn inspect_root(
                 Some(marker::CURRENT_DATA_FORMAT),
                 Some(contract),
                 blockers,
-                vec![],
-                journal_scan.recovery_pending,
+                plugin.notices,
+                journal_scan.recovery_pending || plugin_migration,
+                plugin_layout,
             ));
         }
         marker::MarkerRead::Missing => {}
@@ -128,8 +150,9 @@ pub(super) fn inspect_root(
             None,
             None,
             vec![],
-            vec![],
+            plugin.notices,
             true,
+            plugin_layout,
         ));
     }
 
@@ -143,8 +166,9 @@ pub(super) fn inspect_root(
             None,
             None,
             blockers,
-            vec![],
-            journal_scan.recovery_pending,
+            plugin.notices,
+            journal_scan.recovery_pending || plugin_migration,
+            plugin_layout,
         ));
     }
 
@@ -155,15 +179,16 @@ pub(super) fn inspect_root(
             None,
             None,
             vec![],
-            vec![],
-            false,
+            plugin.notices,
+            plugin_migration,
+            plugin_layout,
         ));
     }
-    if !has_kerminal_signature(root, &entries)? {
+    if !has_kerminal_signature(root, &entries, plugin_layout)? {
         return Ok(blocked(DataMigrationBlocker::UnknownNonEmptyRoot));
     }
 
-    let mut notices = Vec::new();
+    let mut notices = plugin.notices;
     inspect_legacy_sqlite(root, &mut blockers, &mut notices)?;
     let mut edits = match collect_plan(root, legacy_window_state, host_types) {
         Ok(edits) => edits,
@@ -188,13 +213,28 @@ pub(super) fn inspect_root(
         None,
         blockers,
         notices,
-        journal_scan.recovery_pending,
+        journal_scan.recovery_pending || plugin_migration,
+        plugin_layout,
     ))
 }
 
 /// 当前 marker 快速路径仍验证新增恢复文档；上一契约绝不通过该路径启动普通 runtime。
 /// @author kongweiguang
 pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMigrationInspection>> {
+    let plugin = plugins::inspect(root)?;
+    let plugin_layout = plugin.readiness();
+    let plugin_migration = plugin.requires_migration();
+    if !plugin.blockers.is_empty() {
+        return Ok(Some(inspection(
+            DataMigrationReadiness::Blocked,
+            None,
+            None,
+            plugin.blockers,
+            plugin.notices,
+            plugin_migration,
+            plugin_layout,
+        )));
+    }
     if !path_exists_without_following(root)? {
         return Ok(None);
     }
@@ -204,6 +244,10 @@ pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMig
     }
     match marker::read_marker(root)? {
         marker::MarkerRead::Current => {
+            if plugin_migration {
+                // 数据 marker 已是当前代，但插件仍待迁移时不能返回 current 快路径。
+                return Ok(None);
+            }
             let mut journal_scan = transaction::inspect_journals(root)?;
             if journal_scan
                 .target_migration_contract
@@ -227,8 +271,9 @@ pub(super) fn inspect_current_fast_path(root: &Path) -> AppResult<Option<DataMig
                 Some(marker::CURRENT_DATA_FORMAT),
                 Some(marker::CURRENT_MIGRATION_CONTRACT),
                 journal_scan.blockers,
-                vec![],
+                plugin.notices,
                 journal_scan.recovery_pending,
+                plugin_layout,
             )))
         }
         marker::MarkerRead::Blocked(blocker) => Ok(Some(blocked(blocker))),
@@ -373,9 +418,15 @@ pub(super) fn validate_edits(root: &Path, edits: &[FileEdit]) -> Result<(), Data
 }
 
 /// 插件目录在主机配置扫描前冻结，因此新根可能先有插件状态，再进入数据格式初始化。
-/// 只有通过同一存储校验的状态才构成签名，不能把任意同名文件当成受管数据放行。
-fn has_kerminal_signature(root: &Path, entries: &[String]) -> AppResult<bool> {
-    if entries == ["plugins"] && is_plugin_bootstrap_root(root)? {
+/// 只有通过插件布局分类的状态才构成签名，不能把任意同名文件当成受管数据放行。
+fn has_kerminal_signature(
+    root: &Path,
+    entries: &[String],
+    plugin_layout: PluginLayoutReadiness,
+) -> AppResult<bool> {
+    // Fresh/Current/Legacy/RecoveryPending 都由分类器确认属于受管根；RecoveryPending
+    // 覆盖“插件迁移已完成、数据 marker 尚未写出”的中断窗口，否则收尾永远无法执行。
+    if entries == ["plugins"] && plugin_layout != PluginLayoutReadiness::Blocked {
         return Ok(true);
     }
     for name in [
@@ -412,29 +463,6 @@ fn has_kerminal_signature(root: &Path, entries: &[String]) -> AppResult<bool> {
         }
     }
     Ok(false)
-}
-
-/// 新根只允许插件引导状态这一项控制材料；不能让启动新写的状态替未知用户目录洗白。
-fn is_plugin_bootstrap_root(root: &Path) -> AppResult<bool> {
-    let Some(bytes) =
-        read_optional_regular_file(root, Path::new("plugins/state.json"), MAX_DOCUMENT_BYTES)?
-    else {
-        return Ok(false);
-    };
-    let Ok(state) = serde_json::from_slice::<kerminal_domain::plugins::PluginStoreState>(&bytes)
-    else {
-        return Ok(false);
-    };
-    if crate::plugins::store::validate_state(&state).is_err() {
-        return Ok(false);
-    }
-    for entry in fs::read_dir(root.join("plugins")).map_err(io_error("读取插件引导目录失败"))?
-    {
-        if entry.map_err(io_error("读取插件引导目录失败"))?.file_name() != "state.json" {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// SQLite dry-run 仅检查主库 magic、user_version 与 WAL 是否存在，避免打开连接生成 -shm。
@@ -847,6 +875,7 @@ fn inspection(
     blockers: Vec<DataMigrationBlocker>,
     notices: Vec<DataMigrationNotice>,
     recovery_pending: bool,
+    plugin_layout: PluginLayoutReadiness,
 ) -> DataMigrationInspection {
     DataMigrationInspection {
         readiness,
@@ -855,10 +884,11 @@ fn inspection(
         blockers,
         notices,
         recovery_pending,
+        plugin_layout,
     }
 }
 
-/// 构造单个阻断项 DTO，调用方不需要复制序列化字段规则。
+/// 构造单个阻断项 DTO，调用方不需要复制序列化字段规则；插件布局此时无法判定。
 fn blocked(blocker: DataMigrationBlocker) -> DataMigrationInspection {
     inspection(
         DataMigrationReadiness::Blocked,
@@ -867,6 +897,7 @@ fn blocked(blocker: DataMigrationBlocker) -> DataMigrationInspection {
         vec![blocker],
         vec![],
         false,
+        PluginLayoutReadiness::Blocked,
     )
 }
 

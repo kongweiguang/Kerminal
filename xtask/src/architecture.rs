@@ -28,7 +28,6 @@ const EXPECTED_WORKSPACE_PACKAGES: [&str; 8] = [
 
 const SDK_WORKSPACE_PACKAGES: &[&str] = &[
     "kerminal-plugin-protocol",
-    "kerminal-plugin-host",
     "kerminal-plugin-sdk",
     "kerminal-plugin-cli",
 ];
@@ -303,6 +302,9 @@ fn collect_legacy_web_inputs(directory: &Path, found: &mut Vec<PathBuf>) -> std:
         ".agents",
         ".codegraph",
         ".git",
+        // `.local` 被 .gitignore 的 `*.local` 忽略，是本地临时目录，CI 检出中不存在；
+        // 扫描器只应检查会进入仓库的产品输入。
+        ".local",
         ".updeng",
         ".next",
         "__tests__",

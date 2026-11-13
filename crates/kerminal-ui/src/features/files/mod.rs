@@ -33,7 +33,7 @@ pub(crate) use target_names::{FileTargetNameLookup, FileTargetNameState, SftpHos
 use std::{
     collections::HashSet,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gpui_kit::component::tree::{TreeEvent, TreeState};
@@ -65,6 +65,7 @@ pub(crate) use workspace_context::FileBrowserContextSnapshot;
 pub use workspace_context::{FileWorkspaceDirectoryChanged, OpenDirectoryInWorkspaceRequested};
 
 use crate::locale;
+use crate::ui_motion::{TargetDataEntrance, motion_allowed};
 use transfer_refresh::{
     TransferRefreshScope, completed_transfer_refresh_directories, panel_needs_transfer_refresh,
 };
@@ -474,6 +475,21 @@ pub struct FilesPane {
     pending_transfer_conflict: Option<PendingTransferConflict>,
     permissions: permissions::PermissionEditor,
     compact_layout: bool,
+    /// 右栏 SFTP 是否真实可见；隐藏时立即落位并停止帧请求，但不取消已发起的目录读取。
+    active: bool,
+    /// 只有紧凑右栏在新文件系统/宿主的首个成功目录结果上播放一次数据入场。
+    data_entrance: TargetDataEntrance,
+    /// 入场武装等待的目标读取端点；只有该端点自身的成功回执可以消费入场，
+    /// 手动下钻、普通刷新等其它读取不得借用或代为消费播放资格。
+    data_entrance_request: Option<FileEndpoint>,
+    /// 记录 `ready` 真正启动入场的次数，避免回归用时序或渲染采样碰运气。
+    /// 常驻字段配合 `cfg!(test)` 读取，避免 `src` 出现测试专属属性；生产不读取该计数。
+    #[cfg_attr(not(test), allow(dead_code))]
+    started_entrances_for_test: usize,
+    /// 测试只替换系统侧动效结论，应用内 reduce_motion 仍由生产门禁优先判定。
+    /// 生产构建恒为 None，读取处用 `cfg!(test)` 常量分支保持行为不变。
+    #[cfg_attr(not(test), allow(dead_code))]
+    motion_allowed_for_test: Option<bool>,
     view_mode: view_mode::FilesViewMode,
     show_hidden_files: bool,
     status: Option<String>,
@@ -890,6 +906,11 @@ impl FilesPane {
             pending_transfer_conflict: None,
             permissions: permissions::PermissionEditor::default(),
             compact_layout: false,
+            active: false,
+            data_entrance: TargetDataEntrance::default(),
+            data_entrance_request: None,
+            started_entrances_for_test: 0,
+            motion_allowed_for_test: None,
             view_mode: view_mode::FilesViewMode::List,
             show_hidden_files: true,
             status: None,
@@ -920,12 +941,28 @@ impl FilesPane {
         self.compact_layout = compact;
         if compact {
             self.set_transfer_origin(None, cx);
-        }
-        if !compact {
+        } else {
             self.permission_dialog_target = None;
+            // 中央工作区不使用局部入场；换挂时撤销等待和残留动画，避免回到右栏后补播。
+            self.disarm_target_data_entrance(cx);
         }
         if !compact && self.initialized && self.panels[0].listing.is_none() {
             self.load_panel(0, cx);
+        }
+        cx.notify();
+    }
+
+    /// 右栏真实可见性只驱动动效生命周期，不启动、取消或改写任何目录读取。
+    /// 隐藏时立即落位，但保留尚未消费的目标等待，使首个成功结果能按原身份静默消费。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if !active {
+            self.data_entrance.settle();
         }
         cx.notify();
     }
@@ -1039,6 +1076,7 @@ impl FilesPane {
             if self.compact_target_is_cleared() {
                 return;
             }
+            self.disarm_target_data_entrance(cx);
             self.current_terminal_endpoint = None;
             self.current_terminal_binding = None;
             self.external_target_lease = None;
@@ -1065,6 +1103,7 @@ impl FilesPane {
                                 if !self.compact_target_error_is_current(&message) {
                                     self.current_terminal_endpoint = None;
                                     self.external_target_lease = None;
+                                    self.disarm_target_data_entrance(cx);
                                     self.invalidate_compact_target(cx);
                                     self.status = Some(message);
                                     cx.notify();
@@ -1108,6 +1147,8 @@ impl FilesPane {
         // 文件系统切换清除旧目标；终端来源遵守本机保留和 SSH opt-in。
         let should_notify = match action {
             CompactTargetUpdateAction::BindTarget => {
+                // 只有真实文件系统/宿主切换才武装一次入场；普通刷新、同主机目录跟随和树读取不触发。
+                self.begin_target_data_entrance(endpoint.clone(), cx);
                 self.invalidate_compact_target(cx);
                 self.panels[1].endpoint = endpoint.clone();
                 self.panels[1].navigation_history.reset(endpoint.clone());
@@ -1115,7 +1156,28 @@ impl FilesPane {
                 true
             }
             CompactTargetUpdateAction::FollowDirectory => {
-                self.follow_terminal_directory_to(endpoint, cx);
+                // 同一 SSH 宿主内切换分屏也可能真正换目录；只有 binding 与终端目录同时变化才登记入场，
+                // 同 pane 的 cwd 跟随则先撤销可能残留的等待，避免本次普通读取借用旧代次播放。
+                // 右栏已显示同一目录（或同路径读取在途）时跳过重读：数据没有变化，
+                // 重新读取并把可见数据压暗再淡入只是无意义的重复请求。
+                let arm_entrance = binding_changed && target_changed;
+                let committed_same_directory = self.panels[1]
+                    .listing
+                    .as_ref()
+                    .is_some_and(|listing| listing.directory == endpoint)
+                    && self.panels[1]
+                        .requested_endpoint
+                        .as_ref()
+                        .is_none_or(|pending| pending == &endpoint);
+                if !binding_changed || committed_same_directory {
+                    self.disarm_target_data_entrance(cx);
+                }
+                if !committed_same_directory {
+                    self.follow_terminal_directory_to(endpoint, arm_entrance, cx);
+                }
+                // 跳过重读时不登记跟随取消资格：取消资格只属于 follow_terminal_directory_to
+                // 发起的读取。此处在途请求可能是用户手动刷新（load_panel_at 已清空登记），
+                // 凭空写回会让关闭跟随误取消用户请求，违反“关闭只取消自动跟随”。
                 true
             }
             CompactTargetUpdateAction::PreservePath => lease_changed || binding_changed,
@@ -1317,6 +1379,74 @@ impl FilesPane {
             && self.status.as_deref() == Some(message)
     }
 
+    /// 目标身份切换时统一推进动效代次，避免宿主切换与分屏换目录各自维护一套门禁。
+    /// 只有紧凑右栏保留等待；中央文件工作区和其他挂载直接落位。
+    /// 等待同时登记将读取的目标端点：此时面板 endpoint 尚未切换到新目标，
+    /// 不能从面板状态推断，必须由调用方显式传入，否则等待会被自己的读取撤销。
+    ///
+    /// @author kongweiguang
+    fn begin_target_data_entrance(&mut self, armed_target: FileEndpoint, cx: &mut Context<Self>) {
+        let arm_entrance = self.compact_layout && !self.file_workspace_layout;
+        self.data_entrance.target_changed(
+            arm_entrance,
+            self.data_motion_allowed(cx.reduce_motion()),
+            Instant::now(),
+        );
+        self.data_entrance_request =
+            (arm_entrance && self.data_entrance.awaiting_result()).then_some(armed_target);
+    }
+
+    /// 目标失效、租约拒绝或普通跟随读取前撤销等待中的入场，避免旧 epoch 的迟到成功
+    /// 或随后的普通刷新借用分屏切换的入场补播。只调整视觉生命周期，不触碰 SFTP
+    /// 租约、目录请求或已入队传输。
+    ///
+    /// @author kongweiguang
+    fn disarm_target_data_entrance(&mut self, cx: &mut Context<Self>) {
+        self.data_entrance.target_changed(
+            false,
+            self.data_motion_allowed(cx.reduce_motion()),
+            Instant::now(),
+        );
+        self.data_entrance_request = None;
+    }
+
+    /// 目标未变化时延续同一份等待并迁移到新读取的代次；其它端点的新读取立即撤销。
+    /// 判断只依据武装端点本身：失败重试读取 failed_directory，而面板 endpoint
+    /// 仍停留在旧已提交目录，不能拿面板端点做等价判断。
+    ///
+    /// @author kongweiguang
+    fn track_data_entrance_request(&mut self, endpoint: &FileEndpoint) {
+        let continues_armed_request = self.data_entrance.awaiting_result()
+            && self.data_entrance_request.as_ref() == Some(endpoint);
+        if !continues_armed_request {
+            // 撤销等待并同步清掉播放资格：手动导航或异端刷新不得借用，
+            // 残留的死武装也不会被之后无关的成功结果意外消费。
+            self.data_entrance.target_changed(
+                false,
+                self.data_entrance.allows_motion(),
+                Instant::now(),
+            );
+            self.data_entrance_request = None;
+        }
+    }
+
+    /// 测试替换系统动效结论；应用内 reduce_motion 仍由生产门禁优先判定，
+    /// 与工作台 LogsView 的注入方式保持一致。
+    ///
+    /// @author kongweiguang
+    fn data_motion_allowed(&self, reduce_motion: bool) -> bool {
+        if reduce_motion {
+            return false;
+        }
+        // 生产构建该字段恒为 None；用 cfg! 常量分支而非条件编译属性，保持 src 无测试专属项。
+        if cfg!(test)
+            && let Some(allowed) = self.motion_allowed_for_test
+        {
+            return allowed;
+        }
+        motion_allowed(false)
+    }
+
     /// 无法把临时 SSH lease 绑定到当前 endpoint 时撤销旧目标并保留就地诊断。
     ///
     /// @author kongweiguang
@@ -1333,6 +1463,7 @@ impl FilesPane {
         self.current_terminal_endpoint = None;
         self.current_terminal_binding = None;
         self.external_target_lease = None;
+        self.disarm_target_data_entrance(cx);
         self.invalidate_compact_target(cx);
         self.status = Some(message);
         cx.notify();
@@ -3635,10 +3766,16 @@ impl FilesPane {
             (generation, cancellation)
         };
         let requested_endpoint = endpoint.clone();
+        // 目标读取的身份登记只看右栏：左侧中央工作台的读取与右栏武装无关，
+        // 武装等待只在本次读取仍是等待的目标时延续，其它端点的手动导航或刷新立即撤销。
+        if side == 1 {
+            self.track_data_entrance_request(&endpoint);
+        }
         self.panels[side]
             .tree
             .begin_root_request(&endpoint, generation);
         let external_target_lease = self.external_target_lease_for_endpoint(&endpoint);
+        let entrance_epoch = self.data_entrance.epoch();
         let files = self.files.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -3667,6 +3804,7 @@ impl FilesPane {
                     panel.loading = false;
                     panel.directory_error = None;
                     panel.failed_directory = None;
+                    let mut entrance_succeeded = false;
                     match result {
                         Ok(listing) => {
                             if side == 0
@@ -3765,6 +3903,7 @@ impl FilesPane {
                             }
                             panel.selected = selected;
                             panel.listing = Some(listing);
+                            entrance_succeeded = true;
                             if let FileEndpoint::Local { path } = &panel.endpoint {
                                 pane.local_directories[side] = path.clone();
                             }
@@ -3783,6 +3922,31 @@ impl FilesPane {
                             panel.directory_error = Some(error_message);
                             panel.failed_directory = Some(requested_endpoint.clone());
                             pane.panels[side].pending_selection = None;
+                        }
+                    }
+                    if entrance_succeeded && side == 1 && pane.compact_layout {
+                        // 每个 side-1 成功都必须过一次 ready：非武装成功在这里登记初始
+                        // 基线（ready 的 !armed 分支），否则之后的目标切换永远不武装。
+                        // 动画播放只属于武装等待的那次目标读取自己的首个成功；
+                        // 手动下钻或刷新即使端点相同也不是目标切换的那次结果。
+                        let consume_entrance = !pane.file_workspace_layout
+                            && pane.data_entrance.awaiting_result()
+                            && pane.data_entrance_request.as_ref() == Some(&requested_endpoint);
+                        let animate = consume_entrance
+                            && pane.active
+                            && pane.data_entrance.allows_motion()
+                            && pane.data_motion_allowed(cx.reduce_motion());
+                        let entrance_started =
+                            pane.data_entrance
+                                .ready(entrance_epoch, Instant::now(), animate);
+                        // 播放资格一次性消费；无论是否真的启动动画，等待都已闭合。
+                        if consume_entrance {
+                            pane.data_entrance_request = None;
+                        }
+                        // 计数只在测试构建生效；cfg! 常量分支让生产代码保持普通语句。
+                        if cfg!(test) && entrance_started {
+                            pane.started_entrances_for_test =
+                                pane.started_entrances_for_test.saturating_add(1);
                         }
                     }
                     pane.sync_target_name_requests(cx);
@@ -5423,3 +5587,7 @@ mod dialog_interaction_tests;
 #[cfg(test)]
 #[path = "../../../tests/unit/files_root_request_cancellation.rs"]
 mod root_request_cancellation_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/files_data_entrance.rs"]
+mod data_entrance_tests;

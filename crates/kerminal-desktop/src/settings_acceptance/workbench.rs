@@ -10,6 +10,7 @@ use kerminal_application::{
         HostTerminalOptions, LocalHostDraft, RdpDisplayOptions, RecoverableLocalHostSaveOutcome,
     },
     preferences::{ProfileDraft, ProfileRevision, VersionedProfile},
+    sessions::SessionFilter,
 };
 use kerminal_domain::{
     agents::AgentTargetBinding, connections::HostEndpoint, identity::HostId,
@@ -35,6 +36,8 @@ const WORKBENCH_DROP_GROUP_ID: &str = "acceptance-drop-group";
 mod column_reflow;
 #[path = "workbench_motion.rs"]
 mod motion;
+#[path = "workbench_right_rail_split_switch.rs"]
+mod right_rail_split_switch;
 #[path = "workbench_sidebar_menus.rs"]
 mod sidebar_menus;
 #[path = "workbench_split_directory.rs"]
@@ -68,6 +71,27 @@ struct WorkbenchState {
     workspace_persistence_state: &'static str,
     pending_workspace_resource: Option<(&'static str, String)>,
     active_local_pane_id: Option<String>,
+}
+
+/// 右栏专项的成功和失败路径都要留下会话回收回执；只记录 shutdown 结果而不回读
+/// 会话表会无法区分“服务声称关闭”和“A/B PTY 已经没有存活条目”。
+/// 本验收没有逐 pane 显式 close，回执明确标注只能依赖组合根 shutdown。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RightRailSplitCleanupEvidence {
+    schema_version: u32,
+    scope: &'static str,
+    ui_result: &'static str,
+    ui_error: Option<String>,
+    sessions_before: Vec<String>,
+    sessions_before_error: Option<String>,
+    shutdown_succeeded: bool,
+    shutdown_error: Option<String>,
+    sessions_after: Vec<String>,
+    sessions_after_error: Option<String>,
+    explicit_session_close: bool,
+    pty_cleanup_source: &'static str,
+    pty_reclaimed: bool,
 }
 
 #[derive(Serialize)]
@@ -162,6 +186,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         column_reflow::requested(),
         split_directory::requested(),
         motion::requested(),
+        right_rail_split_switch::requested(),
     ];
     if specialized_scopes
         .into_iter()
@@ -182,6 +207,19 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     };
     let config_directory = output_directory.join("config");
     fs::create_dir(&config_directory)?;
+    let right_rail_environment = if right_rail_split_switch::requested() {
+        // 环境白名单必须在 DesktopComposition 和任何 PTY 创建之前成立；否则后续
+        // 子 shell 可能继承真实用户目录或模块路径，验收结果不再是私有隔离。
+        right_rail_split_switch::prepare_isolated_environment(&output_directory)?;
+        Some(right_rail_split_switch::validate_isolated_environment(
+            &output_directory,
+            &config_directory,
+        )?)
+    } else {
+        None
+    };
+    // 旧 split-directory helper 要求 USERPROFILE=config；右栏白名单使用 output/home，
+    // 两者不能共用。右栏只调用自己的 prepare_profile，旧 split scope 行为保持不变。
     if split_directory::requested() {
         split_directory::prepare_isolated_profile(&config_directory)?;
     }
@@ -198,7 +236,10 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         }
     };
     let services = composition.app_services();
-    let ui_result = match runtime.block_on(prepare_fixture(&services)) {
+    // run_hidden_window 按值消费 AppServices；shutdown 前后的会话回读只依赖 Arc<dyn SessionService>，
+    // 提前克隆该句柄即可，不必克隆整个服务集，也不改变回读时机。
+    let sessions_service = services.sessions.clone();
+    let ui_result = match runtime.block_on(prepare_fixture(&services, &config_directory)) {
         Ok(fixture) => {
             let context = WorkbenchContext {
                 output_directory: output_directory.clone(),
@@ -206,6 +247,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                 width: options.width.unwrap_or(DEFAULT_WIDTH),
                 height: options.height.unwrap_or(DEFAULT_HEIGHT),
                 fixture,
+                right_rail_environment,
             };
             catch_unwind(AssertUnwindSafe(|| run_hidden_window(services, context))).unwrap_or_else(
                 |_| Err(io::Error::other("workbench acceptance event loop panicked").into()),
@@ -213,14 +255,53 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
         }
         Err(error) => Err(error),
     };
+    let ui_error = ui_result.as_ref().err().map(ToString::to_string);
+    let sessions_before = runtime
+        .block_on(sessions_service.list(SessionFilter::default()))
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .map(|session| session.session_id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .map_err(|error| error.to_string());
     let shutdown_result = runtime
         .block_on(composition.shutdown_until(tokio::time::Instant::now() + SHUTDOWN_TIMEOUT));
+    let sessions_after = runtime
+        .block_on(sessions_service.list(SessionFilter::default()))
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .map(|session| session.session_id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .map_err(|error| error.to_string());
+    let cleanup_result = if right_rail_split_switch::requested() {
+        write_right_rail_split_cleanup(
+            &output_directory,
+            ui_error,
+            sessions_before,
+            shutdown_result.as_ref().err().map(ToString::to_string),
+            shutdown_result.is_ok(),
+            sessions_after,
+        )
+    } else {
+        Ok(())
+    };
     runtime.shutdown();
 
+    if let Err(error) = cleanup_result {
+        if let Err(ui_error) = ui_result {
+            return Err(ui_error);
+        }
+        return Err(error);
+    }
     ui_result?;
     shutdown_result?;
     let report_file = if motion::requested() {
         "workbench-motion-report.json"
+    } else if right_rail_split_switch::requested() {
+        right_rail_split_switch::REPORT_FILE
     } else if column_reflow::requested() {
         "column-reflow-report.json"
     } else {
@@ -233,19 +314,77 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// 在成功和失败退出后都回读会话表，证明组合根 shutdown 后 A/B 会话没有存活条目；
+/// 本验收不直接逐个关闭 pane，因此回执把依赖关系写成 shutdown，不能把它冒充显式回收。
+///
+/// @author kongweiguang
+fn write_right_rail_split_cleanup(
+    output_directory: &Path,
+    ui_error: Option<String>,
+    sessions_before: Result<Vec<String>, String>,
+    shutdown_error: Option<String>,
+    shutdown_succeeded: bool,
+    sessions_after: Result<Vec<String>, String>,
+) -> Result<(), Box<dyn Error>> {
+    let (mut sessions_before, sessions_before_error) = match sessions_before {
+        Ok(sessions) => (sessions, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let (mut sessions_after, sessions_after_error) = match sessions_after {
+        Ok(sessions) => (sessions, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    sessions_before.sort();
+    sessions_before.dedup();
+    sessions_after.sort();
+    sessions_after.dedup();
+    let pty_reclaimed = shutdown_succeeded
+        && sessions_before_error.is_none()
+        && !sessions_before.is_empty()
+        && sessions_after_error.is_none()
+        && sessions_after.is_empty();
+    let evidence = RightRailSplitCleanupEvidence {
+        schema_version: 1,
+        scope: "right-rail-split",
+        ui_result: if ui_error.is_some() {
+            "failure"
+        } else {
+            "success"
+        },
+        ui_error,
+        sessions_before,
+        sessions_before_error,
+        shutdown_succeeded,
+        shutdown_error,
+        sessions_after,
+        sessions_after_error,
+        explicit_session_close: false,
+        pty_cleanup_source: "composition.shutdown_until:SessionService::close_all_until",
+        pty_reclaimed,
+    };
+    fs::write(
+        output_directory.join(right_rail_split_switch::CLEANUP_FILE),
+        serde_json::to_vec_pretty(&evidence)?,
+    )?;
+    Ok(())
+}
+
 struct WorkbenchContext {
     output_directory: PathBuf,
     config_directory: PathBuf,
     width: u32,
     height: u32,
     fixture: AcceptanceFixture,
+    right_rail_environment: Option<right_rail_split_switch::EnvironmentIsolationEvidence>,
 }
 
 /// 通过应用服务创建隔离主机、置顶分组和默认 Profile，同时核对真实目录样式与连接生命周期。
 /// 加入未分组与 SFTP 样本覆盖菜单差异，所有网络地址均为未连接的隔离 fixture。
 /// 可显式选用 Store PowerShell 的真实安装入口，避免 cmd 样本掩盖应用别名启动故障。
+/// 右栏分屏专项在同一隔离根内额外保存一个独立 Profile，供显式分屏目标选择使用。
 async fn prepare_fixture(
     services: &kerminal_ui::AppServices,
+    config_directory: &Path,
 ) -> Result<AcceptanceFixture, Box<dyn Error>> {
     let host_id = HostId::parse(WORKBENCH_HOST_ID)?;
     let host_service = services
@@ -358,6 +497,9 @@ async fn prepare_fixture(
         })
         .await?;
 
+    if right_rail_split_switch::requested() {
+        right_rail_split_switch::prepare_profile(services, config_directory).await?;
+    }
     let profile_service = services.profiles.clone();
     let profile_rows = services
         .executor
@@ -523,6 +665,7 @@ fn acceptance_profile_shell() -> String {
 /// 用真实控件覆盖单击保持终端、双击及键盘连接、失败恢复、分屏与独立关闭，不借助中央详情按钮。
 /// 失败重试恢复本轮真实 shell；报告保留入口，区分普通 cmd 与 Store 应用别名验收。
 /// 专项验收只在显式环境变量开启时复用已创建会话，避免增加普通工作台验收耗时。
+/// 右栏分屏切换专项在同一隐藏窗口内独立驱动 pane 焦点和右栏目标，不混入左侧栏动效结论。
 /// 动效采样走平台帧提交，不能用测试驱动的离屏绘制代替真实 present。
 /// 重复打开优先记录有限的状态变化，始终保留带提示的观测以便定位短暂失败。
 /// 准入相关状态与提示一同记录，不把终端 Ready 推断为工作区持久化完成。
@@ -567,6 +710,17 @@ async fn capture_workbench(
     if split_directory::requested() {
         return split_directory::capture(cx, &root, window, &services, &context, first_session)
             .await;
+    }
+    if right_rail_split_switch::requested() {
+        return right_rail_split_switch::capture(
+            cx,
+            &root,
+            window,
+            &services,
+            &context,
+            first_session,
+        )
+        .await;
     }
     if motion::requested() {
         return motion::capture(cx, &root, window, &services, &context, first_session).await;

@@ -440,6 +440,7 @@ impl RootView {
     }
 
     /// 新建表单冻结当前文件面板与侧别；保存和模态关闭后仍需校验原工作区身份。
+    /// SFTP 被禁用时在捕获来源与打开模态前拒绝，保留面板和原选择，不写入 pending。
     ///
     /// @author kongweiguang
     pub(super) fn begin_create_sftp_host_from_workbench(
@@ -450,6 +451,24 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self
+            .services
+            .hosts
+            .as_ref()
+            .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Sftp))
+        {
+            let message = crate::locale::text(
+                "SFTP 已禁用，请先在插件设置中启用。",
+                "SFTP is disabled. Enable it in plugin settings first.",
+            )
+            .to_string();
+            self.status = Some(message.clone().into());
+            pane.update(cx, |pane, cx| {
+                pane.fail_host_selection(side, generation, message, cx)
+            });
+            cx.notify();
+            return false;
+        }
         let Some(origin) = self.capture_file_sftp_origin(pane, side, generation, cx) else {
             return false;
         };
@@ -541,6 +560,30 @@ impl RootView {
             cx.notify();
         }
         started
+    }
+
+    /// 端点所属 SSH 主机的 SSH 单元禁用时，SFTP 打开/传输仍依赖该连接能力，必须一并拒绝。
+    /// 导航快照缺失时保持原有 SFTP 单检查：事件身份可能来自上一代目录，不能把尚未同步
+    /// 的刷新误判成协议变化；与 MCP files_tools 的“SSH 端点额外要求 ssh”保持一致。
+    ///
+    /// @author kongweiguang
+    fn sftp_endpoint_ssh_disabled(&self, endpoint: &FileEndpoint, cx: &mut Context<Self>) -> bool {
+        let Some(host_id) = endpoint.host_id() else {
+            return false;
+        };
+        let Some(host) = self
+            .host_navigation
+            .as_ref()
+            .and_then(|navigation| navigation.read(cx).host_snapshot(host_id))
+        else {
+            return false;
+        };
+        host.protocol == RemoteProtocol::Ssh
+            && self
+                .services
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Ssh))
     }
 
     /// 保存回执和模态观察器共享同一恢复入口；模态关闭前保留资格，关闭后最多消费一次。
@@ -746,6 +789,22 @@ pub(super) fn handle_connections_event(
             target,
             intent_id,
         } => {
+            // 导航和面板都可能在目录刷新前捕获旧目标；创建会话前按冻结启用视图再拒绝一次。
+            if let Some(protocol) = connect_target_protocol(target)
+                && root
+                    .services
+                    .hosts
+                    .as_ref()
+                    .is_some_and(|hosts| !hosts.protocol_enabled(protocol))
+            {
+                root.pending_sidebar_container = None;
+                root.status = Some(crate::locale::text(
+                    "该协议已禁用，无法创建连接。",
+                    "This protocol is disabled; no connection was created.",
+                ));
+                cx.notify();
+                return true;
+            }
             if let Some(intent_id) = intent_id {
                 super::sidebar_containers::accept_connection(
                     root, intent_id, host_id, target, window, cx,
@@ -777,6 +836,29 @@ pub(super) fn handle_connections_event(
             initial_local_directory,
             title,
         } => {
+            // 独立传输标签同样需要 SFTP 能力；SSH 端点还依赖 SSH 单元。禁用时保留原导航材料，
+            // 不创建后台资源。
+            let sftp_disabled = root
+                .services
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Sftp));
+            let ssh_disabled = root.sftp_endpoint_ssh_disabled(endpoint, cx);
+            if sftp_disabled || ssh_disabled {
+                root.status = Some(if ssh_disabled {
+                    crate::locale::text(
+                        "SSH 已禁用，请先在插件设置中启用。",
+                        "SSH is disabled. Enable it in plugin settings first.",
+                    )
+                } else {
+                    crate::locale::text(
+                        "SFTP 已禁用，请先在插件设置中启用。",
+                        "SFTP is disabled. Enable it in plugin settings first.",
+                    )
+                });
+                cx.notify();
+                return true;
+            }
             let disposition = consume_sftp_navigation_receipt(
                 &mut root.pending_sftp_transfer_navigation,
                 root.latest_sftp_request_id.as_deref(),
@@ -881,6 +963,45 @@ pub(super) fn handle_connections_event(
             {
                 return true;
             }
+            // 面板预检与导航快照可能来自不同刷新时点；真正提交文件目标前再核对一次
+            // 冻结启用视图，防止等待中的回执在 SFTP/SSH 被禁用后继续读取远端目录。
+            let sftp_disabled = root
+                .services
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Sftp));
+            // 导航快照缺失时 `sftp_endpoint_ssh_disabled` 返回 false：事件身份可能来自
+            // 上一代未刷新的目录，不能把尚未同步的更新误判成协议变化，因此保留 SFTP
+            // 单检查语义。
+            let ssh_disabled = root.sftp_endpoint_ssh_disabled(endpoint, cx);
+            if sftp_disabled || ssh_disabled {
+                let Some(request) = root.active_file_sftp_selection.take() else {
+                    return true;
+                };
+                if let Some(pane) = root.file_sftp_origin_pane(&request.origin) {
+                    pane.update(cx, |pane, cx| {
+                        pane.cancel_host_selection(
+                            request.origin.side,
+                            request.origin.generation,
+                            cx,
+                        )
+                    });
+                }
+                root.status = Some(if ssh_disabled {
+                    crate::locale::text(
+                        "SSH 已禁用，请先在插件设置中启用。",
+                        "SSH is disabled. Enable it in plugin settings first.",
+                    )
+                } else {
+                    crate::locale::text(
+                        "SFTP 已禁用，请先在插件设置中启用。",
+                        "SFTP is disabled. Enable it in plugin settings first.",
+                    )
+                });
+                cx.notify();
+                root.advance_file_sftp_selections(cx);
+                return true;
+            }
             let Some(request) = root.active_file_sftp_selection.take() else {
                 return true;
             };
@@ -953,6 +1074,29 @@ pub(super) fn handle_connections_event(
             endpoint,
             initial_local_directory,
         } => {
+            // 面板列表和导航可能来自不同刷新时点；文件工作区打开前再按启用视图拒绝禁用
+            // SFTP，SSH 端点还须同时确认 SSH 单元仍启用。
+            let sftp_disabled = root
+                .services
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Sftp));
+            let ssh_disabled = root.sftp_endpoint_ssh_disabled(endpoint, cx);
+            if sftp_disabled || ssh_disabled {
+                root.status = Some(if ssh_disabled {
+                    crate::locale::text(
+                        "SSH 已禁用，请先在插件设置中启用。",
+                        "SSH is disabled. Enable it in plugin settings first.",
+                    )
+                } else {
+                    crate::locale::text(
+                        "SFTP 已禁用，请先在插件设置中启用。",
+                        "SFTP is disabled. Enable it in plugin settings first.",
+                    )
+                });
+                cx.notify();
+                return true;
+            }
             let disposition = consume_sftp_navigation_receipt(
                 &mut root.pending_sftp_navigation,
                 root.latest_sftp_request_id.as_deref(),
@@ -1945,6 +2089,8 @@ fn handle_pinned_container_removal(
 }
 
 /// 双击复用唯一同目标容器会话，否则创建默认容器 shell；所有入口都绑定原 SSH HostId。
+/// 已有会话直接复用，不因插件新近禁用而截断正在运行的目标；新建/重开则必须在派生
+/// 终端前同时确认 SSH 与 containers 单元仍启用。
 /// @author kongweiguang
 fn open_pinned_container(
     root: &mut RootView,
@@ -1976,6 +2122,35 @@ fn open_pinned_container(
         cx.notify();
         return;
     };
+    let existing = existing_container_session_target(root, &container.target);
+    // 已有容器会话直接复用，不因插件新近禁用而截断正在运行的目标；只有新建/重开
+    // 必须在创建终端前同时核对 SSH 与 containers 单元，避免继续派生远端资源。
+    if matches!(&existing, ExistingContainerSessionTarget::Missing) {
+        let ssh_disabled = root
+            .services
+            .hosts
+            .as_ref()
+            .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Ssh));
+        // 空 registry 表示测试或离线装配未注入插件声明，按启用处理；与冻结视图和工作区
+        // 恢复保持一致，避免禁用判定只覆盖已声明内置单元而误伤轻量装配。
+        let containers_disabled = !(root.services.plugins.providers().is_empty()
+            || root.services.plugins.is_enabled("kerminal.containers"));
+        if ssh_disabled || containers_disabled {
+            root.status = Some(if ssh_disabled {
+                crate::locale::text(
+                    "SSH 已禁用，请先在插件设置中启用。",
+                    "SSH is disabled. Enable it in plugin settings first.",
+                )
+            } else {
+                crate::locale::text(
+                    "容器插件已禁用，请先在插件设置中启用。",
+                    "The containers plugin is disabled. Enable it in plugin settings first.",
+                )
+            });
+            cx.notify();
+            return;
+        }
+    }
     let Some(navigation) = root.host_navigation.as_ref() else {
         root.status = Some(crate::locale::text(
             "主机导航尚未就绪，无法打开容器终端。",
@@ -1996,7 +2171,7 @@ fn open_pinned_container(
         synchronize_sidebar_snapshot(root, snapshot, cx);
     }
 
-    match existing_container_session_target(root, &container.target) {
+    match existing {
         ExistingContainerSessionTarget::Unique { tab_id, pane_id } => {
             activate_container_session_target(root, &tab_id, &pane_id, window, cx);
             return;
@@ -2095,6 +2270,21 @@ pub(super) fn handle_host_navigation_event(
             .then_some(root.center_panel);
     match event {
         HostNavigationEvent::OpenSftpWorkbenchRequested => {
+            // 导航按钮在同一刷新帧会隐藏，但快捷键、旧帧点击或迟到事件仍可能到达；
+            // 在打开文件资源前复查冻结启用视图，禁用时只写状态，不切换中央工作区。
+            if root
+                .services
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.protocol_enabled(RemoteProtocol::Sftp))
+            {
+                root.status = Some(crate::locale::text(
+                    "SFTP 已禁用，请先在插件设置中启用。",
+                    "SFTP is disabled. Enable it in plugin settings first.",
+                ));
+                cx.notify();
+                return;
+            }
             root.open_shared_sftp_workbench(window, cx);
             return;
         }
@@ -2374,6 +2564,21 @@ fn runtime_target_matches(
         (RemoteProtocol::Telnet, SessionTarget::Telnet(_)) => true,
         (RemoteProtocol::Serial, SessionTarget::Serial(_)) => true,
         _ => false,
+    }
+}
+
+/// 把终端目标映射到可禁用的连接协议；本地与容器不参与协议插件启停。
+///
+/// 连接事件同时携带具体目标，不能仅凭 HostId 推断协议；容器记录仍沿用原来的
+/// 生命周期门禁，避免把 SFTP 文件会话的启停语义误套到容器执行。
+///
+/// @author kongweiguang
+fn connect_target_protocol(target: &SessionTarget) -> Option<RemoteProtocol> {
+    match target {
+        SessionTarget::Ssh(_) => Some(RemoteProtocol::Ssh),
+        SessionTarget::Telnet(_) => Some(RemoteProtocol::Telnet),
+        SessionTarget::Serial(_) => Some(RemoteProtocol::Serial),
+        SessionTarget::Local(_) | SessionTarget::Container(_) => None,
     }
 }
 

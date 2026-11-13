@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use kerminal_application::AppError;
+use kerminal_application::{AppError, plugins::capabilities};
 use kerminal_domain::{
     commands::{
         CommandHistoryEntry, CommandHistoryListRequest, CommandHistorySource, CommandHistoryTarget,
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args, success},
+    terminal_tools::{failure, parse_args, success, units_gate},
 };
 
 #[derive(Deserialize)]
@@ -48,6 +48,9 @@ pub(crate) async fn dispatch(
     if tool_id != "history.search" {
         return failure(AppError::unsupported("history tool is not available"));
     }
+    if let Some(result) = units_gate(services, tool_id, capabilities::tool_units(tool_id)) {
+        return result;
+    }
     history_search(services, arguments, cancellation).await
 }
 
@@ -64,10 +67,23 @@ pub(crate) async fn history_search(
         Ok(args) => args,
         Err(error) => return failure(error),
     };
+    let source_token = args.source.clone();
     let request = match build_history_request(args) {
         Ok(request) => request,
         Err(error) => return failure(error),
     };
+    // 历史来源仍由 commands 单元提供；只有显式远程目标才追加 SSH，本地默认不受远程插件影响。
+    let mut required_units = Vec::new();
+    if matches!(request.target, Some(CommandHistoryTarget::Ssh)) || request.remote_host_id.is_some()
+    {
+        required_units.extend_from_slice(capabilities::host_protocol_units("ssh"));
+    }
+    if let Some(source) = source_token.as_deref() {
+        required_units.extend_from_slice(capabilities::history_source_units(source));
+    }
+    if let Some(result) = units_gate(services, "history.search", &required_units) {
+        return result;
+    }
     if cancellation.is_cancelled() {
         return failure(AppError::cancelled("history search cancelled"));
     }

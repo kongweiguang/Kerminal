@@ -7,7 +7,16 @@
   "api": "^1.0",
   "publisher": "test",
   "license": "MIT",
-  "runtime": {"kind":"script","main":"main.js","activation":"on-demand"},
+  "runtime": {
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/sidecar.exe",
+      "linux-x86_64": "bin/sidecar",
+      "macos-x86_64": "bin/sidecar",
+      "macos-aarch64": "bin/sidecar"
+    },
+    "activation": "on-demand"
+  },
   "permissions": [],
   "contributes": {"tabs":[{"id":"records","title":"Native list 100000","view":"records","state_version":1}]},
   "views": {"records":{"kind":"native","file":"views/records.json"}}

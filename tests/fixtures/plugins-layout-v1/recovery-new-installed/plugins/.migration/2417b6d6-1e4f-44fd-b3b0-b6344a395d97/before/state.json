@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "revision": 7,
+  "plugins": {
+    "acme.notes": {
+      "active": "1.0.0",
+      "previous": "0.9.0",
+      "enabled": true,
+      "source": "local",
+      "installed_at": "2026-01-02T03:04:05Z"
+    },
+    "acme.missing": {
+      "active": "2.0.0",
+      "enabled": false,
+      "source": "local",
+      "installed_at": "2026-01-02T03:04:05Z"
+    }
+  },
+  "pending": [],
+  "failures": {},
+  "pending_failures": [],
+  "boot": null
+}

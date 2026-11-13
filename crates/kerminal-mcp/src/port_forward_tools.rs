@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use kerminal_application::{AppError, operations::PortForwardSnapshot};
+use kerminal_application::{AppError, operations::PortForwardSnapshot, plugins::capabilities};
 use kerminal_domain::{
     identity::HostId,
     operations::{
@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args, success},
+    terminal_tools::{failure, parse_args, success, units_gate},
 };
 
 #[derive(Deserialize)]
@@ -54,6 +54,10 @@ pub(crate) async fn dispatch(
     arguments: Map<String, Value>,
     cancellation: CancellationToken,
 ) -> CallToolResult {
+    // 端口转发同时依赖 ports 与 ssh；整族门禁集中在此，避免直接调用绕过目录过滤。
+    if let Some(result) = units_gate(services, tool_id, capabilities::tool_units(tool_id)) {
+        return result;
+    }
     match tool_id {
         "port_forward.create" => create(services, arguments, cancellation).await,
         "port_forward.list" => list(services, arguments).await,

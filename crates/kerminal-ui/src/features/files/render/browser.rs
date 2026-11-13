@@ -449,6 +449,7 @@ fn render_file_more_menu(
 pub(super) fn render_browser(
     pane: &mut FilesPane,
     side: usize,
+    data_opacity: f32,
     window: &mut Window,
     theme: ThemeTokens,
     cx: &mut Context<FilesPane>,
@@ -861,6 +862,9 @@ pub(super) fn render_browser(
                     app,
                 )
             });
+        // 树与列表共用同一数据入场：渲染路径不因视图模式分叉透明度，
+        // 否则树模式下动画照跑、屏幕却无变化，只是空转请求帧。
+        let tree = tree.when(data_opacity < 1.0, |tree| tree.opacity(data_opacity));
         return panel_view.child(table_heading).child(tree);
     }
 
@@ -1089,15 +1093,18 @@ pub(super) fn render_browser(
         show_hidden: show_hidden_files,
         target: FileMenuTarget::Background,
     };
-    let list = list.context_menu(move |menu, _, app| {
-        build_file_context_menu(
-            menu,
-            theme,
-            background_entity.clone(),
-            background_snapshot.clone(),
-            app,
-        )
-    });
+    // 只让目录数据层参与入场；路径、工具栏、传输和书签保持完整，不随目标切换一起淡化。
+    let list = list
+        .when(data_opacity < 1.0, |list| list.opacity(data_opacity))
+        .context_menu(move |menu, _, app| {
+            build_file_context_menu(
+                menu,
+                theme,
+                background_entity.clone(),
+                background_snapshot.clone(),
+                app,
+            )
+        });
 
     if pane.compact_layout {
         panel_view.child(

@@ -2237,6 +2237,10 @@ impl ConnectionsPanel {
 
     /// 文件选择不改写侧栏选中主机，主机存在性与协议校验通过后直接交给 Root。
     ///
+    /// SFTP 单元关闭后即便旧行仍留在列表中，也不能再读取远端目录；SSH 主机还依赖 SSH
+    /// 连接能力，必须一并核对冻结启用视图。拒绝统一走原回执出口并刷新目录，避免把
+    /// 失效主机行当成可继续排队的目标。
+    ///
     /// @author kongweiguang
     pub(crate) fn request_sftp_selection(
         &mut self,
@@ -2246,30 +2250,65 @@ impl ConnectionsPanel {
     ) {
         self.cancel_connection_request(cx);
         let host = self.rows.iter().find(|host| &host.id == host_id).cloned();
-        let endpoint = host.as_ref().and_then(|host| {
-            host_sftp_capable(host.protocol, host.sftp_options.enabled)
-                .then(|| {
-                    FileEndpoint::remote(
-                        host.id.clone(),
-                        host.sftp_options
-                            .remote_start_directory
-                            .as_deref()
-                            .unwrap_or("/"),
-                    )
-                    .ok()
-                })
-                .flatten()
-        });
-        let Some(endpoint) = endpoint else {
-            cx.emit(ConnectionsEvent::SftpSelectionFinished {
+        let Some(host) = host else {
+            self.reject_sftp_selection(
                 request_id,
-                message: Some(crate::locale::text(
+                crate::locale::text(
                     "主机不存在、未启用 SFTP 或起始目录无效，请刷新后重试。",
                     "The host is unavailable, SFTP is disabled, or its start directory is invalid. Refresh and try again.",
-                ).to_string()),
-                interrupted: false,
-            });
-            self.reload(cx);
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        };
+        if !self.hosts.protocol_enabled(RemoteProtocol::Sftp) {
+            self.reject_sftp_selection(
+                request_id,
+                crate::locale::text(
+                    "SFTP 已禁用，请先在插件设置中启用。",
+                    "SFTP is disabled. Enable it in plugin settings first.",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        if host.protocol == RemoteProtocol::Ssh && !self.hosts.protocol_enabled(RemoteProtocol::Ssh)
+        {
+            self.reject_sftp_selection(
+                request_id,
+                crate::locale::text(
+                    "SSH 已禁用，请先在插件设置中启用。",
+                    "SSH is disabled. Enable it in plugin settings first.",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        let endpoint = host_sftp_capable(host.protocol, host.sftp_options.enabled)
+            .then(|| {
+                FileEndpoint::remote(
+                    host.id.clone(),
+                    host.sftp_options
+                        .remote_start_directory
+                        .as_deref()
+                        .unwrap_or("/"),
+                )
+                .ok()
+            })
+            .flatten();
+        let Some(endpoint) = endpoint else {
+            self.reject_sftp_selection(
+                request_id,
+                crate::locale::text(
+                    "主机不存在、未启用 SFTP 或起始目录无效，请刷新后重试。",
+                    "The host is unavailable, SFTP is disabled, or its start directory is invalid. Refresh and try again.",
+                )
+                .to_string(),
+                cx,
+            );
             return;
         };
         self.sftp_selection_request_id = Some(request_id.clone());
@@ -2280,6 +2319,24 @@ impl ConnectionsPanel {
             },
             cx,
         );
+    }
+
+    /// 被门禁拒绝的选择只回投失败并刷新主机目录；不写入 `sftp_selection_request_id`，
+    /// 因此 Root 队列会立即推进，后续连接意图不会被一个从未真正开始的预检占住。
+    ///
+    /// @author kongweiguang
+    fn reject_sftp_selection(
+        &mut self,
+        request_id: String,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(ConnectionsEvent::SftpSelectionFinished {
+            request_id,
+            message: Some(message),
+            interrupted: false,
+        });
+        self.reload(cx);
     }
 
     /// 取消指定选择只结束同一请求身份，迟到结果不会再进入工作台。
@@ -2486,6 +2543,25 @@ impl ConnectionsPanel {
             self.reload(cx);
             return;
         };
+        // 复制会创建一个待保存的新主机，目标协议同样不能绕过新建门禁；即使原主机仍在，
+        // 禁用协议下的副本也无法连接，因此拒绝打开编辑器而不复制凭据材料。
+        let copy_protocol = protocol.unwrap_or(host.protocol);
+        if !self.hosts.protocol_enabled(copy_protocol) {
+            let label = super::host_navigation::host_protocol_label(copy_protocol);
+            self.status = Some(
+                    crate::locale::text(
+                        format!(
+                            "{label} 已禁用，无法复制为该协议主机。请先在插件设置中启用。"
+                        ),
+                        format!(
+                            "{label} is disabled; the host cannot be copied with this protocol. Enable it in plugin settings first."
+                        ),
+                    )
+                    .to_string(),
+                );
+            cx.notify();
+            return;
+        }
         if let Some(protocol) = protocol {
             if host.protocol != RemoteProtocol::Sftp {
                 self.status = Some(
@@ -3479,6 +3555,19 @@ impl ConnectionsPanel {
                 }
             },
             (RemoteProtocol::Rdp, false) => {
+                // 面板内直接启动 RDP 不经过 Root 的 ConnectRequested 门禁；这里必须在创建
+                // 请求与平台进程前复查启用视图，禁用时只复用现有状态反馈。
+                if !self.hosts.protocol_enabled(RemoteProtocol::Rdp) {
+                    self.status = Some(
+                        crate::locale::text(
+                            "RDP 已禁用，请先在插件设置中启用。",
+                            "RDP is disabled. Enable it in plugin settings first.",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 let Some(service) = self.rdp.clone() else {
                     self.status = Some(
                         crate::locale::text(
@@ -3572,16 +3661,31 @@ impl ConnectionsPanel {
 
     /// 创建一个纯表单草稿；已有凭据只显示关联状态，不从加密 vault 回填。
     /// 返回是否真正打开新草稿，供调用方在替换被拒绝时保留原表单状态。
+    /// 默认协议取第一个启用项，避免新建表单展示被禁用的协议；全部禁用时不打开表单。
     /// @author kongweiguang
     pub(super) fn create_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.refuse_host_editor_replacement(cx) {
             return false;
         }
+        let Some(protocol) =
+            first_enabled_new_host_protocol(|protocol| self.hosts.protocol_enabled(protocol))
+        else {
+            self.status = Some(
+                crate::locale::text(
+                    "所有远端协议均已禁用，无法新建主机。请先在插件设置中启用协议。",
+                    "All remote protocols are disabled, so a host cannot be created. Enable a protocol in plugin settings first.",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return false;
+        };
         self.cancel_sftp_host_creation_intent(cx);
-        self.create_host_with_protocol(RemoteProtocol::Ssh, window, cx)
+        self.create_host_with_protocol(protocol, window, cx)
     }
 
     /// 复用通用表单构造，只允许明确的 picker 入口覆盖新主机协议默认值。
+    /// 显式协议同样受启用视图约束，禁用时不打开表单并保留原编辑器状态。
     ///
     /// @author kongweiguang
     fn create_host_with_protocol(
@@ -3591,6 +3695,20 @@ impl ConnectionsPanel {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.refuse_host_editor_replacement(cx) {
+            return false;
+        }
+        if !self.hosts.protocol_enabled(protocol) {
+            let label = super::host_navigation::host_protocol_label(protocol);
+            self.status = Some(
+                crate::locale::text(
+                    format!("{label} 已禁用，无法新建该协议主机。请先在插件设置中启用。"),
+                    format!(
+                        "{label} is disabled; a host of this protocol cannot be created. Enable it in plugin settings first."
+                    ),
+                )
+                .to_string(),
+            );
+            cx.notify();
             return false;
         }
         self.cancel_local_host_background_requests();
@@ -4262,6 +4380,22 @@ impl ConnectionsPanel {
                 return;
             }
         };
+        // 保存前再次核对冻结启用视图：表单打开后协议可能被外部禁用，不能在提交时才暴露
+        // 一个永远无法连接的配置，也不能提前分配新主机 ID 或触碰凭据。
+        if !self.hosts.protocol_enabled(draft.protocol) {
+            let label = super::host_navigation::host_protocol_label(draft.protocol);
+            self.status = Some(
+                crate::locale::text(
+                    format!("{label} 已禁用，无法保存该协议主机。请先在插件设置中启用。"),
+                    format!(
+                        "{label} is disabled; a host of this protocol cannot be saved. Enable it in plugin settings first."
+                    ),
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if draft.id.is_none() {
             let host_id = self.pending_new_host_id.get_or_insert_with(HostId::new);
             draft.id = Some(host_id.clone());
@@ -5614,6 +5748,24 @@ pub(super) fn should_continue_local_host_action_after_discard(
     pending_local_action: bool,
 ) -> bool {
     local_editor_active && pending_local_action
+}
+
+/// 新主机表单按固定优先级选择首个启用协议；顺序保持既有 SSH 默认，同时让禁用协议
+/// 不再成为无法连接的表单初值，全部禁用时由调用方拒绝打开表单。
+///
+/// @author kongweiguang
+pub(super) fn first_enabled_new_host_protocol(
+    enabled: impl Fn(RemoteProtocol) -> bool,
+) -> Option<RemoteProtocol> {
+    [
+        RemoteProtocol::Ssh,
+        RemoteProtocol::Sftp,
+        RemoteProtocol::Telnet,
+        RemoteProtocol::Serial,
+        RemoteProtocol::Rdp,
+    ]
+    .into_iter()
+    .find(|protocol| enabled(*protocol))
 }
 
 /// SFTP-only 的文件能力由协议保证；SSH 才受可选开关约束，与配置和队列共用同一规则。

@@ -2,6 +2,7 @@
 //!
 //! @author kongweiguang
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use gpui_kit::{
@@ -10,6 +11,10 @@ use gpui_kit::{
 };
 use kerminal_application::{
     platform::external_launch::ExternalTargetLease,
+    plugins::{
+        PluginRegistry,
+        capabilities::{COMMANDS_UNIT, SSH_UNIT},
+    },
     preferences::{ToolRailPanelPlacement, ToolRailSettings, ToolRailToolId},
     sessions::UiSessionBinding,
     transfers::TransferOrigin,
@@ -22,7 +27,7 @@ use kerminal_domain::{
 use crate::{
     features::commands::SnippetHostMoveRequested,
     features::operations::{OperationsEvent, OperationsSection, OperationsView},
-    plugins::tools::{ToolContext, ToolProjection, ToolScope},
+    plugins::tools::{ProjectionTicket, ToolContext, ToolProjection, ToolScope},
     theme::ThemeTokens,
 };
 
@@ -36,7 +41,7 @@ use super::{
     keybindings::KeybindingFocusScope,
     logical_input_modal_blocked,
     workbench::{
-        ToolRailPanelSlots, WorkbenchToolPanelRenderers, WorkbenchToolPanels,
+        ToolRailLayout, ToolRailPanelSlots, WorkbenchToolPanelRenderers, WorkbenchToolPanels,
         attached_dock_default_width, focused_workspace_pane,
     },
     workspace_runtime::RuntimePanePhase,
@@ -59,7 +64,75 @@ struct SnippetHostFocusIntent {
     focus_generation: u64,
 }
 
+/// ToolRail 工具在目录归属之外还依赖的启停单元；UI 侧只在本文维护这一张映射。
+/// 与 MCP `capabilities::tool_units` 和 `guides_tools` 保持一致：tmux、服务器信息、
+/// 容器都经 SSH 会话执行，端口转发同时要求 ports 与 SSH；ports/containers 的自身
+/// 单元已由注册表 owner 判定覆盖，这里只补跨族依赖，避免入口与真实执行能力对不上。
+/// sftp 只按自身单元判定，目标协议是否可用由连接层拒绝；context、agentLauncher、
+/// snippets、logs 维持目录 owner 的原有依赖，不在这里重复推断。
+///
+/// @author kongweiguang
+fn tool_rail_required_units(tool: ToolRailToolId) -> &'static [&'static str] {
+    match tool {
+        ToolRailToolId::Tmux
+        | ToolRailToolId::System
+        | ToolRailToolId::Containers
+        | ToolRailToolId::Ports => &[SSH_UNIT],
+        _ => &[],
+    }
+}
+
+/// 右栏入口、快捷键、程序化导航和命令面板统一读取冻结插件目录的启用视图。
+/// ToolRail 身份到目录工具 ID 的映射只放在这里，避免各处各写一份判定后互相漂移；
+/// 禁用只过滤入口，持久顺序与停靠仍由设置层保留，重新启用后按原偏好复原。
+/// 空目录代表独立界面/测试未装配插件服务（生产组合根始终注入完整快照），
+/// 此时沿用原有入口，避免把所有 Rail 工具误判为禁用。
+///
+/// @author kongweiguang
+pub(super) fn tool_rail_tool_enabled(plugins: &PluginRegistry, tool: ToolRailToolId) -> bool {
+    plugins.tools().is_empty()
+        || (plugins.tool_enabled(tool.as_str())
+            && tool_rail_required_units(tool)
+                .iter()
+                .all(|unit| plugins.is_enabled(unit)))
+}
+
+/// 命令面板需要一份禁用工具身份集合；复用与右栏完全相同的判定，
+/// 使 SSH 依赖导致的隐藏（tmux、容器、端口、服务器信息）不会只发生在图标入口。
+///
+/// @author kongweiguang
+pub(super) fn disabled_tool_rail_tools(plugins: &PluginRegistry) -> BTreeSet<ToolRailToolId> {
+    plugins
+        .tools()
+        .iter()
+        .filter_map(|tool| ToolRailToolId::from_id(tool.id.as_str()).ok())
+        .filter(|tool| !tool_rail_tool_enabled(plugins, *tool))
+        .collect()
+}
+
+/// 片段与工作流内容直接依赖 commands 单元；程序化入口不经过 Rail 图标，
+/// 必须在改动中心页或宿主状态前用同一启用视图拒绝。空目录仍视为未装配插件服务。
+///
+/// @author kongweiguang
+pub(super) fn commands_content_enabled(plugins: &PluginRegistry) -> bool {
+    plugins.tools().is_empty() || plugins.is_enabled(COMMANDS_UNIT)
+}
+
 impl RootView {
+    /// Root 侧调用点复用模块级判定；纯函数边界也让冻结视图可在不启动窗口时直接覆盖。
+    ///
+    /// @author kongweiguang
+    pub(super) fn tool_rail_tool_enabled(&self, tool: ToolRailToolId) -> bool {
+        tool_rail_tool_enabled(&self.services.plugins, tool)
+    }
+
+    /// 命令片段宿主与 Rail 图标共享同一条 commands 门禁，避免只有一处补校验。
+    ///
+    /// @author kongweiguang
+    pub(super) fn commands_content_enabled(&self) -> bool {
+        commands_content_enabled(&self.services.plugins)
+    }
+
     /// 活动 terminal pane 优先；只有当前中心没有 terminal context 时才回退到明确选中的 SSH 主机。
     ///
     /// @author kongweiguang
@@ -327,6 +400,11 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 点击、命令面板动作和程序化导航都汇入此入口；禁用工具在改动任何投影状态前退出，
+        // 既不创建插件实例，也不改写持久布局。
+        if !self.tool_rail_tool_enabled(tool) {
+            return;
+        }
         self.sync_tool_rail_active_tab();
         self.pending_tool_rail_placement_focus = None;
         // 明确切换到任意工具代表用户离开当前 Agent 首帧；迟到 Ready 不能再抢回输入焦点。
@@ -931,35 +1009,36 @@ impl RootView {
         }
     }
 
-    /// 工具栏读取当前标签投影；宿主迁移必须已由导航或布局事件完成。
-    /// 扩展创建与生命周期只随投影变化或显式打开执行，同一投影的重绘仅接收内置视图更新。
+    /// 事件边界与渲染共享同一份 Rail 布局和上下文，避免右侧面板在首个绘制帧继续用上一 pane 的目标。
+    /// 这里只计算宿主可见项，不创建实例、不执行插件回调；渲染阶段仍复用同一结果并保留原有 defer 兜底。
     ///
     /// @author kongweiguang
-    pub(super) fn workbench_tool_panels(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> WorkbenchToolPanels {
+    fn project_tool_rail(&mut self, cx: &Context<Self>) -> (ToolRailLayout, ToolContext) {
         let settings = self.current_tool_rail_settings();
         self.sync_tool_rail_active_tab();
         let previous_tool = self.tool_rail_state.attached_tool();
         let mut layout = self.tool_rail_state.project(&settings);
         let plugin_context = self.plugin_tool_context(cx);
-        layout
-            .entries
-            .main
-            .retain(|tool| self.plugin_tools.is_applicable(*tool, &plugin_context));
-        layout
-            .entries
-            .bottom
-            .retain(|tool| self.plugin_tools.is_applicable(*tool, &plugin_context));
+        layout.entries.main.retain(|tool| {
+            self.plugin_tools.is_applicable(*tool, &plugin_context)
+                && self.tool_rail_tool_enabled(*tool)
+        });
+        layout.entries.bottom.retain(|tool| {
+            self.plugin_tools.is_applicable(*tool, &plugin_context)
+                && self.tool_rail_tool_enabled(*tool)
+        });
         for slot in [
             &mut layout.panels.attached,
             &mut layout.panels.left,
             &mut layout.panels.bottom,
             &mut layout.panels.center,
         ] {
-            if slot.is_some_and(|tool| !self.plugin_tools.is_applicable(tool, &plugin_context)) {
+            // 槽位投影来自持久偏好，禁用时只清空本帧的宿主槽位；偏好本身保持原值，
+            // 重新启用后同一 order/placement 会再次生效。
+            if slot.is_some_and(|tool| {
+                !self.plugin_tools.is_applicable(tool, &plugin_context)
+                    || !self.tool_rail_tool_enabled(tool)
+            }) {
                 *slot = None;
             }
         }
@@ -972,7 +1051,20 @@ impl RootView {
                 .set_attached_tool(layout.panels.attached, next_default);
             self.prepare_attached_dock_width_restore(layout.panels.attached);
         }
-        let theme = ThemeTokens::current(window, cx);
+        (layout, plugin_context)
+    }
+
+    /// 只按已提交布局和上下文推算可见工具，供事件边界与渲染共用，避免两处形成不同的挂载集合。
+    /// `window_active` 在隐藏窗口也按真实状态投影，显示时仍由窗口激活事件重新提交。
+    ///
+    /// @author kongweiguang
+    fn projection_for_layout(
+        &mut self,
+        layout: &ToolRailLayout,
+        plugin_context: &ToolContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolProjection {
         let window_active = window.is_window_active();
         #[cfg(feature = "right-rail-acceptance")]
         let window_active = window_active || self.right_rail_acceptance_active_override;
@@ -986,62 +1078,58 @@ impl RootView {
         .into_iter()
         .flatten()
         .filter(|tool| {
-            self.plugin_tools.is_applicable(*tool, &plugin_context)
+            self.plugin_tools.is_applicable(*tool, plugin_context)
+                && self.tool_rail_tool_enabled(*tool)
                 && super::workbench::tool_rail_panel_mounted(self, layout.panels, *tool, window, cx)
         })
         .collect();
-        let projection = ToolProjection {
+        ToolProjection {
             context: plugin_context.clone(),
             visible,
             window_active,
-        };
-        if self.plugin_tools.stage_projection(projection.clone()) {
-            cx.defer_in(window, move |root, window, cx| {
-                root.apply_tool_projection(projection, window, cx);
-            });
-        } else {
-            cx.defer_in(window, move |root, window, cx| {
-                if root.plugin_tools.projection_is_current(&projection) {
-                    let previous_mounts = projection
-                        .visible
-                        .iter()
-                        .map(|tool| {
-                            root.plugin_tools
-                                .view_for_mount(
-                                    *tool,
-                                    &projection.context,
-                                    projection.window_active,
-                                )
-                                .map(|view| view.entity_id())
-                        })
-                        .collect::<Vec<_>>();
-                    let changed = root.refresh_builtin_tool_instances(&projection, window, cx);
-                    root.refresh_operations_panel_targets(cx);
-                    root.sync_shared_panel_activity(
-                        &projection.visible,
-                        projection.window_active,
-                        window,
-                        cx,
-                    );
-                    let mounts_changed = projection
-                        .visible
-                        .iter()
-                        .map(|tool| {
-                            root.plugin_tools
-                                .view_for_mount(
-                                    *tool,
-                                    &projection.context,
-                                    projection.window_active,
-                                )
-                                .map(|view| view.entity_id())
-                        })
-                        .ne(previous_mounts);
-                    if changed || mounts_changed {
-                        cx.notify();
-                    }
-                }
-            });
         }
+    }
+
+    /// 真实焦点或标签激活后，在事件安全阶段换挂当前 Tab 的既有实体并提交完整工具投影，
+    /// 使新 Logs/Operations/SFTP 目标与插件 context/visibility 早于窗口首个绘制帧生效。
+    /// 插件实例创建和上下文回调只在此事件阶段执行，渲染仍只读取已提交投影；投影换代会让旧 defer 失效。
+    /// 先换挂 Agent/工具实体再计算投影，保留 Tab 级草稿和绑定，不在过渡期把新目标写进旧实体。
+    ///
+    /// @author kongweiguang
+    pub(super) fn sync_tool_projection_before_first_draw(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconcile_agent_panel_for_tab(window, cx);
+        self.reconcile_tab_tool_contents(window, cx);
+        if !self.tab_tool_contents_are_current() {
+            return;
+        }
+        let (layout, plugin_context) = self.project_tool_rail(cx);
+        let projection = self.projection_for_layout(&layout, &plugin_context, window, cx);
+        let ticket = self.plugin_tools.stage_projection(projection.clone());
+        self.apply_tool_projection(ticket, projection, window, cx);
+    }
+
+    /// 工具栏读取当前标签投影；宿主迁移必须已由导航或布局事件完成。
+    /// 扩展创建与生命周期只随投影变化或显式打开执行，同一投影的重绘仅接收内置视图更新。
+    ///
+    /// @author kongweiguang
+    pub(super) fn workbench_tool_panels(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WorkbenchToolPanels {
+        let (layout, plugin_context) = self.project_tool_rail(cx);
+        let theme = ThemeTokens::current(window, cx);
+        let projection = self.projection_for_layout(&layout, &plugin_context, window, cx);
+        let window_active = projection.window_active;
+        let ticket = self.plugin_tools.stage_projection(projection.clone());
+        // 值相同也必须提交：render 可能刚暂存同一投影而生命周期还没执行，或内置活动需要更新。
+        cx.defer_in(window, move |root, window, cx| {
+            root.apply_tool_projection(ticket, projection, window, cx);
+        });
 
         let mut renderers = WorkbenchToolPanelRenderers::default();
         for tool in self.plugin_tools.registered_tools() {
@@ -1102,7 +1190,10 @@ impl RootView {
                     if !root.host_shutdown_requested
                         && !root.tool_panel_overlay_focus_is_blocked(window, cx)
                     {
-                        root.prepare_plugin_tool(tool, window, cx);
+                        if root.prepare_plugin_tool(tool, window, cx) {
+                            // 重试成功后立即在点击事件内提交新代投影，避免先画一帧恢复占位。
+                            root.sync_tool_projection_before_first_draw(window, cx);
+                        }
                         cx.notify();
                     }
                 }))
@@ -1110,59 +1201,125 @@ impl RootView {
             .into_any_element()
     }
 
-    /// 只应用仍然有效的挂载投影；创建、可见性回调及数据刷新均在 effect 周期运行。
+    /// 只应用仍然有效的挂载票据；同一代只发起一次插件生命周期，旧代次即使投影值相同也拒绝。
+    /// 内置面板活动和目标刷新每帧仍执行，避免把“值未变”误当成宿主状态无需更新。
     ///
     /// @author kongweiguang
     fn apply_tool_projection(
         &mut self,
+        ticket: ProjectionTicket,
         projection: ToolProjection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.plugin_tools.projection_is_current(&projection) {
+        if !self.plugin_tools.projection_is_current(ticket) {
             return;
         }
-        for (tool, section) in [
-            (ToolRailToolId::Containers, OperationsSection::Containers),
-            (ToolRailToolId::Tmux, OperationsSection::Tmux),
-            (ToolRailToolId::Ports, OperationsSection::PortForwards),
-            (ToolRailToolId::System, OperationsSection::ServerInfo),
-        ] {
-            if projection.visible.contains(&tool) {
-                let _ = self.ensure_operations_panel(tool, section, window, cx);
+        let needs_attempt = self.plugin_tools.projection_lifecycle_needs_attempt(ticket);
+        let mut did_attempt = false;
+        if needs_attempt {
+            // 先标记再回调：插件回调若同步触发重入，同一代不会重复 ensure 或显隐通知。
+            self.plugin_tools
+                .mark_projection_lifecycle_attempted(ticket);
+            did_attempt = true;
+            for (tool, section) in [
+                (ToolRailToolId::Containers, OperationsSection::Containers),
+                (ToolRailToolId::Tmux, OperationsSection::Tmux),
+                (ToolRailToolId::Ports, OperationsSection::PortForwards),
+                (ToolRailToolId::System, OperationsSection::ServerInfo),
+            ] {
+                if projection.visible.contains(&tool) {
+                    let _ = self.ensure_operations_panel(tool, section, window, cx);
+                }
+            }
+            if projection.visible.contains(&ToolRailToolId::Sftp) {
+                self.ensure_sftp_panel(window, cx);
+                self.try_bind_files_from_active_terminal(cx);
             }
         }
-        if projection.visible.contains(&ToolRailToolId::Sftp) {
-            self.ensure_sftp_panel(window, cx);
-            self.try_bind_files_from_active_terminal(cx);
-        }
-        self.refresh_builtin_tool_instances(&projection, window, cx);
-        for tool in &projection.visible {
-            if matches!(tool, ToolRailToolId::Plugin(_))
-                && let Err(error) = self
-                    .plugin_tools
-                    .ensure(*tool, &projection.context, window, cx)
-            {
-                self.status = Some(format!("工具 {} 无法打开：{error}", tool.as_str()).into());
+        let previous_mounts = projection
+            .visible
+            .iter()
+            .map(|tool| {
+                self.plugin_tools
+                    .view_for_mount(*tool, &projection.context, projection.window_active)
+                    .map(|view| view.entity_id())
+            })
+            .collect::<Vec<_>>();
+        let changed = self.refresh_builtin_tool_instances(&projection, window, cx);
+        if did_attempt {
+            for tool in &projection.visible {
+                if matches!(tool, ToolRailToolId::Plugin(_))
+                    && let Err(error) =
+                        self.plugin_tools
+                            .ensure(*tool, &projection.context, window, cx)
+                {
+                    self.status = Some(format!("工具 {} 无法打开：{error}", tool.as_str()).into());
+                }
             }
         }
         self.refresh_operations_panel_targets(cx);
         self.sync_shared_panel_activity(&projection.visible, projection.window_active, window, cx);
-        if let Err(error) = self.plugin_tools.sync_visibility(
-            &projection.context,
-            &projection.visible,
-            projection.window_active,
-            cx,
-        ) {
-            self.status = Some(format!("工具状态同步失败：{error}").into());
+        if did_attempt {
+            // 回调可能同步改变投影；旧代不得再请求可见性或 Agent 快照。
+            if !self.plugin_tools.projection_is_current(ticket) {
+                return;
+            }
+            match self.plugin_tools.sync_visibility(
+                &projection.context,
+                &projection.visible,
+                projection.window_active,
+                cx,
+            ) {
+                Ok(()) => {
+                    // 恢复成功后撤掉旧失败提示，避免用户继续按过期状态排查。
+                    if self
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.to_string().contains("状态未确认"))
+                    {
+                        self.status = None;
+                    }
+                }
+                Err(error) => {
+                    // 隐藏失败不会制造可见的宿主面板，必须用状态提示保留可恢复入口；
+                    // 同代去重仍保留下一次显式重开或新投影的重新确认机会。
+                    let unconfirmed = self
+                        .plugin_tools
+                        .unconfirmed_tools()
+                        .into_iter()
+                        .map(|tool| tool.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    let subject = if unconfirmed.is_empty() {
+                        "工具".to_owned()
+                    } else {
+                        format!("工具 {unconfirmed}")
+                    };
+                    self.status = Some(
+                        format!("{subject}状态未确认：{error}；重新打开对应工具可重试").into(),
+                    );
+                }
+            }
+            if self
+                .plugin_tools
+                .projected_tool_active(ToolRailToolId::AgentLauncher)
+            {
+                self.request_agent_snapshot(cx);
+            }
         }
-        if self
-            .plugin_tools
-            .projected_tool_active(ToolRailToolId::AgentLauncher)
-        {
-            self.request_agent_snapshot(cx);
+        let mounts_changed = projection
+            .visible
+            .iter()
+            .map(|tool| {
+                self.plugin_tools
+                    .view_for_mount(*tool, &projection.context, projection.window_active)
+                    .map(|view| view.entity_id())
+            })
+            .ne(previous_mounts);
+        if did_attempt || changed || mounts_changed {
+            cx.notify();
         }
-        cx.notify();
     }
 
     /// 工厂只借当前标签的已保留实体；切换尚未提交时不把旧标签句柄绑定到新标签。
@@ -1555,6 +1712,11 @@ impl RootView {
     ///
     /// @author kongweiguang
     pub(super) fn open_snippets_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 终端建议、命令面板和快捷键都汇入这里；commands 禁用时在改动宿主或中心页前拒绝，
+        // 保持原工作区原样，避免禁用插件仍被程序化导航拉到前台。
+        if !self.commands_content_enabled() {
+            return;
+        }
         self.sync_tool_rail_active_tab();
         self.reconcile_tab_tool_contents(window, cx);
         self.reconcile_snippets_host(window, cx);
@@ -1820,8 +1982,10 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         if let Some(files_pane) = self.sftp_panel.clone() {
+            let sftp_active = window_active && visible_tools.contains(&ToolRailToolId::Sftp);
             files_pane.update(cx, |files_pane, cx| {
                 files_pane.set_compact_layout(true, cx);
+                files_pane.set_active(sftp_active, cx);
             });
         }
         if !self.snippet_editor_modal_open
@@ -1878,6 +2042,10 @@ impl RootView {
             })
         });
         let theme_mode = self.theme_mode;
+        // 测试构建记录投影目标；cfg! 常量分支让生产代码保持普通语句且不读取该字段。
+        if cfg!(test) {
+            self.projected_logs_target_for_test = current_target.clone();
+        }
         if let Some(view) = self.logs_view.clone() {
             view.update(cx, |view, cx| {
                 view.set_target(current_target.clone(), cx);

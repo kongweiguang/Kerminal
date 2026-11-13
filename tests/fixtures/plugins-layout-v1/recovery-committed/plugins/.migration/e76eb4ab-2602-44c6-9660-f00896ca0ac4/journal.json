@@ -1,0 +1,64 @@
+{
+  "kind": "plugin_layout_migration",
+  "schema": 1,
+  "operation_id": "e76eb4ab-2602-44c6-9660-f00896ca0ac4",
+  "phase": "committed",
+  "backup_relative": "plugins/.migration/e76eb4ab-2602-44c6-9660-f00896ca0ac4/before",
+  "legacy_state_sha256": "d0f10a1d1d52aacab3e9e5f19c9730cb25775a97aeb191f19871f60d032a803c",
+  "target_state": {
+    "schema": 2,
+    "revision": 7,
+    "plugins": {
+      "acme.missing": {
+        "active": "2.0.0",
+        "enabled": false,
+        "source": "local",
+        "installed_at": "2026-01-02T03:04:05Z",
+        "status": {
+          "kind": "missing"
+        },
+        "confirmed": true
+      },
+      "acme.notes": {
+        "active": "1.0.0",
+        "enabled": true,
+        "source": "local",
+        "installed_at": "2026-01-02T03:04:05Z",
+        "fingerprint": "v1:523a0887e6edc9934fd963b158d3070d304a6f6199fd32c9daceda1cec79c297",
+        "status": {
+          "kind": "ready"
+        },
+        "confirmed": true
+      }
+    },
+    "pending": [],
+    "failures": {}
+  },
+  "target_state_sha256": "1b355c0add7162c4be323a10446fbd7e7cc966f072c7c074cd3e9ca47d201aec",
+  "packages_present": true,
+  "packages_fingerprint": "v1:af9107dece0eb341466a2fa8c9993d4f83206e41c53f711a21140b5d4436bf16",
+  "entries": [
+    {
+      "id": "acme.missing",
+      "version": "2.0.0",
+      "source": "",
+      "target": "acme.missing",
+      "fingerprint": null,
+      "status": {
+        "kind": "missing"
+      }
+    },
+    {
+      "id": "acme.notes",
+      "version": "1.0.0",
+      "source": "packages/acme.notes/1.0.0",
+      "target": "acme.notes",
+      "fingerprint": "v1:523a0887e6edc9934fd963b158d3070d304a6f6199fd32c9daceda1cec79c297",
+      "status": {
+        "kind": "ready"
+      }
+    }
+  ],
+  "removed_previous_versions": 1,
+  "discarded_pending": 0
+}

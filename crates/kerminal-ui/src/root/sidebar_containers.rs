@@ -81,6 +81,11 @@ fn host_is_available(root: &RootView, host_id: &HostId, cx: &Context<RootView>) 
 }
 
 /// 文件入口直接使用固定项的完整 host/runtime/container 端点，绝不回退到宿主 SFTP。
+///
+/// 固定项菜单可能由禁用前的旧帧触发，因此进入共享容器文件入口前先复核 containers
+/// 单元；禁用时只写状态，不创建 pane 或远端 I/O。空 registry 是测试/离线装配未注入
+/// 声明，按启用处理，与工作区恢复语义一致。
+///
 /// @author kongweiguang
 pub(super) fn open_pinned_files(
     root: &mut RootView,
@@ -97,6 +102,16 @@ pub(super) fn open_pinned_files(
         cx.notify();
         return;
     };
+    if !(root.services.plugins.providers().is_empty()
+        || root.services.plugins.is_enabled("kerminal.containers"))
+    {
+        root.status = Some(crate::locale::text(
+            "容器插件已禁用，请先在插件设置中启用。",
+            "The containers plugin is disabled. Enable it in plugin settings first.",
+        ));
+        cx.notify();
+        return;
+    }
     if !target
         .host_id
         .as_ref()

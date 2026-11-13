@@ -233,6 +233,11 @@ impl FilesPane {
             }
         };
         let restored = self.restored_file_browser_endpoint.take();
+        // 文件工作区不播放紧凑右栏入场：进入该上下文时落位残留等待，
+        // 避免 preserve 分支不产生读取时，旧武装被之后任意一次普通刷新借用消费。
+        if self.data_entrance.awaiting_result() {
+            self.disarm_target_data_entrance(cx);
+        }
         let preserve = (self.compact_target_is_available()
             || restored.as_ref() == Some(&self.panels[1].endpoint))
             && endpoint_same_filesystem(&self.panels[1].endpoint, &endpoint);
@@ -363,27 +368,6 @@ impl FilesPane {
     /// @author kongweiguang
     pub(crate) fn current_directory_endpoint(&self) -> &FileEndpoint {
         &self.panels[1].endpoint
-    }
-
-    /// 显式定位才允许文件工作区采用当前文档父目录，普通内容激活不走此入口。
-    ///
-    /// @author kongweiguang
-    pub(crate) fn locate_file_workspace_directory(
-        &mut self,
-        endpoint: FileEndpoint,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(self.compact_context, CompactFilesContext::FileWorkspace(_))
-            && self.compact_target_is_available()
-            && endpoint_same_filesystem(&self.panels[1].endpoint, &endpoint)
-            && self.panels[1]
-                .requested_endpoint
-                .as_ref()
-                .unwrap_or(&self.panels[1].endpoint)
-                != &endpoint
-        {
-            self.open_endpoint_on_side(1, endpoint, cx);
-        }
     }
 
     /// 菜单冻结明确目录和独立连接 scope；Root 接受前切换来源不会把请求改投其它主机。

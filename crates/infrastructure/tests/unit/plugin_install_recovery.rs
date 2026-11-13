@@ -2,6 +2,7 @@
 //! @author kongweiguang
 
 use super::*;
+use crate::plugins::layout;
 use kerminal_application::PublicErrorCode;
 
 /// 使用真实本地归档和独立配置根，避免恢复测试依赖网络或用户现有插件。
@@ -34,6 +35,31 @@ fn fixture() -> (
     (root, store, installer, validator)
 }
 
+/// 单版本布局的活动目录固定为 `plugins/<id>`；测试只按契约路径取现场。
+fn active_directory(root: &Path) -> PathBuf {
+    layout::package_directory(root, &PluginId::parse("acme.notes").unwrap())
+}
+
+/// 失败 pending 绑定的暂存槽是安装当时的 UUID 目录，撤销只能清理它。
+fn staging_slot(root: &Path, state: &PluginStoreState) -> PathBuf {
+    let change = state.pending.first().expect("failed pending exists");
+    let (id, operation_id) = match change {
+        PendingPluginChange::Install { id, staged, .. }
+        | PendingPluginChange::Update { id, staged, .. } => (id, staged),
+        other => panic!("unexpected pending: {other:?}"),
+    };
+    layout::staging_directory(root, id, operation_id).unwrap()
+}
+
+/// 篡改已排队的暂存清单，让下次启动在应用 pending 时按指纹失败。
+fn corrupt_staged_manifest(root: &Path, state: &PluginStoreState) {
+    fs::write(
+        staging_slot(root, state).join("kerminal-plugin.json"),
+        b"corrupt",
+    )
+    .unwrap();
+}
+
 /// 临时根必须命中真实磁盘空间，溢出与真实可用量不足都不能绕过安装空间检查。
 #[test]
 fn temporary_root_staging_checks_actual_disk_capacity() {
@@ -42,7 +68,7 @@ fn temporary_root_staging_checks_actual_disk_capacity() {
         .stage(1)
         .expect("resolve the temporary directory disk");
     assert!(stage.directory.is_dir());
-    let canonical = fs::canonicalize(root.path().join("plugins/staging")).unwrap();
+    let canonical = fs::canonicalize(root.path().join("plugins/.staging/_incoming")).unwrap();
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let disk = disks
         .list()
@@ -106,8 +132,9 @@ fn cancellation(state: &PluginStoreState) -> ExtensionChange {
 async fn failed_install_can_cancel_and_reinstall_same_version() {
     let (root, store, installer, validator) = fixture();
     install_local(&installer, root.path(), "1.0.0").await;
-    let directory = root.path().join("plugins/packages/acme.notes/1.0.0");
-    fs::write(directory.join("kerminal-plugin.json"), b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     assert_eq!(failed.failures.len(), 1);
@@ -121,7 +148,7 @@ async fn failed_install_can_cancel_and_reinstall_same_version() {
     assert!(cancelled.pending.is_empty() && cancelled.failures.is_empty());
     assert!(cancelled.pending_failures.is_empty());
     assert!(cancelled.plugins.is_empty());
-    assert!(!directory.exists());
+    assert!(!slot.exists());
     let replay = installer.change(cancellation(&failed)).await.unwrap_err();
     assert_eq!(replay.public_code(), PublicErrorCode::Conflict);
     assert_eq!(store.load().unwrap().state, cancelled);
@@ -131,9 +158,9 @@ async fn failed_install_can_cancel_and_reinstall_same_version() {
     assert!(boot.store.state.pending.is_empty() && boot.store.state.failures.is_empty());
 }
 
-/// 更新失败保留活动与上一版本及用户数据，清理目标版本后允许立即重新安装。
+/// 更新失败保留活动版本与用户数据，清理本次暂存后允许立即重新安装。
 #[tokio::test]
-async fn failed_update_preserves_active_previous_and_data_before_reinstall() {
+async fn failed_update_preserves_active_and_data_before_reinstall() {
     let (root, store, installer, validator) = fixture();
     for version in ["0.9.0", "1.0.0"] {
         install_local(&installer, root.path(), version).await;
@@ -143,26 +170,21 @@ async fn failed_update_preserves_active_previous_and_data_before_reinstall() {
     fs::create_dir_all(data.parent().unwrap()).unwrap();
     fs::write(&data, b"keep").unwrap();
     install_local(&installer, root.path(), "1.1.0").await;
-    let directory = root.path().join("plugins/packages/acme.notes/1.1.0");
-    fs::write(directory.join("kerminal-plugin.json"), b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
+    assert_eq!(
+        failed.plugins[&PluginId::parse("acme.notes").unwrap()].active,
+        PluginVersion::parse("1.0.0").unwrap()
+    );
     installer.change(cancellation(&failed)).await.unwrap();
     let cancelled = store.load().unwrap().state;
     assert_eq!(cancelled.plugins, failed.plugins);
     assert!(cancelled.pending.is_empty() && cancelled.failures.is_empty());
-    assert!(
-        root.path()
-            .join("plugins/packages/acme.notes/0.9.0")
-            .is_dir()
-    );
-    assert!(
-        root.path()
-            .join("plugins/packages/acme.notes/1.0.0")
-            .is_dir()
-    );
     assert_eq!(fs::read(data).unwrap(), b"keep");
-    assert!(!directory.exists());
+    assert!(!slot.exists());
     install_local(&installer, root.path(), "1.1.0").await;
     let boot = store.begin_startup(&validator, false).unwrap();
     assert_eq!(
@@ -172,17 +194,20 @@ async fn failed_update_preserves_active_previous_and_data_before_reinstall() {
     assert!(boot.store.state.pending.is_empty() && boot.store.state.failures.is_empty());
 }
 
-/// 用户尝试更新到上一版本失败时，该目录仍是回退资料，取消不能把它当新包删掉。
+/// 回装旧版本失败时也必须保留当前活动目录，不能把旧 UUID 当作可回退版本。
 #[tokio::test]
-async fn cancel_preserves_failed_target_when_previous_still_references_it() {
+async fn cancel_failed_downgrade_preserves_active_package() {
     let (root, store, installer, validator) = fixture();
     for version in ["0.9.0", "1.0.0"] {
         install_local(&installer, root.path(), version).await;
         store.begin_startup(&validator, false).unwrap();
     }
+    let active = active_directory(root.path());
+    let manifest = active.join("kerminal-plugin.json");
+    let original = fs::read(&manifest).unwrap();
     install_local(&installer, root.path(), "0.9.0").await;
-    let directory = root.path().join("plugins/packages/acme.notes/0.9.0");
-    fs::write(directory.join("kerminal-plugin.json"), b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     installer.change(cancellation(&failed)).await.unwrap();
@@ -190,9 +215,10 @@ async fn cancel_preserves_failed_target_when_previous_still_references_it() {
     assert_eq!(cancelled.plugins, failed.plugins);
     assert!(cancelled.pending.is_empty() && cancelled.failures.is_empty());
     assert_eq!(
-        fs::read(directory.join("kerminal-plugin.json")).unwrap(),
-        b"corrupt"
+        cancelled.plugins[&PluginId::parse("acme.notes").unwrap()].active,
+        PluginVersion::parse("1.0.0").unwrap()
     );
+    assert_eq!(fs::read(&manifest).unwrap(), original);
 }
 
 /// 没有启动失败证据或身份不匹配时不能取消，避免旧页面撤销另一笔有效操作。
@@ -204,12 +230,7 @@ async fn cancel_rejects_unfailed_or_mismatched_pending() {
     let error = installer.change(cancellation(&queued)).await.unwrap_err();
     assert_eq!(error.public_code(), PublicErrorCode::Conflict);
     assert_eq!(store.load().unwrap().state, queued);
-    fs::write(
-        root.path()
-            .join("plugins/packages/acme.notes/1.0.0/kerminal-plugin.json"),
-        b"corrupt",
-    )
-    .unwrap();
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     let mut mismatch = failed.pending[0].clone();
@@ -235,8 +256,7 @@ async fn unbound_package_failure_cannot_cancel_later_pending() {
     store.begin_startup(&validator, false).unwrap();
     let id = PluginId::parse("acme.notes").unwrap();
     fs::write(
-        root.path()
-            .join("plugins/packages/acme.notes/1.0.0/kerminal-plugin.json"),
+        active_directory(root.path()).join("kerminal-plugin.json"),
         b"corrupt",
     )
     .unwrap();
@@ -256,13 +276,14 @@ async fn unbound_package_failure_cannot_cancel_later_pending() {
     assert_eq!(store.load().unwrap().state, queued);
 }
 
-/// 用户快照过期与读后并发 CAS 两种冲突都必须先失败，不能先清理包再发现冲突。
+/// 用户快照过期与读后并发 CAS 两种冲突都必须先失败，不能先清理暂存再发现冲突。
 #[tokio::test]
 async fn cancel_rejects_revision_and_cas_conflicts_before_cleanup() {
     let (root, store, installer, validator) = fixture();
     install_local(&installer, root.path(), "1.0.0").await;
-    let directory = root.path().join("plugins/packages/acme.notes/1.0.0");
-    fs::write(directory.join("kerminal-plugin.json"), b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let stale = store.load().unwrap();
     let latest = store.compare_and_swap(&stale, stale.state.clone()).unwrap();
@@ -280,7 +301,7 @@ async fn cancel_rejects_revision_and_cas_conflicts_before_cleanup() {
     .unwrap_err();
     assert_eq!(error.public_code(), PublicErrorCode::Conflict);
     assert_eq!(store.load().unwrap().state, latest.state);
-    assert!(directory.exists());
+    assert!(slot.exists());
 }
 
 /// 未知提交材料即使不影响 load 也必须阻止取消与目录清理，不能自动丢弃或重放。
@@ -288,8 +309,9 @@ async fn cancel_rejects_revision_and_cas_conflicts_before_cleanup() {
 async fn unknown_recovery_fences_failed_cancellation_and_cleanup() {
     let (root, store, installer, validator) = fixture();
     install_local(&installer, root.path(), "1.0.0").await;
-    let directory = root.path().join("plugins/packages/acme.notes/1.0.0");
-    fs::write(directory.join("kerminal-plugin.json"), b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     let recovery = root.path().join("plugins/state-recovery-test.json");
@@ -298,65 +320,85 @@ async fn unknown_recovery_fences_failed_cancellation_and_cleanup() {
     assert_eq!(error.public_code(), PublicErrorCode::OutcomeUnknown);
     assert_eq!(store.load().unwrap().state, failed);
     assert_eq!(fs::read(recovery).unwrap(), b"unknown commit material");
-    assert!(directory.exists());
+    assert!(slot.exists());
 }
 
-/// 危险残留应阻止该版本重装，但不能继续锁住正常撤销后的回退与卸载。
+/// 活动目录被手工占用且内容不同时只记插件失败，撤销能清掉暂存而不碰用户目录。
 #[tokio::test]
-async fn file_residue_allows_cancel_then_rollback_or_uninstall() {
-    for uninstall in [false, true] {
-        let (root, store, installer, validator) = fixture();
-        for version in ["0.9.0", "1.0.0"] {
-            install_local(&installer, root.path(), version).await;
-            store.begin_startup(&validator, false).unwrap();
-        }
-        install_local(&installer, root.path(), "1.1.0").await;
-        let directory = root.path().join("plugins/packages/acme.notes/1.1.0");
-        fs::remove_dir_all(&directory).unwrap();
-        fs::write(&directory, b"retain unsafe residue").unwrap();
-        store.begin_startup(&validator, false).unwrap();
-        let failed = store.load().unwrap().state;
-        let receipt = installer.change(cancellation(&failed)).await.unwrap();
-        assert!(receipt.cleanup_warning.is_some());
-        let cancelled = store.load().unwrap().state;
-        assert_eq!(cancelled.plugins, failed.plugins);
-        assert!(cancelled.pending.is_empty() && cancelled.failures.is_empty());
-        assert_eq!(fs::read(&directory).unwrap(), b"retain unsafe residue");
+async fn occupied_active_directory_fails_pending_without_journal() {
+    let (root, store, installer, validator) = fixture();
+    install_local(&installer, root.path(), "1.0.0").await;
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    let active = active_directory(root.path());
+    fs::create_dir_all(&active).unwrap();
+    fs::write(active.join("manifest"), b"acme.notes@0.9.0").unwrap();
+    fs::write(active.join("kerminal-plugin.json"), b"user-owned").unwrap();
+    let original: Vec<_> = ["manifest", "kerminal-plugin.json"]
+        .into_iter()
+        .map(|name| fs::read(active.join(name)).unwrap())
+        .collect();
 
-        let archive = root.path().join("local-1.1.0.kplugin");
-        let inspected = installer
-            .inspect_file(archive.clone(), CancellationToken::new())
-            .await
-            .unwrap();
-        let (progress, _) = watch::channel(InstallProgress::Preparing);
-        let error = installer
-            .install_file(archive, inspected, progress, CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(error.public_message().contains("残留"));
-        assert_eq!(store.load().unwrap().state, cancelled);
+    let boot = store.begin_startup(&validator, false).unwrap();
+    let failed = store.load().unwrap().state;
+    let id = PluginId::parse("acme.notes").unwrap();
+    assert!(boot.plugins.is_empty());
+    assert!(failed.pending_failures.contains(&id));
+    assert!(failed.plugins.is_empty());
+    assert!(!root.path().join("plugins/.migration").exists());
+    assert_eq!(fs::read(active.join("manifest")).unwrap(), original[0]);
+    assert_eq!(
+        fs::read(active.join("kerminal-plugin.json")).unwrap(),
+        original[1]
+    );
 
-        let id = PluginId::parse("acme.notes").unwrap();
-        installer
-            .change(if uninstall {
-                ExtensionChange::Uninstall(id)
-            } else {
-                ExtensionChange::Rollback(id)
-            })
-            .await
-            .unwrap();
-        let boot = store.begin_startup(&validator, false).unwrap();
-        assert!(boot.store.state.pending.is_empty() && boot.store.state.failures.is_empty());
-        if uninstall {
-            assert!(boot.plugins.is_empty());
-        } else {
-            assert_eq!(
-                boot.plugins[0].version,
-                PluginVersion::parse("0.9.0").unwrap()
-            );
-        }
-        assert_eq!(fs::read(directory).unwrap(), b"retain unsafe residue");
-    }
+    let receipt = installer.change(cancellation(&failed)).await.unwrap();
+    assert!(receipt.cleanup_warning.is_none());
+    assert!(store.load().unwrap().state.pending.is_empty());
+    assert!(!slot.exists());
+    assert!(active.is_dir());
+    assert_eq!(fs::read(active.join("manifest")).unwrap(), original[0]);
+    assert!(!root.path().join("plugins/.migration").exists());
+}
+
+/// 危险残留应阻止本次撤销清理，但同 ID 的新操作可用独立 UUID 槽继续重装。
+#[tokio::test]
+async fn file_residue_allows_cancel_then_reinstall_or_uninstall() {
+    let (root, store, installer, validator) = fixture();
+    install_local(&installer, root.path(), "1.0.0").await;
+    store.begin_startup(&validator, false).unwrap();
+    install_local(&installer, root.path(), "1.1.0").await;
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    fs::remove_dir_all(&slot).unwrap();
+    fs::write(&slot, b"retain unsafe residue").unwrap();
+    store.begin_startup(&validator, false).unwrap();
+    let failed = store.load().unwrap().state;
+    let receipt = installer.change(cancellation(&failed)).await.unwrap();
+    assert!(receipt.cleanup_warning.is_some());
+    let cancelled = store.load().unwrap().state;
+    assert_eq!(cancelled.plugins, failed.plugins);
+    assert!(cancelled.pending.is_empty() && cancelled.failures.is_empty());
+    assert_eq!(fs::read(&slot).unwrap(), b"retain unsafe residue");
+
+    // 同 ID 的新操作使用独立 UUID 槽，旧残留不能再阻塞重装。
+    install_local(&installer, root.path(), "1.1.0").await;
+    let boot = store.begin_startup(&validator, false).unwrap();
+    assert_eq!(
+        boot.plugins[0].version,
+        PluginVersion::parse("1.1.0").unwrap()
+    );
+    assert_eq!(fs::read(&slot).unwrap(), b"retain unsafe residue");
+
+    installer
+        .change(ExtensionChange::Uninstall(
+            PluginId::parse("acme.notes").unwrap(),
+        ))
+        .await
+        .unwrap();
+    let boot = store.begin_startup(&validator, false).unwrap();
+    assert!(boot.plugins.is_empty());
+    assert_eq!(fs::read(&slot).unwrap(), b"retain unsafe residue");
 }
 
 /// Windows 文件被其他进程占用时清理可能失败，但状态撤销仍必须提交并报告残留。
@@ -367,10 +409,10 @@ async fn cleanup_io_failure_reports_warning_without_locking_failed_change() {
 
     let (root, store, installer, validator) = fixture();
     install_local(&installer, root.path(), "1.0.0").await;
-    let manifest = root
-        .path()
-        .join("plugins/packages/acme.notes/1.0.0/kerminal-plugin.json");
-    fs::write(&manifest, b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    let manifest = slot.join("kerminal-plugin.json");
+    corrupt_staged_manifest(root.path(), &queued);
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     // 允许读取和写入但不共享删除，稳定复现 Windows 清理的权限错误。
@@ -394,20 +436,20 @@ async fn cleanup_io_failure_reports_warning_without_locking_failed_change() {
 async fn symlink_residue_is_retained_and_external_target_is_untouched() {
     let (root, store, installer, validator) = fixture();
     install_local(&installer, root.path(), "1.0.0").await;
-    let directory = root.path().join("plugins/packages/acme.notes/1.0.0");
-    fs::write(directory.join("kerminal-plugin.json"), b"corrupt").unwrap();
+    let queued = store.load().unwrap().state;
+    let slot = staging_slot(root.path(), &queued);
+    corrupt_staged_manifest(root.path(), &queued);
     let external = tempfile::tempdir().unwrap();
     let target = external.path().join("keep");
     fs::write(&target, b"outside").unwrap();
-    std::os::unix::fs::symlink(&target, directory.join("linked")).unwrap();
+    std::os::unix::fs::symlink(&target, slot.join("linked")).unwrap();
     store.begin_startup(&validator, false).unwrap();
     let failed = store.load().unwrap().state;
     let receipt = installer.change(cancellation(&failed)).await.unwrap();
     assert!(receipt.cleanup_warning.is_some());
     assert!(store.load().unwrap().state.pending.is_empty());
     assert!(
-        directory
-            .join("linked")
+        slot.join("linked")
             .symlink_metadata()
             .unwrap()
             .file_type()

@@ -4,19 +4,23 @@
 
 use super::{
     ContainerStatusFilter, DirtyOperationTargets, LatestRequestState, SectionPhase,
-    SectionSelection, SectionState, ServerInfoHistory, ServerNetworkFilter, filter_containers,
-    filtered_network_rates, group_container_projects, group_container_projects_with_retained,
-    network_rate_label, time_series_position, tmux_confirmation_session_matches,
+    SectionSelection, SectionState, ServerInfoHistory, ServerNetworkFilter,
+    TMUX_DEFERRED_FEEDBACK_CAPACITY, TmuxKilledDetailGuard, TmuxMutationFeedback,
+    TmuxMutationIdentity, defer_tmux_feedback, filter_containers, filtered_network_rates,
+    group_container_projects, group_container_projects_with_retained, network_rate_label,
+    take_deferred_tmux_feedback, time_series_position, tmux_confirmation_session_matches,
 };
 use crate::features::operations::{
     ActiveOperationsPaneTarget, ContainerOutputKind, ContainerOutputTarget, DetailReadPhase,
-    DetailReadState, OperationsSection, TmuxAttachTarget, TmuxAttachTerminalBinding,
-    TmuxDetachIntent, TmuxDetailState, ToolRailOperationTarget, forward_form_can_save,
-    forward_unavailable_hint, resolve_forward_add_host, resolve_forward_form_host,
+    DetailReadState, OperationsSection, OperationsView, TmuxAttachTarget,
+    TmuxAttachTerminalBinding, TmuxDetachIntent, TmuxDetailState, TmuxSnapshot,
+    ToolRailOperationTarget, forward_form_can_save, forward_unavailable_hint,
+    plan_tmux_attach_transition, resolve_forward_add_host, resolve_forward_form_host,
     resolve_ports_panel_target, resolve_tool_rail_operation_target,
     tmux_attach_binding_matches_target, tmux_detach_intent_can_send,
     tmux_detach_intent_matches_current,
 };
+use kerminal_application::operations::TmuxCapability;
 use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::{
     files::ContainerRuntime,
@@ -30,6 +34,7 @@ use kerminal_domain::{
     },
     sessions::SessionOwner,
 };
+use std::collections::VecDeque;
 
 /// 刷新可更新活动信息，但不能把退出、重建、改名或其它 socket 的会话当作旧确认对象。
 /// @author kongweiguang
@@ -86,6 +91,148 @@ fn tmux_confirmation_rejects_replaced_sessions_but_keeps_activity_updates() {
             Some(&replacement)
         ));
     }
+}
+
+/// kill 成功但换 pane 抑制状态回执时，只有冻结的目标/代次和稳定会话身份仍一致才清理旧详情。
+/// 该测试验证生产清理门禁；完整异步回执由 operations_tmux_binding 的内存命令端口覆盖。
+///
+/// @author kongweiguang
+#[test]
+fn confirmed_kill_detail_cleanup_requires_frozen_identity_and_success() {
+    let target = TmuxTarget {
+        host_id: Some(HostId::new()),
+        socket_name: Some("work".to_owned()),
+        ..TmuxTarget::default()
+    };
+    let details = TmuxDetailState {
+        session_id: Some("$1".to_owned()),
+        session_name: Some("work".to_owned()),
+        windows: Some(Vec::new()),
+        generation: 7,
+        ..TmuxDetailState::default()
+    };
+    let session = TmuxSession {
+        id: "$1".into(),
+        name: "work".into(),
+        attached: false,
+        clients: 0,
+        windows: 1,
+        current_path: None,
+        created_at: Some(100),
+        activity_at: Some(100),
+        target_ref: "ssh-fixture:work".into(),
+    };
+    let guard = TmuxKilledDetailGuard::freeze(&target, 5, &details, Some(&session))
+        .expect("complete identity should freeze cleanup guard");
+    let listed = TmuxSession {
+        attached: true,
+        clients: 2,
+        activity_at: Some(200),
+        ..session.clone()
+    };
+
+    // 列表刷新只更新 attached/clients 等描述，不重载窗口/pane 详情，也不推进详情代次；
+    // 即使 tmux server 在同一秒内重启并用尽身份字段，此处清理的仍只可能是提交时的旧详情。
+    // 新会话的详情只有经重新选择或窗口/分屏重新载入才会出现，而那些路径都会递增详情代次
+    // 并被清理门禁挡下；单独的 capture 读取不递增代次，但清理后旧回执仍会被拒绝。
+    assert!(guard.can_clear(true, &target, 5, &details, std::slice::from_ref(&listed)));
+    assert!(!guard.can_clear(false, &target, 5, &details, std::slice::from_ref(&listed)));
+
+    // 切到其它 profile 或目标代次前进后，旧详情已不属于当前查询。
+    let other_target = TmuxTarget {
+        profile_id: Some("beta".to_owned()),
+        ..target.clone()
+    };
+    assert!(!guard.can_clear(
+        true,
+        &other_target,
+        5,
+        &details,
+        std::slice::from_ref(&listed)
+    ));
+    assert!(!guard.can_clear(true, &target, 6, &details, std::slice::from_ref(&listed)));
+
+    // 用户快速重选任意会话都会递增详情代次；即使仍选同一 ID，也必须保守保留。
+    let reselected_same_id = TmuxDetailState {
+        session_id: Some("$1".to_owned()),
+        generation: 8,
+        ..TmuxDetailState::default()
+    };
+    assert!(!guard.can_clear(
+        true,
+        &target,
+        5,
+        &reselected_same_id,
+        std::slice::from_ref(&listed)
+    ));
+    let selected_other = TmuxDetailState {
+        session_id: Some("$2".to_owned()),
+        generation: 7,
+        ..TmuxDetailState::default()
+    };
+    assert!(!guard.can_clear(
+        true,
+        &target,
+        5,
+        &selected_other,
+        std::slice::from_ref(&listed)
+    ));
+
+    // 列表已无该会话，或同 ID 会话已重建时都不能再清理。
+    assert!(!guard.can_clear(true, &target, 5, &details, &[]));
+    let rebuilt = TmuxSession {
+        created_at: Some(101),
+        ..session.clone()
+    };
+    assert!(!guard.can_clear(true, &target, 5, &details, &[rebuilt]));
+
+    // 缺少创建时间时无法跨刷新证明身份，冻结阶段就放弃清理。
+    let unknown_identity = TmuxSession {
+        created_at: None,
+        ..session
+    };
+    assert!(TmuxKilledDetailGuard::freeze(&target, 5, &details, Some(&unknown_identity)).is_none());
+    assert!(
+        TmuxKilledDetailGuard::freeze(&target, 5, &selected_other, Some(&unknown_identity))
+            .is_none()
+    );
+}
+
+/// 只有真实 `list_sessions` 成功（含空列表）才清除写后 dirty；probe-only 不可用快照保留核对机会。
+/// 该测试验证 `load_tmux` 的生产判定谓词和 dirty 转换，不冒充完整异步读取测试。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_dirty_is_consumed_only_by_an_actual_session_list() {
+    let target = TmuxTarget {
+        host_id: Some(HostId::new()),
+        ..TmuxTarget::default()
+    };
+    let snapshot = |available: bool| TmuxSnapshot {
+        capability: TmuxCapability {
+            target_ref: "ssh-fixture:work".to_owned(),
+            available,
+            version: available.then(|| "tmux 3.4".to_owned()),
+            reason: (!available).then(|| "tmux unavailable".to_owned()),
+        },
+        sessions: Vec::new(),
+    };
+
+    let probe_only = snapshot(false);
+    assert!(!OperationsView::tmux_snapshot_confirms_refresh(&probe_only));
+    let empty_list = snapshot(true);
+    assert!(OperationsView::tmux_snapshot_confirms_refresh(&empty_list));
+
+    let mut dirty = DirtyOperationTargets::default();
+    dirty.mark_tmux_dirty(target.clone());
+    if OperationsView::tmux_snapshot_confirms_refresh(&probe_only) {
+        dirty.tmux_refreshed(&target);
+    }
+    assert!(dirty.tmux_is_dirty(&target));
+    if OperationsView::tmux_snapshot_confirms_refresh(&empty_list) {
+        dirty.tmux_refreshed(&target);
+    }
+    assert!(!dirty.tmux_is_dirty(&target));
 }
 
 /// Compose 拆除后没有容器行仍保留完整目标，不会与同名但不同目录的项目合并。
@@ -392,6 +539,35 @@ fn selected_host_tmux_query_does_not_enable_unbound_attach() {
     ));
 }
 
+/// 构造可区分 pane owner 与 tmux host/profile 身份的固定栏绑定，供切换边界回归使用。
+///
+/// TabId 由调用方提供，使同一场景的 A/B 只改变 pane、session 与 owner generation，
+/// 避免把“换 Tab”误当成“同 Tab 换 pane”而放松 owner 断言。
+///
+/// @author kongweiguang
+fn tmux_attach_binding_fixture(
+    tab_id: TabId,
+    host_id: Option<HostId>,
+    profile_id: Option<&str>,
+    pane_id: PaneId,
+) -> TmuxAttachTerminalBinding {
+    TmuxAttachTerminalBinding {
+        pane_id: pane_id.clone(),
+        target: host_id.map_or_else(
+            || TmuxAttachTarget::Local {
+                profile_id: profile_id.map(str::to_owned),
+            },
+            |host_id| TmuxAttachTarget::Ssh { host_id },
+        ),
+        binding: UiSessionBinding {
+            session_id: SessionId::new(),
+            owner: SessionOwner::Ui { tab_id, pane_id },
+            session_generation: 4,
+        },
+        working_directory: None,
+    }
+}
+
 /// 给纯身份比较测试构造真实 UI owner，使 pane 与重连 generation 都参与完全相等校验。
 ///
 /// @author kongweiguang
@@ -479,6 +655,219 @@ fn tmux_detach_intent_rejects_stale_target_and_terminal_binding() {
     ));
 }
 
+/// 同 host 不同 pane 只更换 attach owner，tmux 查询目标和已加载数据仍可复用。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_attach_owner_switch_on_same_ssh_host_keeps_query_data() {
+    let tab_id = TabId::new();
+    let host_id = HostId::new();
+    let previous =
+        tmux_attach_binding_fixture(tab_id.clone(), Some(host_id.clone()), None, PaneId::new());
+    let next = tmux_attach_binding_fixture(tab_id, Some(host_id), None, PaneId::new());
+    let previous_target = previous.target.to_tmux_target();
+    let next_target = next.target.to_tmux_target();
+    assert_eq!(previous_target, next_target);
+
+    let transition = plan_tmux_attach_transition(
+        Some(&previous),
+        Some(&next),
+        &previous_target,
+        &next_target,
+        true,
+        SectionPhase::Ready,
+        true,
+    );
+    assert!(transition.owner_changed);
+    // owner_changed 在 setter 中驱动视图代次递增、冻结确认清理和 detach 撤销；
+    // 这里要求 reset_reads/load_sessions 为假，固定 setter 应采用的复用决策；
+    // 列表和详情的实际保留由 operations_tmux_binding 的真实 setter 回归覆盖。
+    assert!(!transition.reset_reads);
+    assert!(!transition.load_sessions);
+
+    // SSH 查询目标仍有效且刚刚获得 attach binding 时，不应丢弃宿主级列表或重读。
+    let transition = plan_tmux_attach_transition(
+        None,
+        Some(&next),
+        &next_target,
+        &next_target,
+        true,
+        SectionPhase::Ready,
+        true,
+    );
+    assert!(transition.owner_changed);
+    assert!(!transition.reset_reads);
+    assert!(!transition.load_sessions);
+
+    // 工作目录只影响 attach 输入，不是 tmux 查询身份；同一 owner 的 cwd 变化不应触发重读。
+    let mut changed_working_directory = next.clone();
+    changed_working_directory.working_directory = Some("/srv/other".to_owned());
+    let transition = plan_tmux_attach_transition(
+        Some(&next),
+        Some(&changed_working_directory),
+        &next_target,
+        &next_target,
+        true,
+        SectionPhase::Ready,
+        true,
+    );
+    assert!(!transition.owner_changed);
+    assert!(!transition.reset_reads);
+    assert!(!transition.load_sessions);
+}
+
+/// host/profile 身份变化才重置 tmux 列表与详情，并在可见时读取新目标。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_attach_target_change_resets_and_reads_current_target() {
+    let tab_id = TabId::new();
+    let previous =
+        tmux_attach_binding_fixture(tab_id.clone(), Some(HostId::new()), None, PaneId::new());
+    let next = tmux_attach_binding_fixture(tab_id, Some(HostId::new()), None, PaneId::new());
+    let previous_target = previous.target.to_tmux_target();
+    let next_target = next.target.to_tmux_target();
+    assert_ne!(previous_target, next_target);
+
+    let transition = plan_tmux_attach_transition(
+        Some(&previous),
+        Some(&next),
+        &previous_target,
+        &next_target,
+        true,
+        SectionPhase::Ready,
+        true,
+    );
+    assert!(transition.owner_changed);
+    assert!(transition.reset_reads);
+    assert!(transition.load_sessions);
+
+    let tab_id = TabId::new();
+    let previous = tmux_attach_binding_fixture(tab_id.clone(), None, Some("alpha"), PaneId::new());
+    let next = tmux_attach_binding_fixture(tab_id, None, Some("beta"), PaneId::new());
+    let previous_target = previous.target.to_tmux_target();
+    let next_target = next.target.to_tmux_target();
+    assert_ne!(previous_target, next_target);
+    let transition = plan_tmux_attach_transition(
+        Some(&previous),
+        Some(&next),
+        &previous_target,
+        &next_target,
+        true,
+        SectionPhase::Ready,
+        true,
+    );
+    assert!(transition.owner_changed);
+    assert!(transition.reset_reads);
+    assert!(transition.load_sessions);
+}
+
+/// 目标失效时先丢弃旧查询和详情；不能为复用列表继续展示失效目标的数据。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_attach_invalid_target_resets_without_refetch() {
+    let previous =
+        tmux_attach_binding_fixture(TabId::new(), Some(HostId::new()), None, PaneId::new());
+    let target = previous.target.to_tmux_target();
+    let transition = plan_tmux_attach_transition(
+        Some(&previous),
+        None,
+        &target,
+        &target,
+        false,
+        SectionPhase::Ready,
+        true,
+    );
+    assert!(transition.owner_changed);
+    assert!(transition.reset_reads);
+    assert!(!transition.load_sessions);
+}
+
+/// 面板隐藏或尚未初始化时只登记重置；同目标首次可见时仍允许补读。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_attach_target_change_waits_for_activation_and_initial_load() {
+    let tab_id = TabId::new();
+    let host_id = HostId::new();
+    let previous =
+        tmux_attach_binding_fixture(tab_id.clone(), Some(host_id.clone()), None, PaneId::new());
+    let next = tmux_attach_binding_fixture(tab_id.clone(), Some(host_id), None, PaneId::new());
+    let previous_target = previous.target.to_tmux_target();
+    let next_target = next.target.to_tmux_target();
+    assert_eq!(previous_target, next_target);
+
+    let other_previous =
+        tmux_attach_binding_fixture(tab_id.clone(), Some(HostId::new()), None, PaneId::new());
+    let other_next = tmux_attach_binding_fixture(tab_id, Some(HostId::new()), None, PaneId::new());
+    let other_previous_target = other_previous.target.to_tmux_target();
+    let other_next_target = other_next.target.to_tmux_target();
+    assert_ne!(other_previous_target, other_next_target);
+
+    let hidden = plan_tmux_attach_transition(
+        Some(&other_previous),
+        Some(&other_next),
+        &other_previous_target,
+        &other_next_target,
+        true,
+        SectionPhase::Ready,
+        false,
+    );
+    assert!(hidden.owner_changed);
+    assert!(hidden.reset_reads);
+    assert!(!hidden.load_sessions);
+
+    let same_target_not_loaded = plan_tmux_attach_transition(
+        Some(&previous),
+        Some(&next),
+        &previous_target,
+        &next_target,
+        true,
+        SectionPhase::NotLoaded,
+        true,
+    );
+    assert!(same_target_not_loaded.owner_changed);
+    assert!(!same_target_not_loaded.reset_reads);
+    assert!(same_target_not_loaded.load_sessions);
+}
+
+/// 同目标正在读取、成功、失败或取消时换 pane 不重复请求，保留快照供用户操作。
+///
+/// @author kongweiguang
+#[test]
+fn tmux_attach_same_target_keeps_inflight_and_retryable_reads() {
+    let tab_id = TabId::new();
+    let host_id = HostId::new();
+    let previous =
+        tmux_attach_binding_fixture(tab_id.clone(), Some(host_id.clone()), None, PaneId::new());
+    let next = tmux_attach_binding_fixture(tab_id, Some(host_id), None, PaneId::new());
+    let target = previous.target.to_tmux_target();
+    assert_eq!(target, next.target.to_tmux_target());
+
+    // Failed/Cancelled 也保持现状：切 pane 不自动重试，避免在用户未确认时重复远端读取；
+    // 需要恢复时由用户显式刷新触发重新读取。
+    for phase in [
+        SectionPhase::Loading,
+        SectionPhase::Ready,
+        SectionPhase::Failed,
+        SectionPhase::Cancelled,
+    ] {
+        let transition = plan_tmux_attach_transition(
+            Some(&previous),
+            Some(&next),
+            &target,
+            &target,
+            true,
+            phase,
+            true,
+        );
+        assert!(transition.owner_changed);
+        assert!(!transition.reset_reads, "phase {phase:?}");
+        assert!(!transition.load_sessions, "phase {phase:?}");
+    }
+}
+
 /// 面板被关闭时 section 会撤销尚未结束的读取任务。
 #[test]
 fn dropping_section_cancels_pending_request() {
@@ -550,35 +939,93 @@ fn stale_container_mutation_marks_original_target_until_authoritative_refresh() 
     );
 }
 
-/// tmux 回执在同 host 的 pane 代次变化后仍刷新列表；异 host 只保留 dirty，避免跨目标写回。
+/// tmux 回执按完整查询目标刷新；dirty 只保留当前目标的未确认状态，由目标重置重新置位。
+///
+/// 同目标 pane 变化只阻止状态改写；旧目标迟到写回不缓存，切回时依赖重置先产生 dirty。
 ///
 /// @author kongweiguang
 #[test]
-fn tmux_mutation_decision_separates_host_refresh_from_view_update() {
-    let original_host = Some(HostId::new());
-    let other_host = Some(HostId::new());
+fn tmux_mutation_decision_scopes_refresh_and_dirty_to_full_target() {
+    let host = HostId::new();
+    let ssh_target = TmuxTarget {
+        host_id: Some(host.clone()),
+        ..TmuxTarget::default()
+    };
     let mut dirty = DirtyOperationTargets::default();
 
-    let same_view = dirty.tmux_mutation_completed(original_host.clone(), &original_host, 3, 3);
-    assert!(same_view.refresh_current_host);
+    let same_view = dirty.tmux_mutation_completed(ssh_target.clone(), &ssh_target, 3, 3);
+    assert!(same_view.refresh_current_target);
     assert!(same_view.update_current_view);
+    assert!(dirty.tmux_is_dirty(&ssh_target));
+    dirty.tmux_refreshed(&ssh_target);
+    assert!(!dirty.tmux_is_dirty(&ssh_target));
 
-    let changed_pane = dirty.tmux_mutation_completed(original_host.clone(), &original_host, 3, 4);
-    assert!(changed_pane.refresh_current_host);
+    // 同 query 目标只换 pane：列表仍可刷新，但旧 pane 的确认/状态不得写回新焦点。
+    let changed_pane = dirty.tmux_mutation_completed(ssh_target.clone(), &ssh_target, 3, 4);
+    assert!(changed_pane.refresh_current_target);
     assert!(!changed_pane.update_current_view);
+    dirty.tmux_refreshed(&ssh_target);
 
-    let different_host = dirty.tmux_mutation_completed(original_host.clone(), &other_host, 3, 3);
-    assert!(!different_host.refresh_current_host);
-    assert!(!different_host.update_current_view);
-    assert!(dirty.tmux_hosts.contains(&original_host));
-    assert!(!dirty.tmux_hosts.contains(&other_host));
+    let alpha = TmuxTarget {
+        profile_id: Some("alpha".to_owned()),
+        ..TmuxTarget::default()
+    };
+    let beta = TmuxTarget {
+        profile_id: Some("beta".to_owned()),
+        ..TmuxTarget::default()
+    };
+    assert_ne!(alpha, beta);
 
-    let returned_to_original =
-        dirty.tmux_mutation_completed(original_host.clone(), &original_host, 3, 5);
-    assert!(returned_to_original.refresh_current_host);
-    assert!(!returned_to_original.update_current_view);
-    dirty.tmux_refreshed(&original_host);
-    assert!(!dirty.tmux_hosts.contains(&original_host));
+    // Local profile alpha 的迟到回执到达 beta 时不能触发 beta 刷新或改写 beta 视图；
+    // 有界状态不为已离开的 alpha 保留历史 dirty，切回时由目标重置重新置为未确认。
+    let late_alpha = dirty.tmux_mutation_completed(alpha.clone(), &beta, 3, 3);
+    assert!(!late_alpha.refresh_current_target);
+    assert!(!late_alpha.update_current_view);
+    assert!(!dirty.tmux_is_dirty(&alpha));
+    assert!(!dirty.tmux_is_dirty(&beta));
+
+    // beta 成功读取只清 beta 的 dirty，不能代办 alpha 的未核对变更。
+    dirty.tmux_refreshed(&beta);
+    assert!(!dirty.tmux_is_dirty(&alpha));
+    assert!(!dirty.tmux_is_dirty(&beta));
+
+    // 切回 alpha 属于一次新的目标重置：先标未确认，失败或不可用时保留激活重试机会。
+    dirty.mark_tmux_dirty(alpha.clone());
+    let returned = dirty.tmux_mutation_completed(alpha.clone(), &alpha, 3, 7);
+    assert!(returned.refresh_current_target);
+    assert!(!returned.update_current_view);
+    // 失败重试不会调用 tmux_refreshed；dirty 保留到同一目标成功读取，避免失败被当成已核对。
+    assert!(dirty.tmux_is_dirty(&alpha));
+    dirty.tmux_refreshed(&alpha);
+    assert!(!dirty.tmux_is_dirty(&alpha));
+
+    // 同 host/profile 但 socket 不同仍是不同查询目标，不能互相刷新或清 dirty。
+    let socket_a = TmuxTarget {
+        host_id: Some(host.clone()),
+        socket_name: Some("a".to_owned()),
+        ..TmuxTarget::default()
+    };
+    let socket_b = TmuxTarget {
+        host_id: Some(host),
+        socket_name: Some("b".to_owned()),
+        ..TmuxTarget::default()
+    };
+    let other_socket = dirty.tmux_mutation_completed(socket_a.clone(), &socket_b, 1, 1);
+    assert!(!other_socket.refresh_current_target);
+    assert!(!other_socket.update_current_view);
+    assert!(!dirty.tmux_is_dirty(&socket_a));
+    assert!(!dirty.tmux_is_dirty(&socket_b));
+    dirty.tmux_refreshed(&socket_b);
+    assert!(!dirty.tmux_is_dirty(&socket_a));
+
+    // 当前目标重复写回只保留一个未确认目标；切换目标后旧标记被新目标覆盖，状态有固定上界。
+    for _ in 0..100 {
+        dirty.mark_tmux_dirty(socket_a.clone());
+    }
+    assert!(dirty.tmux_is_dirty(&socket_a));
+    dirty.mark_tmux_dirty(alpha.clone());
+    assert!(dirty.tmux_is_dirty(&alpha));
+    assert!(!dirty.tmux_is_dirty(&socket_a));
 }
 
 /// 在状态模块内核对私有目标，保留迟到成功不能绑定历史或追加样本的回归，避免为测试暴露 getter。
@@ -1309,4 +1756,122 @@ fn tmux_detail_hide_leaves_completed_snapshot_unchanged() {
         detail.capture.as_ref().map(|capture| capture.text.as_str()),
         Some("complete")
     );
+}
+
+/// 写回执暂存按完整目标和操作身份去重，同目标重试覆盖旧提示，容量固定且不累积历史。
+/// 消费只取走目标匹配的提示一次，其它目标的失败或未知结果不会被串走。
+///
+/// @author kongweiguang
+#[test]
+fn deferred_tmux_feedback_is_bounded_identity_scoped_and_consumed_once() {
+    let target_a = TmuxTarget {
+        host_id: Some(HostId::new()),
+        ..TmuxTarget::default()
+    };
+    let target_b = TmuxTarget {
+        host_id: Some(HostId::new()),
+        ..TmuxTarget::default()
+    };
+    let mut queue = VecDeque::new();
+    let mut losses = 0usize;
+
+    defer_tmux_feedback(
+        &mut queue,
+        &mut losses,
+        TmuxMutationFeedback {
+            target: target_a.clone(),
+            identity: TmuxMutationIdentity::Kill {
+                session_id: "$1".to_owned(),
+            },
+            message: "first".to_owned(),
+        },
+    );
+    // 同目标同操作的迟到重试覆盖旧文案，不累积两条冲突提示；被覆盖的旧结果
+    // 尚未展示，必须计入显式丢失，不能静默消失。
+    defer_tmux_feedback(
+        &mut queue,
+        &mut losses,
+        TmuxMutationFeedback {
+            target: target_a.clone(),
+            identity: TmuxMutationIdentity::Kill {
+                session_id: "$1".to_owned(),
+            },
+            message: "retry".to_owned(),
+        },
+    );
+    assert_eq!(losses, 1);
+    defer_tmux_feedback(
+        &mut queue,
+        &mut losses,
+        TmuxMutationFeedback {
+            target: target_b.clone(),
+            identity: TmuxMutationIdentity::Detach {
+                session_id: "$2".to_owned(),
+            },
+            message: "other".to_owned(),
+        },
+    );
+    assert_eq!(losses, 1);
+    assert_eq!(queue.len(), 2);
+
+    // 消费只取走 A 的提示，B 的失败留给 B 返回时显示。
+    assert_eq!(
+        take_deferred_tmux_feedback(&mut queue, &target_a).as_deref(),
+        Some("retry")
+    );
+    assert_eq!(queue.len(), 1);
+    assert!(take_deferred_tmux_feedback(&mut queue, &target_a).is_none());
+
+    // 不同操作身份各自保留；容量上限按 FIFO 淘汰最早条目，被淘汰条目计入显式丢失。
+    // 循环开始前队列里仍有 B 的一条 Detach，它会先于本轮新增条目被淘汰；只按“本轮
+    // 溢出数”断言会漏掉这条从未展示的既有结果，因此丢失增量必须包含它。
+    let before = losses;
+    let queued_before = queue.len();
+    assert_eq!(queued_before, 1, "target B entry must still be queued");
+    let inserted = TMUX_DEFERRED_FEEDBACK_CAPACITY + 3;
+    for index in 0..inserted {
+        defer_tmux_feedback(
+            &mut queue,
+            &mut losses,
+            TmuxMutationFeedback {
+                target: target_a.clone(),
+                identity: TmuxMutationIdentity::Rename {
+                    session_id: format!("${index}"),
+                },
+                message: format!("rename {index}"),
+            },
+        );
+    }
+    assert_eq!(queue.len(), TMUX_DEFERRED_FEEDBACK_CAPACITY);
+    // 既有 B 条目 + 本轮插入条目超出容量的部分都要计入丢失。
+    let evicted = queued_before + inserted - TMUX_DEFERRED_FEEDBACK_CAPACITY;
+    assert_eq!(
+        losses - before,
+        evicted,
+        "pre-existing and overflowing entries are both counted as lost"
+    );
+    assert!(
+        queue.iter().all(|entry| entry.target == target_a),
+        "oldest entry (target B) is evicted first once capacity is exceeded"
+    );
+    let consumed = take_deferred_tmux_feedback(&mut queue, &target_a).expect("queued renames");
+    // 被淘汰的既有条目不属于本轮 rename，因此本轮 rename 的起点是“被淘汰数 - 既有条数”。
+    let first_kept = evicted - queued_before;
+    let expected = (first_kept..inserted)
+        .map(|index| format!("rename {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        consumed, expected,
+        "FIFO keeps exactly the newest entries in arrival order"
+    );
+    assert!(queue.is_empty());
+
+    // 丢失只累计条数，不保存被丢文案；提示只报数量与原因，不伪造结果归属，
+    // 断言同时接受双语文案，不预设应用 locale。
+    let notice = super::tmux_feedback_loss_notice(3);
+    assert!(notice.contains('3'));
+    assert!(notice.contains("未展示") || notice.contains("were not shown"));
+    assert!(!notice.contains("rename 0"));
+    assert!(!notice.contains("retry"));
 }

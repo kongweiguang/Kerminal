@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "id": "acme.notes",
+  "name": {
+    "en": "Workspace Notes",
+    "zh-CN": "工作区笔记"
+  },
+  "description": {
+    "en": "Keep a small workspace note"
+  },
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "acme",
+  "runtime": {
+    "kind": "none"
+  },
+  "permissions": [],
+  "contributes": {
+    "host_types": [
+      {
+        "id": "example",
+        "title": "Example Host",
+        "schema": "schemas/host.json"
+      }
+    ]
+  },
+  "views": {}
+}

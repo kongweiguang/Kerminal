@@ -4,13 +4,18 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use kerminal_domain::plugins::{PendingPluginChange, PluginId, PluginStoreState, PluginVersion};
+use kerminal_domain::plugins::{
+    PendingPluginChange, PluginId, PluginInstallStatus, PluginStoreState, PluginVersion,
+};
 use kerminal_plugin_protocol::Platform;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AppError, AppResult};
+use crate::{
+    AppError, AppResult,
+    plugins::{CORE_PLUGIN_ID, PluginRegistry, is_builtin_unit},
+};
 
 /// 目录是验签后的只读投影；来源由宿主固定，不由条目声明。
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -59,7 +64,7 @@ impl CatalogVersion {
         Ok(requirement.satisfies(&version))
     }
 
-    /// 平台资产对应 Sidecar 包，按协议隐含完全访问权限。
+    /// 平台资产对应 Sidecar 包；完全访问只用于界面展示，不再限制运行能力。
     pub fn requires_full_access(&self) -> bool {
         self.assets
             .iter()
@@ -109,13 +114,33 @@ pub struct CatalogSelection {
     pub platform: Platform,
 }
 
+/// 扩展页展示的内置单元静态身份，不包含运行时启停结果。
+///
+/// 内置单元不存在于插件安装记录中，因此这里只承载身份与可关闭性：启用态仍以
+/// 权威 `PluginStoreState.builtins`（缺省 true）为准。页面通过本 DTO 枚举条目，
+/// 无需复制内置名单或直接持有 `PluginRegistry`。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltinUnit {
+    /// 固定稳定身份；显示名变化不影响持久引用。
+    pub id: PluginId,
+    /// 注册表原文名称；本地化由界面按 `id` 处理，应用层不做语言选择。
+    pub name: String,
+    /// 核心单元为 false，其余内置单元允许关闭；持久化受理由存储端负责。
+    pub can_disable: bool,
+}
+
 /// 不同操作只表达用户意图，状态迁移由存储端核对当前权威快照。
 #[derive(Clone, Debug)]
 pub enum ExtensionChange {
     Enable(PluginId),
     Disable(PluginId),
+    /// 单版本目录已没有可回退版本；变体只为 UI 编译兼容保留，服务层固定拒绝。
     Rollback(PluginId),
     Uninstall(PluginId),
+    /// 目录缺失的登记项只移除记录，不触碰 `data/` 与磁盘材料；有无 pending 由存储端核对。
+    RemoveMissingRecord(PluginId),
     /// 取消必须绑定用户已看过的失败意图，避免旧页面撤销更新后的另一笔操作。
     CancelFailedChange {
         expected_revision: u64,
@@ -123,12 +148,32 @@ pub enum ExtensionChange {
     },
 }
 
-/// 预检结果绑定待确认的文件摘要，展示权限包含 Sidecar 的隐含完全访问。
+/// 手动放入插件的只读观察结果；确认时用指纹与 revision 绑定用户实际看到的目录内容。
+#[derive(Clone, Debug)]
+pub struct DropInInspection {
+    pub id: PluginId,
+    pub version: PluginVersion,
+    /// 名称按语言保留原文，界面自行选择；目录损坏或清单不可读时为空。
+    pub name: BTreeMap<String, String>,
+    /// 权限仅作描述；Sidecar 隐含的完全访问由基础设施追加。
+    pub permissions: Vec<String>,
+    /// 检查时目录的内容摘要；目录缺失或无法安全读取时为空，界面不能据此确认。
+    pub fingerprint: Option<String>,
+    pub enabled: bool,
+    pub confirmed: bool,
+    /// 如实报告磁盘证据，不把损坏、缺失或旧运行时伪造成已就绪。
+    pub status: PluginInstallStatus,
+    /// 本次观察对应的状态修订，确认时用于拒绝过期页面。
+    pub revision: u64,
+}
+
+/// 预检结果绑定待确认的文件摘要；权限字段仅用于界面展示，安装时不再校验授权。
 #[derive(Clone, Debug)]
 pub struct LocalPackageInspection {
     pub id: PluginId,
     pub version: PluginVersion,
     pub name: BTreeMap<String, String>,
+    /// 清单声明原样保留；Sidecar 追加 "full-access" 仅作展示。
     pub permissions: Vec<String>,
     pub size: u64,
     pub sha256: String,
@@ -184,6 +229,18 @@ pub trait PluginPackageStore: Send + Sync + 'static {
     ) -> AppResult<ExtensionReceipt>;
     /// 每个意图基于当前状态执行 CAS，不重放未知结果。
     async fn change(&self, change: ExtensionChange) -> AppResult<ExtensionReceipt>;
+    /// 只读列出手动放入的插件；目录缺失、损坏或旧运行时也必须如实报告，不能修改状态。
+    async fn inspect_drop_ins(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<Vec<DropInInspection>>;
+    /// 确认必须绑定检查时的指纹与修订；成功后只排队启用，运行态在重启后生效。
+    async fn confirm_drop_in(
+        &self,
+        id: PluginId,
+        expected_fingerprint: String,
+        expected_revision: u64,
+    ) -> AppResult<ExtensionReceipt>;
     /// 数据删除是独立的显式操作，仓储核对插件生命周期与路径安全。
     async fn delete_data(&self, id: PluginId) -> AppResult<()>;
 }
@@ -198,6 +255,31 @@ impl ExtensionsService {
     /// 注入共享仓储和目录，避免界面构造另一套信任配置。
     pub fn new(catalog: Arc<dyn CatalogSource>, packages: Arc<dyn PluginPackageStore>) -> Self {
         Self { catalog, packages }
+    }
+
+    /// 枚举内置单元供扩展页展示；只读冻结目录，不触碰目录端口或安装存储。
+    ///
+    /// 页面在 activate 时同步调用即可，顺序与 `providers()` 的注册顺序一致，
+    /// 避免界面另维护名单后与启动装配漂移。身份转换失败说明内置声明本身无效，
+    /// 属于启动级基础设施问题，因此带 source 返回而不是静默丢弃条目。
+    ///
+    /// @author kongweiguang
+    pub fn builtin_units(&self) -> AppResult<Vec<BuiltinUnit>> {
+        let registry = PluginRegistry::builtin()?;
+        registry
+            .providers()
+            .iter()
+            .map(|descriptor| {
+                let id = PluginId::parse(descriptor.id.as_str()).map_err(|source| {
+                    AppError::infrastructure_with_source("内置插件身份无效", source)
+                })?;
+                Ok(BuiltinUnit {
+                    id,
+                    name: descriptor.name.clone(),
+                    can_disable: descriptor.can_disable,
+                })
+            })
+            .collect()
     }
 
     /// 缓存和刷新分开，页面可以先显示已有内容再异步更新。
@@ -307,8 +389,50 @@ impl ExtensionsService {
     }
 
     /// 生命周期操作只排队；取消失败意图只撤销该次排队，不热替换运行中的贡献。
+    ///
+    /// 回退变体只为界面编译保留：单版本目录没有旧版本可切回，固定返回类型化错误，
+    /// 且不把任何排队意图写入存储。内置单元不存在安装记录，卸载类意图在转发前拒绝；
+    /// 核心单元也不能停用。这些校验都发生在触达存储之前，避免仓储承担 UI 语义判断。
+    ///
+    /// @author kongweiguang
     pub async fn change(&self, change: ExtensionChange) -> AppResult<ExtensionReceipt> {
+        if matches!(&change, ExtensionChange::Rollback(_)) {
+            return Err(AppError::invalid("插件回退已移除"));
+        }
+        match &change {
+            // 核心单元是应用基本可用的前提，必须始终启用；先于通用内置判断返回明确文案。
+            ExtensionChange::Disable(id) if id.as_str() == CORE_PLUGIN_ID => {
+                return Err(AppError::invalid("核心插件不可停用"));
+            }
+            // 内置单元没有安装记录，卸载与移除缺失记录都无从执行；启停则正常排队。
+            ExtensionChange::Uninstall(id) | ExtensionChange::RemoveMissingRecord(id)
+                if is_builtin_unit(id.as_str()) =>
+            {
+                return Err(AppError::invalid("内置单元没有安装记录"));
+            }
+            _ => {}
+        }
         self.packages.change(change).await
+    }
+
+    /// 手动放入插件默认未确认；这里只转发只读观察，是否可确认由目录证据决定。
+    pub async fn inspect_drop_ins(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<Vec<DropInInspection>> {
+        self.packages.inspect_drop_ins(cancellation).await
+    }
+
+    /// 指纹与修订都来自用户看过的检查结果；存储端在锁内重算后再提交启用。
+    pub async fn confirm_drop_in(
+        &self,
+        id: PluginId,
+        expected_fingerprint: String,
+        expected_revision: u64,
+    ) -> AppResult<ExtensionReceipt> {
+        self.packages
+            .confirm_drop_in(id, expected_fingerprint, expected_revision)
+            .await
     }
 
     /// 删除数据需要界面传入明确确认，卸载不会隐式触碰数据。

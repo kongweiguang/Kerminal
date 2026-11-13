@@ -14,12 +14,16 @@ use std::{
 use gpui_kit::{AppContext as _, Context, Entity, TestAppContext, VisualTestContext, Window};
 use kerminal_application::{
     AppResult, ApplicationTaskExecutor, ProfileService,
-    connections::management::{
-        HostAuthenticationMode, HostDocumentRevision, HostDraft, HostGroup,
-        HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot, HostManagementRepository,
-        HostManagementService, HostRouteSettings, HostSftpOptions, HostTerminalOptions,
-        ManagedHost, RdpDisplayOptions,
+    connections::{
+        RdpLaunchService,
+        management::{
+            HostAuthenticationMode, HostDocumentRevision, HostDraft, HostGroup,
+            HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot, HostManagementRepository,
+            HostManagementService, HostRouteSettings, HostSftpOptions, HostTerminalOptions,
+            ManagedHost, RdpDisplayOptions,
+        },
     },
+    plugins::PluginRegistry,
     preferences::{
         DefaultLocalShellProvider, ProfileDraft, ProfileRepository, ProfileRevision,
         VersionedProfile,
@@ -315,9 +319,38 @@ fn fixture_with_profiles(
     groups: Vec<HostGroup>,
     profiles: Option<ProfileService>,
 ) -> (Runtime, Entity<ConnectionsPanel>, &mut VisualTestContext) {
+    fixture_with_services_and_profiles(app, rows, groups, None, None, profiles)
+}
+
+/// 需要冻结插件启用视图或 RDP 启动器时复用同一生产面板装配，避免测试另建一条
+/// 绕过构造器默认值的初始化路径。
+///
+/// @author kongweiguang
+pub(in crate::features::connections) fn fixture_with_services(
+    app: &mut TestAppContext,
+    rows: Vec<ManagedHost>,
+    groups: Vec<HostGroup>,
+    plugins: Option<Arc<PluginRegistry>>,
+    rdp: Option<Arc<RdpLaunchService>>,
+) -> (Runtime, Entity<ConnectionsPanel>, &mut VisualTestContext) {
+    fixture_with_services_and_profiles(app, rows, groups, plugins, rdp, None)
+}
+
+fn fixture_with_services_and_profiles(
+    app: &mut TestAppContext,
+    rows: Vec<ManagedHost>,
+    groups: Vec<HostGroup>,
+    plugins: Option<Arc<PluginRegistry>>,
+    rdp: Option<Arc<RdpLaunchService>>,
+    profiles: Option<ProfileService>,
+) -> (Runtime, Entity<ConnectionsPanel>, &mut VisualTestContext) {
     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
     let executor = ApplicationTaskExecutor::new(runtime.handle().clone());
     let hosts = HostManagementService::new(Arc::new(ReadOnlyHostDirectory { rows, groups }));
+    let hosts = match plugins {
+        Some(plugins) => hosts.with_plugins(plugins),
+        None => hosts,
+    };
     app.update(|app| {
         crate::init(app);
         app.set_reduce_motion(true);
@@ -328,7 +361,7 @@ fn fixture_with_profiles(
         let panel = cx.new(|cx| {
             let panel = ConnectionsPanel::new(
                 hosts,
-                None,
+                rdp,
                 executor,
                 ConfigurationRecoveryState {
                     mode: ConfigurationMode::ReadWrite,
@@ -1262,6 +1295,9 @@ fn sidebar_container_cancel_releases_intent(app: &mut TestAppContext) {
 
 #[path = "connections_probe_lifecycle.rs"]
 mod probe_lifecycle_tests;
+
+#[path = "connections_protocol_gating.rs"]
+mod protocol_gating_tests;
 
 #[path = "connections_editor_scroll.rs"]
 mod scroll_tests;

@@ -7,6 +7,7 @@ use std::time::Instant;
 use gpui_kit::{Context, IntoElement, Render, Window, div, prelude::*, px};
 
 use crate::theme::UI_TRANSITION_DURATION as TRANSITION_DURATION;
+use crate::ui_motion::motion_allowed;
 
 /// 仅保存布局已决定的可见性，动画进度不能反向影响空间预算或面板归属。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +93,7 @@ impl WorkbenchMotion {
         reduce_motion: bool,
     ) -> MotionFrame {
         if self.targets != Some(targets) {
-            self.allow_motion = !reduce_motion && system_allows_motion();
+            self.allow_motion = motion_allowed(reduce_motion);
         }
         self.update_at(targets, Instant::now(), self.allow_motion && !reduce_motion)
     }
@@ -146,38 +147,7 @@ impl Render for WorkbenchMotion {
     }
 }
 
-/// Windows 未能读取偏好时保守地关闭动效；该读取只在目标变化时发生。
-#[cfg(target_os = "windows")]
-fn system_allows_motion() -> bool {
-    const SPI_GETCLIENTAREAANIMATION: u32 = 4162;
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SystemParametersInfoW(
-            action: u32,
-            parameter: u32,
-            value: *mut core::ffi::c_void,
-            flags: u32,
-        ) -> i32;
-    }
-    let mut enabled: i32 = 0;
-    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL to this valid pointer and retains no reference.
-    let success = unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            (&mut enabled as *mut i32).cast(),
-            0,
-        )
-    };
-    success != 0 && enabled != 0
-}
-
-/// 其它平台继续服从 GPUI 的 reduce_motion 状态，等待平台提供系统偏好映射。
-#[cfg(not(target_os = "windows"))]
-fn system_allows_motion() -> bool {
-    true
-}
-
+/// 测试反向、中断和无动画状态；系统偏好读取由共享动效模块统一提供。
 #[cfg(test)]
 #[path = "../../tests/unit/workbench_motion.rs"]
 mod tests;

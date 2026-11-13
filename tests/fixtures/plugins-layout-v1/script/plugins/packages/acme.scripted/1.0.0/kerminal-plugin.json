@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "id": "acme.scripted",
+  "name": {
+    "en": "Scripted Notes"
+  },
+  "description": {
+    "en": "Legacy script runtime package"
+  },
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "acme",
+  "runtime": {
+    "kind": "script",
+    "main": "main.js"
+  },
+  "permissions": [],
+  "contributes": {
+    "host_types": [
+      {
+        "id": "legacy",
+        "title": "Legacy Host",
+        "schema": "schemas/host.json"
+      }
+    ]
+  }
+}

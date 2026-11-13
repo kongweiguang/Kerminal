@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
     agents::{AgentResumeCapability, AgentSessionView},
+    plugins::PluginRegistryBuilder,
     preferences::{
         CONFIG_GUIDE, DefaultLocalShellProvider, ProfileDraft, ProfileRepository, ProfileRevision,
         ProfileService, VersionedProfile,
@@ -168,10 +169,37 @@ fn production_service_validation_lists_all_missing_capabilities() {
             "commands",
             "profiles",
             "configuration_validation",
+            "plugins",
             "task_executor",
         ]
     );
     assert!(error.to_string().contains("MCP 服务装配不完整"));
+}
+
+/// 冻结启用视图是生产装配的必需依赖；注入后缺失列表不再包含 plugins。
+///
+/// @author kongweiguang
+#[test]
+fn production_service_validation_requires_plugin_registry() {
+    let services = McpServices::new(Arc::new(FakeSessionService::default()));
+    assert!(
+        services
+            .validate_complete()
+            .expect_err("缺少插件启用视图时不能发布完整目录")
+            .missing_services()
+            .contains(&"plugins")
+    );
+
+    let mut builder = PluginRegistryBuilder::new();
+    builder.register_builtins().expect("内置声明应可注册");
+    let services = services.with_plugins(Arc::new(builder.freeze().expect("启用视图应可冻结")));
+    let missing = services
+        .validate_complete()
+        .expect_err("其余测试用依赖仍缺失")
+        .missing_services()
+        .to_vec();
+    assert!(!missing.contains(&"plugins"));
+    assert!(missing.contains(&"agents"));
 }
 
 /// 以真实 listener 验证无 Origin 原生请求、精确同源请求及 DNS rebinding 拒绝边界。

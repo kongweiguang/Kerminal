@@ -12,6 +12,7 @@ use kerminal_application::{
     connections::host_types::HostConfigurationCatalog,
     data_migration::{
         DataMigrationInspection, DataMigrationOutcome, DataMigrationReadiness, DataMigrationReport,
+        PluginLayoutOutcome,
     },
 };
 use uuid::Uuid;
@@ -29,17 +30,25 @@ pub(super) fn inspect_journals(root: &Path) -> AppResult<journal::JournalScan> {
     journal::inspect_journals(root)
 }
 
-/// 同一根锁内先恢复旧 journal 再重检升级；只有最终契约完整 current 才能放行普通服务。
+/// 同一根锁内先恢复插件布局或执行 schema 1 转换，再恢复数据 journal 并重检升级。
+///
+/// 插件布局结果未知时停止数据迁移，保留各自 journal；marker 仍然最后提交。
 pub(super) fn apply_locked(
     root: &Path,
     legacy_window_state: &Option<PathBuf>,
-    mut inspection_result: DataMigrationInspection,
     host_types: Option<&HostConfigurationCatalog>,
 ) -> AppResult<DataMigrationReport> {
+    let plugin_report = super::plugins::migrate_locked(root)?;
+    let mut inspection_result =
+        inspection::inspect_root(root, legacy_window_state.as_deref(), host_types)?;
     if inspection_result.readiness == DataMigrationReadiness::Blocked {
         return Err(AppError::conflict("用户数据迁移预检存在阻断项"));
     }
     let mut recovered = report(DataMigrationOutcome::AlreadyCurrent, 0, false, None);
+    // 回执只描述本次真正执行的插件步骤；Fresh/Current 的幂等读回保持缺省。
+    if plugin_report.outcome != PluginLayoutOutcome::AlreadyCurrent {
+        recovered.plugin_layout = Some(plugin_report.clone());
+    }
     let mut previous_committed = None;
     if let Some(mut active) = journal::read_active_journal(root)? {
         if active.state != JournalState::Committed {
@@ -84,6 +93,7 @@ pub(super) fn apply_locked(
     }
     migrated.changed_file_count += recovered.changed_file_count;
     migrated.resumed |= recovered.resumed;
+    migrated.plugin_layout = recovered.plugin_layout.clone();
     if migrated.resumed {
         migrated.outcome = DataMigrationOutcome::Resumed;
     }
@@ -1060,6 +1070,7 @@ fn report(
         resumed,
         backup_relative_paths: backup_relative_path.iter().cloned().collect(),
         backup_relative_path,
+        plugin_layout: None,
     }
 }
 

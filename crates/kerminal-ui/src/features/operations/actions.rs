@@ -20,11 +20,15 @@ use kerminal_domain::operations::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ContainerPanelContext, ContainerReadKind, OperationsEvent, OperationsView, TmuxDetailState,
+    ContainerPanelContext, ContainerReadKind, OperationsEvent, OperationsSection, OperationsView,
+    TmuxDetailState,
     container_mutation::{ContainerOperation, ContainerOperationOutcome},
     container_panel::ContainerPanelActionTicket,
     forms::{ForwardFormTransition, container_command, forward_config, next_forward_form_open},
-    state::{ContainerMutationRequest, LoadTicket, run_cancellable_request, run_section_request},
+    state::{
+        ContainerMutationRequest, LoadTicket, TmuxKilledDetailGuard, TmuxMutationIdentity,
+        run_cancellable_request, run_section_request,
+    },
 };
 
 use std::path::PathBuf;
@@ -340,6 +344,7 @@ impl OperationsView {
                 {
                     return;
                 }
+                self.complete_fixed_data_entrance(OperationsSection::ServerInfo, cx);
             }
             Ok(None) => {
                 self.server.cancel(&ticket);
@@ -392,6 +397,7 @@ impl OperationsView {
                             ) {
                                 return;
                             }
+                            view.complete_fixed_data_entrance(OperationsSection::ServerInfo, cx);
                         }
                         Ok(None) => {
                             view.server.cancel(&ticket);
@@ -488,6 +494,10 @@ impl OperationsView {
                                     !rows.iter().any(|row| row.target == target.target)
                                 });
                             if view.containers.complete(&ticket, Ok(rows)) {
+                                view.complete_fixed_data_entrance(
+                                    OperationsSection::Containers,
+                                    cx,
+                                );
                                 view.compose_projects = projects;
                                 if inspect_target_missing {
                                     view.container_inspect_request.cancel_pending();
@@ -604,7 +614,17 @@ impl OperationsView {
         }
     }
 
+    /// 只有实际执行 `list_sessions` 的可用快照才是权威列表；探测不可用时仅返回版本
+    /// 能力，空集合不是读取结果，不能消费写后 dirty，否则会丢掉能力恢复后的核对机会。
+    /// 成功空列表仍是有效读取，应清除该目标 dirty。
+    ///
+    /// @author kongweiguang
+    pub(super) fn tmux_snapshot_confirms_refresh(snapshot: &super::TmuxSnapshot) -> bool {
+        snapshot.capability.available
+    }
+
     /// tmux 的探测和 session 查询只影响 tmux 区域；未安装时显示能力原因而非伪装空成功。
+    /// 只有真实会话列表读取成功才消费写后 dirty，不可用探测保留恢复后的核对机会。
     /// 接纳新快照后复核待确认会话身份，已退出或重建的会话必须重新选择。
     ///
     /// @author kongweiguang
@@ -616,7 +636,8 @@ impl OperationsView {
         let cancel_request = ticket.cancellation.clone();
         let generation = self.target_generation;
         let target = self.tmux_target();
-        let target_host = target.host_id.clone();
+        // 完成回执必须按本次读取的完整目标清 dirty，不能只按 host 误清其它 profile/socket。
+        let refreshed_target = target.clone();
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -643,16 +664,21 @@ impl OperationsView {
                     }
                     match result {
                         Ok(Some(snapshot)) => {
-                            let selected_session_missing = view
-                                .tmux_details
-                                .session_id
-                                .as_ref()
-                                .is_some_and(|session_id| {
-                                    !snapshot
-                                        .sessions
-                                        .iter()
-                                        .any(|session| &session.id == session_id)
-                                });
+                            // dirty 只有在真实会话列表读取成功后才能消费；不可用探测只
+                            // 说明能力缺失，仍保留写后核对机会供恢复时重新确认。
+                            let list_confirmed = Self::tmux_snapshot_confirms_refresh(&snapshot);
+                            // 探测不可用时快照里的空 sessions 只是占位，并不代表执行过
+                            // `list_sessions`；把它当成权威空列表会在一次能力探测失败后
+                            // 清掉仍可能有效的详情，丢失恢复后的核对材料。
+                            let selected_session_missing = list_confirmed
+                                && view.tmux_details.session_id.as_ref().is_some_and(
+                                    |session_id| {
+                                        !snapshot
+                                            .sessions
+                                            .iter()
+                                            .any(|session| &session.id == session_id)
+                                    },
+                                );
                             if view.tmux.complete(&ticket, Ok(snapshot)) {
                                 if selected_session_missing {
                                     view.tmux_details.cancel_pending_reads();
@@ -663,7 +689,12 @@ impl OperationsView {
                                         ..TmuxDetailState::default()
                                     };
                                 }
-                                view.dirty_targets.tmux_refreshed(&target_host);
+                                if list_confirmed {
+                                    view.dirty_targets.tmux_refreshed(&refreshed_target);
+                                    // 只有真实会话列表成功才消费目标入场；probe-only 不可用
+                                    // 或失败仍等待能力恢复后的首个有效结果。
+                                    view.complete_fixed_data_entrance(OperationsSection::Tmux, cx);
+                                }
                                 view.reconcile_tmux_dialog_session(cx);
                             }
                         }
@@ -720,6 +751,10 @@ impl OperationsView {
                                     view.host_target.as_ref(),
                                 );
                                 if view.forwards.complete(&ticket, Ok(rows)) {
+                                    view.complete_fixed_data_entrance(
+                                        OperationsSection::PortForwards,
+                                        cx,
+                                    );
                                     view.sync_proxy_forward_projection(cx);
                                     if let Some(message) = message {
                                         view.notify_forward_error(message, generation, cx);
@@ -854,6 +889,7 @@ impl OperationsView {
         {
             return;
         }
+        let previous_container_scope = (self.host_target.clone(), self.runtime);
         self.runtime = runtime;
         self.container_host
             .reset_for_target(self.host_target.as_ref(), runtime);
@@ -872,6 +908,7 @@ impl OperationsView {
         self.container_output_target_label = None;
         self.status = None;
         self.container_delete_confirmation = None;
+        self.arm_container_data_entrance_if_changed(&previous_container_scope, cx);
         self.load_containers(cx);
     }
 
@@ -1015,11 +1052,13 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let current_host = view.host_target.clone();
+                    let current_runtime = view.runtime;
                     let target_is_current = view.dirty_targets.container_mutation_completed(
                         target_host.clone(),
                         target_runtime,
-                        &view.host_target,
-                        view.runtime,
+                        &current_host,
+                        current_runtime,
                     );
                     let outcome = match result {
                         Ok(receipt) if receipt.applied => ContainerOperationOutcome::Applied,
@@ -1293,11 +1332,13 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let current_host = view.host_target.clone();
+                    let current_runtime = view.runtime;
                     let target_is_current = view.dirty_targets.container_mutation_completed(
                         target_host.clone(),
                         target_runtime,
-                        &view.host_target,
-                        view.runtime,
+                        &current_host,
+                        current_runtime,
                     );
                     let outcome = match result {
                         Ok(_) => ContainerOperationOutcome::Applied,
@@ -1545,7 +1586,8 @@ impl OperationsView {
             name,
             working_directory,
         };
-        let target_host = request.target.host_id.clone();
+        // 写入回执归属打开表单时冻结的完整 tmux 查询目标，而不是完成时的 host 投影。
+        let frozen_target = request.target.clone();
         let tmux_view_generation = self.tmux_view_generation;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
@@ -1559,24 +1601,27 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let current_target = view.tmux_target();
+                    let current_view_generation = view.tmux_view_generation;
                     let disposition = view.dirty_targets.tmux_mutation_completed(
-                        target_host.clone(),
-                        &view.host_target,
+                        frozen_target.clone(),
+                        &current_target,
                         tmux_view_generation,
-                        view.tmux_view_generation,
+                        current_view_generation,
                     );
-                    if disposition.update_current_view {
-                        if result.is_ok() {
-                            view.clear_tmux_dialog();
-                            cx.emit(OperationsEvent::RootConfirmationChanged);
-                        }
-                        view.status = tmux_mutation_feedback(
-                            result,
-                            cancellation_requested,
-                            view.compact_layout,
-                        );
+                    if disposition.update_current_view && result.is_ok() {
+                        view.clear_tmux_dialog();
+                        cx.emit(OperationsEvent::RootConfirmationChanged);
                     }
-                    if disposition.refresh_current_host {
+                    // 反馈按冻结的完整目标投递：当前同目标立即显示，其它目标有界暂存，
+                    // 不因 pane 换焦点或隐藏而丢失失败、取消和未知结果。紧凑成功返回
+                    // None 也必须保留旧代码的清 status 语义，避免取消等待提示残留。
+                    view.apply_tmux_mutation_receipt(
+                        &frozen_target,
+                        TmuxMutationIdentity::Create,
+                        tmux_mutation_feedback(result, cancellation_requested, view.compact_layout),
+                    );
+                    if disposition.refresh_current_target {
                         view.load_tmux(cx);
                     }
                 });
@@ -1848,7 +1893,7 @@ impl OperationsView {
         let cancellation_status = request_cancellation.clone();
         let renamed_session_id = session_id.clone();
         let target = self.tmux_target();
-        let target_host = target.host_id.clone();
+        let frozen_target = target.clone();
         let tmux_view_generation = self.tmux_view_generation;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
@@ -1865,27 +1910,31 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let current_target = view.tmux_target();
+                    let current_view_generation = view.tmux_view_generation;
                     let disposition = view.dirty_targets.tmux_mutation_completed(
-                        target_host.clone(),
-                        &view.host_target,
+                        frozen_target.clone(),
+                        &current_target,
                         tmux_view_generation,
-                        view.tmux_view_generation,
+                        current_view_generation,
                     );
-                    if disposition.update_current_view {
-                        if result.is_ok()
-                            && view.tmux_rename_target.as_deref()
-                                == Some(renamed_session_id.as_str())
-                        {
-                            view.clear_tmux_dialog();
-                            cx.emit(OperationsEvent::RootConfirmationChanged);
-                        }
-                        view.status = tmux_mutation_feedback(
-                            result,
-                            cancellation_requested,
-                            view.compact_layout,
-                        );
+                    if disposition.update_current_view
+                        && result.is_ok()
+                        && view.tmux_rename_target.as_deref() == Some(renamed_session_id.as_str())
+                    {
+                        view.clear_tmux_dialog();
+                        cx.emit(OperationsEvent::RootConfirmationChanged);
                     }
-                    if disposition.refresh_current_host {
+                    // 改名反馈同样绑定冻结目标和会话身份，换 pane 或离开目标都不静默丢弃；
+                    // 紧凑成功为 None 时仍按旧语义清当前 status，不让取消等待提示残留。
+                    view.apply_tmux_mutation_receipt(
+                        &frozen_target,
+                        TmuxMutationIdentity::Rename {
+                            session_id: renamed_session_id.clone(),
+                        },
+                        tmux_mutation_feedback(result, cancellation_requested, view.compact_layout),
+                    );
+                    if disposition.refresh_current_target {
                         view.load_tmux(cx);
                     }
                 });
@@ -1895,7 +1944,9 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// kill 复核冻结的 server 与会话 ID；失败保留确认，回读期间禁重复提交，实际回执才可清详情。
+    /// kill 复核冻结的完整目标与会话身份；失败保留确认，回读期间禁重复提交。
+    /// 同目标换 pane 时回执不改写新视图，但已确认删除且身份仍可核对的旧详情会清理，
+    /// 避免列表刷新失败后继续展示已结束会话的窗口与 capture。
     ///
     /// @author kongweiguang
     pub(super) fn kill_tmux_session(&mut self, session_id: String, cx: &mut Context<Self>) {
@@ -1908,10 +1959,18 @@ impl OperationsView {
         self.busy = true;
         let request_cancellation = self.begin_operation_mutation();
         let cancellation_status = request_cancellation.clone();
-        let killed_session_id = session_id.clone();
         let target = self.tmux_target();
-        let target_host = target.host_id.clone();
+        let frozen_target = target.clone();
+        let killed_session_id = session_id.clone();
         let tmux_view_generation = self.tmux_view_generation;
+        // 换 pane 时回执不能写新视图，但已确认删除的旧详情仍需清理；冻结最小身份门禁，
+        // 只清提交时展示的原会话，不碰新 pane 的 status、确认或后续选择。
+        let killed_detail_guard = TmuxKilledDetailGuard::freeze(
+            &frozen_target,
+            self.target_generation,
+            &self.tmux_details,
+            self.tmux_dialog_session.as_ref(),
+        );
         let operations = self.operations.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
@@ -1927,33 +1986,64 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let current_target = view.tmux_target();
+                    let current_view_generation = view.tmux_view_generation;
                     let disposition = view.dirty_targets.tmux_mutation_completed(
-                        target_host.clone(),
-                        &view.host_target,
+                        frozen_target.clone(),
+                        &current_target,
                         tmux_view_generation,
-                        view.tmux_view_generation,
+                        current_view_generation,
                     );
-                    if disposition.update_current_view {
-                        if result.is_ok() {
-                            view.clear_tmux_dialog();
-                            cx.emit(OperationsEvent::RootConfirmationChanged);
-                        }
-                        let killed = matches!(&result, Ok(true));
-                        view.status = match result {
-                            Ok(true) if view.compact_layout => None,
-                            Ok(killed) => Some(kill_session_result_message(Ok(killed))),
-                            Err(error) => {
-                                Some(mutation_error_message(error, cancellation_requested))
-                            }
-                        };
-                        if killed
-                            && view.tmux_details.session_id.as_deref()
-                                == Some(killed_session_id.as_str())
-                        {
-                            view.tmux_details = TmuxDetailState::default();
-                        }
+                    let killed = matches!(&result, Ok(true));
+                    // 已确认删除时，即使换 pane 抑制了状态回执，也可在身份仍可核对时
+                    // 清掉原会话的旧详情；列表刷新失败后不能再向用户展示其窗口/capture。
+                    let confirmed_killed_details =
+                        killed_detail_guard.as_ref().is_some_and(|guard| {
+                            guard.can_clear(
+                                killed,
+                                &view.tmux_target(),
+                                view.target_generation,
+                                &view.tmux_details,
+                                view.tmux
+                                    .data()
+                                    .map(|snapshot| snapshot.sessions.as_slice())
+                                    .unwrap_or(&[]),
+                            )
+                        });
+                    if disposition.update_current_view && result.is_ok() {
+                        view.clear_tmux_dialog();
+                        cx.emit(OperationsEvent::RootConfirmationChanged);
                     }
-                    if disposition.refresh_current_host {
+                    // kill 的成功、已不存在、失败与取消都要有归属：当前同目标立即显示，
+                    // 已离开的目标暂存一次，避免换 pane 后提示随代次抑制一起消失。
+                    // 紧凑成功为 None 时仍按旧语义清当前 status，让取消等待提示随真实
+                    // 成功回执一起消失，而不是永久残留与终态矛盾。
+                    let kill_receipt = match &result {
+                        Ok(true) if view.compact_layout => None,
+                        Ok(killed) => Some(kill_session_result_message(Ok(*killed))),
+                        Err(error) => Some(mutation_error_message(
+                            error.clone(),
+                            cancellation_requested,
+                        )),
+                    };
+                    view.apply_tmux_mutation_receipt(
+                        &frozen_target,
+                        TmuxMutationIdentity::Kill {
+                            session_id: killed_session_id.clone(),
+                        },
+                        kill_receipt,
+                    );
+                    if confirmed_killed_details {
+                        // 只重置经身份门禁确认的旧会话详情；新 pane 的状态、确认、当前
+                        // 选择与会话列表保持原样，快速重选或同 ID 新会话走保守保留。
+                        view.tmux_details.cancel_pending_reads();
+                        let generation = view.tmux_details.generation.wrapping_add(1).max(1);
+                        view.tmux_details = TmuxDetailState {
+                            generation,
+                            ..TmuxDetailState::default()
+                        };
+                    }
+                    if disposition.refresh_current_target {
                         view.load_tmux(cx);
                     }
                 });
@@ -1963,7 +2053,7 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// detach 只分离选定 session 的客户端；同 host 迟到回执刷新列表，不改写新 pane 状态。
+    /// detach 只分离选定 session 的客户端；同查询目标迟到回执刷新列表，不改写新 pane 状态。
     ///
     /// @author kongweiguang
     pub(super) fn detach_tmux_session(&mut self, session_id: String, cx: &mut Context<Self>) {
@@ -1974,7 +2064,8 @@ impl OperationsView {
         let request_cancellation = self.begin_operation_mutation();
         let cancellation_status = request_cancellation.clone();
         let target = self.tmux_target();
-        let target_host = target.host_id.clone();
+        let frozen_target = target.clone();
+        let detached_session_id = session_id.clone();
         let tmux_view_generation = self.tmux_view_generation;
         let operations = self.operations.clone();
         let executor = self.executor.clone();
@@ -1991,25 +2082,34 @@ impl OperationsView {
             cx.update(|app| {
                 let _ = this.update(app, |view, cx| {
                     view.finish_operation_mutation();
+                    let current_target = view.tmux_target();
+                    let current_view_generation = view.tmux_view_generation;
                     let disposition = view.dirty_targets.tmux_mutation_completed(
-                        target_host.clone(),
-                        &view.host_target,
+                        frozen_target.clone(),
+                        &current_target,
                         tmux_view_generation,
-                        view.tmux_view_generation,
+                        current_view_generation,
                     );
-                    if disposition.update_current_view {
-                        view.status = match result {
-                            Ok(()) if view.compact_layout => None,
-                            Ok(()) => Some(
-                                crate::locale::text("客户端已分离。", "Client detached.")
-                                    .to_string(),
-                            ),
-                            Err(error) => {
-                                Some(mutation_error_message(error, cancellation_requested))
-                            }
-                        };
-                    }
-                    if disposition.refresh_current_host {
+                    // detach 的成功与失败同样需要归属：离开原目标后暂存，返回时显示一次；
+                    // 紧凑成功为 None 时仍按旧语义清当前 status，不让取消等待提示残留。
+                    let detach_receipt = match &result {
+                        Ok(()) if view.compact_layout => None,
+                        Ok(()) => Some(
+                            crate::locale::text("客户端已分离。", "Client detached.").to_string(),
+                        ),
+                        Err(error) => Some(mutation_error_message(
+                            error.clone(),
+                            cancellation_requested,
+                        )),
+                    };
+                    view.apply_tmux_mutation_receipt(
+                        &frozen_target,
+                        TmuxMutationIdentity::Detach {
+                            session_id: detached_session_id.clone(),
+                        },
+                        detach_receipt,
+                    );
+                    if disposition.refresh_current_target {
                         view.load_tmux(cx);
                     }
                 });

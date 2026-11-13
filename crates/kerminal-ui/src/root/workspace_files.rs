@@ -205,7 +205,19 @@ impl WorkspaceFileRuntime {
                     // 冷恢复的活动文档也需在首帧显露，不让长标签带把实际内容藏在屏外。
                     if let WorkspaceSessionTab::FileWorkspace { state, .. } = &runtime.tab
                         && let Some(index) = state.active_item_id.as_ref().and_then(|active| {
-                            state.items.iter().position(|item| item.id() == active)
+                            // 宿主标签带只渲染文档，冷恢复的滚动索引同样必须使用文档序号。
+                            state
+                                .items
+                                .iter()
+                                .filter(|item| {
+                                    matches!(
+                                        item,
+                                        kerminal_application::workspace::FileWorkspaceItem::Document {
+                                            ..
+                                        }
+                                    )
+                                })
+                                .position(|item| item.id() == active)
                         })
                     {
                         handle.scroll_to_item(index);

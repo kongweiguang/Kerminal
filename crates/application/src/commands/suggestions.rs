@@ -22,6 +22,8 @@ use kerminal_domain::{
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::plugins::{PluginRegistry, capabilities};
+
 use super::{
     AppError, AppResult, CommandHistoryRepository, CommandSuggestionProvider, SnippetRepository,
 };
@@ -198,6 +200,8 @@ impl CommandSuggestionProvider for CompositeCommandSuggestionProvider {
 pub struct HistoryCommandSuggestionProvider {
     history: Arc<dyn CommandHistoryRepository>,
     snippets: Arc<dyn SnippetRepository>,
+    /// 组合根冻结的插件启用视图；片段建议与片段面板 UI 必须读取同一份启停答案。
+    plugins: Option<Arc<PluginRegistry>>,
 }
 
 impl HistoryCommandSuggestionProvider {
@@ -206,7 +210,32 @@ impl HistoryCommandSuggestionProvider {
         history: Arc<dyn CommandHistoryRepository>,
         snippets: Arc<dyn SnippetRepository>,
     ) -> Self {
-        Self { history, snippets }
+        Self {
+            history,
+            snippets,
+            plugins: None,
+        }
+    }
+
+    /// 组合根注入冻结启用视图，避免建议入口与 UI/MCP 对 `kerminal.commands` 各持一套答案。
+    ///
+    /// 缺省不注入时视为全部可用，仅为测试与离线装配保留旧构造路径；
+    /// 生产组合根必须注入，否则禁用 commands 后终端仍会提示片段候选，
+    /// 用户接受后只会被片段面板门禁拒绝，形成“可见但不可用”的分叉。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugins(mut self, plugins: Arc<PluginRegistry>) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+
+    /// 片段建议归属 commands 单元；未注入 registry 时按启用处理以兼容离线构造。
+    ///
+    /// @author kongweiguang
+    fn commands_enabled(&self) -> bool {
+        self.plugins
+            .as_ref()
+            .is_none_or(|plugins| plugins.is_enabled(capabilities::COMMANDS_UNIT))
     }
 }
 
@@ -401,6 +430,11 @@ impl HistoryCommandSuggestionProvider {
         cursor: usize,
         cancellation: &CancellationToken,
     ) -> AppResult<Vec<CommandSuggestionCandidate>> {
+        // commands 单元禁用时片段面板本身会拒绝打开；在入口直接返回空候选，
+        // 既不向用户暴露已关闭能力的标题，也避免为不可能的接受动作查询目录。
+        if !self.commands_enabled() {
+            return Ok(Vec::new());
+        }
         let Some(query) = prefix.strip_prefix("::") else {
             return Ok(Vec::new());
         };

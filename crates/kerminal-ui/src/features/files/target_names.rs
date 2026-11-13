@@ -102,6 +102,10 @@ impl FileTargetNameLookup {
 
     /// 主机选择器只投影可用 SFTP 目标的非凭据字段，避免 UI 缓存完整认证配置。
     ///
+    /// 候选与面板预检共用冻结启用视图：SFTP 单元关闭时整体不提供候选，SSH 主机还要求
+    /// SSH 单元启用，避免用户选中后必然被拒绝。`hosts` 服务缺失的离线/测试装配仍在上面
+    /// 返回错误，保持原有行为。
+    ///
     /// @author kongweiguang
     pub(crate) async fn list_sftp_hosts(
         &self,
@@ -113,6 +117,8 @@ impl FileTargetNameLookup {
         let Some(host_service) = &self.hosts else {
             return Err(AppError::unsupported("主机目录服务尚未配置"));
         };
+        let sftp_enabled = host_service.protocol_enabled(RemoteProtocol::Sftp);
+        let ssh_enabled = host_service.protocol_enabled(RemoteProtocol::Ssh);
         let hosts = host_service.list_hosts().await?;
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("SFTP 主机列表读取已取消"));
@@ -130,8 +136,10 @@ impl FileTargetNameLookup {
         let choices = hosts
             .into_iter()
             .filter(|host| {
-                matches!(host.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
+                sftp_enabled
+                    && matches!(host.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp)
                     && HostSftpOptions::enabled_for(host.protocol, host.sftp_options.enabled)
+                    && (host.protocol != RemoteProtocol::Ssh || ssh_enabled)
             })
             .map(|host| SftpHostChoice {
                 id: host.id,

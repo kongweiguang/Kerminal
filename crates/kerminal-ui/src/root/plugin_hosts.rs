@@ -68,6 +68,16 @@ impl RootView {
             .plugins
             .content_type(&request.content_id)
             .ok_or_else(|| kerminal_application::AppError::not_found("内容提供方不可用"))?;
+        // 声明与被禁用的归属单元分离保存；打开内容必须同时通过启用视图。
+        if !self
+            .services
+            .plugins
+            .content_type_enabled(&request.content_id)
+        {
+            return Err(kerminal_application::AppError::not_found(
+                "内容提供方不可用",
+            ));
+        }
         if declaration.provider.as_str() != provider_id {
             return Err(kerminal_application::AppError::conflict(
                 "主机不能打开其它提供方的内容",
@@ -115,6 +125,20 @@ impl RootView {
             cx.notify();
             return;
         };
+        // 导航和 Root 可能处于不同刷新代次；打开前用当前快照复核插件启停，禁用时保留配置。
+        let disabled_host = self
+            .host_navigation
+            .as_ref()
+            .and_then(|navigation| navigation.read(cx).plugin_host_snapshot(&host_id))
+            .filter(|host| !service.host_enabled(host));
+        if disabled_host.is_some() {
+            self.status = Some(crate::locale::text(
+                "插件主机已禁用，配置仍保留供查看或迁移。",
+                "This plugin host is disabled; its configuration is kept for review or migration.",
+            ));
+            cx.notify();
+            return;
+        }
         let cancellation = CancellationToken::new();
         let request_id = uuid::Uuid::new_v4().to_string();
         self.pending_plugin_host_open = Some(PendingPluginHostOpen {

@@ -51,11 +51,11 @@ const MIN_OBSERVED_SPAN: usize = 8;
 const CONTINUOUS_RANGE_TOLERANCE: usize = 2;
 /// 逐条观测与报告共用同一输入来源文本，PS 门禁可拒绝把物理输入或其它滚动通道写进证据。
 const INPUT_MODE: &str = "production VirtualListScrollHandle.scroll_to_item";
-/// 正式 RPC 列表身份固定到具体外部插件、视图和脚本运行时，宿主 fixture 不能靠相同快照形状冒充。
+/// 正式 RPC 列表身份固定到具体外部插件、视图和 Sidecar 运行时，宿主 fixture 不能靠相同快照形状冒充。
 const LIST_CONTENT_ID: &str = "test.list-performance/records";
 const LIST_PLUGIN_ID: &str = "test.list-performance";
 const LIST_VIEW: &str = "records";
-const LIST_RUNTIME: &str = "script";
+const LIST_RUNTIME: &str = "sidecar";
 const HOST_LIST_CONTENT_ID: &str = "acceptance.host-list";
 const HOST_LIST_PLUGIN_ID: &str = "fixture.host-list";
 /// 副本不可变策略同时写入报告与 PS 门禁；只读位与摘要重算共同覆盖原地写和同尺寸换入。
@@ -158,8 +158,8 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
     {
         return Err(io::Error::other("十万行fixture未加载").into());
     }
-    // 候选身份必须绑定实际执行的全部包文件：main.js、native 视图和清单本身都在内，
-    // 只摘要 manifest/resources 会让替换脚本却复用旧摘要的候选混过验收。
+    // 候选身份必须绑定实际执行的全部包文件：Sidecar 二进制、native 视图和清单本身都在内，
+    // 只摘要 manifest/resources 会让替换 Sidecar 却复用旧摘要的候选混过验收。
     let plugin_hash = plugin_tree_digest(&options.plugin)?;
     let catalogs = startup.catalogs("en")?;
     bootstrap::run_after_migration(
@@ -272,7 +272,7 @@ fn plugin_content_digest(files: &std::collections::BTreeMap<String, Vec<u8>>) ->
 }
 
 /// 从验收副本递归读取全部普通文件并按共享规则摘要；PS 对同一目录使用相同路径字节序和
-/// 长度前缀，因此任何额外注入、脚本替换或视图修改都会让两侧摘要同时变化。
+/// 长度前缀，因此任何额外注入、二进制替换或视图修改都会让两侧摘要同时变化。
 fn plugin_tree_digest(directory: &Path) -> Result<String, io::Error> {
     let mut files = BTreeMap::new();
     collect_plugin_files(directory, directory, &mut files)?;
@@ -1148,7 +1148,7 @@ fn inspect_source(snapshot: &Value, expected_tab: &TabId) -> Result<Option<Value
     }
     if runtime != LIST_RUNTIME {
         return Err(io::Error::other(format!(
-            "列表renderer运行时{runtime}不是外部脚本运行时{LIST_RUNTIME}"
+            "列表renderer运行时{runtime}不是外部 Sidecar 运行时{LIST_RUNTIME}"
         )));
     }
     if !required_bool(list, "external", "列表快照")?

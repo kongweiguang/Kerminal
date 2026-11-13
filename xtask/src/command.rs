@@ -158,7 +158,7 @@ pub(super) fn migration_helper_build_arguments(target: &str) -> Result<Vec<&str>
     ])
 }
 
-/// 插件宿主和作者工具随应用分发，但保持 SDK 自己的版本；每次打包重建，拒绝旧缓存产物。
+/// 插件作者工具随应用分发，但保持 SDK 自己的版本；每次打包重建，拒绝旧缓存产物。
 ///
 /// @author kongweiguang
 pub(super) fn plugin_helper_build_arguments(target: &str) -> Result<Vec<&str>, Box<dyn Error>> {
@@ -167,8 +167,6 @@ pub(super) fn plugin_helper_build_arguments(target: &str) -> Result<Vec<&str>, B
         "--locked",
         "build",
         "--release",
-        "--package",
-        "kerminal-plugin-host",
         "--package",
         "kerminal-plugin-cli",
         "--bins",
@@ -545,12 +543,8 @@ fn validate_packager_binary(
             .get("path")
             .and_then(toml::Value::as_str)
             .ok_or("packager binary path is missing")?;
-        if !matches!(
-            name,
-            "kerminal" | "kerminal-plugin-host" | "kerminal-plugin"
-        ) || !names.insert(name)
-        {
-            return Err("packager binaries must be the unique desktop and plugin helpers".into());
+        if !matches!(name, "kerminal" | "kerminal-plugin") || !names.insert(name) {
+            return Err("packager binaries must be the unique desktop and plugin helper".into());
         }
         let executable = if target == "x86_64-pc-windows-msvc" {
             release_directory.join(name).with_extension("exe")
@@ -565,9 +559,9 @@ fn validate_packager_binary(
             .into());
         }
     }
-    if names.len() != 3 {
+    if names.len() != 2 {
         return Err(
-            "packager config must include both plugin helpers beside the desktop binary".into(),
+            "packager config must include the plugin helper beside the desktop binary".into(),
         );
     }
     Ok(())

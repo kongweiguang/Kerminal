@@ -14,6 +14,7 @@ use gpui_kit::{
     prelude::*,
     px,
 };
+use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::ThemeTokens;
@@ -50,6 +51,24 @@ impl Render for OperationsView {
             if self.active {
                 self.start_visible_services(cx);
                 self.reload_non_server(cx);
+            }
+        }
+        // 固定 tmux 的 Root 同步顺序会先更新目标再绑定 pane，中途可能清理 status；
+        // 在每次绘制前补投一次当前目标尚未消费的写回执，保证迟到结果不会因步骤交错丢失。
+        // 提示在本帧正文构建前写入 status，因此无需再额外请求一帧。
+        if self.active
+            && self.section_selection.is_fixed()
+            && self.section_selection.active() == OperationsSection::Tmux
+        {
+            self.restore_deferred_tmux_feedback();
+        }
+        // 固定右栏只为正在播放的短入场请求帧；完整工作台、隐藏面板和减少动效不空转。
+        let entrance_now = Instant::now();
+        if self.section_selection.is_fixed() {
+            if cx.reduce_motion() {
+                self.settle_fixed_data_entrance();
+            } else if self.active && self.fixed_data_entrance_is_running(entrance_now) {
+                window.request_animation_frame();
             }
         }
         let theme = ThemeTokens::current(window, cx);

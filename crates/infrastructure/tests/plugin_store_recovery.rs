@@ -7,6 +7,10 @@
 pub mod storage;
 
 #[allow(dead_code)]
+#[path = "../src/plugins/layout.rs"]
+pub mod layout;
+
+#[allow(dead_code)]
 #[path = "../src/plugins/store.rs"]
 mod plugin_store_under_test;
 

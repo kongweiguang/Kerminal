@@ -13,12 +13,12 @@ use kerminal_domain::{
     operations::{
         ComposeProjectTarget, ContainerAction, ContainerRuntime, ContainerStatus, ContainerSummary,
         ContainerTarget, NetworkCounterSnapshot, NetworkRateSnapshot, ServerInfoProbeStatus,
-        ServerInfoSnapshot, ServerInfoTarget, TmuxSession,
+        ServerInfoSnapshot, ServerInfoTarget, TmuxSession, TmuxTarget,
     },
 };
 use tokio_util::sync::CancellationToken;
 
-use super::OperationsSection;
+use super::{OperationsSection, TmuxDetailState};
 
 const SERVER_HISTORY_CAPACITY: usize = 60;
 
@@ -35,6 +35,168 @@ pub(super) fn tmux_confirmation_session_matches(
             && expected.created_at == current.created_at
             && expected.target_ref == current.target_ref
     })
+}
+
+/// 同目标换 pane 后 kill 回执被视图代次抑制；仅在提交时详情确属确认会话且身份包含
+/// 创建时间时冻结清理门禁。缺少稳定身份时宁可保留旧详情，避免把重建的同 ID 会话
+/// 误当成已删除对象，也避免改动新 pane 的状态、确认或当前选中会话。
+/// @author kongweiguang
+pub(super) struct TmuxKilledDetailGuard {
+    target: TmuxTarget,
+    target_generation: u64,
+    detail_generation: u64,
+    session: TmuxSession,
+}
+
+impl TmuxKilledDetailGuard {
+    /// 详情投影与确认会话必须指向同一 ID，且确认会话带创建时间；否则无法证明旧详情
+    /// 就是本次成功删除的对象，后续清理会误伤重选或重建后的同 ID 会话。
+    /// @author kongweiguang
+    pub(super) fn freeze(
+        target: &TmuxTarget,
+        target_generation: u64,
+        details: &TmuxDetailState,
+        confirmed_session: Option<&TmuxSession>,
+    ) -> Option<Self> {
+        let session = confirmed_session?;
+        if session.created_at.is_none()
+            || details.session_id.as_deref() != Some(session.id.as_str())
+        {
+            return None;
+        }
+        Some(Self {
+            target: target.clone(),
+            target_generation,
+            detail_generation: details.generation,
+            session: session.clone(),
+        })
+    }
+
+    /// 成功回执只有完整目标、目标代次、详情代次和选中会话全部未变，且当前列表仍能用
+    /// 现有确认匹配核对原会话身份时才允许清理；快速重选、目标变化或身份不明均保守保留。
+    ///
+    /// tmux 的 `session_created` 只有秒级精度，server 快速重启可能复用 ID、名称、
+    /// target 与创建时间。身份碰撞时列表刷新不会重载详情，详情代次仍停在冻结值，
+    /// 因此这里清掉的只能是提交时那份已删除会话的旧窗口/capture；任何重新选择或
+    /// 窗口/分屏列表重新载入都会递增代次并阻止清理。单独的 capture 读取不递增代次，
+    /// 但仍受目标/视图门禁约束，且清理后不会被旧回执写回新目标。
+    /// @author kongweiguang
+    pub(super) fn can_clear(
+        &self,
+        kill_succeeded: bool,
+        target: &TmuxTarget,
+        target_generation: u64,
+        details: &TmuxDetailState,
+        sessions: &[TmuxSession],
+    ) -> bool {
+        kill_succeeded
+            && &self.target == target
+            && self.target_generation == target_generation
+            && self.detail_generation == details.generation
+            && details.session_id.as_deref() == Some(self.session.id.as_str())
+            && tmux_confirmation_session_matches(
+                &self.session,
+                sessions
+                    .iter()
+                    .find(|session| session.id == self.session.id),
+            )
+    }
+}
+
+/// tmux 写回执可能在同一目标的 pane 切换、隐藏或 A→B→A 之后才到达；身份必须同时
+/// 绑定完整查询目标和本次操作，否则迟到结果会串到其它 profile/socket，或覆盖另一
+/// 次操作留下的提示。这里只表达身份，不携带执行状态，也不触发任何重放。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum TmuxMutationIdentity {
+    Create,
+    Rename { session_id: String },
+    Kill { session_id: String },
+    Detach { session_id: String },
+}
+
+/// 离开原目标后仍待投递的一次写回执；只保存文案，恢复时消费一次即移除，
+/// 避免返回旧目标时重新执行写操作或重复播放历史提示。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TmuxMutationFeedback {
+    pub(super) target: TmuxTarget,
+    pub(super) identity: TmuxMutationIdentity,
+    pub(super) message: String,
+}
+
+/// 待投递写回执只保留固定条数：正常使用中同时离开的目标极少，超过上限说明已有更早
+/// 的历史结果，淘汰最早一条即可保持有界；这里不引入按目标累积的集合或持久化。
+///
+/// @author kongweiguang
+pub(super) const TMUX_DEFERRED_FEEDBACK_CAPACITY: usize = 8;
+
+/// 暂存溢出或同身份覆盖丢弃未展示结果时递增的丢失计数；只记条数，不保存被丢文案，
+/// 因此状态上界仍为常数，不会随历史目标累积。
+///
+/// @author kongweiguang
+pub(super) type TmuxFeedbackLosses = usize;
+
+/// 同一完整目标与同一操作的旧回执由新回执覆盖，避免重试或重复提交累积；
+/// 超出容量时淘汰最早一条。被覆盖或淘汰的条目都尚未展示过，静默丢弃会让
+/// 用户把“只有最新结果”误读成“只有这一条结果”，因此每次丢弃都递增丢失计数，
+/// 由视图在下次可见时机以显式提示告知，不在这里伪造投递或自动重放。
+///
+/// @author kongweiguang
+pub(super) fn defer_tmux_feedback(
+    queue: &mut VecDeque<TmuxMutationFeedback>,
+    losses: &mut TmuxFeedbackLosses,
+    entry: TmuxMutationFeedback,
+) {
+    let mut dropped = 0usize;
+    queue.retain(|stored| {
+        if stored.target == entry.target && stored.identity == entry.identity {
+            dropped += 1;
+            false
+        } else {
+            true
+        }
+    });
+    queue.push_back(entry);
+    while queue.len() > TMUX_DEFERRED_FEEDBACK_CAPACITY {
+        queue.pop_front();
+        dropped += 1;
+    }
+    *losses = losses.saturating_add(dropped);
+}
+
+/// 把丢弃计数格式化成一次性显式提示；只报条数与原因，不携带目标或结果归属，
+/// 避免把其它目标被丢弃的结果伪投成当前目标的结果，也不据此重放任何写操作。
+///
+/// @author kongweiguang
+pub(super) fn tmux_feedback_loss_notice(count: TmuxFeedbackLosses) -> String {
+    crate::locale::text(
+        format!("另有 {count} 条较早的 tmux 操作结果未展示（暂存有界，已被覆盖或丢弃）。"),
+        format!("{count} earlier tmux result(s) were not shown; the bounded backlog dropped them."),
+    )
+    .to_string()
+}
+
+/// 返回目标时一次取走该目标的全部待投递提示，按到达顺序拼接后移除；取走即消失，
+/// 保证只显示一次、不自动重放写操作，也不会把其它目标的失败或未知结果串过来。
+///
+/// @author kongweiguang
+pub(super) fn take_deferred_tmux_feedback(
+    queue: &mut VecDeque<TmuxMutationFeedback>,
+    target: &TmuxTarget,
+) -> Option<String> {
+    let mut messages = Vec::new();
+    queue.retain(|entry| {
+        if &entry.target == target {
+            messages.push(entry.message.clone());
+            false
+        } else {
+            true
+        }
+    });
+    (!messages.is_empty()).then(|| messages.join("\n"))
 }
 
 /// 服务器详情只切换展示投影，不重复探测或丢弃同一目标的采样历史。
@@ -685,15 +847,19 @@ pub(super) struct LatestRequestTicket {
 #[derive(Default)]
 pub(super) struct DirtyOperationTargets {
     containers: Vec<(Option<HostId>, ContainerRuntime)>,
-    tmux_hosts: Vec<Option<HostId>>,
+    /// 只记录当前完整 tmux 查询目标的未核对状态。目标重置本身会丢弃旧快照并重新置为
+    /// 未确认，因此离开目标时无需为历史目标保留 dirty；切回同一目标后即使首次读取失败
+    /// 或仅探测到能力不可用，该标记仍会保留，激活时继续重试。这样状态有固定上界，也不
+    /// 会丢失写后未知结果的恢复机会。
+    tmux_target: Option<TmuxTarget>,
 }
 
-/// tmux 回执分开决定主机级列表刷新与 pane 级状态更新，避免新 pane 丢失旧主机的脏列表。
+/// tmux 回执分开决定查询目标级列表刷新与 pane 级状态更新，避免新 pane 丢失旧目标的脏列表。
 ///
 /// @author kongweiguang
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TmuxMutationDisposition {
-    pub(super) refresh_current_host: bool,
+    pub(super) refresh_current_target: bool,
     pub(super) update_current_view: bool,
 }
 
@@ -735,42 +901,52 @@ impl DirtyOperationTargets {
             .retain(|(host, candidate)| host != host_id || *candidate != runtime);
     }
 
-    /// 将迟到 tmux 回执绑定原 host；同 host 仍刷新列表，pane 状态仅接受原视图代次。
+    /// 将迟到 tmux 回执绑定原查询目标；只有完整 `TmuxTarget` 一致才刷新当前列表，
+    /// pane 状态仍只接受原视图代次，避免 Local profile 或 socket 不同目标互相刷新。
+    ///
+    /// 旧目标回执不进入缓存：切回旧目标时，目标重置会先把它重新标为未确认并强制
+    /// 读取，因此无需保留无限历史，也不会丢掉失败后的激活重试机会。
     ///
     /// @author kongweiguang
     pub(super) fn tmux_mutation_completed(
         &mut self,
-        target_host: Option<HostId>,
-        current_host: &Option<HostId>,
+        target: TmuxTarget,
+        current_target: &TmuxTarget,
         mutation_view_generation: u64,
         current_view_generation: u64,
     ) -> TmuxMutationDisposition {
-        self.mark_tmux_dirty(target_host.clone());
-        let refresh_current_host = target_host.as_ref() == current_host.as_ref();
+        let refresh_current_target = &target == current_target;
+        if refresh_current_target {
+            self.mark_tmux_dirty(target);
+        }
         TmuxMutationDisposition {
-            refresh_current_host,
-            update_current_view: refresh_current_host
+            refresh_current_target,
+            update_current_view: refresh_current_target
                 && mutation_view_generation == current_view_generation,
         }
     }
 
-    /// 记录由 tmux 外部命令产生的可能变化，等待对应 host 的权威读取确认。
-    pub(super) fn mark_tmux_dirty(&mut self, host_id: Option<HostId>) {
-        if !self.tmux_hosts.iter().any(|host| host == &host_id) {
-            self.tmux_hosts.push(host_id);
-        }
-    }
-
-    /// 恢复面板可见性时只核对确有变更的原目标，普通窗口激活不使已读快照失效。
+    /// 记录当前完整查询目标的未核对状态；新的真实目标重置会覆盖它，历史目标不累积。
     ///
     /// @author kongweiguang
-    pub(super) fn tmux_is_dirty(&self, host_id: &Option<HostId>) -> bool {
-        self.tmux_hosts.contains(host_id)
+    pub(super) fn mark_tmux_dirty(&mut self, target: TmuxTarget) {
+        self.tmux_target = Some(target);
     }
 
-    /// tmux 清单成功刷新后清除对应 host 的脏标记。
-    pub(super) fn tmux_refreshed(&mut self, host_id: &Option<HostId>) {
-        self.tmux_hosts.retain(|host| host != host_id);
+    /// 只有仍属于当前完整查询目标的未确认状态才算 dirty。
+    ///
+    /// @author kongweiguang
+    pub(super) fn tmux_is_dirty(&self, target: &TmuxTarget) -> bool {
+        self.tmux_target.as_ref() == Some(target)
+    }
+
+    /// 同一完整查询目标成功刷新后清除当前未确认状态；失败、其它目标或旧票据不得代办。
+    ///
+    /// @author kongweiguang
+    pub(super) fn tmux_refreshed(&mut self, target: &TmuxTarget) {
+        if self.tmux_is_dirty(target) {
+            self.tmux_target = None;
+        }
     }
 }
 
@@ -906,9 +1082,9 @@ impl<T> SectionState<T> {
         self.phase
     }
 
-    /// 验收只读请求代次，以真实生产读取判断折叠操作是否意外发起刷新。
+    /// 验收与单元测试只读请求代次，以真实生产读取判断折叠或换 pane 是否意外发起刷新。
     /// @author kongweiguang
-    #[cfg(feature = "right-rail-acceptance")]
+    #[cfg(any(test, feature = "right-rail-acceptance"))]
     pub(super) const fn acceptance_request_id(&self) -> u64 {
         self.request_id
     }

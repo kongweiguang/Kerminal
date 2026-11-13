@@ -1,8 +1,8 @@
-//! 外部插件实例、权限和宿主能力的统一应用用例。
+//! 外部插件实例、宿主能力和生命周期的统一应用用例。
 //! @author kongweiguang
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -13,9 +13,9 @@ use std::{
 use async_trait::async_trait;
 use kerminal_domain::plugins::{PluginId, PluginRuntimeState};
 use kerminal_plugin_protocol::{
-    MAX_STATE_BYTES, MAX_VIEW_BYTES, MAX_VIEW_PATCH_BYTES, MAX_VIEW_STATE_BYTES, Permission,
+    MAX_STATE_BYTES, MAX_VIEW_BYTES, MAX_VIEW_PATCH_BYTES, MAX_VIEW_STATE_BYTES,
     PluginRuntime as RuntimeKind, ViewActionResult, ViewFetchResult, ViewOpenResult, error_code,
-    host_method_permission,
+    host_method_supported,
 };
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -35,29 +35,16 @@ use crate::{
     },
 };
 
-/// 冻结的清单及授权必须来自同一个已验证插件版本。
+/// 冻结的已验证插件版本；启用后不再派生或校验权限集合。
 #[derive(Clone)]
 pub struct PluginRuntimeDescriptor {
     pub prepared: Arc<PreparedPlugin>,
-    pub permissions: BTreeSet<Permission>,
 }
 
 impl PluginRuntimeDescriptor {
-    /// 从冻结清单推导授权，避免组合根单独维护不一致的权限集合。
+    /// 组合根只需提供冻结清单，避免运行服务保存第二份能力状态。
     pub fn from_prepared(prepared: Arc<PreparedPlugin>) -> Self {
-        let manifest = &prepared.package.manifest;
-        let mut permissions = manifest
-            .permissions
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if matches!(manifest.runtime, RuntimeKind::Sidecar { .. }) {
-            permissions.insert(Permission::FullAccess);
-        }
-        Self {
-            prepared,
-            permissions,
-        }
+        Self { prepared }
     }
 }
 
@@ -90,7 +77,7 @@ pub struct PluginRuntimeService {
 }
 
 impl PluginRuntimeService {
-    /// 组合根只注入已验证启动快照；权限门禁以弱引用注册，避免服务循环持有。
+    /// 组合根只注入已验证启动快照；权限门禁已移除，弱引用注册仍需避免服务循环持有。
     pub fn new(
         plugins: Vec<PluginRuntimeDescriptor>,
         process: Arc<dyn PluginProcessPort>,
@@ -100,19 +87,10 @@ impl PluginRuntimeService {
         let mut entries = BTreeMap::new();
         for plugin in plugins {
             let manifest = &plugin.prepared.package.manifest;
-            let mut declared = manifest
-                .permissions
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if matches!(manifest.runtime, RuntimeKind::Sidecar { .. }) {
-                declared.insert(Permission::FullAccess);
-            }
             if manifest.id != plugin.prepared.id.as_str()
                 || manifest.version != plugin.prepared.version.to_string()
-                || plugin.permissions != declared
             {
-                return Err(AppError::invalid("插件运行权限与已验证清单不一致"));
+                return Err(AppError::invalid("插件运行身份与已验证清单不一致"));
             }
             if entries.insert(plugin.prepared.id.clone(), plugin).is_some() {
                 return Err(AppError::conflict("插件运行配置重复"));
@@ -136,7 +114,7 @@ impl PluginRuntimeService {
         Ok(service)
     }
 
-    /// WebView 与进程请求复用同一权限路由；实例身份由宿主覆盖而非信任页面。
+    /// WebView 与进程请求复用同一实例绑定；实例身份由宿主覆盖而非信任页面。
     pub async fn route_webview(
         &self,
         identity: &PluginViewIdentity,
@@ -173,7 +151,7 @@ impl PluginRuntimeService {
             })?
     }
 
-    /// 页面订阅复用相同权限与实例绑定规则，并强制交付独立流，禁止转发到插件进程。
+    /// 页面订阅复用相同实例绑定规则，并强制交付独立流，禁止转发到插件进程。
     pub fn subscribe_webview_events(
         &self,
         target: PluginWebViewEventTarget,
@@ -204,16 +182,6 @@ impl PluginRuntimeService {
             Some(kerminal_plugin_protocol::ViewDefinition::Webview { .. })
         ) {
             return Err(host_error(error_code::INVALID_PARAMS, "WebView required"));
-        }
-        if !descriptor
-            .permissions
-            .contains(&Permission::EventsSubscribe)
-            && !descriptor.permissions.contains(&Permission::FullAccess)
-        {
-            return Err(host_error(
-                error_code::PERMISSION_DENIED,
-                "permission denied",
-            ));
         }
         let names = params
             .get("names")
@@ -790,7 +758,7 @@ impl PluginHostRouter for PluginRuntimeService {
         route_view_update(&self.shared, plugin, generation, params)
     }
 
-    /// 所有来源先按协议方法检查权限，再按进程和实例代次绑定具体宿主能力。
+    /// 所有来源先确认宿主实现该方法，再按进程和实例代次绑定具体宿主能力。
     async fn route(
         &self,
         plugin: &PluginId,
@@ -805,8 +773,7 @@ impl PluginHostRouter for PluginRuntimeService {
         if method == "view.update" {
             return route_view_update(&self.shared, plugin, generation, params);
         }
-        let descriptor = self
-            .shared
+        self.shared
             .plugins
             .get(plugin)
             .ok_or_else(|| host_error(error_code::STALE, "stale"))?;
@@ -818,17 +785,8 @@ impl PluginHostRouter for PluginRuntimeService {
                 _ => return Err(host_error(error_code::STALE, "stale")),
             }
         }
-        let permission = host_method_permission(method)
+        host_method_supported(method)
             .map_err(|_| host_error(error_code::METHOD_NOT_FOUND, "method not found"))?;
-        if permission.is_some_and(|permission| {
-            !descriptor.permissions.contains(&permission)
-                && !descriptor.permissions.contains(&Permission::FullAccess)
-        }) {
-            return Err(host_error(
-                error_code::PERMISSION_DENIED,
-                "permission denied",
-            ));
-        }
         let object = params
             .as_object()
             .ok_or_else(|| host_error(error_code::INVALID_PARAMS, "invalid params"))?;
@@ -983,7 +941,7 @@ fn view_response_observer(
     })
 }
 
-/// 纯声明插件没有进程，但仍可显示视图并经相同权限门禁使用宿主能力。
+/// 纯声明插件没有进程，但仍可显示视图并使用已实现的宿主能力。
 fn declarative(shared: &Shared, plugin: &PluginId) -> bool {
     shared.plugins.get(plugin).is_some_and(|descriptor| {
         matches!(

@@ -24,6 +24,7 @@ use crate::{
         credentials::{CredentialService, SaveCredentialRequest, SecretValue},
         host_types::{PluginHost, PluginHostDraft, valid_host_type_id},
     },
+    plugins::PluginRegistry,
 };
 
 mod local_hosts;
@@ -786,6 +787,8 @@ pub struct HostManagementService {
     credential_cleanup: Option<Arc<dyn HostCredentialCleanup>>,
     local_environment_resolver: Option<Arc<dyn CredentialResolver>>,
     local_host_gate: Arc<tokio::sync::Mutex<()>>,
+    /// 冻结后的插件启用视图，只用于连接门禁；缺省表示测试/离线工具视为全部可用。
+    plugins: Option<Arc<PluginRegistry>>,
 }
 
 impl HostManagementService {
@@ -799,6 +802,7 @@ impl HostManagementService {
             credential_cleanup: None,
             local_environment_resolver: None,
             local_host_gate: Arc::new(tokio::sync::Mutex::new(())),
+            plugins: None,
         }
     }
 
@@ -815,6 +819,51 @@ impl HostManagementService {
             credential_cleanup: None,
             local_environment_resolver: None,
             local_host_gate: Arc::new(tokio::sync::Mutex::new(())),
+            plugins: None,
+        }
+    }
+
+    /// 组合根注入冻结启用视图，使主机和协议门禁共享同一份插件启停快照。
+    ///
+    /// 缺省不注入时查询一律放行，保证大量测试构造点和离线工具无需装配插件系统；
+    /// 但生产组合根必须注入，否则禁用 SSH/SFTP 等插件后仍能新建连接。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugins(mut self, plugins: Arc<PluginRegistry>) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+
+    /// 将连接协议映射到主机配置类型后查询冻结启用视图。
+    ///
+    /// 禁用只影响新建连接：已有主机配置和运行中的会话继续保留，避免把启停状态
+    /// 误当成数据删除；未注入 registry 时保持原行为返回 true。
+    ///
+    /// @author kongweiguang
+    pub fn protocol_enabled(&self, protocol: RemoteProtocol) -> bool {
+        let Some(plugins) = &self.plugins else {
+            return true;
+        };
+        let configuration_type = match protocol {
+            RemoteProtocol::Ssh => "ssh",
+            RemoteProtocol::Sftp => "sftp",
+            RemoteProtocol::Telnet => "telnet",
+            RemoteProtocol::Serial => "serial",
+            RemoteProtocol::Rdp => "rdp",
+        };
+        plugins.host_type_enabled(configuration_type)
+    }
+
+    /// 按配置中保存的 provider 与类型定位主机贡献，再查询归属单元是否启用。
+    ///
+    /// 同时比较 provider 和 type，避免外部插件复用内置类型键时被错误放行；
+    /// 未注入 registry 时视为可用，供测试和离线工具保持轻量装配。
+    ///
+    /// @author kongweiguang
+    pub fn plugin_host_enabled(&self, host: &PluginHost) -> bool {
+        match &self.plugins {
+            Some(plugins) => plugins.host_type_enabled_for(&host.provider_id, &host.type_id),
+            None => true,
         }
     }
 

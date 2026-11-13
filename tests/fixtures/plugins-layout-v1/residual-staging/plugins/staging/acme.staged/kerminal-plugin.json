@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "acme.staged",
+  "name": {
+    "en": "Staged Package"
+  },
+  "version": "1.0.0",
+  "api": "^1.0",
+  "publisher": "acme",
+  "runtime": {
+    "kind": "none"
+  },
+  "contributes": {},
+  "views": {}
+}

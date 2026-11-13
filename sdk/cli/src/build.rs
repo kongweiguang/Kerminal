@@ -68,23 +68,6 @@ pub fn build(
     }
     let executable = extract_esbuild(temporary.path())?;
     match &manifest.runtime {
-        PluginRuntime::Script { main, .. } => {
-            let source = project.join("src/main.ts");
-            if !source.is_file() {
-                return Err("脚本入口 src/main.ts 不存在".into());
-            }
-            validate_package_path(main)?;
-            let destination = staged.join(main);
-            fs::create_dir_all(destination.parent().ok_or("脚本输出缺少父目录")?)?;
-            run_esbuild(
-                &executable,
-                &project,
-                &source,
-                &destination,
-                "esm",
-                "neutral",
-            )?;
-        }
         PluginRuntime::Sidecar { main, .. } => {
             let platform = selected
                 .or_else(Platform::current)
@@ -121,7 +104,7 @@ pub fn build(
         }
         PluginRuntime::None { .. } => {}
     }
-    // 浏览器入口与脚本进程入口分开打包，不能把 DOM 代码放入 QuickJS。
+    // 浏览器入口独立打包，不能把 DOM 代码放入插件进程。
     let browser_source = project.join("src/web.ts");
     if browser_source.is_file() {
         let web_output = staged.join("web/main.js");
@@ -279,7 +262,7 @@ fn extract_esbuild(directory: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// 明确平台与模块格式，避免 Node 专用内置模块被错误打进 QuickJS 脚本。
+/// 明确平台与模块格式，避免 Node 专用内置模块被错误打进浏览器脚本。
 fn run_esbuild(
     executable: &Path,
     project: &Path,

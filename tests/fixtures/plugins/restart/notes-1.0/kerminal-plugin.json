@@ -17,8 +17,13 @@
     "productivity"
   ],
   "runtime": {
-    "kind": "script",
-    "main": "dist/main.js",
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/sidecar.exe",
+      "linux-x86_64": "bin/sidecar",
+      "macos-x86_64": "bin/sidecar",
+      "macos-aarch64": "bin/sidecar"
+    },
     "activation": "on-demand"
   },
   "permissions": [

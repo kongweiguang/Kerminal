@@ -51,7 +51,10 @@ pub(crate) fn run_after_migration<T>(
         Ok(report) => Ok(start(report)),
         Err(error) if allow_beta_contract => {
             let inspection = service.inspect()?;
-            if inspection.migration_contract == Some(BETA_CONTRACT) && !inspection.recovery_pending
+            // 插件布局仍为 schema 1 或留有迁移 journal 时，beta 豁免也不能绕过迁移屏障。
+            if inspection.migration_contract == Some(BETA_CONTRACT)
+                && !inspection.recovery_pending
+                && inspection.plugin_layout.is_settled()
             {
                 return Ok(start(DataMigrationReport {
                     outcome: DataMigrationOutcome::AlreadyCurrent,
@@ -59,6 +62,7 @@ pub(crate) fn run_after_migration<T>(
                     resumed: false,
                     backup_relative_path: None,
                     backup_relative_paths: Vec::new(),
+                    plugin_layout: None,
                 }));
             }
             Err(error)

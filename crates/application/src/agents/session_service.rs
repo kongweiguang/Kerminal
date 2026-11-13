@@ -39,6 +39,7 @@ use zeroize::Zeroizing;
 use crate::{
     AppError, AppResult, PreferencesService, ProfileService,
     mcp_runtime::McpRuntimeControl,
+    plugins::PluginRegistry,
     sessions::{
         AgentTerminalSubmissionRequest, CreateSessionRequest, MAX_AGENT_TERMINAL_SUBMISSION_BYTES,
         PlainTextSnapshot, PlainTextSnapshotRequest, SessionFilter, SessionService,
@@ -188,6 +189,8 @@ pub struct AgentSessionService {
     shutdown: CancellationToken,
     shutting_down: AtomicBool,
     shutdown_complete: AtomicBool,
+    /// P3-D 的 Agent/模板门禁将消费的冻结启用视图；None 表示未注入且不做额外过滤。
+    plugins: Option<Arc<PluginRegistry>>,
 }
 
 impl AgentSessionService {
@@ -208,7 +211,19 @@ impl AgentSessionService {
             shutdown: CancellationToken::new(),
             shutting_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
+            plugins: None,
         }
+    }
+
+    /// 注入组合根冻结的插件启用视图；本阶段仅保存，模板与 Agent 门禁由 P3-D 消费。
+    ///
+    /// 未注入时视为不过滤，保持现有调用点和离线测试行为不变；生产组合根必须注入，
+    /// 否则禁用 SSH 等插件后 Agent 仍会提供依赖该插件的主机模板。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugins(mut self, plugins: Arc<PluginRegistry>) -> Self {
+        self.plugins = Some(plugins);
+        self
     }
 
     /// 将桌面同一 ProfileService 注入 launcher resolver，使 Windows shell 命令遵循实际 profile。
@@ -2604,6 +2619,7 @@ impl AgentSessionService {
                     endpoint,
                     agent_terminal,
                     snapshot,
+                    self.plugins.as_deref(),
                     token,
                 )
             })

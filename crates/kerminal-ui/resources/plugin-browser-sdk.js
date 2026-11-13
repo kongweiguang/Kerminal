@@ -42,7 +42,7 @@ function createBrowserBridge(transport, identity, environment = { locale: "", th
     function cancelRequest(id) {
         send({ jsonrpc: "2.0", method: "$/cancel", params: { id } });
     }
-    /** 共享注册表与脚本宿主一致，重复方法不能静默覆盖处理器。 */
+    /** 共享注册表按方法名去重，重复注册不能静默覆盖已生效的处理器。 */
     function register(method, handler) {
         if (closed || typeof method !== "string" || !method || typeof handler !== "function" || handlers.has(method)) {
             throw new TypeError("invalid or duplicate handler");
@@ -56,7 +56,7 @@ function createBrowserBridge(transport, identity, environment = { locale: "", th
         else
             console.error(error);
     }
-    /** 与脚本宿主保留相同的业务错误范围，防止页面伪造宿主协议错误。 */
+    /** 只允许宿主定义的业务错误范围，防止页面伪造取消或过载等协议错误。 */
     function responseError(error) {
         const record = error && typeof error === "object" ? error : undefined;
         const code = record?.code;
@@ -261,7 +261,7 @@ function createBrowserBridge(transport, identity, environment = { locale: "", th
         onCancellableRequest: register,
         request,
         view: Object.freeze({
-            /** 只允许更新当前 WebView 实例，权限仍由宿主统一校验。 */
+            /** 只允许更新当前 WebView 实例，关闭或重载后的迟到请求不能写入其他视图。 */
             update: (instance, patch, options) => request("view.update", { instance, patch }, options),
         }),
         ui: Object.freeze({

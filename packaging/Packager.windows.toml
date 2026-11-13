@@ -21,11 +21,7 @@ resources = [
 path = "kerminal"
 main = true
 
-# 插件程序与主程序同目录，运行时不从 PATH 选择宿主。
-[[binaries]]
-path = "kerminal-plugin-host"
-main = false
-
+# 插件作者工具与主程序同目录，运行时不从 PATH 选择。
 [[binaries]]
 path = "kerminal-plugin"
 main = false

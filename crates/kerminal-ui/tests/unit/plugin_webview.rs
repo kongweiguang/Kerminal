@@ -149,12 +149,10 @@ fn frozen_resources_serve_nested_modules_styles_images_and_fonts() {
             assert_eq!(response.headers()["Content-Type"], mime);
             assert_eq!(response.body().as_ref(), bytes);
             assert_eq!(response.headers()["X-Content-Type-Options"], "nosniff");
-            let csp = response.headers()["Content-Security-Policy"]
-                .to_str()
-                .unwrap();
-            assert!(csp.contains("default-src kplugin: 'self'"));
-            assert!(csp.contains("connect-src 'none'"));
-            assert!(!csp.contains("unsafe-inline"));
+            // 插件启用后不做能力限制：正式资源文档不注入限制性 CSP，页面不得再出现 connect-src 'none'。
+            if let Some(csp) = response.headers().get("Content-Security-Policy") {
+                assert!(!csp.to_str().unwrap().contains("connect-src 'none'"));
+            }
         }
     }
 }
@@ -359,19 +357,19 @@ fn inline_acceptance_api_retains_its_isolated_document() {
     );
 }
 
-/// 受验包只暴露冻结资源和获准 HTTPS 目标，未获准目标不能进入响应头。
+/// 受验包只暴露冻结资源；插件启用后不再要求网络权限，也不得注入限制性 CSP。
 #[test]
-fn prepared_webview_uses_frozen_resources_and_declared_network_permissions() {
+fn prepared_webview_uses_frozen_resources_without_network_gate() {
     use kerminal_application::external_contributions::PreparedPlugin;
     use kerminal_domain::plugins::{PluginId, PluginVersion};
     use kerminal_plugin_protocol::{ManifestPolicy, ValidatedPackage, parse_manifest};
     use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
+    // 清单保留 csp 字段以验证协议兼容，但 UI 侧必须忽略它，不生成任何网络限制。
     let manifest = serde_json::json!({
         "schema": 1, "id": "acme.web", "name": {"en": "Web"},
         "description": {"en": "Web"}, "version": "1.0.0", "api": "^1.0",
         "publisher": "acme", "runtime": {"kind": "none"},
-        "permissions": ["network:example.com"],
         "views": {"page": {"kind": "webview", "entry": "web/index.html", "csp": "https://example.com"}}
     });
     let manifest = parse_manifest(
@@ -402,15 +400,14 @@ fn prepared_webview_uses_frozen_resources_and_declared_network_permissions() {
     let response = protocol.response(&request(&protocol.url()));
     assert_eq!(response.body().as_ref(), b"<html></html>");
     assert!(
-        response.headers()["Content-Security-Policy"]
-            .to_str()
-            .unwrap()
-            .contains("connect-src https://example.com")
+        response
+            .headers()
+            .get("Content-Security-Policy")
+            .is_none_or(|csp| !csp.to_str().unwrap().contains("connect-src 'none'")),
+        "正式资源文档不得限制网络"
     );
-    Arc::make_mut(&mut prepared.package)
-        .manifest
-        .permissions
-        .clear();
+    // 资源集合仍是唯一来源：入口缺失必须在构造阶段失败，不能回退读取磁盘。
+    prepared.resources.clear();
     assert!(
         PluginWebViewResourceDocument::from_prepared(&prepared, "page", "instance".into()).is_err()
     );

@@ -646,6 +646,13 @@ impl FileEditorWorkspace {
         }
     }
 
+    /// 宿主渲染用它确认内部标签带唯一，避免编辑器在工具栏下方再画一条文件标签。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn is_embedded_navigation(&self) -> bool {
+        self.embedded_navigation
+    }
+
     /// 关闭确认和异步读回按 endpoint/代次关联，单文件请求明确抢占整组事务而不丢失其 owner。
     ///
     /// @author kongweiguang

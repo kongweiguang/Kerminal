@@ -2,6 +2,8 @@
 //!
 //! @author kongweiguang
 
+use std::collections::BTreeSet;
+
 use gpui_kit::{
     AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, IntoElement, Render,
     Stateful, Window,
@@ -13,7 +15,11 @@ use gpui_kit::{
     prelude::*,
     px,
 };
-use kerminal_application::{AppError, commands::CommandHistoryAvailability};
+use kerminal_application::{
+    AppError,
+    commands::{CommandHistoryAvailability, CommandsService},
+    preferences::ToolRailToolId,
+};
 use kerminal_domain::{
     agents::AgentSessionStatus,
     commands::{
@@ -176,6 +182,7 @@ impl QuickOpenView {
             terminal: None,
             terminal_binding: None,
             plugin_commands: Vec::new(),
+            disabled_tools: BTreeSet::new(),
         });
         let query = self.query.clone();
         let local_entries = self.local_entries(mode, &context, &query);
@@ -212,7 +219,7 @@ impl QuickOpenView {
                         return Err(AppError::cancelled("Quick Open query was cancelled"));
                     }
                     append_command_catalogs(
-                        &services,
+                        services.commands.as_deref(),
                         &context,
                         &query,
                         &worker_cancel,
@@ -465,6 +472,13 @@ pub(super) fn local_search_entries(
             );
         }
         for action in KeybindingAction::ALL {
+            // 禁用工具的动作和右栏入口共用同一目录视图；先跳过再走文案与禁用原因，
+            // 避免命令面板出现点了也不会执行的“幽灵”动作。
+            if keybinding_action_tool(action)
+                .is_some_and(|tool| context.disabled_tools.contains(&tool))
+            {
+                continue;
+            }
             if action == KeybindingAction::ApplicationQuit {
                 push_matching(
                     &mut entries,
@@ -514,6 +528,22 @@ pub(super) fn local_search_entries(
     }
     entries.truncate(MAX_QUICK_OPEN_ENTRIES);
     entries
+}
+
+/// 快捷键动作到右栏工具身份只在这里映射一份；禁用过滤、文案与分类共享同一来源，
+/// 避免新增动作时在列表、命令行和过滤逻辑各维护一份名单而互相漂移。
+///
+/// @author kongweiguang
+fn keybinding_action_tool(action: KeybindingAction) -> Option<ToolRailToolId> {
+    match action {
+        KeybindingAction::ToolAgentLauncher => Some(ToolRailToolId::AgentLauncher),
+        KeybindingAction::ToolSystem => Some(ToolRailToolId::System),
+        KeybindingAction::ToolSftp => Some(ToolRailToolId::Sftp),
+        KeybindingAction::ToolPorts => Some(ToolRailToolId::Ports),
+        KeybindingAction::ToolSnippets => Some(ToolRailToolId::Snippets),
+        KeybindingAction::ToolLogs => Some(ToolRailToolId::Logs),
+        _ => None,
+    }
 }
 
 /// 命令名称对应 Root 的实际作用范围；工具入口使用面板同名文案，稳定 action ID 仍用于配置和搜索。
@@ -644,18 +674,42 @@ async fn append_hosts(
     }
 }
 
+/// 命令内容与历史目录共用打开面板时冻结的禁用工具集合：Snippets 入口归属 commands 单元，
+/// Logs 入口归属 logs 单元，因此不需要在视图层再维护第二套插件映射。
+/// 空集合代表独立界面或离线测试未装配插件服务，沿用旧行为视为启用。
+///
+/// @author kongweiguang
+fn command_catalogs_enabled(context: &QuickOpenOpenContext) -> bool {
+    !context.disabled_tools.contains(&ToolRailToolId::Snippets)
+}
+
+/// 历史命令的读取与插入都要求 logs 单元仍启用；与右栏入口读取同一冻结集合。
+///
+/// @author kongweiguang
+fn command_history_enabled(context: &QuickOpenOpenContext) -> bool {
+    !context.disabled_tools.contains(&ToolRailToolId::Logs)
+}
+
 /// 历史、片段和工作流保留各自服务状态，并把片段风险转换成用户文案而非内部 enum 名。
+/// 禁用对应单元后不再读取目录，避免列出无法打开或插入的行；过滤后的空结果沿用现有空态，
+/// 不追加额外占位状态，也不让布局因缺少来源而抖动。
 ///
 /// @author kongweiguang
 async fn append_command_catalogs(
-    services: &AppServices,
+    commands: Option<&CommandsService>,
     context: &QuickOpenOpenContext,
     query: &str,
     cancellation: &CancellationToken,
     entries: &mut Vec<QuickOpenEntry>,
     statuses: &mut Vec<QuickOpenSourceStatus>,
 ) {
-    let Some(commands) = services.commands.as_ref() else {
+    let commands_enabled = command_catalogs_enabled(context);
+    let history_enabled = command_history_enabled(context);
+    // 两类来源都禁用时连服务句柄都不查询，离线/禁用宿主不会产生“目录未配置”的误导提示。
+    if !commands_enabled && !history_enabled {
+        return;
+    }
+    let Some(commands) = commands else {
         statuses.push(QuickOpenSourceStatus::Error(text(
             "命令目录未配置",
             "Command catalog is not configured",
@@ -670,76 +724,87 @@ async fn append_command_catalogs(
             && target.binding.owner == target.context.owner
             && target.binding.session_generation == target.context.session_generation
     });
-    match commands.history_availability() {
-        CommandHistoryAvailability::Available => {
-            let request = CommandHistoryListRequest {
-                query: (!query.is_empty()).then(|| query.to_owned()),
-                limit: Some(80),
-                ..Default::default()
-            };
-            match commands.list_history(request).await {
-                Ok(history) => {
-                    for entry in history {
-                        if cancellation.is_cancelled() || entries.len() >= MAX_QUICK_OPEN_ENTRIES {
-                            break;
+    if history_enabled {
+        match commands.history_availability() {
+            CommandHistoryAvailability::Available => {
+                let request = CommandHistoryListRequest {
+                    query: (!query.is_empty()).then(|| query.to_owned()),
+                    limit: Some(80),
+                    ..Default::default()
+                };
+                match commands.list_history(request).await {
+                    Ok(history) => {
+                        for entry in history {
+                            if cancellation.is_cancelled()
+                                || entries.len() >= MAX_QUICK_OPEN_ENTRIES
+                            {
+                                break;
+                            }
+                            let command_safe =
+                                QuickOpenEntry::history_command_is_insertable(&entry.command);
+                            let can_insert = insertion_target.is_some() && command_safe;
+                            let detail = if !command_safe {
+                                text(
+                                    "多行或含控制字符，不能安全插入",
+                                    "Multiline or control text cannot be inserted safely",
+                                )
+                            } else if insertion_target.is_none() {
+                                text(
+                                    "需要空白且可信的终端提示符",
+                                    "Requires a clean, trusted terminal prompt",
+                                )
+                            } else {
+                                format!(
+                                    "{} · {}",
+                                    text("历史命令", "Command history"),
+                                    entry.cwd.as_deref().unwrap_or("")
+                                )
+                            };
+                            push_matching(
+                                entries,
+                                QuickOpenEntry {
+                                    label: entry.command.clone(),
+                                    detail,
+                                    keywords: vec![entry.id, entry.shell.unwrap_or_default()],
+                                    selection: Some(QuickOpenSelection::HistoryCommand(
+                                        entry.command,
+                                    )),
+                                    disabled: !can_insert,
+                                },
+                                query,
+                            );
                         }
-                        let command_safe =
-                            QuickOpenEntry::history_command_is_insertable(&entry.command);
-                        let can_insert = insertion_target.is_some() && command_safe;
-                        let detail = if !command_safe {
-                            text(
-                                "多行或含控制字符，不能安全插入",
-                                "Multiline or control text cannot be inserted safely",
-                            )
-                        } else if insertion_target.is_none() {
-                            text(
-                                "需要空白且可信的终端提示符",
-                                "Requires a clean, trusted terminal prompt",
-                            )
-                        } else {
-                            format!(
-                                "{} · {}",
-                                text("历史命令", "Command history"),
-                                entry.cwd.as_deref().unwrap_or("")
-                            )
-                        };
-                        push_matching(
-                            entries,
-                            QuickOpenEntry {
-                                label: entry.command.clone(),
-                                detail,
-                                keywords: vec![entry.id, entry.shell.unwrap_or_default()],
-                                selection: Some(QuickOpenSelection::HistoryCommand(entry.command)),
-                                disabled: !can_insert,
-                            },
-                            query,
-                        );
+                    }
+                    Err(error) => {
+                        statuses.push(source_error("命令历史", "Command history", &error))
                     }
                 }
-                Err(error) => statuses.push(source_error("命令历史", "Command history", &error)),
             }
-        }
-        CommandHistoryAvailability::Unavailable { reason } => {
-            let english = match reason {
-                kerminal_application::commands::CommandHistoryUnavailableReason::MigrationRequired(_) => {
-                    "Command history requires the 0.4 data migration before it can be used"
-                }
-                _ => "Command history is unavailable",
-            };
-            statuses.push(QuickOpenSourceStatus::Error(text(
-                match reason {
-                    kerminal_application::commands::CommandHistoryUnavailableReason::MigrationRequired(_) => "命令历史需要先执行0.4数据迁移",
-                    kerminal_application::commands::CommandHistoryUnavailableReason::UnsupportedSchemaVersion(_) => "命令历史数据库版本不受支持",
-                    kerminal_application::commands::CommandHistoryUnavailableReason::CorruptDatabase => "命令历史数据库已损坏",
-                    kerminal_application::commands::CommandHistoryUnavailableReason::StorageUnavailable => "命令历史存储不可用",
-                    kerminal_application::commands::CommandHistoryUnavailableReason::BackupFailed => "命令历史安全备份失败",
-                    kerminal_application::commands::CommandHistoryUnavailableReason::StorageLockUnavailable => "命令历史存储锁不可用",
-                },
-                english,
-            )));
+            CommandHistoryAvailability::Unavailable { reason } => {
+                let english = match reason {
+                    kerminal_application::commands::CommandHistoryUnavailableReason::MigrationRequired(_) => {
+                        "Command history requires the 0.4 data migration before it can be used"
+                    }
+                    _ => "Command history is unavailable",
+                };
+                statuses.push(QuickOpenSourceStatus::Error(text(
+                    match reason {
+                        kerminal_application::commands::CommandHistoryUnavailableReason::MigrationRequired(_) => "命令历史需要先执行0.4数据迁移",
+                        kerminal_application::commands::CommandHistoryUnavailableReason::UnsupportedSchemaVersion(_) => "命令历史数据库版本不受支持",
+                        kerminal_application::commands::CommandHistoryUnavailableReason::CorruptDatabase => "命令历史数据库已损坏",
+                        kerminal_application::commands::CommandHistoryUnavailableReason::StorageUnavailable => "命令历史存储不可用",
+                        kerminal_application::commands::CommandHistoryUnavailableReason::BackupFailed => "命令历史安全备份失败",
+                        kerminal_application::commands::CommandHistoryUnavailableReason::StorageLockUnavailable => "命令历史存储锁不可用",
+                    },
+                    english,
+                )));
+            }
         }
     }
     if cancellation.is_cancelled() {
+        return;
+    }
+    if !commands_enabled {
         return;
     }
 

@@ -7,14 +7,17 @@ use async_trait::async_trait;
 use kerminal_domain::{
     agents::{
         AgentLauncherKey, AgentProvider, AgentProviderSession, AgentSession, AgentSessionScope,
-        AgentSessionStatus, AgentTargetBinding,
+        AgentSessionStatus, AgentTargetBinding, AgentTargetLiveStatus,
     },
     identity::{AgentSessionId, PaneId, SessionId, TabId},
     preferences::{
         ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
         ConfigurationRecoveryState,
     },
-    sessions::{LocalSessionTarget, SessionExitStatus, SessionOwner, SessionTarget, TerminalSize},
+    sessions::{
+        LocalSessionTarget, SessionExitStatus, SessionLifecycle, SessionOwner, SessionTarget,
+        TerminalSize,
+    },
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -31,11 +34,11 @@ use crate::{
     AppError, AppResult, PreferencesService, PublicErrorCode,
     agents::{
         AgentHistoryMode, AgentHistoryRequest, AgentProviderSessionSnapshot,
-        AgentProviderSessionStatus, AgentSessionService, AgentWorkspaceDocument,
-        AgentWorkspaceDocumentContent, AgentWorkspaceDocumentKind, AgentWorkspaceRepository,
-        AgentWorkspaceRevision, AgentWorkspaceSessionSnapshot, AgentWorkspaceWriteReceipt,
-        CreateAgentSessionFromHistoryRequest, RenameAgentSessionTitleRequest,
-        SendAgentCommandRequest,
+        AgentProviderSessionStatus, AgentSessionService, AgentTerminalSnapshotRequest,
+        AgentWorkspaceDocument, AgentWorkspaceDocumentContent, AgentWorkspaceDocumentKind,
+        AgentWorkspaceRepository, AgentWorkspaceRevision, AgentWorkspaceSessionSnapshot,
+        AgentWorkspaceWriteReceipt, CreateAgentSessionFromHistoryRequest,
+        RenameAgentSessionTitleRequest, SendAgentCommandRequest,
     },
     preferences::{
         ConfigurationGuideStatus, ConfigurationRepository, SettingsRepository, SettingsSnapshot,
@@ -294,6 +297,23 @@ impl MemoryAgentWorkspace {
                 path: format!("C:/fixture/.kerminal/agents/sessions/{id}/provider.toml"),
             },
         );
+    }
+
+    /// 改变隔离仓储里的会话状态并推进 revision，验证非 Active 会话在真实 snapshot 写入门禁前被拒绝。
+    /// 只服务于本文件的失败分支，不模拟 provider 或恢复材料的变化。
+    ///
+    /// @author kongweiguang
+    fn set_session_status(&self, id: &AgentSessionId, status: AgentSessionStatus) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Agent workspace test mutex should not be poisoned");
+        let snapshot = state
+            .sessions
+            .get_mut(id.as_str())
+            .expect("requested Agent fixture should exist");
+        snapshot.session.status = status;
+        snapshot.revision = AgentWorkspaceRevision::Sha256(format!("status-{status:?}"));
     }
 }
 
@@ -1080,6 +1100,7 @@ impl ConfigurationRepository for UnusedConfigurationRepository {
 
 struct MemorySessions {
     sessions: Mutex<Vec<kerminal_domain::sessions::SessionInfo>>,
+    snapshots: Mutex<HashMap<SessionId, String>>,
     create_count: AtomicUsize,
     created_session_ids: Mutex<Vec<SessionId>>,
     generation: u64,
@@ -1099,6 +1120,7 @@ impl MemorySessions {
     ) -> Self {
         Self {
             sessions: Mutex::new(sessions),
+            snapshots: Mutex::new(HashMap::new()),
             create_count: AtomicUsize::new(0),
             created_session_ids: Mutex::new(Vec::new()),
             generation,
@@ -1136,6 +1158,42 @@ impl MemorySessions {
             .lock()
             .expect("Agent session test mutex should not be poisoned")
             .clone()
+    }
+
+    /// 为目标上下文用例配置可读的纯文本输出；未配置的会话仍走 unused_port，
+    /// 保证旧用例不会因新增 fake 能力而误读默认空快照。
+    ///
+    /// @author kongweiguang
+    fn set_snapshot_text(&self, session_id: &SessionId, text: &str) {
+        self.snapshots
+            .lock()
+            .expect("Agent snapshot test mutex should not be poisoned")
+            .insert(session_id.clone(), text.to_owned());
+    }
+
+    /// 改变已登记终端的生命周期，覆盖 Agent CLI 不在 Running 与显式目标已退出的真实服务分支。
+    ///
+    /// @author kongweiguang
+    fn set_lifecycle(&self, session_id: &SessionId, lifecycle: SessionLifecycle) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("Agent session test mutex should not be poisoned");
+        let session = sessions
+            .iter_mut()
+            .find(|session| &session.session_id == session_id)
+            .expect("fixture terminal should exist");
+        session.lifecycle = lifecycle;
+    }
+
+    /// 移除终端以模拟显式目标已不存在；真实服务必须返回 not_found，不能用首选 A 补位。
+    ///
+    /// @author kongweiguang
+    fn remove(&self, session_id: &SessionId) {
+        self.sessions
+            .lock()
+            .expect("Agent session test mutex should not be poisoned")
+            .retain(|session| &session.session_id != session_id);
     }
 }
 
@@ -1300,13 +1358,33 @@ impl SessionService for MemorySessions {
         unused_port()
     }
 
-    /// 本用例不从 scrollback 读取文本。
+    /// 只有显式配置过的终端才返回纯文本，让真实 target_context 能读取 A 的快照；
+    /// 未配置的旧用例继续走 unused_port，避免悄悄改变既有失败语义。
+    ///
+    /// @author kongweiguang
     async fn plaintext_snapshot(
         &self,
-        _session_id: SessionId,
+        session_id: SessionId,
         _request: PlainTextSnapshotRequest,
     ) -> AppResult<PlainTextSnapshot> {
-        unused_port()
+        let text = self
+            .snapshots
+            .lock()
+            .expect("Agent snapshot test mutex should not be poisoned")
+            .get(&session_id)
+            .cloned();
+        let Some(text) = text else {
+            return unused_port();
+        };
+        let line_count = text.lines().count();
+        Ok(PlainTextSnapshot {
+            session_id,
+            text,
+            first_line: 0,
+            line_count,
+            total_scrollback_lines: line_count,
+            truncated: false,
+        })
     }
 
     /// 本测试不滚动终端视口。
@@ -3271,4 +3349,447 @@ async fn target_binding_retry_keeps_identity_and_rejects_older_generation() {
             .and_then(|binding| binding.binding_id.as_deref()),
         Some("binding-id-stable-9")
     );
+}
+
+/// 同一 Tab 的 A/B 首选目标夹具；只保存测试需要的身份，避免用长元组掩盖每条断言来源。
+struct ContinuityTargets {
+    service: AgentSessionService,
+    workspace: Arc<MemoryAgentWorkspace>,
+    sessions: Arc<MemorySessions>,
+    agent_session_id: AgentSessionId,
+    agent_terminal_session_id: SessionId,
+    a_session_id: SessionId,
+    b_session_id: SessionId,
+    preferred: AgentTargetBinding,
+}
+
+const CONTINUITY_SNAPSHOT_LIMIT: usize = 4096;
+
+/// 构造真实 AgentSessionService 的三终端场景：Agent CLI、首选 A、同 Tab 另一 pane B。
+/// A/B 都必须是 Running 的 UI 终端，才能进入生产首选目标解析；快照文本只放在内存 fake 中。
+///
+/// @author kongweiguang
+async fn continuity_targets() -> ContinuityTargets {
+    let agent_session_id = AgentSessionId::new();
+    let agent_terminal_session_id = SessionId::new();
+    let a_session_id = SessionId::new();
+    let b_session_id = SessionId::new();
+    let tab_id = TabId::parse("tab-continuity").expect("valid fixture tab ID");
+    let a_pane_id = PaneId::parse("pane-a").expect("valid fixture pane ID");
+    let b_pane_id = PaneId::parse("pane-b").expect("valid fixture pane ID");
+    let mut preferred = stale_target("local://target-a");
+    preferred.binding_id = Some("binding-a".to_owned());
+    preferred.generation = 3;
+    preferred.pane_id = Some(a_pane_id.clone());
+    preferred.tab_id = Some(tab_id.clone());
+    preferred.terminal_session_id = Some(a_session_id.clone());
+    preferred.live_status = AgentTargetLiveStatus::Ready;
+
+    let workspace = Arc::new(MemoryAgentWorkspace::new(
+        agent_with_history_binding(
+            agent_session_id.clone(),
+            AgentSessionStatus::Active,
+            preferred.clone(),
+        ),
+        codex_provider_session(),
+        CommitBehavior::Accept,
+    ));
+    let sessions = Arc::new(MemorySessions::new(
+        vec![
+            terminal_info(
+                agent_terminal_session_id.clone(),
+                SessionOwner::Agent {
+                    agent_session_id: agent_session_id.clone(),
+                },
+                SessionLifecycle::Running,
+            ),
+            terminal_info(
+                a_session_id.clone(),
+                SessionOwner::Ui {
+                    tab_id: tab_id.clone(),
+                    pane_id: a_pane_id,
+                },
+                SessionLifecycle::Running,
+            ),
+            terminal_info(
+                b_session_id.clone(),
+                SessionOwner::Ui {
+                    tab_id,
+                    pane_id: b_pane_id,
+                },
+                SessionLifecycle::Running,
+            ),
+        ],
+        TEST_SESSION_GENERATION,
+        false,
+    ));
+    sessions.set_snapshot_text(&a_session_id, "preferred A output");
+    sessions.set_snapshot_text(&b_session_id, "explicit B output");
+    let service = agent_service(workspace.clone(), sessions.clone());
+    *service.endpoint.write().await = Some(TEST_AGENT_ENDPOINT.to_owned());
+    ContinuityTargets {
+        service,
+        workspace,
+        sessions,
+        agent_session_id,
+        agent_terminal_session_id,
+        a_session_id,
+        b_session_id,
+        preferred,
+    }
+}
+
+/// 读取真实服务生成的受管 context 文档正文，只解析不修改；内存 workspace 不落盘，
+/// 因此这里覆盖的是服务实际生成的文档内容，而不是磁盘上的文件。
+///
+/// @author kongweiguang
+fn context_json(
+    workspace: &MemoryAgentWorkspace,
+    agent_session_id: &AgentSessionId,
+    kind: AgentWorkspaceDocumentKind,
+) -> serde_json::Value {
+    let text = workspace
+        .context_document(agent_session_id, kind)
+        .unwrap_or_else(|| panic!("missing context document: {kind:?}"));
+    serde_json::from_str(&text).expect("context document should be valid JSON")
+}
+
+/// 通过真实 application service 记录显式目标输出；测试只替换 SessionService/workspace 端口，
+/// 不绕过 Active、Agent CLI Running、目标存在和脱敏/裁剪门禁。
+///
+/// @author kongweiguang
+async fn record_terminal_output(
+    service: &AgentSessionService,
+    agent_session_id: &AgentSessionId,
+    target_session_id: &SessionId,
+    output: &str,
+) -> AppResult<()> {
+    service
+        .record_terminal_snapshot(
+            AgentTerminalSnapshotRequest {
+                agent_session_id: agent_session_id.clone(),
+                target_session_id: target_session_id.clone(),
+                output: output.to_owned(),
+                max_bytes: CONTINUITY_SNAPSHOT_LIMIT,
+                truncated: false,
+                redacted: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+}
+
+/// 显式记录 B 的快照只允许写 B 的来源元数据和输出；首选绑定仍为 A，重新读取
+/// target_context 必须按 A 刷新，而不是把 B 变成新的绑定。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn explicit_target_snapshot_keeps_preferred_a_and_target_context_refreshes_a() {
+    let targets = continuity_targets().await;
+    let first = targets
+        .service
+        .target_context(
+            targets.agent_session_id.clone(),
+            CONTINUITY_SNAPSHOT_LIMIT,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("preferred A context should be readable");
+    assert_eq!(
+        first.target.resolved_session_id.as_ref(),
+        Some(&targets.a_session_id)
+    );
+    assert_eq!(&first.target.binding, &targets.preferred);
+    let first_snapshot = first
+        .snapshot
+        .as_ref()
+        .expect("preferred A should expose a snapshot");
+    assert_eq!(first_snapshot.session_id, targets.a_session_id);
+    assert_eq!(first_snapshot.text, "preferred A output");
+    assert_eq!(first.captured_bytes, "preferred A output".len());
+
+    let b_output = "pane-b ready\nsecond line";
+    record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        b_output,
+    )
+    .await
+    .expect("explicit B snapshot should be accepted while Agent CLI remains running");
+
+    assert_eq!(
+        targets
+            .workspace
+            .stored_session(&targets.agent_session_id)
+            .target
+            .as_ref(),
+        Some(&targets.preferred),
+        "recording B must not change the preferred A binding"
+    );
+    let target_document = context_json(
+        &targets.workspace,
+        &targets.agent_session_id,
+        AgentWorkspaceDocumentKind::TargetBindingContext,
+    );
+    assert_eq!(
+        target_document["binding"]["bindingId"].as_str(),
+        Some("binding-a")
+    );
+    assert_eq!(
+        target_document["binding"]["targetTerminalSessionId"].as_str(),
+        Some(targets.a_session_id.as_str())
+    );
+    let snapshot_document = context_json(
+        &targets.workspace,
+        &targets.agent_session_id,
+        AgentWorkspaceDocumentKind::TerminalSnapshotContext,
+    );
+    assert_eq!(
+        snapshot_document["targetTerminalSessionId"].as_str(),
+        Some(targets.b_session_id.as_str())
+    );
+    assert_eq!(snapshot_document["output"].as_str(), Some(b_output));
+    assert_eq!(
+        snapshot_document["capturedBytes"].as_u64(),
+        Some(b_output.len() as u64)
+    );
+    assert_eq!(
+        snapshot_document["maxBytes"].as_u64(),
+        Some(CONTINUITY_SNAPSHOT_LIMIT as u64)
+    );
+    assert_eq!(snapshot_document["truncated"].as_bool(), Some(false));
+    assert_eq!(snapshot_document["redacted"].as_bool(), Some(false));
+
+    let refreshed = targets
+        .service
+        .target_context(
+            targets.agent_session_id.clone(),
+            CONTINUITY_SNAPSHOT_LIMIT,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("repeated context refresh should still resolve preferred A");
+    assert_eq!(
+        refreshed.target.resolved_session_id.as_ref(),
+        Some(&targets.a_session_id)
+    );
+    assert_eq!(&refreshed.target.binding, &targets.preferred);
+    let refreshed_snapshot = refreshed
+        .snapshot
+        .as_ref()
+        .expect("refreshed A should expose its snapshot");
+    assert_eq!(refreshed_snapshot.session_id, targets.a_session_id);
+    assert_eq!(refreshed_snapshot.text, "preferred A output");
+    assert_eq!(refreshed.captured_bytes, "preferred A output".len());
+    let refreshed_document = context_json(
+        &targets.workspace,
+        &targets.agent_session_id,
+        AgentWorkspaceDocumentKind::TerminalSnapshotContext,
+    );
+    // `target_context` 以 None 表示“按首选绑定规则取快照来源”，文档层再回退到
+    // `session.target.terminal_session_id`，所以这里必须精确记录首选 A，而不是 B 或 null。
+    assert_eq!(
+        refreshed_document["targetTerminalSessionId"].as_str(),
+        Some(targets.a_session_id.as_str()),
+        "preferred target refresh must record the preferred A source, never the explicit B source"
+    );
+    assert_ne!(
+        refreshed_document["targetTerminalSessionId"].as_str(),
+        Some(targets.b_session_id.as_str()),
+        "refreshing the preferred target must not retain the explicit B snapshot source"
+    );
+    assert_eq!(
+        refreshed_document["output"].as_str(),
+        Some("preferred A output")
+    );
+    let refreshed_target = context_json(
+        &targets.workspace,
+        &targets.agent_session_id,
+        AgentWorkspaceDocumentKind::TargetBindingContext,
+    );
+    assert_eq!(
+        refreshed_target["binding"]["bindingId"].as_str(),
+        Some("binding-a")
+    );
+    assert_eq!(
+        refreshed_target["binding"]["targetTerminalSessionId"].as_str(),
+        Some(targets.a_session_id.as_str())
+    );
+    assert_eq!(
+        targets
+            .workspace
+            .stored_session(&targets.agent_session_id)
+            .target
+            .as_ref(),
+        Some(&targets.preferred)
+    );
+    assert_eq!(
+        targets.sessions.create_count(),
+        0,
+        "context reads and snapshot writes must not start another CLI"
+    );
+}
+
+/// B 已退出或已不存在时，真实服务必须对显式目标返回 not_found；不能回退到首选 A，
+/// 也不能用失败请求覆盖上一次成功写入的 B 快照或改变 A 绑定。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn exited_or_missing_explicit_target_returns_not_found_without_overwriting_snapshot() {
+    let targets = continuity_targets().await;
+    record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        "first B snapshot",
+    )
+    .await
+    .expect("initial explicit B snapshot should be recorded");
+    let document_before = targets
+        .workspace
+        .context_document(
+            &targets.agent_session_id,
+            AgentWorkspaceDocumentKind::TerminalSnapshotContext,
+        )
+        .expect("initial B snapshot document should exist");
+
+    targets
+        .sessions
+        .set_lifecycle(&targets.b_session_id, SessionLifecycle::Exited);
+    let error = record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        "must not replace exited B",
+    )
+    .await
+    .expect_err("exited explicit target must not be accepted");
+    assert_eq!(error.public_code(), PublicErrorCode::NotFound);
+    assert_eq!(error.public_message(), "Terminal snapshot target not found");
+    assert_eq!(
+        targets.workspace.context_document(
+            &targets.agent_session_id,
+            AgentWorkspaceDocumentKind::TerminalSnapshotContext
+        ),
+        Some(document_before.clone())
+    );
+    let unchanged = context_json(
+        &targets.workspace,
+        &targets.agent_session_id,
+        AgentWorkspaceDocumentKind::TerminalSnapshotContext,
+    );
+    assert_eq!(
+        unchanged["targetTerminalSessionId"].as_str(),
+        Some(targets.b_session_id.as_str())
+    );
+    assert_eq!(unchanged["output"].as_str(), Some("first B snapshot"));
+
+    targets.sessions.remove(&targets.b_session_id);
+    let error = record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        "must not replace missing B",
+    )
+    .await
+    .expect_err("missing explicit target must not be accepted");
+    assert_eq!(error.public_code(), PublicErrorCode::NotFound);
+    assert_eq!(error.public_message(), "Terminal snapshot target not found");
+    assert_eq!(
+        targets.workspace.context_document(
+            &targets.agent_session_id,
+            AgentWorkspaceDocumentKind::TerminalSnapshotContext
+        ),
+        Some(document_before)
+    );
+    assert_eq!(
+        targets
+            .workspace
+            .stored_session(&targets.agent_session_id)
+            .target
+            .as_ref(),
+        Some(&targets.preferred),
+        "a failed explicit snapshot must not fall back to A or rebind"
+    );
+}
+
+/// Agent CLI 不在 Running 或 session 非 Active 时，真实写入门禁必须拒绝；失败不得触碰
+/// 已成功写入的快照，也不得把首选绑定改成显式请求的目标。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn snapshot_write_rejects_nonrunning_cli_and_inactive_session() {
+    let targets = continuity_targets().await;
+    record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        "first B snapshot",
+    )
+    .await
+    .expect("initial explicit B snapshot should be recorded");
+    let document_before = targets
+        .workspace
+        .context_document(
+            &targets.agent_session_id,
+            AgentWorkspaceDocumentKind::TerminalSnapshotContext,
+        )
+        .expect("initial B snapshot document should exist");
+
+    targets
+        .sessions
+        .set_lifecycle(&targets.agent_terminal_session_id, SessionLifecycle::Exited);
+    let error = record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        "must not write when CLI exited",
+    )
+    .await
+    .expect_err("non-running Agent CLI must reject the snapshot");
+    assert_eq!(error.public_code(), PublicErrorCode::Conflict);
+    assert_eq!(error.public_message(), "Agent CLI session is not running");
+    assert_eq!(
+        targets.workspace.context_document(
+            &targets.agent_session_id,
+            AgentWorkspaceDocumentKind::TerminalSnapshotContext
+        ),
+        Some(document_before.clone())
+    );
+
+    targets.sessions.set_lifecycle(
+        &targets.agent_terminal_session_id,
+        SessionLifecycle::Running,
+    );
+    targets
+        .workspace
+        .set_session_status(&targets.agent_session_id, AgentSessionStatus::Archived);
+    targets.sessions.remove(&targets.agent_terminal_session_id);
+    let error = record_terminal_output(
+        &targets.service,
+        &targets.agent_session_id,
+        &targets.b_session_id,
+        "must not write when session archived",
+    )
+    .await
+    .expect_err("non-active Agent session must reject the snapshot");
+    assert_eq!(error.public_code(), PublicErrorCode::Conflict);
+    assert_eq!(error.public_message(), "Agent session is not active");
+    assert_eq!(
+        targets.workspace.context_document(
+            &targets.agent_session_id,
+            AgentWorkspaceDocumentKind::TerminalSnapshotContext
+        ),
+        Some(document_before)
+    );
+    assert_eq!(
+        targets
+            .workspace
+            .stored_session(&targets.agent_session_id)
+            .target
+            .as_ref(),
+        Some(&targets.preferred)
+    );
+    assert_eq!(targets.sessions.create_count(), 0);
 }

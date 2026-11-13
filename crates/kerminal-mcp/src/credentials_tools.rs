@@ -11,6 +11,7 @@ use kerminal_application::{
             HostManagementService, HostRouteSettings,
         },
     },
+    plugins::capabilities,
 };
 use kerminal_domain::{
     connections::{
@@ -27,7 +28,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args, success},
+    terminal_tools::{failure, parse_args, success, units_gate},
 };
 
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
@@ -112,6 +113,15 @@ async fn upsert_host(
         return failure(AppError::capability_not_supported(
             "credential upsert supports SSH, SFTP, and RDP hosts",
         ));
+    }
+    // 新建默认协议为 SSH，更新沿用既有协议；门禁必须在任何 vault/host 写入之前执行。
+    let protocol_token = capabilities::remote_protocol_token(protocol);
+    if let Some(result) = units_gate(
+        services,
+        "kerminal.host.upsert_with_credential",
+        capabilities::host_protocol_units(protocol_token),
+    ) {
+        return result;
     }
     let host_id = existing.as_ref().map(|host| host.id.clone());
     let group_id = requested_group(
@@ -228,6 +238,14 @@ async fn encrypt_secret(
     let kind_value = args.kind.trim();
     if !matches!(kind_value, "ssh-host" | "jump-host" | "rdp-host") {
         return failure(AppError::invalid("credential kind"));
+    }
+    // 凭据种类决定依赖单元；SSH 与 RDP 凭据不能因另一协议启用而被写入。
+    if let Some(result) = units_gate(
+        services,
+        "kerminal.vault.encrypt_secret",
+        capabilities::credential_kind_units(kind_value),
+    ) {
+        return result;
     }
     let kind = match CredentialKind::parse(kind_value) {
         Ok(kind) => kind,

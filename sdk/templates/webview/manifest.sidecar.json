@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "id": "__PLUGIN_ID__",
+  "name": {"en": "Example WebView"},
+  "description": {"en": "A Kerminal WebView plugin with a Rust Sidecar"},
+  "version": "0.1.0",
+  "api": "^1.0",
+  "publisher": "__PUBLISHER__",
+  "runtime": {
+    "kind": "sidecar",
+    "main": {
+      "windows-x86_64": "bin/sidecar.exe",
+      "linux-x86_64": "bin/sidecar",
+      "macos-x86_64": "bin/sidecar",
+      "macos-aarch64": "bin/sidecar"
+    },
+    "activation": "on-demand"
+  },
+  "contributes": {"tabs": [{"id": "page", "title": "%page.title%", "view": "page", "state_version": 1}]},
+  "views": {"page": {"kind": "webview", "entry": "web/index.html"}},
+  "l10n": "l10n"
+}

@@ -1,8 +1,8 @@
-//! 插件运行服务的身份、权限与崩溃恢复回归。
+//! 插件运行服务的身份、宿主方法与崩溃恢复回归。
 //! @author kongweiguang
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc, Mutex, Weak,
@@ -22,9 +22,7 @@ use kerminal_application::{
     plugin_runtime::{PluginRuntimeDescriptor, PluginRuntimeService},
 };
 use kerminal_domain::plugins::{PluginId, PluginRuntimeState, PluginVersion};
-use kerminal_plugin_protocol::{
-    ManifestPolicy, Permission, ValidatedPackage, error_code, parse_manifest,
-};
+use kerminal_plugin_protocol::{ManifestPolicy, ValidatedPackage, error_code, parse_manifest};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -89,7 +87,7 @@ impl FakeProcess {
 
 #[async_trait]
 impl PluginProcessPort for FakeProcess {
-    /// 记录弱引用以模拟同一个权限路由，不延长应用服务生命周期。
+    /// 记录弱引用以模拟同一个宿主路由，不延长应用服务生命周期。
     fn register_host_router(&self, router: Weak<dyn PluginHostRouter>) -> AppResult<()> {
         *self.router.lock().expect("router lock") = Some(router);
         Ok(())
@@ -190,24 +188,21 @@ impl PluginHostApi for FakeHost {
 }
 
 /// 每个用例创建隔离服务和共享执行器，不依赖桌面或用户配置。
-fn fixture(
-    permissions: BTreeSet<Permission>,
-) -> (Arc<PluginRuntimeService>, Arc<FakeProcess>, PluginId) {
-    fixture_with_runtime(permissions, false)
+fn fixture() -> (Arc<PluginRuntimeService>, Arc<FakeProcess>, PluginId) {
+    fixture_with_runtime(false)
 }
 
-/// 对照纯声明插件与脚本插件，避免把进程激活错误套到全部视图。
+/// 对照纯声明插件与 Sidecar 插件，避免把进程激活错误套到全部视图。
 fn fixture_with_runtime(
-    permissions: BTreeSet<Permission>,
     declarative: bool,
 ) -> (Arc<PluginRuntimeService>, Arc<FakeProcess>, PluginId) {
     let plugin = PluginId::parse("acme.notes").expect("id");
     let process = Arc::new(FakeProcess::new());
+    // 清单不再声明权限，验证无授权声明时已知宿主方法仍能到达后端。
     let manifest = json!({
         "schema":1,"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},
         "version":"1.0.0","api":"^1.0","publisher":"acme",
-        "runtime":if declarative { json!({"kind":"none"}) } else { json!({"kind":"script","main":"main.js"}) },
-        "permissions":permissions.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "runtime":if declarative { json!({"kind":"none"}) } else { json!({"kind":"sidecar","main":{"windows-x86_64":"bin/app.exe","linux-x86_64":"bin/app","macos-x86_64":"bin/app"}}) },
         "views":{"notes.editor":{"kind":"native","file":"views/editor.json"}}
     });
     let manifest = parse_manifest(
@@ -234,10 +229,7 @@ fn fixture_with_runtime(
     });
     let executor = ApplicationTaskExecutor::new(tokio::runtime::Handle::current());
     let service = PluginRuntimeService::new(
-        vec![PluginRuntimeDescriptor {
-            prepared,
-            permissions,
-        }],
+        vec![PluginRuntimeDescriptor { prepared }],
         process.clone(),
         Arc::new(FakeHost),
         executor,
@@ -247,10 +239,9 @@ fn fixture_with_runtime(
 }
 
 #[tokio::test]
-/// 声明式插件无需进程也能打开界面，并且宿主能力仍需通过权限校验。
+/// 声明式插件无需进程也能打开界面，并且无权限声明仍可使用已知宿主能力。
 async fn declarative_views_do_not_activate_a_process() {
-    let (service, process, plugin) =
-        fixture_with_runtime(BTreeSet::from([Permission::UiNotify]), true);
+    let (service, process, plugin) = fixture_with_runtime(true);
     let instance = identity(&plugin, "notes.editor", 1);
     service
         .open(
@@ -303,7 +294,7 @@ fn deadline() -> Instant {
 #[tokio::test]
 /// 关闭重开后旧 wire 身份必须被拒绝，即使插件与业务实例名称相同。
 async fn reopened_view_rejects_old_wire_identity() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let first = identity(&plugin, "notes.editor", 1);
     service
         .open(
@@ -345,10 +336,10 @@ async fn reopened_view_rejects_old_wire_identity() {
 }
 
 #[tokio::test]
-/// WebView 和进程调用必须采用同一权限判断与实例门禁。
-async fn webview_and_process_share_permission_gate() {
-    let (service, process, plugin) = fixture(BTreeSet::from([Permission::UiNotify]));
-    let instance = identity(&plugin, "notes.editor", 1);
+/// WebView 与无进程宿主路由共用实例门禁，已知方法不再按权限拒绝，未知方法仍拒绝。
+async fn webview_and_host_route_share_instance_gate() {
+    let (service, _process, plugin) = fixture_with_runtime(true);
+    let instance = identity(&plugin, "notes.editor", 0);
     service
         .open(
             instance.clone(),
@@ -359,18 +350,17 @@ async fn webview_and_process_share_permission_gate() {
         )
         .await
         .expect("open");
-    let wire = process.wire("notes.editor");
-    let denied = service
+    let prompt = service
         .route_webview(&instance, "ui.prompt", json!({}), CancellationToken::new())
         .await
-        .expect_err("prompt denied");
-    assert_eq!(denied.code, error_code::PERMISSION_DENIED);
+        .expect("known method allowed without declaration");
+    assert_eq!(prompt["accepted"], true);
     let result = service
         .route(
             &plugin,
-            1,
+            0,
             "ui.notify",
-            json!({"instance":wire,"message":"hi"}),
+            json!({"message":"hi"}),
             CancellationToken::new(),
         )
         .await
@@ -391,7 +381,7 @@ async fn webview_and_process_share_permission_gate() {
 #[tokio::test]
 /// 崩溃后以最新已保存状态重新打开，并换用新的进程与 wire 代次。
 async fn restart_reopens_instances_with_saved_state() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     service
         .open(
@@ -476,7 +466,7 @@ async fn restart_reopens_instances_with_saved_state() {
 #[tokio::test]
 /// 权威缓存按合并补丁保存进程结果，事件始终携带原始进程代次。
 async fn view_data_cache_applies_merge_patches_and_tracks_generation() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     let mut events = service.subscribe();
     service
@@ -550,7 +540,7 @@ async fn view_data_cache_applies_merge_patches_and_tracks_generation() {
 #[tokio::test]
 /// 声明式视图只回读已有恢复状态，未知状态不能伪造为有效快照。
 async fn declarative_snapshot_and_close_preserve_saved_state() {
-    let (service, process, plugin) = fixture_with_runtime(BTreeSet::new(), true);
+    let (service, process, plugin) = fixture_with_runtime(true);
     let instance = identity(&plugin, "notes.editor", 1);
     let saved = PluginViewSavedState {
         state_version: 2,
@@ -583,7 +573,7 @@ async fn declarative_snapshot_and_close_preserve_saved_state() {
 #[tokio::test]
 /// 关闭超时仍应释放宿主身份并暴露失败，迟到的插件更新不能命中关闭后的视图。
 async fn timed_out_close_reclaims_instance_without_faking_success() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     let saved = PluginViewSavedState {
         state_version: 1,
@@ -635,7 +625,7 @@ async fn timed_out_close_reclaims_instance_without_faking_success() {
 #[tokio::test]
 /// 崩溃后的窗口必须能释放实例并保留最后确认状态，后续重启不能复活已关闭视图。
 async fn crashed_view_closes_without_reopening() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     service
         .open(
@@ -713,7 +703,7 @@ async fn crashed_view_closes_without_reopening() {
 #[tokio::test]
 /// 视图身份必须属于冻结清单，未知视图不得触发插件进程。
 async fn undeclared_view_is_rejected_before_activation() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let unknown = identity(&plugin, "notes.unknown", 1);
     assert!(
         service
@@ -733,7 +723,7 @@ async fn undeclared_view_is_rejected_before_activation() {
 #[tokio::test]
 /// 快照水位覆盖已排队的旧补丁，之后的动作和更新仍保持单调顺序。
 async fn snapshot_revision_filters_buffered_patches_and_preserves_later_updates() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     let mut events = service.subscribe();
     service
@@ -798,7 +788,7 @@ async fn snapshot_revision_filters_buffered_patches_and_preserves_later_updates(
 #[tokio::test]
 /// 恢复失败只影响对应实例，进程仍就绪时用户可显式重试并收到成功确认。
 async fn failed_reopen_can_be_explicitly_retried_with_ready_process() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     service
         .open(
@@ -857,7 +847,7 @@ async fn failed_reopen_can_be_explicitly_retried_with_ready_process() {
 #[tokio::test]
 /// 恢复请求已发送时关闭需等待其结束，保证插件端不会出现无人持有的实例。
 async fn close_waits_for_inflight_automatic_reopen() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     service
         .open(
@@ -910,7 +900,7 @@ async fn close_waits_for_inflight_automatic_reopen() {
 #[tokio::test]
 /// 旧 wire 的关闭无确认时不得重开新实例；随后明确重试仍能回收并恢复。
 async fn failed_reopen_retains_wire_until_cleanup_acknowledged() {
-    let (service, process, plugin) = fixture(BTreeSet::new());
+    let (service, process, plugin) = fixture();
     let instance = identity(&plugin, "notes.editor", 1);
     service
         .open(

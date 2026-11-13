@@ -707,6 +707,26 @@ impl HostNavigation {
             .map(|host| host.name.clone().into())
     }
 
+    /// 向 Root 打开入口提供当前插件主机快照，使启用判定复用注入后的同一服务映射。
+    ///
+    /// 不直接暴露整张表，避免打开路径自行缓存或改写配置；缺失表示目录尚未包含该身份。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn plugin_host_snapshot(&self, host_id: &HostId) -> Option<PluginHost> {
+        self.plugin_rows
+            .iter()
+            .find(|host| &host.id == host_id)
+            .cloned()
+    }
+
+    /// 向 Root 的 SFTP 打开/传输入口提供当前远程主机快照，用来判断 SSH 端点是否还依赖
+    /// SSH 单元；只读投影避免事件处理复制整张目录，缺失表示该身份尚未进入当前快照。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn host_snapshot(&self, host_id: &HostId) -> Option<ManagedHost> {
+        self.rows.iter().find(|host| &host.id == host_id).cloned()
+    }
+
     /// 复制当前已加载主机的稳定 ID→显示名投影，供 Operations 标题与多主机转发行使用。
     ///
     /// @author kongweiguang
@@ -723,13 +743,7 @@ impl HostNavigation {
         self.rows
             .iter()
             .map(|host| {
-                let protocol = match host.protocol {
-                    RemoteProtocol::Ssh => "SSH",
-                    RemoteProtocol::Sftp => "SFTP",
-                    RemoteProtocol::Telnet => "Telnet",
-                    RemoteProtocol::Serial => "Serial",
-                    RemoteProtocol::Rdp => "RDP",
-                };
+                let protocol = host_protocol_label(host.protocol);
                 (
                     host.id.clone(),
                     format!("{} · {protocol}", host_endpoint_label(host)).into(),
@@ -764,6 +778,10 @@ impl HostNavigation {
         let mut options = split_target_hosts(&self.rows, &self.groups, query)
             .into_iter()
             .filter_map(|host| {
+                // 禁用协议仍保留在主机树中供查看和编辑，但不能成为新标签或分屏目标。
+                if !self.hosts.protocol_enabled(host.protocol) {
+                    return None;
+                }
                 let (target, protocol_label) = match host.protocol {
                     RemoteProtocol::Ssh => (
                         WorkspaceTargetRef::Ssh {
@@ -1111,7 +1129,25 @@ impl HostNavigation {
     }
 
     /// 插件选择单独通知宿主，以便切换目标时清理旧主机的上下文。
+    /// 禁用插件的记录仍可查看或编辑，但不能成为运行目标或运维选择。
     fn select_plugin_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
+        if self
+            .plugin_rows
+            .iter()
+            .find(|host| host.id == host_id)
+            .is_some_and(|host| !self.hosts.plugin_host_enabled(host))
+        {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "插件主机已禁用，配置仍保留供查看或迁移。",
+                    "This plugin host is disabled; its configuration is kept for review or migration.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
         self.selected_host = Some(host_id.clone());
         self.selected_profile = None;
         self.feedback = None;
@@ -1119,13 +1155,33 @@ impl HostNavigation {
         cx.notify();
     }
 
-    /// 打开时重新检查当前目录快照；没有运行提供方或主机已移除时不派发意图。
+    /// 打开时重新检查当前目录快照；没有运行提供方、已移除或所属插件被禁用的主机不派发意图。
     fn request_plugin_host_open(&mut self, host_id: HostId, cx: &mut Context<Self>) {
-        if !self
-            .plugin_rows
-            .iter()
-            .any(|host| host.id == host_id && host.is_runnable())
-        {
+        let Some(host) = self.plugin_rows.iter().find(|host| host.id == host_id) else {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "插件主机不可用，请检查提供方后刷新。",
+                    "This plugin host is unavailable. Check its provider and refresh.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        };
+        if !self.hosts.plugin_host_enabled(host) {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "插件主机已禁用，配置仍保留供查看或迁移。",
+                    "This plugin host is disabled; its configuration is kept for review or migration.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if !host.is_runnable() {
             self.feedback = Some(NavigationFeedback {
                 message: crate::locale::text(
                     "插件主机不可用，请检查提供方后刷新。",
@@ -1201,14 +1257,35 @@ impl HostNavigation {
     }
 
     /// 每次显式打开都进入原连接面板预检；会话是否已存在不改变新标签的创建意图。
+    /// 协议被禁用时保留主机行与配置，但在导航层直接拒绝，不向连接面板发出可执行意图。
     /// @author kongweiguang
     fn request_connect(&mut self, host_id: HostId, cx: &mut Context<Self>) {
-        let protocol = self
-            .rows
-            .iter()
-            .find(|host| host.id == host_id)
-            .map(|host| host.protocol)
-            .unwrap_or(RemoteProtocol::Ssh);
+        let Some(host) = self.rows.iter().find(|host| host.id == host_id) else {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "主机已不存在，请刷新列表后重试。",
+                    "This host no longer exists. Refresh the list and try again.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            self.reload(cx);
+            cx.notify();
+            return;
+        };
+        if !self.hosts.protocol_enabled(host.protocol) {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "该协议已禁用，请先在插件设置中启用。",
+                    "This protocol is disabled. Enable it in plugin settings first.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        let protocol = host.protocol;
         match primary_host_action(protocol) {
             HostPrimaryAction::Connect => {
                 self.select_host(host_id.clone(), cx);
@@ -1263,6 +1340,32 @@ impl HostNavigation {
             cx.notify();
             return false;
         };
+        if !self.hosts.protocol_enabled(RemoteProtocol::Sftp) {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "SFTP 已禁用，请先在插件设置中启用。",
+                    "SFTP is disabled. Enable it in plugin settings first.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return false;
+        }
+        // SSH 主机上的文件动作复用 SSH 连接能力；SSH 单元禁用时即使 SFTP 启用也不能发起。
+        if host.protocol == RemoteProtocol::Ssh && !self.hosts.protocol_enabled(RemoteProtocol::Ssh)
+        {
+            self.feedback = Some(NavigationFeedback {
+                message: crate::locale::text(
+                    "SSH 已禁用，请先在插件设置中启用。",
+                    "SSH is disabled. Enable it in plugin settings first.",
+                )
+                .to_string(),
+                is_error: true,
+            });
+            cx.notify();
+            return false;
+        }
         if host_context_menu_actions(host).show_transfer_tab {
             return true;
         }
@@ -2394,6 +2497,18 @@ enum HostPrimaryAction {
     OpenSftp,
 }
 
+/// 协议显示名集中在这里，供目录副标题、禁用标记和选择器保持同一拼写。
+/// @author kongweiguang
+pub(super) fn host_protocol_label(protocol: RemoteProtocol) -> &'static str {
+    match protocol {
+        RemoteProtocol::Ssh => "SSH",
+        RemoteProtocol::Sftp => "SFTP",
+        RemoteProtocol::Telnet => "Telnet",
+        RemoteProtocol::Serial => "Serial",
+        RemoteProtocol::Rdp => "RDP",
+    }
+}
+
 /// SFTP-only 主机双击打开文件工作区；其它协议沿用连接面板的原协议分派。
 /// @author kongweiguang
 fn primary_host_action(protocol: RemoteProtocol) -> HostPrimaryAction {
@@ -2572,30 +2687,36 @@ fn render_navigation_header(
             .tooltip(crate::locale::text("刷新主机列表", "Refresh hosts"))
             .on_click(cx.listener(|navigation, _: &ClickEvent, _, cx| navigation.reload(cx))),
     );
-    let actions = actions.child(
-        Button::new("host-navigation-sftp-workbench")
-            .debug_selector(|| "host-navigation-sftp-workbench".into())
-            .compact()
-            .ghost()
-            .w(px(metrics.action_width))
-            .h(px(metrics.control_height))
-            .icon(gpui_kit::assets::IconName::ArrowLeftRight)
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .color(theme.sidebar.opacity(0.))
-                    .foreground(theme.muted)
-                    .hover(theme.hover)
-                    .active(theme.selected),
-            )
-            .accessibility_label(crate::locale::text(
-                "打开 SFTP 工作台",
-                "Open SFTP workbench",
-            ))
-            .tooltip(crate::locale::text("SFTP 工作台", "SFTP workbench"))
-            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                cx.emit(HostNavigationEvent::OpenSftpWorkbenchRequested)
-            })),
-    );
+    // SFTP 单元禁用时整个工作台入口没有可用目标；这里只做条件显示，按钮样式和
+    // 槽位度量保持不变，旧帧点击仍由 Root 事件门禁兜底。
+    let actions = if navigation.hosts.protocol_enabled(RemoteProtocol::Sftp) {
+        actions.child(
+            Button::new("host-navigation-sftp-workbench")
+                .debug_selector(|| "host-navigation-sftp-workbench".into())
+                .compact()
+                .ghost()
+                .w(px(metrics.action_width))
+                .h(px(metrics.control_height))
+                .icon(gpui_kit::assets::IconName::ArrowLeftRight)
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(theme.sidebar.opacity(0.))
+                        .foreground(theme.muted)
+                        .hover(theme.hover)
+                        .active(theme.selected),
+                )
+                .accessibility_label(crate::locale::text(
+                    "打开 SFTP 工作台",
+                    "Open SFTP workbench",
+                ))
+                .tooltip(crate::locale::text("SFTP 工作台", "SFTP workbench"))
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                    cx.emit(HostNavigationEvent::OpenSftpWorkbenchRequested)
+                })),
+        )
+    } else {
+        actions
+    };
     let actions = actions.child(
         Button::new("host-navigation-toggle-groups")
             .compact()
@@ -3394,7 +3515,9 @@ fn plugin_host_row(
         .read(cx)
         .clone();
     let selected = navigation.selected_host.as_ref() == Some(&host_id);
+    let plugin_enabled = navigation.hosts.plugin_host_enabled(&host);
     let runnable = host.is_runnable();
+    let openable = runnable && plugin_enabled;
     let readonly = navigation.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
     let editable = host.is_available() && !readonly;
     let can_drag = !readonly
@@ -3405,7 +3528,9 @@ fn plugin_host_row(
         .pending_host_move
         .as_ref()
         .is_some_and(|pending| pending.host_id == host_id);
-    let subtitle = if !host.is_available() {
+    let subtitle = if !plugin_enabled {
+        crate::locale::text("插件已禁用", "Plugin disabled")
+    } else if !host.is_available() {
         crate::locale::text("插件配置不可用", "Plugin configuration unavailable")
     } else if !runnable {
         crate::locale::text("插件运行提供方不可用", "Plugin runtime unavailable")
@@ -3456,7 +3581,7 @@ fn plugin_host_row(
             .justify_center()
             .rounded_lg()
             .bg(theme.selected)
-            .text_color(if runnable { theme.accent } else { theme.muted })
+            .text_color(if openable { theme.accent } else { theme.muted })
             .child(Icon::new(gpui_kit::assets::IconName::Box).size(px(15.))),
     )
     .child(
@@ -3495,10 +3620,15 @@ fn plugin_host_row(
                 slot.child(Spinner::new().small().color(theme.muted))
             }),
     )
-    .accessibility_label(if runnable {
+    .accessibility_label(if openable {
         crate::locale::text(
             format!("{name}，单击选择，双击或按 Enter 打开"),
             format!("{name}; click to select, double-click or press Enter to open"),
+        )
+    } else if !plugin_enabled {
+        crate::locale::text(
+            format!("{name}，插件已禁用，可查看或编辑配置"),
+            format!("{name}; plugin disabled; configuration can still be viewed or edited"),
         )
     } else {
         crate::locale::text(
@@ -3517,7 +3647,7 @@ fn plugin_host_row(
         }),
     )
     .context_menu(move |mut menu, window, cx| {
-        if runnable {
+        if openable {
             let open_entity = menu_entity.clone();
             let open_id = menu_id.clone();
             menu = menu.item(
@@ -3763,6 +3893,9 @@ fn pinned_container_row(
     let name = container.name.clone();
     let description = container.description.clone();
     let selected = navigation.selected_machine_id.as_deref() == Some(stable_id.as_str());
+    // 固定容器的文件操作经 SSH 执行；SSH 禁用时该动作必然失败，直接从菜单隐藏，
+    // 避免可点击的错误入口。containers 单元不在此模块可见，保留 Root 集中防御。
+    let ssh_enabled = navigation.hosts.protocol_enabled(RemoteProtocol::Ssh);
     let click_id = stable_id.clone();
     let keyboard_id = stable_id.clone();
     let open_entity = cx.entity().clone();
@@ -3867,7 +4000,7 @@ fn pinned_container_row(
                 });
             }),
         );
-        menu.item(
+        let menu = menu.item(
             PopupMenuItem::new(crate::locale::text("查看容器详情", "Container details"))
                 .icon(gpui_kit::assets::IconName::Info)
                 .on_click(move |_, _, app| {
@@ -3875,18 +4008,21 @@ fn pinned_container_row(
                         navigation.request_pinned_container_details(details_id.clone(), cx);
                     });
                 }),
-        )
-        .item(
-            PopupMenuItem::new(crate::locale::text("打开文件", "Open files"))
-                .icon(gpui_kit::assets::IconName::FolderOpen)
-                .on_click(move |_, _, app| {
-                    files_entity.update(app, |navigation, cx| {
-                        navigation.request_pinned_container_files(files_id.clone(), cx);
-                    });
-                }),
-        )
-        .separator()
-        .item(
+        );
+        let menu = if ssh_enabled {
+            menu.item(
+                PopupMenuItem::new(crate::locale::text("打开文件", "Open files"))
+                    .icon(gpui_kit::assets::IconName::FolderOpen)
+                    .on_click(move |_, _, app| {
+                        files_entity.update(app, |navigation, cx| {
+                            navigation.request_pinned_container_files(files_id.clone(), cx);
+                        });
+                    }),
+            )
+        } else {
+            menu
+        };
+        menu.separator().item(
             PopupMenuItem::new(crate::locale::text("从侧栏移除", "Remove from sidebar"))
                 .danger()
                 .icon(gpui_kit::assets::IconName::Trash)
@@ -3926,10 +4062,38 @@ fn host_row(
         .read(cx)
         .clone();
     let protocol = host.protocol;
-    let menu_actions = host_context_menu_actions(&host);
+    // 插件启停只影响可用动作；行、名称和端点继续完整列出，配置仍可查看和编辑。
+    let protocol_enabled = navigation.hosts.protocol_enabled(protocol);
+    let sftp_enabled = navigation.hosts.protocol_enabled(RemoteProtocol::Sftp);
+    let ssh_enabled = navigation.hosts.protocol_enabled(RemoteProtocol::Ssh);
+    // SSH 主机打开文件/新传输标签仍复用 SSH 连接单元，SFTP 单元单独启用不足以放行。
+    let sftp_action_enabled = sftp_enabled && (protocol != RemoteProtocol::Ssh || protocol_enabled);
+    let base_actions = host_context_menu_actions(&host);
+    let menu_actions = HostContextMenuActions {
+        show_primary: protocol_enabled
+            && base_actions.show_primary
+            && (protocol != RemoteProtocol::Sftp || sftp_enabled),
+        show_open_files: base_actions.show_open_files && sftp_action_enabled,
+        show_transfer_tab: base_actions.show_transfer_tab && sftp_action_enabled,
+    };
     let can_copy_network_address =
         protocol != RemoteProtocol::Serial && !host.endpoint.host.trim().is_empty();
-    let endpoint = host_endpoint_label(&host);
+    let endpoint = if protocol_enabled {
+        host_endpoint_label(&host)
+    } else {
+        crate::locale::text(
+            format!(
+                "{} · {} 已禁用",
+                host_endpoint_label(&host),
+                host_protocol_label(protocol)
+            ),
+            format!(
+                "{} · {} disabled",
+                host_endpoint_label(&host),
+                host_protocol_label(protocol)
+            ),
+        )
+    };
     let name = host.name.clone();
     let selected = navigation.selected_host.as_ref() == Some(&host_id);
     let pending = navigation
@@ -3943,7 +4107,12 @@ fn host_row(
     let click_id = host_id.clone();
     let menu_entity = cx.entity().clone();
     let menu_id = host_id.clone();
-    let open_label = if menu_actions.show_primary {
+    let open_label = if !protocol_enabled {
+        crate::locale::text(
+            format!("{} 已禁用", host_protocol_label(protocol)),
+            format!("{} disabled", host_protocol_label(protocol)),
+        )
+    } else if menu_actions.show_primary {
         host_primary_action_label(protocol)
     } else {
         crate::locale::text("SFTP 已禁用", "SFTP is disabled")
@@ -3996,7 +4165,11 @@ fn host_row(
             .items_center()
             .justify_center()
             .bg(theme.selected)
-            .text_color(theme.accent)
+            .text_color(if protocol_enabled {
+                theme.accent
+            } else {
+                theme.muted
+            })
             .child(protocol_icon(protocol))
             .child(session_status_dot(session_status, theme)),
     )
@@ -4023,7 +4196,11 @@ fn host_row(
                     .min_w(px(0.))
                     .truncate()
                     .text_size(theme.text_xs)
-                    .text_color(theme.subtle)
+                    .text_color(if protocol_enabled {
+                        theme.subtle
+                    } else {
+                        theme.muted
+                    })
                     .child(endpoint),
             ),
     )
@@ -4038,7 +4215,18 @@ fn host_row(
             }),
     )
     .accessibility_label({
-        let label = if menu_actions.show_primary {
+        let label = if !protocol_enabled {
+            crate::locale::text(
+                format!(
+                    "{name}，{} 已禁用，可查看或编辑配置",
+                    host_protocol_label(protocol)
+                ),
+                format!(
+                    "{name}; {} is disabled; configuration can still be viewed or edited",
+                    host_protocol_label(protocol)
+                ),
+            )
+        } else if menu_actions.show_primary {
             crate::locale::text(
                 format!("{name}，单击选择，双击或按 Enter {open_label}"),
                 format!("{name}; click to select, double-click or press Enter to {open_label}"),
@@ -4180,7 +4368,8 @@ fn host_row(
                     });
                 }),
             );
-            if protocol == RemoteProtocol::Sftp {
+            // 转换副本仍以 SSH 为保存协议；SSH 单元禁用时入口不可用，不能靠复制绕过门禁。
+            if protocol == RemoteProtocol::Sftp && ssh_enabled {
                 let copy_entity = menu_entity.clone();
                 let copy_id = menu_id.clone();
                 menu = menu.item(

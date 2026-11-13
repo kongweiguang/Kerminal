@@ -2,6 +2,7 @@
 //! @author kongweiguang
 
 pub mod archive;
+pub mod asset_url;
 pub mod build;
 pub mod conformance;
 pub mod create;

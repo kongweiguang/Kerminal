@@ -9,20 +9,27 @@ use crate::Result;
 
 const RELEASE: &str = include_str!("../../templates/release.yml");
 
-/// 先由协议验证身份，再在同一父目录暂存；目标已存在时绝不改写。
-pub fn create(id: &str, template: &str, output: &Path, policy: ManifestPolicy) -> Result<()> {
+/// 先由协议验证身份，再在同一父目录暂存；默认生成 Sidecar，无后端时只生成声明式视图。
+pub fn create(
+    id: &str,
+    template: &str,
+    no_backend: bool,
+    output: &Path,
+    policy: ManifestPolicy,
+) -> Result<()> {
     let publisher = id
         .split_once('.')
         .map(|(publisher, _)| publisher)
         .ok_or("插件 ID 必须是 publisher.name")?;
-    let (manifest, files): (&str, &[(&str, &str)]) = match template {
+    // 两种模板共用资源与视图，只有后端文件和清单随选项变化；旧脚本运行时不复生成。
+    let (manifest, mut files): (&str, Vec<(&str, &str)>) = match template {
         "native" => (
-            include_str!("../../templates/native/manifest.json"),
-            &[
-                (
-                    "src/main.ts",
-                    include_str!("../../templates/native/main.ts"),
-                ),
+            if no_backend {
+                include_str!("../../templates/native/manifest.json")
+            } else {
+                include_str!("../../templates/native/manifest.sidecar.json")
+            },
+            vec![
                 (
                     "src/views.ts",
                     include_str!("../../templates/native/views.ts"),
@@ -34,12 +41,12 @@ pub fn create(id: &str, template: &str, output: &Path, policy: ManifestPolicy) -
             ],
         ),
         "webview" => (
-            include_str!("../../templates/webview/manifest.json"),
-            &[
-                (
-                    "src/main.ts",
-                    include_str!("../../templates/webview/main.ts"),
-                ),
+            if no_backend {
+                include_str!("../../templates/webview/manifest.json")
+            } else {
+                include_str!("../../templates/webview/manifest.sidecar.json")
+            },
+            vec![
                 ("src/web.ts", include_str!("../../templates/webview/web.ts")),
                 (
                     "resources/l10n/en.json",
@@ -55,29 +62,30 @@ pub fn create(id: &str, template: &str, output: &Path, policy: ManifestPolicy) -
                 ),
             ],
         ),
-        "sidecar-rust" => (
-            include_str!("../../templates/sidecar-rust/manifest.json"),
-            &[
-                (
-                    "src/main.rs",
-                    include_str!("../../templates/sidecar-rust/main.rs"),
-                ),
-                (
-                    "src/views.ts",
-                    include_str!("../../templates/sidecar-rust/views.ts"),
-                ),
-                (
-                    "resources/l10n/en.json",
-                    include_str!("../../templates/sidecar-rust/en.json"),
-                ),
-                (
-                    "Cargo.toml",
-                    include_str!("../../templates/sidecar-rust/Cargo.toml.in"),
-                ),
-            ],
-        ),
-        _ => return Err("模板必须是 native、webview 或 sidecar-rust".into()),
+        "sidecar-rust" => {
+            return Err(
+                "旧模板 sidecar-rust 已移除；请使用 --template native|webview 生成 Rust Sidecar，或加 --no-backend 生成无后端插件"
+                    .into(),
+            );
+        }
+        _ => return Err("模板必须是 native 或 webview".into()),
     };
+    if !no_backend {
+        files.push((
+            "src/main.rs",
+            match template {
+                "native" => include_str!("../../templates/native/main.rs"),
+                _ => include_str!("../../templates/webview/main.rs"),
+            },
+        ));
+        files.push((
+            "Cargo.toml",
+            match template {
+                "native" => include_str!("../../templates/native/Cargo.toml.in"),
+                _ => include_str!("../../templates/webview/Cargo.toml.in"),
+            },
+        ));
+    }
     let declaration = manifest
         .replace("__PLUGIN_ID__", id)
         .replace("__PUBLISHER__", publisher);

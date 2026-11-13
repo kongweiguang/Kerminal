@@ -14,6 +14,7 @@ use kerminal_application::{
         ShellScriptRequest,
         management::{HostGroupSnapshot, ManagedHost},
     },
+    plugins::capabilities,
 };
 use kerminal_domain::identity::HostId;
 use rmcp::model::CallToolResult;
@@ -24,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args, success},
+    terminal_tools::{failure, parse_args, success, units_gate},
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -224,6 +225,15 @@ pub(crate) async fn command(
         .as_deref()
         .and_then(|id| group_names.get(id))
         .cloned();
+    // SSH 执行工具还要遵守主机自身协议：SFTP-only 主机启用 sftp 后仍不得借用 shell 通道。
+    let target_protocol = capabilities::remote_protocol_token(resolved.protocol);
+    if let Some(result) = units_gate(
+        services,
+        "ssh.command",
+        capabilities::host_protocol_units(target_protocol),
+    ) {
+        return result;
+    }
     execute(
         services,
         SshCommandTarget {

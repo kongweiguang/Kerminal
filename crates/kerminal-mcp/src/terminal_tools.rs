@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use kerminal_application::{
     AppError,
     agents::AgentTerminalSnapshotRequest,
+    plugins::capabilities,
     sessions::{
         CreateSessionRequest, PlainTextSnapshotRequest, SessionFilter, SessionRuntimeMetadata,
         logging::redact_terminal_text,
@@ -181,6 +182,14 @@ pub(crate) async fn create(
         }
         _ => return failure(AppError::invalid("target must be local or ssh")),
     };
+    // 本地目标不依赖 SSH；只有解析出 SSH 主机后才追加请求级门禁，避免禁用远程插件影响本地终端。
+    let target_units: &[&str] = match &target {
+        SessionTarget::Ssh(_) => capabilities::host_protocol_units("ssh"),
+        _ => &[],
+    };
+    if let Some(result) = units_gate(services, "terminal.create", target_units) {
+        return result;
+    }
     let size = match terminal_size(
         args.cols.unwrap_or(DEFAULT_COLUMNS),
         args.rows.unwrap_or(DEFAULT_ROWS),
@@ -257,6 +266,9 @@ pub(crate) async fn write(
         Ok(session_id) => session_id,
         Err(error) => return failure(error),
     };
+    if let Some(result) = session_target_gate(services, "terminal.write", &session_id).await {
+        return result;
+    }
     let bytes_written = args.data.len();
     let commands = match services.require_commands() {
         Ok(commands) => commands,
@@ -314,6 +326,9 @@ pub(crate) async fn snapshot(
         Ok(session_id) => session_id,
         Err(error) => return failure(error),
     };
+    if let Some(result) = session_target_gate(services, "terminal.snapshot", &session_id).await {
+        return result;
+    }
     let session = match services.sessions.list(SessionFilter::default()).await {
         Ok(sessions) => match sessions
             .into_iter()
@@ -429,6 +444,9 @@ pub(crate) async fn resize(
             return failure(AppError::invalid("session id"));
         }
     };
+    if let Some(result) = session_target_gate(services, "terminal.resize", &session_id).await {
+        return result;
+    }
     let size = match terminal_size(args.cols, args.rows) {
         Ok(size) => size,
         Err(error) => return failure(error),
@@ -472,6 +490,7 @@ pub(crate) async fn close(
             return failure(AppError::invalid("session id"));
         }
     };
+    // 关闭属于资源回收路径：即使该会话依赖的插件已被禁用也必须允许释放，避免遗留 PTY/transport。
     match services.sessions.close(session_id.clone()).await {
         Ok(()) => success(
             "终端会话已关闭。".to_owned(),
@@ -756,6 +775,110 @@ fn parse_session_id(value: Option<&str>) -> Result<SessionId, AppError> {
 /// 创建非零的终端网格尺寸并拒绝超出协议字段宽度的请求。
 fn terminal_size(columns: u16, rows: u16) -> Result<TerminalSize, AppError> {
     TerminalSize::new(columns, rows, 0, 0).map_err(|_| AppError::invalid("terminal size"))
+}
+
+/// 检查工具目录可见性；未注入 registry 的离线/测试装配按全部启用处理。
+///
+/// 使用 `tool_visibility_gate` 而不是 `tool_units`，让 any-of 凭据工具在整族禁用时
+/// 仍返回完整的候选/禁用单元，而不是空 requiredUnits 的歧义拒绝。
+///
+/// 生产 `validate_complete` 已要求注入 registry，因此这里的宽松分支只服务离线调用方。
+///
+/// @author kongweiguang
+pub(crate) fn plugin_gate(services: &McpServices, tool: &str) -> Option<CallToolResult> {
+    let registry = services.plugins.as_deref()?;
+    let (required_units, disabled_units) = capabilities::tool_visibility_gate(registry, tool)?;
+    Some(plugin_disabled(tool, required_units, &disabled_units))
+}
+
+/// 对已解析出的真实目标追加单元要求；只有实际禁用时才生成结构化拒绝。
+///
+/// 空集合直接放行，避免核心工具因空映射被误判为未注册。
+///
+/// @author kongweiguang
+pub(crate) fn units_gate(
+    services: &McpServices,
+    tool: &str,
+    required_units: &[&str],
+) -> Option<CallToolResult> {
+    if required_units.is_empty() {
+        return None;
+    }
+    let registry = services.plugins.as_deref()?;
+    let disabled_units = required_units
+        .iter()
+        .copied()
+        .filter(|unit| !registry.is_enabled(unit))
+        .collect::<Vec<_>>();
+    (!disabled_units.is_empty()).then(|| plugin_disabled(tool, required_units, &disabled_units))
+}
+
+/// 生成稳定的 `plugin_disabled` 业务结果，复用其余失败分支的 JSON 外形。
+///
+/// 不复用 `PublicErrorCode` 变体，避免为一个目录层状态扩散全仓匹配；
+/// 调用方拿到结构化错误后可区分“工具未知”（协议错误）与“能力被关闭”。
+///
+/// @author kongweiguang
+pub(crate) fn plugin_disabled(
+    tool: &str,
+    required_units: &[&str],
+    disabled_units: &[&str],
+) -> CallToolResult {
+    let unit_list = disabled_units.join("、");
+    let message = format!("工具 {tool} 依赖已禁用的插件：{unit_list}。请在扩展页启用后重试。");
+    CallToolResult::structured_error(json!({
+        "summary": message,
+        "error": message,
+        "data": {
+            "toolId": tool,
+            "requiredUnits": required_units,
+            "disabledUnits": disabled_units,
+        },
+        "entities": [],
+        "errorKind": "plugin_disabled",
+        "recoverable": false,
+        "nextHints": [format!("在扩展管理页启用 {unit_list} 后重试。")]
+    }))
+}
+
+/// 按会话既有目标追加协议门禁，避免禁用某协议后仍能写入、读取或调整其会话。
+///
+/// Telnet 与串口各有独立启停单元，不能只检查 SSH；否则关闭 Telnet 后
+/// 仍可通过 write/snapshot/resize 操作既有会话。Container 会话保持不门禁：
+/// 已有本地容器会话仍需要可回收和观察，禁用插件不阻断既有资源。
+///
+/// 找不到会话或读取失败时不在这里伪造结论，交给原操作返回其稳定错误；
+/// 关闭与列表不经过此门禁，保证禁用插件后仍可回收资源。
+///
+/// @author kongweiguang
+async fn session_target_gate(
+    services: &McpServices,
+    tool: &str,
+    session_id: &SessionId,
+) -> Option<CallToolResult> {
+    let registry = services.plugins.as_deref()?;
+    // 常见路径下三个协议都启用，无需查询会话即可放行，避免给每次 write 增加列表开销。
+    if registry.is_enabled(capabilities::SSH_UNIT)
+        && registry.is_enabled(capabilities::TELNET_UNIT)
+        && registry.is_enabled(capabilities::SERIAL_UNIT)
+    {
+        return None;
+    }
+    let sessions = services
+        .sessions
+        .list(SessionFilter::default())
+        .await
+        .ok()?;
+    let session = sessions
+        .iter()
+        .find(|session| &session.session_id == session_id)?;
+    let required_units: &[&str] = match &session.target {
+        SessionTarget::Ssh(_) => capabilities::host_protocol_units("ssh"),
+        SessionTarget::Telnet(_) => capabilities::host_protocol_units("telnet"),
+        SessionTarget::Serial(_) => capabilities::host_protocol_units("serial"),
+        SessionTarget::Local(_) | SessionTarget::Container(_) => &[],
+    };
+    units_gate(services, tool, required_units)
 }
 
 /// 生成既兼容旧 MCP schema 又携带稳定 success/error 字段的结构化成功响应。

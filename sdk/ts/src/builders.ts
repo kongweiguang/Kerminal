@@ -32,6 +32,9 @@ export const ui = Object.freeze({
   icon: builder("icon"),
   code: builder("code"),
   progress: builder("progress"),
+  // 构建器只构造节点数据，不做运行时校验；矩阵必须来自实例数据的只读绑定
+  // 这一约束由 Schema 与 Rust 校验执行，构建器入口不额外复制该规则。
+  qrcode: builder("qrcode"),
   empty: builder("empty"),
   notice: builder("notice"),
   input: builder("input"),

@@ -106,11 +106,10 @@ impl RootView {
                 "请先完成当前操作再打开标签",
             ));
         }
-        if self
+        if !self
             .services
             .plugins
-            .content_type(&request.content_id)
-            .is_none()
+            .content_type_enabled(&request.content_id)
         {
             return Err(kerminal_application::AppError::not_found(
                 "内容提供方不可用",
@@ -250,7 +249,8 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> kerminal_application::AppResult<()> {
         let result = (|| {
-            if self.services.plugins.content_type(content_id).is_none() {
+            // 禁用内容仍保留原标签和持久状态；这里只拒绝创建新实例，材料由工作区继续持有。
+            if !self.services.plugins.content_type_enabled(content_id) {
                 return Err(kerminal_application::AppError::not_found(
                     "内容提供方不可用",
                 ));
@@ -316,7 +316,7 @@ impl RootView {
         if self.host_shutdown_requested || self.tool_panel_overlay_focus_is_blocked(window, cx) {
             return Err(AppError::conflict("请先完成当前操作再打开页面"));
         }
-        if self.services.plugins.content_type(content_id).is_none() {
+        if !self.services.plugins.content_type_enabled(content_id) {
             return Err(AppError::not_found("内容提供方不可用"));
         }
         if let Some(route) = builtin_content::page_route(content_id) {

@@ -212,7 +212,7 @@ jobs:
           PACKAGE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo --locked build --release --package kerminal-desktop --package kerminal-plugin-host --package kerminal-plugin-cli --target "$PACKAGE_TARGET"
+          cargo --locked build --release --package kerminal-desktop --package kerminal-plugin-cli --target "$PACKAGE_TARGET"
           cargo --locked xtask package --target "$PACKAGE_TARGET"
 
       - name: Upload beta candidate

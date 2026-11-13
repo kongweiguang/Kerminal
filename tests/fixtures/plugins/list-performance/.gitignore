@@ -1,0 +1,3 @@
+# @author kongweiguang
+# 构建目录由 kerminal-plugin build 生成，不进入版本库。
+.kerminal/

@@ -51,8 +51,9 @@ fn first_plugin_boot_does_not_block_fresh_root_migration() {
 fn unrecognized_plugin_state_does_not_identify_a_managed_root() {
     for bytes in [
         b"{}".as_slice(),
-        br#"{"schema":2,"revision":0,"plugins":{},"pending":[],"failures":{}}"#,
         br#"{"schema":1,"revision":0,"plugins":{},"pending":[],"failures":{},"boot":{"id":"invalid","phase":"starting","consecutive_early_crashes":0}}"#,
+        // 未来格式也不能被认领；最小合法 schema 2 引导状态在上一用例中单独验证。
+        br#"{"schema":3,"revision":0,"plugins":{},"pending":[],"failures":{}}"#,
     ] {
         let root = tempfile::tempdir().expect("隔离数据根");
         std::fs::create_dir(root.path().join("plugins")).expect("插件目录");

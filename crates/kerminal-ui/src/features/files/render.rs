@@ -7,6 +7,8 @@ mod host_picker;
 mod transfers;
 mod tree;
 
+use std::time::Instant;
+
 use gpui_kit::{
     AnyElement, ClickEvent, Context, ElementId, InteractiveElement as _, IntoElement, Render,
     SharedString, StatefulInteractiveElement as _, Window, canvas,
@@ -49,6 +51,25 @@ impl Render for FilesPane {
             .sync_selection(selected.as_ref(), window, cx);
         self.initialize(cx);
         self.watch_transfer_queue(cx);
+        // 只有真实可见的紧凑右栏需要数据入场；隐藏、中央工作区和减少动效都立即落位，
+        // 且只有动画进行中才请求下一帧，避免缓存面板或后台窗口空转。
+        let now = Instant::now();
+        let data_entrance_applies = self.compact_layout && !self.file_workspace_layout;
+        if !self.active || !data_entrance_applies || cx.reduce_motion() {
+            self.data_entrance.settle();
+        }
+        if self.active
+            && data_entrance_applies
+            && !cx.reduce_motion()
+            && self.data_entrance.is_running(now)
+        {
+            window.request_animation_frame();
+        }
+        let data_opacity = if data_entrance_applies {
+            self.data_entrance.opacity(now)
+        } else {
+            1.0
+        };
         let theme = ThemeTokens::current(window, cx);
         let theme = if self.compact_layout {
             theme.for_tool_panel()
@@ -71,7 +92,14 @@ impl Render for FilesPane {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(browser::render_browser(self, 1, window, theme, cx))
+                    .child(browser::render_browser(
+                        self,
+                        1,
+                        data_opacity,
+                        window,
+                        theme,
+                        cx,
+                    ))
                     .into_any_element()
             }
         } else if self.file_workspace_layout {
@@ -83,7 +111,7 @@ impl Render for FilesPane {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .child(browser::render_browser(self, 1, window, theme, cx))
+                .child(browser::render_browser(self, 1, 1.0, window, theme, cx))
                 .into_any_element()
         } else {
             let pane_id = cx.entity_id().as_u64();
@@ -121,7 +149,7 @@ impl Render for FilesPane {
             let left_side = if empty_target[0] {
                 host_picker::render_empty_target(self, 0, theme, window, cx)
             } else {
-                browser::render_browser(self, 0, window, theme, cx).into_any_element()
+                browser::render_browser(self, 0, 1.0, window, theme, cx).into_any_element()
             };
             let left_pane = resizable_panel()
                 .size_range(minimum_extent..px(4_000.))
@@ -146,7 +174,7 @@ impl Render for FilesPane {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(browser::render_browser(self, 1, window, theme, cx))
+                    .child(browser::render_browser(self, 1, 1.0, window, theme, cx))
                     .into_any_element()
             };
             let right_pane = resizable_panel()

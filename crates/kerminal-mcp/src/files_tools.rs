@@ -4,8 +4,9 @@
 
 use std::path::PathBuf;
 
-use kerminal_application::{AppError, AppResult, PublicErrorCode};
+use kerminal_application::{AppError, AppResult, PublicErrorCode, plugins::capabilities};
 use kerminal_domain::{
+    connections::RemoteProtocol,
     files::{
         ConflictPolicy, ContainerRuntime, FileEndpoint, RemotePath, TransferKind, TransferRequest,
         TransferStatus, TransferSummary,
@@ -19,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args},
+    terminal_tools::{failure, parse_args, units_gate},
 };
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +107,10 @@ pub(crate) async fn dispatch(
     if cancellation.is_cancelled() {
         return failure(AppError::cancelled("SFTP MCP 请求已取消"));
     }
+    // 整族门禁用集中映射；本地端点仍无需远端 SSH 能力。
+    if let Some(result) = units_gate(services, tool_id, capabilities::tool_units(tool_id)) {
+        return result;
+    }
     match tool_id {
         "sftp.transfer.enqueue" => enqueue_transfer(services, arguments, cancellation).await,
         "sftp.transfer.list" => list_transfers(services, arguments, cancellation).await,
@@ -127,6 +132,9 @@ async fn enqueue_transfer(
         Ok(request) => request,
         Err(error) => return failure(error),
     };
+    if let Some(result) = transfer_target_gate(services, "sftp.transfer.enqueue", &request).await {
+        return result;
+    }
     if cancellation.is_cancelled() {
         return failure(AppError::cancelled("SFTP transfer enqueue was cancelled"));
     }
@@ -259,6 +267,18 @@ async fn retry_transfer(
         Ok(transfers) => transfers,
         Err(error) => return failure(error),
     };
+    // 重试会按原请求重建入队任务，必须在调用队列前复用与 enqueue 相同的目标门禁；
+    // 否则禁用 SSH 后可通过重试绕过首次入队时的协议检查。
+    if let Some(source) = transfers
+        .list()
+        .await
+        .into_iter()
+        .find(|summary| summary.id == id)
+        && let Some(result) =
+            transfer_target_gate(services, "sftp.transfer.retry", &source.request).await
+    {
+        return result;
+    }
     match transfers.retry(&id).await {
         Ok(summary) => {
             let completed = matches!(
@@ -286,6 +306,45 @@ async fn retry_transfer(
         }
         Err(error) => retry_failure(error),
     }
+}
+
+/// 仅按传输请求中的远端端点解析协议并在对应单元禁用时拒绝。
+///
+/// 本地传输不需要远端协议能力，不能因禁用 SSH 而阻止本机文件复制；
+/// 主机目录未注入或查不到时保持原行为，由传输服务在真实执行阶段给出明确错误。
+/// 入队与重试共用此门禁：重试会按原请求重建任务，不能绕过首次入队的协议检查。
+///
+/// @author kongweiguang
+async fn transfer_target_gate(
+    services: &McpServices,
+    tool_id: &str,
+    request: &TransferRequest,
+) -> Option<CallToolResult> {
+    let registry = services.plugins.as_deref()?;
+    if registry.is_enabled(capabilities::SSH_UNIT) {
+        return None;
+    }
+    let hosts = services.host_management.as_ref()?;
+    for endpoint in [&request.source, &request.destination] {
+        let FileEndpoint::Remote { host_id, .. } = endpoint else {
+            continue;
+        };
+        let Ok(Some(host)) = hosts.load_host(host_id).await else {
+            continue;
+        };
+        if host.protocol != RemoteProtocol::Ssh {
+            continue;
+        }
+        let protocol = capabilities::remote_protocol_token(host.protocol);
+        if let Some(result) = units_gate(
+            services,
+            tool_id,
+            capabilities::host_protocol_units(protocol),
+        ) {
+            return Some(result);
+        }
+    }
+    None
 }
 
 /// 仅在重试拒绝因提交结果未知时映射旧版专用错误族，不改变其他未知结果错误。

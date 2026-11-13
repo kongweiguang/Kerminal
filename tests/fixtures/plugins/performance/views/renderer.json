@@ -1,9 +1,0 @@
-{
-  "schema": 1,
-  "data": {"seq": 0, "done": false, "attempted": 0, "acknowledged": 0, "failed": 0, "elapsed_ms": 0},
-  "root": {"type": "stack", "gap": "md", "children": [
-    {"type": "text", "text": "Plugin performance workload"},
-    {"type": "text", "text": "$seq"},
-    {"type": "text", "text": "$acknowledged"}
-  ]}
-}

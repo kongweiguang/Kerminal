@@ -550,6 +550,7 @@ fn render_host_list(
     cx: &mut Context<OperationsView>,
 ) -> AnyElement {
     let ticket = view.container_action_ticket(None);
+    let data_opacity = view.fixed_data_entrance_opacity();
     let busy = view.busy
         || view.container_write_scope_blocked()
         || view.containers.phase() != super::super::state::SectionPhase::Ready;
@@ -1065,7 +1066,7 @@ fn render_host_list(
         }
     }
 
-    body = body.child(container_list);
+    body = body.child(container_list.when(data_opacity < 1.0, |list| list.opacity(data_opacity)));
     super::section_page(
         crate::locale::text("宿主容器", "Host containers"),
         body,

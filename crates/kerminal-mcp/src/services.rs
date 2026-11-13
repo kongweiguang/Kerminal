@@ -13,6 +13,7 @@ use kerminal_application::{
     },
     executor::ApplicationTaskExecutor,
     operations::OperationsService,
+    plugins::PluginRegistry,
     preferences::{ConfigurationValidationService, ProfileService},
     sessions::SessionService,
     transfers::TransferService,
@@ -33,6 +34,8 @@ pub struct McpServices {
     pub(crate) commands: Option<CommandsService>,
     pub(crate) profiles: Option<ProfileService>,
     pub(crate) configuration_validation: Option<ConfigurationValidationService>,
+    /// MCP 目录和请求门禁必须复用组合根冻结的同一份插件启用视图。
+    pub(crate) plugins: Option<Arc<PluginRegistry>>,
     pub(crate) task_executor: Option<ApplicationTaskExecutor>,
     pub(crate) agent_scope: Option<AgentSessionId>,
 }
@@ -51,6 +54,7 @@ impl McpServices {
             commands: None,
             profiles: None,
             configuration_validation: None,
+            plugins: None,
             task_executor: None,
             agent_scope: None,
         }
@@ -111,6 +115,16 @@ impl McpServices {
         validation: ConfigurationValidationService,
     ) -> Self {
         self.configuration_validation = Some(validation);
+        self
+    }
+
+    /// 注入组合根冻结的插件启用视图，MCP 目录和请求门禁据此隐藏或拒绝禁用能力。
+    ///
+    /// MCP 不重新读取插件状态或自行推导主机映射，避免与桌面 UI 出现不同的启用答案。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugins(mut self, plugins: Arc<PluginRegistry>) -> Self {
+        self.plugins = Some(plugins);
         self
     }
 
@@ -185,6 +199,19 @@ impl McpServices {
             .ok_or_else(|| AppError::unsupported("Configuration validation capability unavailable"))
     }
 
+    /// 要求冻结插件启用视图已装配；目录工具不能在没有启停依据时暴露协议能力。
+    ///
+    /// 当前先作为 P3 后续请求门禁的注入点保留；在此集中错误文本，避免各工具
+    /// 自行解释缺失原因或静默放行。
+    ///
+    /// @author kongweiguang
+    #[allow(dead_code)]
+    pub(crate) fn require_plugins(&self) -> AppResult<&PluginRegistry> {
+        self.plugins
+            .as_deref()
+            .ok_or_else(|| AppError::unsupported("Plugin capability unavailable"))
+    }
+
     /// 在桌面启动 MCP 前一次检查所有目录工具的运行态依赖，阻止部分装配却发布完整目录。
     pub fn validate_complete(&self) -> Result<(), McpServicesValidationError> {
         let mut missing = Vec::new();
@@ -214,6 +241,9 @@ impl McpServices {
         }
         if self.configuration_validation.is_none() {
             missing.push("configuration_validation");
+        }
+        if self.plugins.is_none() {
+            missing.push("plugins");
         }
         if self.task_executor.is_none() {
             missing.push("task_executor");

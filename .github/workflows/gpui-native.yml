@@ -84,25 +84,11 @@ jobs:
           npm test --prefix sdk/ts
           node crates/kerminal-ui/tests/support/check_plugin_browser_sdk.mjs
 
-      - name: Build plugin helpers and acceptance entry points
+      - name: Build plugin helper and acceptance entry points
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked -p kerminal-desktop -p kerminal-plugin-host -p kerminal-plugin-cli --features kerminal-desktop/acceptance,kerminal-desktop/acceptance-metrics,kerminal-desktop/right-rail-acceptance
-
-      - name: Verify headless plugin lifecycle
-        shell: bash
-        run: |
-          set -euo pipefail
-          host="$(pwd -P)/target/debug/kerminal-plugin-host"
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            host="$(cygpath -w "${host}.exe")"
-          fi
-          export KERMINAL_PLUGIN_HOST="$host"
-          mkdir -p target/diagnostics/plugin-lifecycle
-          log=target/diagnostics/plugin-lifecycle/script-host.log
-          cargo test --locked -p kerminal-infrastructure --lib signed_catalog_script_host_lifecycle -- --ignored 2>&1 | tee "$log"
-          grep -F 'test result: ok. 1 passed;' "$log"
+          cargo build --locked -p kerminal-desktop -p kerminal-plugin-cli --features kerminal-desktop/acceptance,kerminal-desktop/acceptance-metrics,kerminal-desktop/right-rail-acceptance
 
       - name: Build and validate plugin examples
         shell: bash

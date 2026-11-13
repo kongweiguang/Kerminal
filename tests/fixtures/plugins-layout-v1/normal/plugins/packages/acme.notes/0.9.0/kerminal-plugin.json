@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "acme.notes",
+  "name": {
+    "en": "Workspace Notes"
+  },
+  "description": {
+    "en": "Previous release kept for rollback"
+  },
+  "version": "0.9.0",
+  "api": "^1.0",
+  "publisher": "acme",
+  "runtime": {
+    "kind": "none"
+  },
+  "permissions": [],
+  "contributes": {},
+  "views": {}
+}

@@ -18,6 +18,14 @@ pub const MAX_VIEW_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_VIEW_NODES: usize = 512;
 pub const MAX_VIEW_DEPTH: usize = 24;
 pub const MAX_INLINE_ROWS: usize = 500;
+/// QR 版本公式为 21 + 4n；177 对应版本 40，是当前规范的上限。
+pub const QR_MIN_MODULES: usize = 21;
+pub const QR_MAX_MODULES: usize = 177;
+/// 静区不进入插件矩阵，由宿主绘制时补齐；4 个模块是规范要求的最小值。
+pub const QR_QUIET_ZONE: usize = 4;
+/// 仅用于在逐行扫描前挡住异常大的数据：每行按 CRLF 预留 2 字节，再留一个行尾换行，
+/// 避免把合法 CRLF 矩阵误判为超限。
+pub const MAX_QRCODE_BYTES: usize = QR_MAX_MODULES * (QR_MAX_MODULES + 2) + 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NativeView {
@@ -106,6 +114,9 @@ native_nodes! {
     Icon { required { icon: String } optional {} },
     Code { required { code: String } optional { language: String } },
     Progress { required { value: Value } optional { max: f64 } },
+    // 只承载插件生成的无静区模块方阵；宿主负责校验、加静区与原生绘制，
+    // 不接受 SVG、URL 或任意图片字节，避免插件内容越界到加载器或网络。
+    Qrcode { required { matrix: String } optional { label: String } },
     Empty { required { title: String } optional { icon: String, description: String } },
     Notice { required { text: String } optional { tone: Tone } },
     Input { required { bind: String } optional { label: String, placeholder: String, on_submit: String } },
@@ -130,6 +141,8 @@ native_nodes! {
 pub enum PickerMode {
     Open,
     Save,
+    // 仅选择目录：即使平台选择器支持文件，也不能把文件路径写回目录语义的绑定。
+    Directory,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -297,6 +310,16 @@ impl NativeNode {
                     return Err(invalid("view.button", "按钮动作、名称或忙碌绑定无效"));
                 }
             }
+            Qrcode { matrix, label, .. } => {
+                // 矩阵必须来自实例数据；静态字面量无法随运行状态刷新，也容易绕过大小预算。
+                if !valid_binding(matrix, true)
+                    || label
+                        .as_deref()
+                        .is_some_and(|label| !valid_text(label, 512))
+                {
+                    return Err(invalid("view.qrcode", "二维码矩阵绑定或标签无效"));
+                }
+            }
             Menu { items, .. } => validate_menu(items)?,
             List {
                 items,
@@ -445,6 +468,33 @@ fn validate_menu(items: &[MenuItem]) -> Result<(), ProtocolError> {
         if !valid_text(&item.label, 512) || !valid_local_id(&item.action) {
             return Err(invalid("view.menu", "菜单项无效"));
         }
+    }
+    Ok(())
+}
+
+/// 二维码矩阵在渲染前校验，且只允许不含静区的 0/1 方阵。
+///
+/// 这里不承担编码，只验证插件自带的编码库输出，避免宿主引入二维码依赖；
+/// 严格拒绝空行、长度不一致、非 QR 版本边长以及超过版本 40 的输入，防止
+/// 任意长文本被当作图片或绘制指令，也保证上下文的行数预算可预期。
+/// @author kongweiguang
+pub fn validate_qr_matrix(matrix: &str) -> Result<(), ProtocolError> {
+    if matrix.len() > MAX_QRCODE_BYTES {
+        return Err(invalid("view.qrcode", "二维码矩阵超过大小上限"));
+    }
+    let rows = matrix.lines().collect::<Vec<_>>();
+    let Some(side) = rows.first().map(|row| row.len()) else {
+        return Err(invalid("view.qrcode", "二维码矩阵为空"));
+    };
+    let valid_side = (QR_MIN_MODULES..=QR_MAX_MODULES).contains(&side)
+        && (side - QR_MIN_MODULES).is_multiple_of(4);
+    if !valid_side
+        || rows.len() != side
+        || rows
+            .iter()
+            .any(|row| row.len() != side || !row.bytes().all(|byte| matches!(byte, b'0' | b'1')))
+    {
+        return Err(invalid("view.qrcode", "二维码矩阵不是合法方阵"));
     }
     Ok(())
 }

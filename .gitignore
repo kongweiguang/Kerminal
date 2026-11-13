@@ -27,12 +27,14 @@ dist
 *.sln
 *.sw?
 .codegraph
+/.claude/skills/
+/.claude/settings.local.json
 
 # BEGIN UPDENG
 # @author kongweiguang
 /.agents/
+/.claude/agents/
 /.codex/
-/.claude/
 /.updeng/
 /AGENTS.md
 /CLAUDE.md

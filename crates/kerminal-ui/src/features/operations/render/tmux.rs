@@ -660,6 +660,7 @@ impl OperationsView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let capability = self.tmux.data().map(|snapshot| &snapshot.capability);
+        let data_opacity = self.fixed_data_entrance_opacity();
         let create_enabled = self.tmux.phase() == SectionPhase::Ready
             && super::super::actions::tmux_session_creation_enabled(
                 self.busy,
@@ -686,7 +687,21 @@ impl OperationsView {
                     theme,
                 ));
             }
-            body = body.children(self.render_tmux_tool_rail_sessions(theme, cx));
+            // 只有已确认可用的会话数据才是目标切换后的真实内容替换；不可用说明、空状态
+            // 和加载提示必须立即完整显示。没有数据时不创建空包装，避免 flex gap 挤动布局。
+            if let Some(sessions) = self.render_tmux_tool_rail_sessions(theme, cx) {
+                let data = div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(sessions)
+                    .when(
+                        tmux_data_entrance_applies(capability, data_opacity),
+                        |data| data.opacity(data_opacity),
+                    );
+                body = body.child(data);
+            }
         } else {
             body = body.child(tmux_empty_state(
                 crate::locale::text("目标不可用", "Target unavailable"),
@@ -2812,6 +2827,17 @@ pub(super) fn tmux_tool_rail_session_status(
 /// @author kongweiguang
 pub(super) fn tmux_tool_rail_feedback_visible(phase: SectionPhase, has_error: bool) -> bool {
     has_error || phase == SectionPhase::Cancelled
+}
+
+/// 只有已确认可用的 tmux 数据才允许入场透明度；不可用说明是状态而非目标内容，
+/// 必须在同目标刷新后立即完整显示，不能被尚未结束的旧入场一起压暗。
+///
+/// @author kongweiguang
+pub(super) fn tmux_data_entrance_applies(
+    capability: Option<&TmuxCapability>,
+    opacity: f32,
+) -> bool {
+    capability.is_some_and(|capability| capability.available) && opacity < 1.0
 }
 
 /// 速查复制使用人类可读的显示形式；发送仍使用可能包含 tmux 前缀控制字节的 payload。

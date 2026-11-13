@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::{sync::CancellationToken, task::task_tracker::TaskTrackerToken};
 
+use kerminal_application::plugins::capabilities;
 use kerminal_domain::identity::AgentSessionId;
 
 use crate::{
@@ -172,8 +173,13 @@ impl ServerHandler for KerminalMcpHandler {
     ) -> Result<CallToolResult, ErrorData> {
         let tool_id = request.name.to_string();
         let services = self.scoped_services(&context);
-        if !is_catalog_tool(&tool_id, &services) {
+        // 先判断目录是否已知，再判断当前是否可用；禁用能力必须作为业务结果返回，
+        // 否则调用方无法区分“工具已移除”和“插件被关闭”。
+        if !is_known_catalog_tool(&tool_id, &services) {
             return Err(unknown_tool(&tool_id));
+        }
+        if let Some(disabled) = terminal_tools::plugin_gate(&services, &tool_id) {
+            return Ok(disabled);
         }
         let arguments = request.arguments.unwrap_or_default();
         let request_cancellation = context.ct.clone();
@@ -276,19 +282,35 @@ async fn dispatch_tool(
     }
 }
 
-/// 固定目录只区分全局核心与会话上下文，不再保留可重新启用的工具组。
-fn tool_is_visible(definition: &ToolDefinition, services: &McpServices) -> bool {
+/// 固定目录只区分全局核心与会话上下文；插件启用视图仅影响当前可用集合。
+fn tool_in_catalog(definition: &ToolDefinition, services: &McpServices) -> bool {
     definition.enabled
         && definition.exposed_to_mcp
         && (!definition.agent_scoped || services.agent_scope.is_some())
 }
 
-/// 调用与发现共用固定目录；已删除工具及全局 endpoint 的会话入口均不能猜名调用。
-fn is_catalog_tool(tool_id: &str, services: &McpServices) -> bool {
+/// 未注入 registry 的离线/测试装配按全部启用处理，生产装配已要求注入。
+///
+/// 目录可见性使用 `tool_visible_for` 而非全依赖判定：凭据工具在任一候选协议
+/// 启用时仍可发现，请求级协议/种类门禁负责拒绝不匹配的真实目标。
+fn plugin_tool_enabled(services: &McpServices, tool_id: &str) -> bool {
+    services
+        .plugins
+        .as_deref()
+        .is_none_or(|registry| capabilities::tool_visible_for(registry, tool_id))
+}
+
+/// 目录、帮助和调用共用同一可见集合；整族禁用的工具不得出现在发现结果中。
+fn tool_is_visible(definition: &ToolDefinition, services: &McpServices) -> bool {
+    tool_in_catalog(definition, services) && plugin_tool_enabled(services, &definition.name)
+}
+
+/// 只按静态目录与 endpoint 范围判断“已知”，供调用分派区分未知工具与禁用工具。
+fn is_known_catalog_tool(tool_id: &str, services: &McpServices) -> bool {
     frozen_catalog()
         .tools
         .iter()
-        .any(|definition| definition.name == tool_id && tool_is_visible(definition, services))
+        .any(|definition| definition.name == tool_id && tool_in_catalog(definition, services))
 }
 
 /// 未知 MCP method 使用协议级 METHOD_NOT_FOUND，不伪装成业务执行错误。
@@ -304,3 +326,10 @@ fn unknown_tool(tool_id: &str) -> ErrorData {
 fn invalid_cursor(message: &'static str) -> ErrorData {
     ErrorData::new(rmcp::model::ErrorCode::INVALID_PARAMS, message, None)
 }
+
+/// 冻结目录与能力映射的一致性测试放在 tests/unit，src 只保留外置模块声明。
+///
+/// @author kongweiguang
+#[cfg(test)]
+#[path = "../tests/unit/protocol_catalog_capability.rs"]
+mod catalog_capability_tests;

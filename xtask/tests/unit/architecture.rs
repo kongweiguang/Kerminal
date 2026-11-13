@@ -36,12 +36,11 @@ fn native_window_dependencies_are_scoped_to_windows_and_rendering_features() {
     assert_eq!(violations.len(), 2);
 }
 
-/// 插件进程与开发工具不得链接产品实现，宿主也只能消费独立协议。
+/// 插件协议与开发工具不得链接产品实现，宿主也只能消费独立协议。
 #[test]
 fn plugin_sdk_and_product_dependency_directions_remain_separate() {
     for sdk in [
         "kerminal-plugin-protocol",
-        "kerminal-plugin-host",
         "kerminal-plugin-sdk",
         "kerminal-plugin-cli",
     ] {
@@ -56,7 +55,7 @@ fn plugin_sdk_and_product_dependency_directions_remain_separate() {
     let mut violations = Vec::new();
     validate_internal_edges(
         "kerminal-ui",
-        &BTreeSet::from(["kerminal-plugin-host".into()]),
+        &BTreeSet::from(["kerminal-plugin-cli".into()]),
         &mut violations,
     );
     assert!(!violations.is_empty());

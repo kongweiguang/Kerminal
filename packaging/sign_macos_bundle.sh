@@ -11,7 +11,7 @@ fi
 : "${APPLE_SIGNING_IDENTITY:?Set the Developer ID Application identity}"
 : "${APPLE_NOTARY_PROFILE:?Set the preconfigured notarytool keychain profile}"
 bundle="$1"
-for name in kerminal-plugin-host kerminal-plugin kerminal; do
+for name in kerminal-plugin kerminal; do
   executable="$bundle/Contents/MacOS/$name"
   [[ -f "$executable" && ! -L "$executable" ]] || { echo "Missing bundle executable: $name" >&2; exit 1; }
   codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$executable"

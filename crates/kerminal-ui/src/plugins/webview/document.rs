@@ -11,15 +11,14 @@ use std::{
 use super::{MAX_BRIDGE_BYTES, PluginWebViewEvent, PluginWebViewResource, PluginWebViewSource};
 
 const INLINE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
-// SDK业务只走有界IPC。禁止fetch/XHR先于Wry读取HTTP请求体生效，避免最终404之前已分配无界body。
-const RESOURCE_CSP: &str = "default-src kplugin: 'self'; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// 协议使用清单插件身份；Windows 的 HTTP 映射仅是 Wry 的本地协议别名。
 pub(super) struct DocumentProtocol {
     origins: [String; 2],
     entrypoint: String,
     resources: BTreeMap<String, PluginWebViewResource>,
-    csp: String,
+    /// 只有隔离的内联验收文档需要 CSP；插件启用后不做能力限制，正式资源文档不再写限制性头。
+    csp: Option<String>,
 }
 
 impl DocumentProtocol {
@@ -36,20 +35,13 @@ impl DocumentProtocol {
                         bytes: Arc::from(document.html.into_bytes()),
                     },
                 )]),
-                INLINE_CSP.to_owned(),
+                Some(INLINE_CSP.to_owned()),
             ),
             PluginWebViewSource::Resources(document) => (
                 document.plugin_id,
                 document.entrypoint,
                 document.resources,
-                if document.network_hosts.is_empty() {
-                    RESOURCE_CSP.to_owned()
-                } else {
-                    RESOURCE_CSP.replace(
-                        "connect-src 'none'",
-                        &format!("connect-src {}", document.network_hosts.join(" ")),
-                    )
-                },
+                None,
             ),
         };
         Self {
@@ -97,7 +89,7 @@ impl DocumentProtocol {
         !url.contains('?') && self.resource_path(url).as_deref() == Some(self.entrypoint.as_str())
     }
 
-    /// 方法和来源同时校验，缺失资源返回空 404；CSP/nosniff 对失败响应同样生效。
+    /// 方法和来源同时校验，缺失资源返回空 404；nosniff 与缓存策略对失败响应同样生效。
     pub(super) fn response(
         &self,
         request: &wry::http::Request<Vec<u8>>,
@@ -130,11 +122,13 @@ impl DocumentProtocol {
                 }),
             ),
         );
-        response.headers_mut().insert(
-            "Content-Security-Policy",
-            wry::http::HeaderValue::from_str(&self.csp)
-                .unwrap_or_else(|_| wry::http::HeaderValue::from_static(RESOURCE_CSP)),
-        );
+        if let Some(csp) = &self.csp
+            && let Ok(csp) = wry::http::HeaderValue::from_str(csp)
+        {
+            response
+                .headers_mut()
+                .insert("Content-Security-Policy", csp);
+        }
         response.headers_mut().insert(
             "X-Content-Type-Options",
             wry::http::HeaderValue::from_static("nosniff"),
@@ -147,7 +141,8 @@ impl DocumentProtocol {
     }
 }
 
-/// 导航、加载完成与验收消息共用入口校验；正式权限路由由后续插件运行时提供。
+/// 导航、加载完成与验收消息共用入口校验；插件启用后不再挂权限处理器，
+/// 但导航/新窗口仍由宿主拦截以保证桥接身份和外部链接策略。
 pub(super) fn builder<'a>(
     document: PluginWebViewSource,
     sender: SyncSender<PluginWebViewEvent>,
@@ -176,9 +171,7 @@ pub(super) fn builder<'a>(
         .with_focused(false)
         .with_incognito(true)
         .with_devtools(false)
-        .with_clipboard(false)
         .with_general_autofill_enabled(false)
-        .with_permission_handler(|_| wry::PermissionResponse::Deny)
         .with_new_window_req_handler(move |url, _| {
             enqueue_external_navigation(&new_window_sender, &new_window_id, &url);
             wry::NewWindowResponse::Deny

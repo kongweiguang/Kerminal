@@ -25,7 +25,7 @@ use super::{
         MIN_PROBE_TIMEOUT,
     },
 };
-use crate::{AppError, AppResult};
+use crate::{AppError, AppResult, plugins::PluginRegistry};
 
 /// codec 只处理非秘密配置；宿主负责文件身份、revision、密钥检查和原子提交。
 pub trait HostConfigurationCodec: Any + Send + Sync + 'static {
@@ -974,6 +974,24 @@ impl PluginHostService {
     /// 目录必须与配置仓储使用同一份冻结实例，调用方负责在组合根共享它。
     pub fn new(hosts: HostManagementService, catalog: Arc<HostConfigurationCatalog>) -> Self {
         Self { hosts, catalog }
+    }
+
+    /// 把冻结启用视图注入同一主机管理实例，打开和探测复用唯一映射判定。
+    ///
+    /// 这里不另存 registry，避免 PluginHostService 与 HostManagementService 各自维护
+    /// 一份插件映射而在后续演进中漂移；调用方负责注入同一份冻结快照。
+    ///
+    /// @author kongweiguang
+    pub fn with_plugins(mut self, plugins: Arc<PluginRegistry>) -> Self {
+        self.hosts = self.hosts.with_plugins(plugins);
+        self
+    }
+
+    /// 插件主机是否仍被启用；禁用后保留配置供查看和迁移，只拒绝打开与探测。
+    ///
+    /// @author kongweiguang
+    pub fn host_enabled(&self, host: &PluginHost) -> bool {
+        self.hosts.plugin_host_enabled(host)
     }
 
     /// 测试前后核对配置并传递取消，旧配置的迟到结果不能报告为当前主机成功。

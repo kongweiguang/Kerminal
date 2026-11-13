@@ -97,6 +97,12 @@ fn late_panel_success_does_not_clear_a_newer_operation_status() {
 
     // 目标切换 A→B 接管状态条，随后的 B→A 又写入新的切换提示。
     status = Some("终端目标已切换，旧广播已请求取消".to_owned());
+    // 读取 A→B 的提示，既验证它确实接管了状态条，也避免连续赋值让第一次写入成为死存储。
+    assert_eq!(
+        status.as_deref(),
+        Some("终端目标已切换，旧广播已请求取消"),
+        "the first switch must publish its own prompt before the return switch replaces it"
+    );
     status = Some("终端目标已切换；旧命令结果可能未知，草稿已保留".to_owned());
     settle_panel_load_status(&mut status, Vec::new(), None, &mut slot);
     assert_eq!(
@@ -230,8 +236,9 @@ fn explicit_history_search_replaces_status_but_automatic_reload_does_not() {
 #[test]
 fn panel_conflict_fallback_is_not_cleared_by_a_clean_read() {
     let mut status = Some("配置冲突".to_owned());
-    let mut slot = ReadStatusSlot::default();
-    slot.owned = Some("配置冲突".to_owned());
+    let mut slot = ReadStatusSlot {
+        owned: Some("配置冲突".to_owned()),
+    };
 
     settle_panel_load_status(
         &mut status,

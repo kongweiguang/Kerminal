@@ -4,7 +4,9 @@
 
 use std::collections::BTreeSet;
 
-use kerminal_application::{AppError, preferences::CONFIG_GUIDE, sessions::SessionFilter};
+use kerminal_application::{
+    AppError, plugins::capabilities, preferences::CONFIG_GUIDE, sessions::SessionFilter,
+};
 use kerminal_domain::sessions::SessionInfo;
 use rmcp::model::CallToolResult;
 use serde::Deserialize;
@@ -100,6 +102,104 @@ fn help(services: &McpServices, mut arguments: Map<String, Value>) -> CallToolRe
     }
 }
 
+/// 未注入 registry 的离线装配按全部启用处理，与协议层目录判定保持同一缺省语义。
+///
+/// @author kongweiguang
+fn unit_enabled(services: &McpServices, unit: &str) -> bool {
+    services
+        .plugins
+        .as_deref()
+        .is_none_or(|registry| registry.is_enabled(unit))
+}
+
+/// 帮助中的工具族可用性按整族判定；credentials 只要 SSH 或 RDP 任一可用就保留，
+/// 避免仅关闭 SSH 时把仍可用于 RDP 的凭据入口一起隐藏。
+///
+/// @author kongweiguang
+fn family_enabled(services: &McpServices, family: &str) -> bool {
+    match family {
+        "ssh" => unit_enabled(services, capabilities::SSH_UNIT),
+        "credentials" => {
+            unit_enabled(services, capabilities::SSH_UNIT)
+                || unit_enabled(services, capabilities::RDP_UNIT)
+        }
+        "agent-session" => unit_enabled(services, capabilities::AGENTS_UNIT),
+        "sftp" => unit_enabled(services, capabilities::SFTP_UNIT),
+        "port-forward" => {
+            unit_enabled(services, capabilities::PORTS_UNIT)
+                && unit_enabled(services, capabilities::SSH_UNIT)
+        }
+        "history" => unit_enabled(services, capabilities::LOGS_UNIT),
+        "containers" => unit_enabled(services, "kerminal.containers"),
+        // terminal、config 和 discovery 属于核心能力，不随内置单元关闭。
+        _ => true,
+    }
+}
+
+/// 帮助推荐与目录共用同一可见性判定，避免凭据工具在任一候选协议启用时
+/// 于 `tools/list` 可见、却在操作指南里被整族规则误删。
+///
+/// @author kongweiguang
+fn guide_tool_enabled(services: &McpServices, tool_id: &str) -> bool {
+    services
+        .plugins
+        .as_deref()
+        .is_none_or(|registry| capabilities::tool_visible_for(registry, tool_id))
+}
+
+/// 意图依赖的启停单元在请求前统一核对；单独检查目录可见性无法表达
+/// “container 还必须打开容器族”这类跨族约束。
+///
+/// @author kongweiguang
+fn intent_enabled(services: &McpServices, intent: &str) -> bool {
+    match intent {
+        "ssh-command" | "tmux" | "server-info" => unit_enabled(services, capabilities::SSH_UNIT),
+        "container" => {
+            unit_enabled(services, capabilities::SSH_UNIT)
+                && unit_enabled(services, "kerminal.containers")
+        }
+        "sftp" => unit_enabled(services, capabilities::SFTP_UNIT),
+        "port-forward" => {
+            unit_enabled(services, capabilities::PORTS_UNIT)
+                && unit_enabled(services, capabilities::SSH_UNIT)
+        }
+        "history" => unit_enabled(services, capabilities::LOGS_UNIT),
+        // 带凭据主机保存支持 SFTP 主机，因此凭据意图按任一候选协议可用判定；
+        // 具体协议拒绝仍由请求级门禁完成，不能用显示族的 SSH/RDP 口径提前隐藏。
+        "credentials" => {
+            unit_enabled(services, capabilities::SSH_UNIT)
+                || unit_enabled(services, capabilities::SFTP_UNIT)
+                || unit_enabled(services, capabilities::RDP_UNIT)
+        }
+        "session-terminal" => unit_enabled(services, capabilities::AGENTS_UNIT),
+        _ => true,
+    }
+}
+
+/// 意图的主工具至少有一个仍可用时才返回工作流；仅剩核心辅助工具时
+/// 回到 overview，避免用空壳步骤冒充请求的能力仍存在。
+///
+/// @author kongweiguang
+fn intent_has_primary_tool(intent: &str, available: &[&str]) -> bool {
+    let has = |predicate: fn(&str) -> bool| available.iter().copied().any(predicate);
+    match intent {
+        "terminal" => has(|id| id.starts_with("terminal.")),
+        "session-terminal" => available.contains(&"kerminal.agent.target_context"),
+        "ssh-command" | "tmux" | "container" | "server-info" => available.contains(&"ssh.command"),
+        "sftp" => has(|id| id.starts_with("sftp.transfer.")),
+        "port-forward" => has(|id| id.starts_with("port_forward.")),
+        "history" => available.contains(&"history.search"),
+        "credentials" => available.iter().any(|id| {
+            matches!(
+                *id,
+                "kerminal.host.upsert_with_credential" | "kerminal.vault.encrypt_secret"
+            )
+        }),
+        "config" => available.contains(&"kerminal.config.validate"),
+        _ => true,
+    }
+}
+
 /// 概览只描述当前 endpoint 的固定可调用集合，避免把已移除入口呈现为可启用工具。
 fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     if !arguments.is_empty() {
@@ -131,7 +231,7 @@ fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallTo
     let families = catalog
         .iter()
         .filter_map(|tool| tool["family"].as_str())
-        .filter(|family| *family != "discovery")
+        .filter(|family| *family != "discovery" && family_enabled(services, family))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|family| {
@@ -144,15 +244,25 @@ fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallTo
             })
         })
         .collect::<Vec<_>>();
+    // 推荐首呼同样受启用视图约束；禁用 SSH 后不能再把 ssh.command 当作通用入口。
+    let mut recommended_first_calls = vec!["kerminal.help", "kerminal.runtime_snapshot"];
+    if unit_enabled(services, capabilities::SSH_UNIT) {
+        recommended_first_calls.push("ssh.command");
+    }
+    recommended_first_calls.push("terminal.create");
+    // SSH 关闭后策略文案不再把 ssh.command 描述为可用手段。
+    let external_mcp_default = if unit_enabled(services, capabilities::SSH_UNIT) {
+        "非交互 SSH 使用 ssh.command；持久、交互或本地 shell 使用 terminal.create 与明确 sessionId。"
+    } else {
+        "持久、交互或本地 shell 使用 terminal.create 与明确 sessionId。"
+    };
 
     success(
         format!("Kerminal MCP 能力指南已读取：当前暴露 {exposed_count} 个 tools。"),
         json!({
             "schemaVersion": 1,
             "purpose": "帮助外部 Agent 发现 Kerminal 运行态工具、配置边界与 host 审批职责。",
-            "recommendedFirstCalls": [
-                "kerminal.help", "kerminal.runtime_snapshot", "ssh.command", "terminal.create"
-            ],
+            "recommendedFirstCalls": recommended_first_calls,
             "sessionWorkspace": {
                 "readFirst": ["AGENTS.md", "CLAUDE.md", "context/mcp-endpoint.json",
                     "context/target-binding.json", "context/terminal-snapshot.json", "kerminal-config.md"],
@@ -162,7 +272,7 @@ fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallTo
                 "terminalExecutionPolicy": {
                     "scope": "global",
                     "preferredTarget": "targetBinding",
-                    "externalMcpDefault": "非交互 SSH 使用 ssh.command；持久、交互或本地 shell 使用 terminal.create 与明确 sessionId。",
+                    "externalMcpDefault": external_mcp_default,
                     "visiblePtyFirst": "仅内置 Agent 的目标上下文流程使用 targetBinding 作为首选目标。",
                     "otherTerminals": "读取 terminal.list 不会切换 UI Tab；指定目标失效时不回退。",
                     "headlessFallback": "创建后台 PTY 后，使用其明确 sessionId 执行 snapshot、write 和 close。",
@@ -217,74 +327,139 @@ fn app_guide(services: &McpServices, arguments: Map<String, Value>) -> CallToolR
     if !arguments.is_empty() {
         return failure(AppError::invalid("tool arguments"));
     }
-    let areas = vec![
-        json!({
+    let ssh_enabled = unit_enabled(services, capabilities::SSH_UNIT);
+    let credentials_enabled = ssh_enabled || unit_enabled(services, capabilities::RDP_UNIT);
+    let agents_enabled = unit_enabled(services, capabilities::AGENTS_UNIT);
+    let sftp_enabled = unit_enabled(services, capabilities::SFTP_UNIT);
+    let ports_enabled = unit_enabled(services, capabilities::PORTS_UNIT) && ssh_enabled;
+    let history_enabled = unit_enabled(services, capabilities::LOGS_UNIT);
+    let containers_enabled = unit_enabled(services, "kerminal.containers");
+    let mut areas = Vec::new();
+    // 区域标题只在仍有可用工具族时出现；全部族都禁用时省略区域本身，
+    // 避免留下空标题或引用已关闭能力的说明。
+    let host_families = [
+        ssh_enabled.then_some("ssh"),
+        credentials_enabled.then_some("credentials"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !host_families.is_empty() {
+        areas.push(json!({
             "id":"hosts",
             "location":"left",
-            "purpose":"左侧主机导航用于浏览已保存的主机与连接；SSH 工具可在后台直接调用，不要求先打开导航。",
-            "toolFamilies":["ssh","credentials"]
-        }),
-        json!({
-            "id":"terminal-workspace",
-            "location":"center",
-            "purpose":"中央工作区承载可见终端 Tab、分屏、文件编辑和完整文件工作区；后台终端和 SSH 调用不要求创建 UI Tab。",
-            "toolFamilies":["terminal"]
-        }),
-        json!({
-            "id":"agent-and-tools",
-            "location":"right",
-            "purpose":"右侧提供 Agent 与文件、运维工具，按需打开；容器和 tmux 面板属于 UI 能力。通过 MCP 操作 SSH 主机上的容器、tmux 和服务器信息时使用 ssh.command。工具的顺序与内容打开位置可通过工具栏右键菜单调整。",
-            "toolFamilies":["agent-session","sftp","ssh","port-forward","discovery"]
-        }),
-        json!({
+            "purpose": if ssh_enabled {
+                "左侧主机导航用于浏览已保存的主机与连接；SSH 工具可在后台直接调用，不要求先打开导航。"
+            } else {
+                "左侧主机导航用于浏览已保存的主机与连接；连接工具可在后台直接调用，不要求先打开导航。"
+            },
+            "toolFamilies":host_families
+        }));
+    }
+    areas.push(json!({
+        "id":"terminal-workspace",
+        "location":"center",
+        // SSH 单元关闭后不再把 SSH 调用描述成工作区能力，避免帮助文案指向已禁用入口。
+        "purpose": if ssh_enabled {
+            "中央工作区承载可见终端 Tab、分屏、文件编辑和完整文件工作区；后台终端和 SSH 调用不要求创建 UI Tab。"
+        } else {
+            "中央工作区承载可见终端 Tab、分屏、文件编辑和完整文件工作区；后台终端调用不要求创建 UI Tab。"
+        },
+        "toolFamilies":["terminal"]
+    }));
+    let right_families = [
+        agents_enabled.then_some("agent-session"),
+        sftp_enabled.then_some("sftp"),
+        ssh_enabled.then_some("ssh"),
+        ports_enabled.then_some("port-forward"),
+        Some("discovery"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let right_base = if agents_enabled || sftp_enabled || ssh_enabled || ports_enabled {
+        "右侧提供 Agent 与文件、运维工具，按需打开；"
+    } else {
+        "右侧提供运行态工具入口，按需打开；"
+    };
+    let mut right_purpose = right_base.to_owned();
+    if containers_enabled && ssh_enabled {
+        right_purpose.push_str(
+            "容器和 tmux 面板属于 UI 能力。通过 MCP 操作 SSH 主机上的容器、tmux 和服务器信息时使用 ssh.command。",
+        );
+    } else if containers_enabled {
+        right_purpose.push_str("容器面板属于 UI 能力。");
+    } else if ssh_enabled {
+        right_purpose.push_str("通过 MCP 操作 SSH 主机上的服务器信息时使用 ssh.command。");
+    }
+    right_purpose.push_str("工具的顺序与内容打开位置可通过工具栏右键菜单调整。");
+    areas.push(json!({
+        "id":"agent-and-tools",
+        "location":"right",
+        "purpose":right_purpose,
+        "toolFamilies":right_families
+    }));
+    if history_enabled {
+        areas.push(json!({
             "id":"bottom-tools",
             "location":"right",
             "purpose":"命令历史默认从右栏底部图标按需打开；bottom-tools 为兼容保留的区域 ID，不表示终端底部工具区。后台查询不要求打开面板。",
             "toolFamilies":["history"]
-        }),
-        json!({
-            "id":"configuration-workspace",
-            "location":"workspace",
-            "purpose":"配置工作区通过文件编辑与 validator 检查；连接凭据由主机连接界面的加密 vault 用例保存。",
-            "toolFamilies":["config"]
-        }),
-    ];
+        }));
+    }
+    areas.push(json!({
+        "id":"configuration-workspace",
+        "location":"workspace",
+        "purpose": if credentials_enabled {
+            "配置工作区通过文件编辑与 validator 检查；连接凭据由主机连接界面的加密 vault 用例保存。"
+        } else {
+            "配置工作区通过文件编辑与 validator 检查。"
+        },
+        "toolFamilies":["config"]
+    }));
+    // 与 tools/list 使用同一可见集合；显示族（如 credentials）可能因展示口径隐藏，
+    // 但任何仍可调用的工具都不能从 mcpToolIds 中消失。
     let tool_ids = tool_catalog_entries(services)
         .iter()
         .filter_map(|tool| tool["toolId"].as_str().map(ToOwned::to_owned))
         .collect::<Vec<_>>();
+    let mut payload = json!({
+        "schemaVersion": 1,
+        "purpose": "帮助外部 Agent 将 Kerminal 的工作区区域映射到对应运行态工具族。",
+        "areas": areas,
+        "mcpToolIds": tool_ids,
+        "sessionWorkspace": {
+            "readFirst": ["AGENTS.md", "CLAUDE.md", "context/mcp-endpoint.json", "context/target-binding.json", "context/terminal-snapshot.json", "kerminal-config.md"],
+            "refreshTools": refresh_tools(services),
+            "scope": "Agent endpoint 对应一个 live Agent session；普通 Tab 切换不会更新首选目标。"
+        },
+        "configuration": {"guide":"kerminal.help", "guideArguments":{"topic":"config"}, "validator":"kerminal.config.validate", "editableFiles":editable_files()},
+        "safetyBoundaries": {
+            "approval": "MCP host 管理审批、权限、hook 与审计，Kerminal 不添加第二层确认。",
+            "background": "外部 MCP 操作不要求先打开终端 Tab。",
+            "targetBinding": "首选目标失效时显式报告，不回退到另一个目标。",
+            "configuration": "settings/profile/host/snippet/workflow 使用文件编辑与 validator，不通过 MCP CRUD。",
+            "secrets": "不读取 vault 文件；普通配置仅保存凭据引用。"
+        }
+    });
+    // 容器面板绑定经过 SSH 宿主校验；SSH 单元关闭后不再返回该说明，
+    // 避免帮助把不可用的宿主绑定继续描述成可执行能力。
+    if containers_enabled && ssh_enabled {
+        payload["containerPanel"] = json!({
+            "uiToolId": "containers",
+            "location": "right",
+            "fixedPosition": false,
+            "defaultAfter": "sftp",
+            "customization": "在工具栏右键菜单中调整顺序、显示状态和内容打开位置。",
+            "binding": "当前活动 SSH pane 或文件 Tab 的已核实宿主",
+            "hostMode": "SSH pane 管理对应宿主的容器列表；本机 pane 不提供宿主容器管理。",
+            "containerMode": "容器 pane 解析创建时的 SSH 宿主，仍显示该宿主的容器工具；文件 Tab 保留真实宿主身份。",
+            "unavailable": "无有效目标、目标身份不一致、本机、Telnet 或串口时显示原因，不回退到左栏选中的主机。"
+        });
+    }
     success(
         "Kerminal 应用导航指南已读取：返回工作区区域、运行态工具和文件化配置边界。".to_owned(),
-        json!({
-            "schemaVersion": 1,
-            "purpose": "帮助外部 Agent 将 Kerminal 的工作区区域映射到对应运行态工具族。",
-            "areas": areas,
-            "mcpToolIds": tool_ids,
-            "sessionWorkspace": {
-                "readFirst": ["AGENTS.md", "CLAUDE.md", "context/mcp-endpoint.json", "context/target-binding.json", "context/terminal-snapshot.json", "kerminal-config.md"],
-                "refreshTools": refresh_tools(services),
-                "scope": "Agent endpoint 对应一个 live Agent session；普通 Tab 切换不会更新首选目标。"
-            },
-            "containerPanel": {
-                "uiToolId": "containers",
-                "location": "right",
-                "fixedPosition": false,
-                "defaultAfter": "sftp",
-                "customization": "在工具栏右键菜单中调整顺序、显示状态和内容打开位置。",
-                "binding": "当前活动 SSH pane 或文件 Tab 的已核实宿主",
-                "hostMode": "SSH pane 管理对应宿主的容器列表；本机 pane 不提供宿主容器管理。",
-                "containerMode": "容器 pane 解析创建时的 SSH 宿主，仍显示该宿主的容器工具；文件 Tab 保留真实宿主身份。",
-                "unavailable": "无有效目标、目标身份不一致、本机、Telnet 或串口时显示原因，不回退到左栏选中的主机。"
-            },
-            "configuration": {"guide":"kerminal.help", "guideArguments":{"topic":"config"}, "validator":"kerminal.config.validate", "editableFiles":editable_files()},
-            "safetyBoundaries": {
-                "approval": "MCP host 管理审批、权限、hook 与审计，Kerminal 不添加第二层确认。",
-                "background": "外部 MCP 操作不要求先打开终端 Tab。",
-                "targetBinding": "首选目标失效时显式报告，不回退到另一个目标。",
-                "configuration": "settings/profile/host/snippet/workflow 使用文件编辑与 validator，不通过 MCP CRUD。",
-                "secrets": "不读取 vault 文件；普通配置仅保存凭据引用。"
-            }
-        }),
+        payload,
         Vec::new(),
     )
 }
@@ -467,19 +642,50 @@ fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> Cal
         .trim()
         .to_ascii_lowercase()
         .replace('_', "-");
-    let intent = normalize_intent(&normalized);
-    let note = (intent != normalized)
-        .then(|| format!("Unsupported intent `{requested_intent}` was normalized to `{intent}`."));
-    let calls = intent_calls(intent);
+    let requested = normalize_intent(&normalized);
+    let mut note = (requested != normalized).then(|| {
+        format!("Unsupported intent `{requested_intent}` was normalized to `{requested}`.")
+    });
     let catalog = tool_catalog_entries(services);
-    let available = calls
+    let calls = intent_calls(requested);
+    let mut available = calls
         .iter()
         .filter(|id| catalog.iter().any(|tool| tool["toolId"] == **id))
+        .filter(|id| guide_tool_enabled(services, id))
         .copied()
         .collect::<Vec<_>>();
+    // 意图依赖的单元被关闭、或主工具全部不可用时，回落到 overview 并说明原因；
+    // 不返回只有辅助工具的空壳流程，也不把禁用工具名写进 missing 列表。
+    let mut intent = requested;
+    let intent_enabled_now = intent_enabled(services, requested);
+    // 会话入口只在 Agent endpoint 暴露；全局 endpoint 缺少主工具是范围问题，
+    // 不能误报成“能力被禁用”，否则调用方会去扩展页徒劳启用插件。
+    let endpoint_scope_excludes_primary =
+        requested == "session-terminal" && intent_enabled_now && services.agent_scope.is_none();
+    if !intent_enabled_now || !intent_has_primary_tool(requested, &available) {
+        intent = "overview";
+        note = Some(if endpoint_scope_excludes_primary {
+            format!(
+                "Intent `{requested_intent}` is unavailable on the global endpoint because kerminal.agent.target_context is only exposed to Agent session endpoints."
+            )
+        } else {
+            format!(
+                "Intent `{requested_intent}` is unavailable because its capabilities are disabled."
+            )
+        });
+        available = intent_calls(intent)
+            .iter()
+            .filter(|id| catalog.iter().any(|tool| tool["toolId"] == **id))
+            .filter(|id| guide_tool_enabled(services, id))
+            .copied()
+            .collect();
+    }
+    let calls = intent_calls(intent);
     let missing = calls
         .iter()
         .filter(|id| !available.contains(id))
+        // 被插件关闭的候选不是“目录缺席”，保留名称会形成悬空推荐。
+        .filter(|id| guide_tool_enabled(services, id))
         .copied()
         .collect::<Vec<_>>();
     let workflow = workflow_steps(intent, &available, &catalog);
@@ -488,6 +694,12 @@ fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> Cal
         .filter(|tool| available.contains(&tool["toolId"].as_str().unwrap_or_default()))
         .cloned()
         .collect::<Vec<_>>();
+    // 安全边界中的替代路径同样不能推荐已关闭的 SSH；本地终端说明始终保留。
+    let server_operations = if unit_enabled(services, capabilities::SSH_UNIT) {
+        "Use ssh.command for server-side container, tmux, system and file commands. Local shell tasks use terminal.create with an explicit sessionId."
+    } else {
+        "Local shell tasks use terminal.create with an explicit sessionId."
+    };
     success(
         format!(
             "Kerminal 操作指南已读取：intent={intent}；返回 {} 个步骤。",
@@ -509,7 +721,7 @@ fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> Cal
                 "hostPolicy":"The MCP host owns confirmation, approval, permissions, hooks, and audit.",
                 "terminalWrite":"External MCP defaults to background. Use returned sessionId explicitly; do not substitute a stale target.",
                 "outcomeUnknown":"If the acknowledgement to a write is lost, read back the destination before deciding whether to retry.",
-                "serverOperations":"Use ssh.command for server-side container, tmux, system and file commands. Local shell tasks use terminal.create with an explicit sessionId.",
+                "serverOperations":server_operations,
                 "secrets":"Never expose vault content or plaintext credentials."
             },
             "availableReferencedToolIds":available,
@@ -590,7 +802,10 @@ async fn runtime_snapshot(
         "terminalSessions":terminal_summaries,
         "agentSessions":agent_sessions,
         "portForwards":forwards,
-        "toolFamilies":families.iter().filter_map(|tool| tool["family"].as_str()).collect::<BTreeSet<_>>(),
+        "toolFamilies":families.iter()
+            .filter_map(|tool| tool["family"].as_str())
+            .filter(|family| family_enabled(services, family))
+            .collect::<BTreeSet<_>>(),
         "diagnostics":diagnostics
     });
     success(
@@ -601,8 +816,9 @@ async fn runtime_snapshot(
 }
 
 /// 普通 endpoint 不推荐会话专用工具，避免帮助再次引导客户端调用隐藏入口。
+/// Agent 单元关闭后，会话 endpoint 也回落到核心终端读取，不推荐已禁用的目标上下文。
 fn refresh_tools(services: &McpServices) -> Vec<&'static str> {
-    if services.agent_scope.is_some() {
+    if services.agent_scope.is_some() && unit_enabled(services, capabilities::AGENTS_UNIT) {
         vec!["kerminal.agent.target_context"]
     } else {
         vec!["terminal.list", "terminal.snapshot"]

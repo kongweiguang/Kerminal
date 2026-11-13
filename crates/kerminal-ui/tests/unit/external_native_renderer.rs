@@ -554,3 +554,490 @@ fn native_content_restart_restores_two_drafts_without_saving_plugin_action(
     });
     runtime_guard.block_on(async { tokio::task::yield_now().await });
 }
+
+/// 静区固定四个模块，模块尺寸与原点按设备像素取整；矩阵内容只影响深浅，不参与尺寸计算。
+#[test]
+fn qr_layout_adds_quiet_zone_and_snaps_modules_to_device_pixels() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let side = 21;
+    let matrix = (0..side)
+        .map(|row| {
+            (0..side)
+                .map(|column| if (row + column) % 2 == 0 { '1' } else { '0' })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(145.0), px(145.0)));
+    let layout = qr_layout(&matrix, bounds, 2.0).expect("valid layout");
+    assert_eq!(layout.matrix_side(), 21);
+    assert_eq!(layout.total_modules(), 29);
+    assert!(layout.module_px() > 0.0);
+    assert!((layout.module_px() * 2.0 - (layout.module_px() * 2.0).round()).abs() < 1e-6);
+    let (x, y) = layout.origin();
+    // 原点也是整数设备像素，整幅二维码连同静区留在画布内。
+    assert!((x * 2.0 - (x * 2.0).round()).abs() < 1e-6);
+    assert!((y * 2.0 - (y * 2.0).round()).abs() < 1e-6);
+    let qr = layout.total_modules() as f32 * layout.module_px();
+    assert!(x >= 0.0 && y >= 0.0);
+    assert!(x + qr <= 145.0 + 1e-3 && y + qr <= 145.0 + 1e-3);
+    for (column, row) in [(0, 0), (3, 3), (25, 25), (28, 0), (29, 29)] {
+        assert!(!layout.is_dark(column, row), "{column},{row}");
+    }
+    assert!(layout.is_dark(4, 4));
+    assert!(!layout.is_dark(4, 5));
+    assert!(qr_layout("not a matrix", bounds, 1.0).is_none());
+    let empty = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(145.0)));
+    assert!(qr_layout(&matrix, empty, 1.0).is_none());
+}
+
+/// 模块不足一个设备像素、或最后一个设备像素也无法保证整数原点时必须失败，
+/// 而不是把分数模块画成空白/截断却仍显示成二维码。
+///
+/// 覆盖版本 40 的 185 个模块：画布设备像素小于 185 时没有可用的整数模块宽，应当返回
+/// `None`；185 设备像素时模块只能取 1 像素、余量为 0，容器查询阶段又拿不到画布的绝对
+/// 原点，若画布落在分数设备像素上就没有可用的整数原点，因此同样判为空间不足；186 设备
+/// 像素留出 1 像素余量后必定存在整数原点，必须完整可绘制。
+#[test]
+fn qr_layout_rejects_canvas_too_small_for_one_device_pixel_module() {
+    use super::super::layout::{QrLayout, qr_layout};
+    use gpui_kit::{Bounds, point, px, size};
+
+    /// 用固定原点构造正方形画布，避免闭包返回借用时触发捕获变量逃逸限制。
+    fn layout(matrix: &str, side_px: f32, scale: f32) -> Option<QrLayout<'_>> {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(side_px), px(side_px)));
+        qr_layout(matrix, bounds, scale)
+    }
+
+    let matrix = patterned_qr(177, 2);
+    // 185 模块 → 至少 185 个设备像素；低 DPI 与非整数 DPR 都按设备空间判定下限。
+    assert!(
+        layout(&matrix, 184.0, 1.0).is_none(),
+        "184 dev px must fail"
+    );
+    assert!(
+        layout(&matrix, 144.0, 1.0).is_none(),
+        "narrow sidebar @1x must fail"
+    );
+    // 1.25 DPR 下 147.2 逻辑像素只有 184 设备像素，同样不足一个模块宽。
+    assert!(
+        layout(&matrix, 147.2, 1.25).is_none(),
+        "184 dev px @1.25x must fail"
+    );
+    // 恰好一个设备像素/模块但零余量：无法保证分数画布原点也能落格，必须走可见失败。
+    assert!(
+        layout(&matrix, 185.0, 1.0).is_none(),
+        "185 dev px leaves no room for an integer origin"
+    );
+    // 186 设备像素：1 像素/模块 + 1 像素余量，整数原点必定存在。
+    let minimal = layout(&matrix, 186.0, 1.0).expect("186 dev px guarantees an integer origin");
+    assert_eq!(minimal.total_modules(), 185);
+    assert!((minimal.module_px() - 1.0).abs() < 1e-6);
+    // 2x DPR 下 280 逻辑像素 = 560 设备像素，185 模块每块 3 设备像素，仍是整数且不为 0。
+    let scaled = layout(&matrix, 280.0, 2.0).expect("280px @2x fits");
+    let module_dev = scaled.module_px() * 2.0;
+    assert!((module_dev - 3.0).abs() < 1e-3);
+    // 非正方形画布取较短边，高度不足同样失败。
+    let narrow = Bounds::new(point(px(0.0), px(0.0)), size(px(280.0), px(120.0)));
+    assert!(qr_layout(&matrix, narrow, 1.0).is_none());
+}
+
+/// 收集布局实际输出的绘制段，供回归断言真实绘制范围而非只检查 `is_dark`。
+fn qr_runs(layout: &super::super::layout::QrLayout<'_>) -> Vec<super::super::layout::QrRun> {
+    let mut runs = Vec::new();
+    layout.for_each_run(|run| runs.push(run));
+    runs
+}
+
+/// 判断某个含静区坐标的模块是否真的被绘制段覆盖。
+///
+/// 回归必须断言「画出来了」而不是「查出来是深色」：旧实现的 `is_dark` 本身正确，
+/// 错的是遍历范围，只有检查绘制输出才能抓住这类截断缺陷。
+fn painted_module(
+    layout: &super::super::layout::QrLayout<'_>,
+    runs: &[super::super::layout::QrRun],
+    column: usize,
+    row: usize,
+) -> bool {
+    let module = layout.module_px();
+    let (origin_x, origin_y) = layout.origin();
+    let x = origin_x + column as f32 * module;
+    let y = origin_y + row as f32 * module;
+    runs.iter().any(|run| {
+        (run.y - y).abs() < 1e-3 && run.x <= x + 1e-3 && run.x + run.width >= x + module - 1e-3
+    })
+}
+
+/// 生成 `(row + column) % period == 0` 为深色的方阵，便于覆盖任意版本的角与边缘。
+fn patterned_qr(side: usize, period: usize) -> String {
+    (0..side)
+        .map(|row| {
+            (0..side)
+                .map(|column| {
+                    if (row + column) % period == 0 {
+                        '1'
+                    } else {
+                        '0'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 构造带三个定位图案与时间图案的 21×21 矩阵，接近真实二维码结构。
+///
+/// 定位图案与右下数据角是扫码最先依赖的区域，也正是旧实现截断时受影响的位置，
+/// 因此回归用结构矩阵而不是纯棋盘格。
+fn realistic_qr() -> String {
+    let side = 21;
+    let mut cells = vec![vec!['0'; side]; side];
+    for (top, left) in [(0, 0), (0, 14), (14, 0)] {
+        for row in 0..7 {
+            for column in 0..7 {
+                let border = row == 0 || row == 6 || column == 0 || column == 6;
+                let center = (2..=4).contains(&row) && (2..=4).contains(&column);
+                cells[top + row][left + column] = if border || center { '1' } else { '0' };
+            }
+        }
+    }
+    // 时间图案连接定位图案，占据第 6 行与第 6 列；同时跨行跨列写入，
+    // 用单轴迭代器表达反而要拆成两次遍历，这里保留按索引的双轴写法。
+    #[allow(clippy::needless_range_loop)]
+    for index in 8..13 {
+        cells[6][index] = if index % 2 == 0 { '1' } else { '0' };
+        cells[index][6] = if index % 2 == 0 { '1' } else { '0' };
+    }
+    // 右下数据角：旧实现正是丢掉了这一整块。
+    cells[20][20] = '1';
+    cells[20][19] = '1';
+    cells
+        .into_iter()
+        .map(|row| row.into_iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 绘制必须覆盖含静区的完整边长：矩阵四个角与右下数据角都要真正落在绘制段内。
+///
+/// 旧实现用原始边长（21）遍历含静区坐标（29），右下 4 个模块被整体截断；这里同时
+/// 断言定位图案合并后的绘制宽度，确保修复没有破坏连续段合并。
+#[test]
+fn qr_paint_covers_finder_patterns_and_bottom_right_corner() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let matrix = realistic_qr();
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(145.0), px(145.0)));
+    let layout = qr_layout(&matrix, bounds, 1.0).expect("valid layout");
+    assert_eq!(layout.matrix_side(), 21);
+    assert_eq!(layout.total_modules(), 29);
+    let runs = qr_runs(&layout);
+    let module = layout.module_px();
+    let (origin_x, origin_y) = layout.origin();
+
+    // 三个定位图案的外角：矩阵 (0,0)、(0,20)、(20,0) 对应绘制坐标加静区。
+    for (column, row) in [(4, 4), (24, 4), (4, 24)] {
+        assert!(
+            painted_module(&layout, &runs, column, row),
+            "finder corner {column},{row} not painted"
+        );
+    }
+    // 右下数据角：旧实现下这里必然缺失。
+    for (column, row) in [(24, 24), (23, 24)] {
+        assert!(
+            painted_module(&layout, &runs, column, row),
+            "bottom-right module {column},{row} not painted"
+        );
+    }
+    // 定位图案顶部横边必须合并为 7 个模块宽的一段。
+    let finder_row = origin_y + 4.0 * module;
+    let merged = runs.iter().any(|run| {
+        (run.y - finder_row).abs() < 1e-3
+            && (run.x - (origin_x + 4.0 * module)).abs() < 1e-3
+            && (run.width - 7.0 * module).abs() < 1e-3
+    });
+    assert!(
+        merged,
+        "finder border row should merge into one 7-module run"
+    );
+    // 静区必须留空：任何绘制段都不允许进入左/上各 4 个模块。
+    assert!(
+        runs.iter()
+            .all(|run| run.x >= origin_x + 4.0 * module - 1e-4
+                && run.y >= origin_y + 4.0 * module - 1e-4)
+    );
+    // 右侧/底部同样保留 4 个模块静区，不能把矩阵一直画到画布边缘。
+    let quiet_end = origin_x + (layout.total_modules() - 4) as f32 * module;
+    assert!(runs.iter().all(|run| run.x + run.width <= quiet_end + 1e-4));
+    assert!(runs.iter().all(
+        |run| run.y + module <= origin_y + (layout.total_modules() - 4) as f32 * module + 1e-4
+    ));
+    // 含静区的整幅二维码不得越出画布。
+    let qr = layout.total_modules() as f32 * module;
+    assert!(origin_x >= 0.0 && origin_y >= 0.0);
+    assert!(origin_x + qr <= 145.0 + 1e-3 && origin_y + qr <= 145.0 + 1e-3);
+}
+
+/// 版本 40 的最大矩阵同样要完整覆盖：177 边长、280px 画布下不能被裁切或丢边。
+#[test]
+fn qr_paint_runs_cover_the_largest_supported_matrix() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let side = 177;
+    let matrix = patterned_qr(side, 2);
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(280.0), px(280.0)));
+    let layout = qr_layout(&matrix, bounds, 1.0).expect("valid layout");
+    assert_eq!(layout.matrix_side(), 177);
+    assert_eq!(layout.total_modules(), 185);
+    let runs = qr_runs(&layout);
+    let module = layout.module_px();
+    let (origin_x, origin_y) = layout.origin();
+    let last = 176 + 4;
+    // 棋盘格在 (176,176) 为深色，最后一行/列都必须被真实绘制。
+    for (column, row) in [(last, last), (4, last), (last, 4)] {
+        assert!(
+            painted_module(&layout, &runs, column, row),
+            "module {column},{row} not painted"
+        );
+    }
+    // 含静区的整幅二维码不得越出画布，也不得被裁掉右侧或底部。
+    let qr = layout.total_modules() as f32 * module;
+    assert!(origin_x >= 0.0 && origin_y >= 0.0);
+    assert!(origin_x + qr <= 280.0 + 1e-3);
+    assert!(origin_y + qr <= 280.0 + 1e-3);
+}
+
+/// 原点按画布绝对坐标吸附到设备像素：非整数 DPR 与奇数剩余像素都不能产生半像素偏移。
+///
+/// 画布原点、画布尺寸和模块宽都换算到设备空间后再取整：模块宽为整数设备像素，原点为
+/// 画布内的整数设备像素。曾经在「画布宽恰好等于整幅二维码宽」时找不到整数原点，实现
+/// 退回原始分数坐标，所有模块落在半设备像素上，产生灰边且扫码不稳；这里把该输入作为
+/// 回归固定为「缩小一级模块换取严格对齐」。
+#[test]
+fn qr_origin_snaps_to_absolute_device_pixels() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let matrix = patterned_qr(21, 2);
+    for (origin, side_px, scale) in [
+        (0.0_f32, 145.0_f32, 1.25_f32),
+        (0.0, 280.0, 1.0),
+        (0.0, 175.0, 1.0),
+        (0.5, 150.0, 1.0),
+        // 画布宽恰好等于 29 × 5 个设备像素：必须缩到 4 像素/模块后严格对齐，
+        // 不能保留 0.5 逻辑像素原点把整幅码摊在半设备像素上。
+        (0.5, 145.0, 1.0),
+        (0.3, 145.0, 1.5),
+        (10.75, 233.0, 1.25),
+        (1.5, 175.0, 2.0),
+        (2.5, 177.0, 1.0),
+        // 宽高不同：两轴独立取整，较短边决定模块宽，较长边只影响居中余量。
+        (3.25, 160.0, 1.5),
+    ] {
+        let bounds = Bounds::new(
+            point(px(origin), px(origin)),
+            size(px(side_px), px(side_px)),
+        );
+        let layout = qr_layout(&matrix, bounds, scale).expect("valid layout");
+        let (x, y) = layout.origin();
+        let qr = layout.total_modules() as f32 * layout.module_px();
+        for value in [x, y] {
+            let device = value * scale;
+            // 无论剩余像素多少都必须落在设备像素网格上：宁可缩小一级模块，也不接受半像素。
+            assert!(
+                (device - device.round()).abs() < 1e-3,
+                "origin {value} at scale {scale} is off the device grid"
+            );
+        }
+        // 吸附不能把内容推出画布：左右上下都保留在边界内。
+        assert!(x >= origin - 1e-3 && y >= origin - 1e-3);
+        assert!(x + qr <= origin + side_px + 1e-3);
+        assert!(y + qr <= origin + side_px + 1e-3);
+        // 模块尺寸按设备像素取整，边缘不会落在半像素上。
+        let module_dev = layout.module_px() * scale;
+        assert!((module_dev - module_dev.round()).abs() < 1e-3);
+        assert!(module_dev >= 1.0);
+    }
+}
+
+/// 对齐只应让模块缩小到必要程度：有余量时不能无谓地少画一级。
+///
+/// 画布 150 设备像素、29 个模块，理论最大整数模块是 5；只有画布恰好整除、余量为 0 时
+/// 才需要让出一级。这里同时验证宽高独立：窄边限制模块宽，长边不影响。
+#[test]
+fn qr_layout_keeps_the_largest_aligned_module() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let matrix = patterned_qr(21, 2);
+    let square = Bounds::new(point(px(0.0), px(0.0)), size(px(150.0), px(150.0)));
+    let layout = qr_layout(&matrix, square, 1.0).expect("valid layout");
+    assert!(
+        (layout.module_px() - 5.0).abs() < 1e-6,
+        "unused slack exists"
+    );
+
+    // 恰好整除（29 × 5 = 145）时让出一级，换取任意分数原点也能对齐。
+    let exact = Bounds::new(point(px(0.5), px(0.5)), size(px(145.0), px(145.0)));
+    let layout = qr_layout(&matrix, exact, 1.0).expect("valid layout");
+    assert!((layout.module_px() - 4.0).abs() < 1e-6);
+    let (x, y) = layout.origin();
+    assert!((x - x.round()).abs() < 1e-6 && (y - y.round()).abs() < 1e-6);
+
+    // 宽 300、高 160：模块宽由高度决定，宽度只影响水平居中余量。
+    let wide = Bounds::new(point(px(0.0), px(0.0)), size(px(300.0), px(160.0)));
+    let layout = qr_layout(&matrix, wide, 1.0).expect("valid layout");
+    assert!((layout.module_px() - 5.0).abs() < 1e-6);
+    let (x, y) = layout.origin();
+    assert!(x > 0.0, "horizontal slack must be centred");
+    assert!((x - x.round()).abs() < 1e-6 && (y - y.round()).abs() < 1e-6);
+}
+
+/// 容器查询按零原点预判、绘制按真实原点落格，两者结论必须一致。
+///
+/// 预判阶段拿不到画布绝对原点，若它放行而绘制阶段因找不到整数原点返回空，界面会只剩
+/// 标签和一块空白画布，看起来像二维码丢了。这里枚举整除边界与非整除尺寸、整数与非整数
+/// DPR，以及各种分数原点，要求预判通过后绘制必定成功，并且严格对齐、完整留在画布内。
+#[test]
+fn qr_layout_probe_guarantees_fractional_origin_paint() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let matrix = patterned_qr(21, 2);
+    for side in [145.0_f32, 146.0, 150.0, 174.0, 175.0, 176.0, 203.0] {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let probe = Bounds::new(point(px(0.0), px(0.0)), size(px(side), px(side)));
+            if qr_layout(&matrix, probe, scale).is_none() {
+                continue;
+            }
+            for eighth in 0..8 {
+                let offset = eighth as f32 / 8.0;
+                let bounds = Bounds::new(point(px(offset), px(offset)), size(px(side), px(side)));
+                let layout = qr_layout(&matrix, bounds, scale).unwrap_or_else(|| {
+                    panic!("probe passed but paint failed at side {side}, scale {scale}, offset {offset}")
+                });
+                let (x, y) = layout.origin();
+                let qr = layout.total_modules() as f32 * layout.module_px();
+                for value in [x, y] {
+                    assert!(
+                        (value * scale - (value * scale).round()).abs() < 1e-3,
+                        "offset {offset} scale {scale} produced a fractional device origin"
+                    );
+                }
+                assert!(x >= offset - 1e-3 && y >= offset - 1e-3);
+                assert!(x + qr <= offset + side + 1e-3);
+                assert!(y + qr <= offset + side + 1e-3);
+            }
+        }
+    }
+}
+
+/// 两轴原点独立取整：x/y 落在不同分数位置时各自吸附，且都留在画布内。
+///
+/// 画布通常是正方形，但侧栏收缩、标签或内边距会让两轴起点不同；共用一次吸附结果会在
+/// 一轴上越界或留下半像素，因此必须分别求解。
+#[test]
+fn qr_origin_aligns_each_axis_independently() {
+    use super::super::layout::qr_layout;
+    use gpui_kit::{Bounds, point, px, size};
+
+    let matrix = patterned_qr(21, 2);
+    // 宽 150 → 5 设备像素/模块、整幅 145；高 170 只影响纵向居中余量。
+    let bounds = Bounds::new(point(px(4.5), px(9.25)), size(px(150.0), px(170.0)));
+    let layout = qr_layout(&matrix, bounds, 1.0).expect("valid layout");
+    assert!((layout.module_px() - 5.0).abs() < 1e-6);
+    let (x, y) = layout.origin();
+    assert!((x - x.round()).abs() < 1e-6, "x is off the device grid");
+    assert!((y - y.round()).abs() < 1e-6, "y is off the device grid");
+    assert!(x >= 4.5 && x + 145.0 <= 154.5 + 1e-3);
+    assert!(y >= 9.25 && y + 145.0 <= 179.25 + 1e-3);
+}
+
+/// 目录模式必须关闭文件选择并保留目录选择；open/save 既有行为不变。
+#[test]
+fn directory_picker_disables_files_and_keeps_directory_selection() {
+    use super::super::layout::path_prompt_options;
+    use kerminal_plugin_protocol::native::PickerMode;
+
+    let directory = path_prompt_options(PickerMode::Directory).expect("directory prompt");
+    assert!(!directory.files);
+    assert!(directory.directories);
+    assert!(!directory.multiple);
+    let open = path_prompt_options(PickerMode::Open).expect("open prompt");
+    assert!(open.files && open.directories && !open.multiple);
+    assert!(path_prompt_options(PickerMode::Save).is_none());
+}
+
+/// 目录 Path 与二维码必须经真实渲染实体绘制；无静区矩阵由宿主验证并补静区。
+#[gpui_kit::test]
+fn qrcode_and_directory_path_render_through_real_renderer(app: &mut gpui_kit::TestAppContext) {
+    use kerminal_application::{ApplicationTaskExecutor, plugin_ports::PluginViewIdentity};
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    let runtime_guard = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let executor = ApplicationTaskExecutor::new(runtime_guard.handle().clone());
+    let prepared = pending_open_plugin();
+    let identity = PluginViewIdentity {
+        plugin: prepared.id.clone(),
+        view: "main".into(),
+        instance: "instance-qrcode".into(),
+        generation: 1,
+    };
+    let matrix = (0..21)
+        .map(|row| {
+            (0..21)
+                .map(|column| if (row + column) % 3 == 0 { '1' } else { '0' })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let view_json = serde_json::json!({
+        "schema":1,
+        "data":{"qr":matrix,"share":{"dir":""}},
+        "root":{"type":"stack","gap":"md","children":[
+            {"type":"path","bind":"share.dir","label":"共享目录","mode":"directory"},
+            {"type":"qrcode","matrix":"$qr","label":"扫码打开"}
+        ]}
+    });
+    let view = Arc::new(
+        kerminal_plugin_protocol::native::parse_native_view(
+            &serde_json::to_vec(&view_json).unwrap(),
+        )
+        .unwrap(),
+    );
+    let config = super::NativeRendererConfig {
+        prepared,
+        view,
+        identity,
+        scope: serde_json::json!({}),
+        saved_state: None,
+        initial_data: None,
+        runtime: Arc::new(PendingOpenRuntime::default()),
+        executor,
+        locale: "en".into(),
+        content_identity: None,
+        embedded_form: None,
+    };
+    app.update(crate::init);
+    let slot = Rc::new(RefCell::new(None));
+    let mounted = slot.clone();
+    let (_, visual) = app.add_window_view(move |window, cx| {
+        let renderer = super::NativeRenderer::mount(config, window, cx).unwrap();
+        *mounted.borrow_mut() = Some(renderer.clone());
+        gpui_kit::base::Root::new(renderer, window, cx)
+    });
+    let renderer = slot.borrow_mut().take().expect("renderer mounted");
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        assert!(renderer.read(cx).error.is_none());
+        renderer.update(cx, |renderer, _| renderer.cancellation.cancel());
+    });
+}

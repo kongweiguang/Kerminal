@@ -32,6 +32,10 @@ pub(crate) async fn target_context(
     if cancellation.is_cancelled() {
         return terminal_tools::failure(AppError::cancelled("MCP request was cancelled"));
     }
+    // Agent 目标上下文整族依赖 agents 单元；禁用后不得读取生命周期或终端上下文。
+    if let Some(result) = terminal_tools::plugin_gate(services, "kerminal.agent.target_context") {
+        return result;
+    }
     let args = match terminal_tools::parse_args::<AgentContextArgs>(arguments) {
         Ok(args) => args,
         Err(error) => return terminal_tools::failure(error),

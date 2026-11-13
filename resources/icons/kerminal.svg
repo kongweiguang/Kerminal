@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Kerminal 应用图标精修预览，未接入正式打包资源。
+  Kerminal 应用图标正式源稿，供应用与安装包共用。
   北极星：克制的深灰终端表面，让 >K 成为唯一的品牌主角。
+  底板沿用旧版全画布尺寸，避免 Dock 在系统安全区内再次缩小图标。
   窗框与字标共用居中内容区，不再使用平台窗口控制点或装饰下划线。
   @author kongweiguang
 -->
@@ -10,28 +11,28 @@
   <desc id="description">深灰圆角终端窗框内，居中的绿色渐变提示符与 K 字标，没有标题栏圆点和下划线。</desc>
   <defs>
     <linearGradient id="surface" x1="512" y1="32" x2="512" y2="992" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#242528"/>
-      <stop offset="0.52" stop-color="#17181A"/>
-      <stop offset="1" stop-color="#101012"/>
+      <stop stop-color="#34373B"/>
+      <stop offset="0.52" stop-color="#25282C"/>
+      <stop offset="1" stop-color="#1D2024"/>
     </linearGradient>
     <linearGradient id="surface-edge" x1="512" y1="32" x2="512" y2="992" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFFFF" stop-opacity="0.16"/>
-      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.035"/>
+      <stop stop-color="#FFFFFF" stop-opacity="0.21"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.065"/>
       <stop offset="1" stop-color="#000000" stop-opacity="0.55"/>
     </linearGradient>
     <linearGradient id="window-fill" x1="512" y1="170" x2="512" y2="854" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#101012"/>
-      <stop offset="1" stop-color="#141815"/>
+      <stop stop-color="#171B19"/>
+      <stop offset="1" stop-color="#1D251F"/>
     </linearGradient>
     <linearGradient id="brand" x1="270" y1="306" x2="770" y2="718" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#A5D6B8"/>
-      <stop offset="0.48" stop-color="#8FC4A5"/>
-      <stop offset="1" stop-color="#3D9D65"/>
+      <stop stop-color="#C5EBD2"/>
+      <stop offset="0.48" stop-color="#A5DDB9"/>
+      <stop offset="1" stop-color="#60C486"/>
     </linearGradient>
     <linearGradient id="frame" x1="190" y1="176" x2="830" y2="848" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#8FC4A5"/>
-      <stop offset="0.55" stop-color="#63A882"/>
-      <stop offset="1" stop-color="#167344"/>
+      <stop stop-color="#A5DDB9"/>
+      <stop offset="0.55" stop-color="#83C99F"/>
+      <stop offset="1" stop-color="#3FA86B"/>
     </linearGradient>
     <linearGradient id="sheen" x1="512" y1="32" x2="512" y2="540" gradientUnits="userSpaceOnUse">
       <stop stop-color="#FFFFFF" stop-opacity="0.05"/>
@@ -45,16 +46,20 @@
     </filter>
   </defs>
 
-  <rect x="32" y="32" width="960" height="960" rx="216" fill="url(#surface)"/>
-  <rect x="33" y="33" width="958" height="958" rx="215" stroke="url(#surface-edge)" stroke-width="2"/>
-  <path d="M32 248C32 128.706 128.706 32 248 32H776C895.294 32 992 128.706 992 248V540H32V248Z" fill="url(#sheen)" clip-path="url(#tile)"/>
+  <!-- 系统 Dock 会施加统一缩放和安全区；全画布底板才能与旧版及相邻应用等大。 -->
+  <g transform="translate(-32 -32) scale(1.066666667)">
+    <rect x="32" y="32" width="960" height="960" rx="216" fill="url(#surface)"/>
+    <rect x="33" y="33" width="958" height="958" rx="215" stroke="url(#surface-edge)" stroke-width="2"/>
+    <path d="M32 248C32 128.706 128.706 32 248 32H776C895.294 32 992 128.706 992 248V540H32V248Z" fill="url(#sheen)" clip-path="url(#tile)"/>
+  </g>
 
   <!-- 扩大主图形占比，减少底板留白；圆角与描边服务识别，不叠加玻璃质感。 -->
   <rect x="164" y="170" width="696" height="684" rx="92" fill="url(#window-fill)" filter="url(#window-shadow)"/>
   <rect x="170" y="176" width="684" height="672" rx="86" stroke="url(#frame)" stroke-width="12"/>
 
   <!-- 只保留很淡的终端语境线，避开放大后的字标并维持四边留白。 -->
-  <path d="M222 276H290M734 276H802M222 748H290M734 748H802" stroke="#8FC4A5" stroke-opacity="0.075" stroke-width="5" stroke-linecap="round"/>
+  <!-- 图标可在系统深色 Dock 显示，绿色适度提亮以保证小尺寸识别，不改变界面主题令牌。 -->
+  <path d="M222 276H290M734 276H802M222 748H290M734 748H802" stroke="#A5DDB9" stroke-opacity="0.10" stroke-width="5" stroke-linecap="round"/>
 
   <!-- >K 占据 254–770 × 306–718，保留至少 48 单位的框内安全区。 -->
   <path d="M282 386L418 512L282 638" stroke="url(#brand)" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>

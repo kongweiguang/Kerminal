@@ -1,0 +1,29 @@
+{
+  "schema": 2,
+  "revision": 7,
+  "plugins": {
+    "acme.missing": {
+      "active": "2.0.0",
+      "enabled": false,
+      "source": "local",
+      "installed_at": "2026-01-02T03:04:05Z",
+      "status": {
+        "kind": "missing"
+      },
+      "confirmed": true
+    },
+    "acme.notes": {
+      "active": "1.0.0",
+      "enabled": true,
+      "source": "local",
+      "installed_at": "2026-01-02T03:04:05Z",
+      "fingerprint": "v1:523a0887e6edc9934fd963b158d3070d304a6f6199fd32c9daceda1cec79c297",
+      "status": {
+        "kind": "ready"
+      },
+      "confirmed": true
+    }
+  },
+  "pending": [],
+  "failures": {}
+}

@@ -173,6 +173,7 @@ impl DataMigrationRepository for BetaContractMigration {
             blockers: Vec::new(),
             notices: Vec::new(),
             recovery_pending: self.recovery_pending,
+            plugin_layout: kerminal_application::data_migration::PluginLayoutReadiness::Current,
         })
     }
 

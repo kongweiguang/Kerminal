@@ -6,9 +6,8 @@
   "version": "0.1.0",
   "api": "^1.0",
   "publisher": "__PUBLISHER__",
-  "runtime": {"kind": "script", "main": "dist/main.js"},
-  "permissions": [],
+  "runtime": {"kind": "none"},
   "contributes": {"tabs": [{"id": "page", "title": "%page.title%", "view": "page", "state_version": 1}]},
-  "views": {"page": {"kind": "webview", "entry": "web/index.html", "csp": "default"}},
+  "views": {"page": {"kind": "webview", "entry": "web/index.html"}},
   "l10n": "l10n"
 }

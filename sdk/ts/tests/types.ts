@@ -1,7 +1,7 @@
 // @author kongweiguang
 
 import { ui } from "../src/builders.js";
-import type { JsonValue, Kerminal, KerminalEnvironment, Permission, PluginManifest, RemoteCall, RpcResponse, ViewFetchParams } from "../src/index.js";
+import type { JsonValue, Kerminal, KerminalEnvironment, PluginManifest, RemoteCall, RpcResponse, ViewFetchParams } from "../src/index.js";
 
 const node = ui.stack({ children: [ui.button({ action: "save", label: "Save", id: "save", "x-test": true })] });
 const iconButton = ui.button({ action: "save", icon: "save" });
@@ -9,17 +9,24 @@ const rpcList = ui.list({ source: "rpc", id: "items", key: "id", title: "name" }
 const inlineList = ui.list({ items: "$items", key: "id", title: "name" });
 const rpcListWithNull = ui.list({ source: "rpc", id: "items", items: null, key: "id", title: "name" });
 const inlineListWithNull = ui.list({ source: null, items: "$items", key: "id", title: "name" });
+// 二维码矩阵与目录选择在类型层只保证必填字段和枚举值；$ 绑定格式仍由 Schema 与 Rust 校验。
+const qrcode = ui.qrcode({ matrix: "$qr", label: "Scan to pair" });
+const directoryPicker = ui.path({ bind: "folder", mode: "directory" });
 const page: ViewFetchParams = {
   instance: "tab-1", node: "rows", range: [0, 20], parent_key: "parent",
   sort: { column: "name", direction: "asc" },
 };
 const response: RpcResponse = { jsonrpc: "2.0", id: "p:1", result: null };
-const permissions: Permission[] = ["ui.notify", "network:api.example.com"];
+// permissions 降为纯描述字符串：允许任意说明性取值，不再充当能力门禁。
+const permissions: string[] = ["ui.notify", "network:api.example.com", "team-specific"];
 const manifest: PluginManifest = {
   schema: 1, id: "acme.example", publisher: "acme", version: "1.0.0", api: "^1.0",
   name: { en: "Example", "zh-CN": "示例" }, description: { en: "Example plugin" }, runtime: { kind: "none" },
+  permissions,
 };
 
+// 浏览器桥只能经 window 取得；移除脚本全局后，网页作者仍复用同一套宿主契约。
+const kerminal: Kerminal = window.kerminal;
 kerminal.onRequest("view.fetch", (params) => ({ total: params.range[1], rows: [] }));
 kerminal.onRequest("view.visibility", (params) => { void params.focused; });
 kerminal.view.update("tab-1", { ready: true });
@@ -39,18 +46,6 @@ kerminal.onCancellableRequest("view.fetch", (params, signal) => {
 });
 // 扩展方法只承诺 JSON 参数，不会误用已知协议方法的结果约束。
 kerminal.onCancellableRequest("acme.custom", (params, signal) => ({ cancelled: signal.aborted, value: params.value }));
-const storedValue: Promise<JsonValue> = kerminal.storage.get("key");
-const stored: Promise<null> = kerminal.storage.set("key", { nested: [1, null, "value"] });
-const deleted: Promise<boolean> = kerminal.storage.delete("key");
-const fileBytes: Promise<Uint8Array> = kerminal.storage.readFile("notes.txt");
-const wroteText: Promise<null> = kerminal.storage.writeFile("notes.txt", "hello");
-const wroteBuffer: Promise<null> = kerminal.storage.writeFile("notes.bin", new ArrayBuffer(2));
-const wroteView: Promise<null> = kerminal.storage.writeFile("notes.bin", new Uint8Array([1, 2]));
-const removed: Promise<boolean> = kerminal.storage.removeFile("notes.txt");
-const files: Promise<string[]> = kerminal.storage.list();
-const nestedFiles: Promise<string[]> = kerminal.storage.list("nested");
-const bridge: Kerminal = window.kerminal;
-if (bridge.storage) void bridge.storage.get("key");
 const notify: RemoteCall = kerminal.ui.notify;
 const hostCalls: Promise<unknown>[] = [
   notify({ level: "info", message: "ready" }),
@@ -77,6 +72,10 @@ ui.list({ source: "rpc", key: "id", title: "name" });
 ui.list({ source: "rpc", id: "items", items: "$items", key: "id", title: "name" });
 // @ts-expect-error 视图不接受颜色或其他任意样式。
 ui.text({ text: "bad", color: "red" });
+// @ts-expect-error 二维码矩阵是必填字段，缺失时构建器不能通过类型检查。
+ui.qrcode({ label: "Scan to pair" });
+// @ts-expect-error 目录选择只是枚举值之一，未知模式不能被静默接受。
+ui.path({ bind: "folder", mode: "folder" });
 // @ts-expect-error 语义间距由协议枚举约束。
 ui.stack({ children: [], gap: "huge" });
 // @ts-expect-error 只有 x- 前缀的扩展字段有效。
@@ -89,8 +88,8 @@ const badSort: ViewFetchParams = { instance: "tab-1", node: "rows", range: [0, 2
 const badResponse: RpcResponse = { jsonrpc: "2.0", result: null, error: { code: -1, message: "bad" } };
 // @ts-expect-error error 字段存在时必须是协议错误对象，不能为 null。
 const nullError: RpcResponse = { jsonrpc: "2.0", id: null, error: null };
-// @ts-expect-error 不属于协议权限枚举的值不能静默通过。
-const badPermission: Permission = "unrestricted";
+// @ts-expect-error 不属于协议枚举的状态码不能静默通过。
+const badStatus: RpcResponse = { jsonrpc: "2.0", id: "p:2", error: { code: "invalid", message: "bad" } };
 // @ts-expect-error 本地化映射必须包含英语，其他语言可按需添加。
 const badManifest: PluginManifest = { ...manifest, name: { "zh-CN": "示例" } };
 // @ts-expect-error 已知 RPC 的处理结果必须遵循对应协议类型。
@@ -103,17 +102,9 @@ kerminal.onCancellableRequest("view.fetch", (_params, _signal: number) => ({ tot
 kerminal.request("custom.request", {}, { signal: "cancel" });
 // @ts-expect-error 视图更新沿用同一信号类型。
 kerminal.view.update("tab-1", {}, { signal: 1 });
-// @ts-expect-error 本地存储的键必须是字符串。
-kerminal.storage.get(1);
-// @ts-expect-error 存储值必须可表示为 JSON。
-kerminal.storage.set("key", () => 1);
-// @ts-expect-error 文件内容必须是字符串、缓冲区或缓冲区视图。
-kerminal.storage.writeFile("file", 123);
-// @ts-expect-error 网页桥的存储可选，使用前必须检查能力存在。
-window.kerminal.storage.get("key");
 // @ts-expect-error 宿主环境是只读快照，不由插件就地修改。
 kerminal.environment.theme = "dark";
 // @ts-expect-error 宿主能力只接受 JSON 对象参数。
 kerminal.ui.notify("ready");
 
-void [node, iconButton, rpcList, inlineList, rpcListWithNull, inlineListWithNull, page, response, permissions, manifest, environment, hostCalls, requestResult, updateResult, storedValue, stored, deleted, fileBytes, wroteText, wroteBuffer, wroteView, removed, files, nestedFiles, badRange, badSort, badResponse, nullError, badPermission, badManifest];
+void [node, iconButton, rpcList, inlineList, rpcListWithNull, inlineListWithNull, qrcode, directoryPicker, page, response, permissions, manifest, environment, hostCalls, requestResult, updateResult, badRange, badSort, badResponse, nullError, badStatus, badManifest];

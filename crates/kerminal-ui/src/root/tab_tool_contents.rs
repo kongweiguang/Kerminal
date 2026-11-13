@@ -56,6 +56,8 @@ impl RetainedTabToolContents {
             view.update(cx, |view, cx| view.set_active(false, cx));
         }
         if let Some(panel) = root.sftp_panel.clone() {
+            // 旧 Tab 的缓存面板不再可见，停用其入场与帧请求；目录读取和传输保持原身份收敛。
+            panel.update(cx, |panel, cx| panel.set_active(false, cx));
             root.sync_file_delete_root_confirmation(panel, false, window, cx);
         }
         let mut operations_views = std::mem::take(&mut root.tool_rail_operations_views);

@@ -10,8 +10,8 @@ use std::{
 
 use crate::{
     ConfigurationSchema, EmptyState, ManifestPolicy, MenuItem, NativeNode, NativeNodeKind,
-    NativeView, Permission, Platform, PluginManifest, PluginRuntime, ProtocolError, ViewDefinition,
-    invalid, parse_json, parse_manifest, parse_native_view,
+    NativeView, Platform, PluginManifest, PluginRuntime, ProtocolError, ViewDefinition, invalid,
+    parse_json, parse_manifest, parse_native_view,
 };
 
 pub const MAX_PACKAGE_ENTRIES: usize = 10_000;
@@ -36,11 +36,7 @@ impl ValidatedPackage {
     /// 平台包只需包含当前平台的 Sidecar，但必须由安装器核对目标平台。
     pub fn validate_for_platform(&self, platform: Platform) -> Result<(), ProtocolError> {
         match &self.manifest.runtime {
-            PluginRuntime::None { .. } | PluginRuntime::Script { .. }
-                if platform == Platform::Any =>
-            {
-                Ok(())
-            }
+            PluginRuntime::None { .. } if platform == Platform::Any => Ok(()),
             PluginRuntime::Sidecar { main, .. } if platform != Platform::Any => {
                 let path = main
                     .get(&platform)
@@ -105,7 +101,6 @@ pub fn validate_package(
     }
     match &manifest.runtime {
         PluginRuntime::None { .. } => {}
-        PluginRuntime::Script { main, .. } => require_file(&files, main)?,
         PluginRuntime::Sidecar { main, .. } => {
             if !main.values().any(|path| files.contains_key(path)) {
                 return Err(invalid("runtime.main", "包内没有任何已声明的 Sidecar"));
@@ -144,11 +139,8 @@ pub fn validate_package(
                 inspect_node_references(&parsed.root, &files, &mut schema_paths, &mut l10n_keys)?;
                 views.insert(id.clone(), parsed);
             }
-            ViewDefinition::Webview { entry, csp, .. } => {
+            ViewDefinition::Webview { entry, .. } => {
                 require_file(&files, entry)?;
-                if let Some(csp) = csp {
-                    validate_csp(csp, &manifest.permissions)?;
-                }
             }
         }
     }
@@ -430,6 +422,7 @@ fn inspect_node_references(
         Form { schema, .. } => {
             schemas.insert(schema.clone());
         }
+        Qrcode { label, .. } => collect_optional_l10n(label.as_deref(), keys),
         Code { .. } | Progress { .. } => {}
     }
     Ok(())
@@ -520,25 +513,6 @@ fn validate_localizations(
             .is_none_or(|text| text.trim().is_empty())
     }) {
         return Err(invalid("l10n", "英文翻译缺少引用的键或文案为空"));
-    }
-    Ok(())
-}
-
-/// 默认 CSP 不授予网络；自定义地址只能复用已声明的网络白名单。
-fn validate_csp(csp: &str, permissions: &[Permission]) -> Result<(), ProtocolError> {
-    if csp == "default" {
-        return Ok(());
-    }
-    for host in csp.split_whitespace() {
-        let Some(host) = host.strip_prefix("https://") else {
-            return Err(invalid("views.csp", "CSP 只能追加 HTTPS 主机"));
-        };
-        if !permissions
-            .iter()
-            .any(|permission| permission.allows_network_host(host))
-        {
-            return Err(invalid("views.csp", "CSP 主机未声明网络权限"));
-        }
     }
     Ok(())
 }

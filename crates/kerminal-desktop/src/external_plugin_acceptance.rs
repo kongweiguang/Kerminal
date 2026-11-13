@@ -22,7 +22,7 @@ use kerminal_application::{
     workspace::{WorkspaceSessionLoad, WorkspaceSessionTab},
 };
 use kerminal_domain::{identity::TabId, plugins::PluginId};
-use kerminal_plugin_protocol::PluginRuntime;
+use kerminal_plugin_protocol::{Platform, PluginRuntime};
 use kerminal_ui::{AppServices, QuitIntent, RootView, RootViewEvent};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -281,7 +281,7 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// 冻结资源与实际脚本一起绑定，源码变化不能让重启验收跨过不同插件候选。
+/// 冻结资源与实际 Sidecar 一起绑定，源码变化不能让重启验收跨过不同插件候选。
 fn frozen_digest(prepared: &PreparedPlugin) -> Result<String, Box<dyn Error>> {
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(&prepared.package.manifest)?);
@@ -290,10 +290,17 @@ fn frozen_digest(prepared: &PreparedPlugin) -> Result<String, Box<dyn Error>> {
         digest.update(path.as_bytes());
         digest.update(bytes.as_ref());
     }
-    if let PluginRuntime::Script { main, .. } = &prepared.package.manifest.runtime {
-        digest.update(fs::read(prepared.directory.join(main))?);
-    } else {
-        return Err(io::Error::other("笔记验收只支持真实脚本宿主").into());
+    match &prepared.package.manifest.runtime {
+        PluginRuntime::Sidecar { main, .. } => {
+            let platform = Platform::current()
+                .ok_or_else(|| io::Error::other("当前平台无法核对 Sidecar 入口"))?;
+            let main = main
+                .get(&platform)
+                .ok_or_else(|| io::Error::other("验收插件未声明当前平台 Sidecar"))?;
+            digest.update(fs::read(prepared.directory.join(main))?);
+        }
+        // 无进程插件没有可执行入口，摘要只绑定冻结清单和资源，不能伪造进程字节。
+        PluginRuntime::None { .. } => {}
     }
     Ok(format!("{:x}", digest.finalize()))
 }

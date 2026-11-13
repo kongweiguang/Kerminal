@@ -25,7 +25,7 @@ mod state;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::{Context, Entity, EventEmitter, Pixels, Point, ScrollHandle};
@@ -46,11 +46,14 @@ use kerminal_domain::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::ui_motion::{TargetDataEntrance, motion_allowed};
+
 use self::{
     forms::OperationsInputs,
     state::{
         DirtyOperationTargets, LatestRequestState, SectionPhase, SectionSelection, SectionState,
-        ServerInfoHistory, ServerInfoPanel,
+        ServerInfoHistory, ServerInfoPanel, TmuxMutationFeedback, TmuxMutationIdentity,
+        defer_tmux_feedback, take_deferred_tmux_feedback,
     },
 };
 
@@ -340,6 +343,54 @@ pub struct TmuxAttachTerminalBinding {
     pub target: TmuxAttachTarget,
     pub binding: UiSessionBinding,
     pub working_directory: Option<String>,
+}
+
+/// 固定 tmux 的 attach owner 与 host/profile 读取目标必须分开判断。
+///
+/// 同 host 换 pane 只改变 owner：必须递增视图代次并撤销冻结的确认、detach 意图和
+/// 迟到写回可见性，但会话列表及窗口/pane/capture 详情仍绑定同一个 `TmuxTarget`，
+/// 可以直接复用。只有目标身份变化或目标失效才重置读取与详情，避免旧目标数据或
+/// 旧请求跨目标显示；重置后是否立即读取仍由可见性和初始化状态决定。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TmuxAttachTransition {
+    pub(super) owner_changed: bool,
+    pub(super) reset_reads: bool,
+    pub(super) load_sessions: bool,
+}
+
+/// 把 owner 变化与数据目标变化拆开，避免换 pane 时清空同一 tmux 服务器的会话与详情。
+///
+/// @author kongweiguang
+fn plan_tmux_attach_transition(
+    current: Option<&TmuxAttachTerminalBinding>,
+    next: Option<&TmuxAttachTerminalBinding>,
+    previous_target: &TmuxTarget,
+    next_target: &TmuxTarget,
+    target_available: bool,
+    phase: SectionPhase,
+    can_read: bool,
+) -> TmuxAttachTransition {
+    let owner_changed = match (current, next) {
+        (Some(current), Some(next)) => {
+            current.pane_id != next.pane_id
+                || current.target != next.target
+                || current.binding != next.binding
+        }
+        (None, None) => false,
+        _ => true,
+    };
+    let target_changed = previous_target != next_target;
+    let reset_reads = target_changed || !target_available;
+    // 首次挂载或从不可用恢复时，只有可见且已初始化才主动补读；隐藏面板等待激活后读取。
+    let load_sessions =
+        target_available && can_read && (reset_reads || phase == SectionPhase::NotLoaded);
+    TmuxAttachTransition {
+        owner_changed,
+        reset_reads,
+        load_sessions,
+    }
 }
 
 /// 分离请求冻结 tmux 查询目标和可见终端身份，不要求该 pane 曾提交 attach 命令。
@@ -789,6 +840,12 @@ pub struct OperationsView {
     forwards: SectionState<Vec<kerminal_application::operations::ManagedPortForwardSnapshot>>,
     /// 未显示目标的写操作回执要求返回时重新读取权威状态。
     dirty_targets: DirtyOperationTargets,
+    /// 四个固定数据区各自只保留一次“目标变化后首个成功结果”的局部入场状态；
+    /// 不复制列表内容，也不参与数据展示与请求生命周期。
+    server_data_entrance: TargetDataEntrance,
+    container_data_entrance: TargetDataEntrance,
+    tmux_data_entrance: TargetDataEntrance,
+    forward_data_entrance: TargetDataEntrance,
     /// Revision watcher 随视图取消；等待与读取仍由应用执行器追踪。
     forward_watch_cancellation: CancellationToken,
     forward_watch_started: bool,
@@ -799,6 +856,12 @@ pub struct OperationsView {
     status: Option<String>,
     /// 隐藏期间已提交写入的最新回执按 Host/runtime 暂存，回来时反馈并回读，不触碰当前其它目标。
     deferred_container_feedback: VecDeque<(Option<HostId>, ContainerRuntime, String)>,
+    /// 离开原 tmux 目标后才到达的写回执按完整目标和操作身份有界暂存；返回该目标时
+    /// 消费一次，当前同目标换 pane 直接显示，不把失败、取消或未知结果静默丢弃。
+    deferred_tmux_feedback: VecDeque<TmuxMutationFeedback>,
+    /// 暂存队列因同身份覆盖或容量淘汰而丢弃的未展示结果条数；丢弃必须显式可见，
+    /// 否则用户无法察觉有结果被有界策略吞掉。
+    deferred_tmux_feedback_losses: state::TmuxFeedbackLosses,
     container_output: DetailReadState<ContainerOutputTarget, ContainerOutputData>,
     container_inspect: DetailReadState<ContainerTarget, ContainerInspect>,
     /// None 表示传统运维页；固定容器工具必须持有 Root 每轮重投影的精确上下文。
@@ -899,6 +962,10 @@ impl OperationsView {
             tmux: SectionState::new(),
             forwards: SectionState::new(),
             dirty_targets: DirtyOperationTargets::default(),
+            server_data_entrance: TargetDataEntrance::default(),
+            container_data_entrance: TargetDataEntrance::default(),
+            tmux_data_entrance: TargetDataEntrance::default(),
+            forward_data_entrance: TargetDataEntrance::default(),
             forward_watch_cancellation: CancellationToken::new(),
             forward_watch_started: false,
             forward_watch_generation: 0,
@@ -906,6 +973,8 @@ impl OperationsView {
             mutation_cancellation: None,
             status: None,
             deferred_container_feedback: VecDeque::new(),
+            deferred_tmux_feedback: VecDeque::new(),
+            deferred_tmux_feedback_losses: 0,
             container_output: DetailReadState::default(),
             container_inspect: DetailReadState::default(),
             container_panel_context: None,
@@ -1134,6 +1203,13 @@ impl OperationsView {
         if self.container_panel_context.as_ref() == Some(&context) {
             return;
         }
+        let previous_container_scope = (self.host_target.clone(), self.runtime);
+        // 不可用分支只切换面板门禁并保留同宿主快照，恢复时不应把保留内容当成新目标重播；
+        // 若恢复后确实换了宿主，reset_for_target 会清空旧数据，保守跳过也比误播安全。
+        let previous_was_unavailable = matches!(
+            self.container_panel_context,
+            Some(ContainerPanelContext::Unavailable { .. })
+        );
         if matches!(context, ContainerPanelContext::Unavailable { .. }) {
             // 连接中、终端结束或协议不支持只是面板暂时不可用；保留同宿主已建立的导航与快照，
             // 回到可用 pane 时再恢复原页，避免一次聚焦丢失项目/容器层级。
@@ -1153,6 +1229,7 @@ impl OperationsView {
             self.compose_pending_context = None;
             self.confirmed_compose_down = None;
             cx.emit(OperationsEvent::RootConfirmationChanged);
+            self.arm_container_data_entrance_if_changed(&previous_container_scope, cx);
             cx.notify();
             return;
         }
@@ -1225,6 +1302,9 @@ impl OperationsView {
         self.status = None;
         self.container_success_notice = None;
         self.restore_deferred_container_feedback(&context);
+        if !previous_was_unavailable {
+            self.arm_container_data_entrance_if_changed(&previous_container_scope, cx);
+        }
         cx.emit(OperationsEvent::RootConfirmationChanged);
         if self.active && self.initialized {
             self.reload_container_context(cx);
@@ -1413,6 +1493,91 @@ impl OperationsView {
         {
             self.status = Some(message);
         }
+    }
+
+    /// 返回当前目标时消费该目标的待投递写回执；拼接后清空，避免返回时重复播放，
+    /// 也避免在尚未回到该目标时把旧提示串到其它 profile/socket。
+    /// 隐藏面板不消费：隐藏期 status 可能随目标重置被清空，留给重新显示时再显示一次。
+    /// 丢弃计数同时清零并转为一次显式提示：丢失只报一次，不跨消费重复播放，
+    /// 计数不与具体目标绑定，因此提示也不伪投给某个目标的结果区。
+    ///
+    /// @author kongweiguang
+    fn restore_deferred_tmux_feedback(&mut self) {
+        if !self.active {
+            return;
+        }
+        let target = self.tmux_target();
+        let mut messages = take_deferred_tmux_feedback(&mut self.deferred_tmux_feedback, &target)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let losses = std::mem::take(&mut self.deferred_tmux_feedback_losses);
+        // 目标回执与丢失提示同一次消费拼接：丢失只报一次，不跨消费重复播放；
+        // 只报条数与原因，不携带目标归属，不把被丢结果伪投成当前目标的内容。
+        if losses > 0 {
+            messages.push(state::tmux_feedback_loss_notice(losses));
+        }
+        let Some(message) = messages
+            .into_iter()
+            .reduce(|joined, message| format!("{joined}\n{message}"))
+        else {
+            return;
+        };
+        self.status = Some(match self.status.take() {
+            Some(previous) if !previous.is_empty() => format!("{previous}\n{message}"),
+            _ => message,
+        });
+    }
+
+    /// 紧凑布局下确认成功没有文案，但旧代码在代次门禁内会显式清空 status；
+    /// 反馈改走投递通道后，None 仍必须保留“清除残留等待/取消提示”的语义，
+    /// 否则“已请求取消”会在远端实际成功后永久残留，与真实终态矛盾。
+    /// None 只在当前可见目标仍与冻结目标一致时清 status：目标已离开时 status 属于
+    /// 新目标，不能代清；隐藏面板的 status 本就会随目标重置被清理，无需处理。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::operations) fn apply_tmux_mutation_receipt(
+        &mut self,
+        frozen_target: &TmuxTarget,
+        identity: TmuxMutationIdentity,
+        message: Option<String>,
+    ) {
+        match message {
+            Some(message) => self.apply_tmux_mutation_feedback(frozen_target, identity, message),
+            None => {
+                if self.active && &self.tmux_target() == frozen_target {
+                    self.status = None;
+                }
+            }
+        }
+    }
+
+    /// 写回执只写入仍展示同一完整目标的可见面板；目标已离开、面板隐藏或该目标不再是
+    /// 当前查询时，按完整目标与操作身份有界暂存，重新显示且目标仍一致或返回该目标后
+    /// 显示一次。当前同目标换 pane 只是视图代次变化，提示仍立即写入，不因代次抑制而丢失。
+    /// 暂存侧溢出或同身份覆盖由共享计数记录，待面板下次消费时显式报告，不静默丢弃。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::operations) fn apply_tmux_mutation_feedback(
+        &mut self,
+        frozen_target: &TmuxTarget,
+        identity: TmuxMutationIdentity,
+        message: String,
+    ) {
+        // 隐藏面板的 status 会在后续目标重置中被清空；先暂存，重显时再消费一次，
+        // 避免用户看不到的提示被当成已展示而静默丢弃。
+        if self.active && &self.tmux_target() == frozen_target {
+            self.status = Some(message);
+            return;
+        }
+        defer_tmux_feedback(
+            &mut self.deferred_tmux_feedback,
+            &mut self.deferred_tmux_feedback_losses,
+            TmuxMutationFeedback {
+                target: frozen_target.clone(),
+                identity,
+                message,
+            },
+        );
     }
 
     /// 让 Root 拒绝面板隐藏后迟到的 exec、文件与 Compose 配置事件。
@@ -1753,6 +1918,7 @@ impl OperationsView {
             return;
         }
         if self.runtime != runtime {
+            let previous_container_scope = (self.host_target.clone(), self.runtime);
             self.runtime = runtime;
             self.container_host
                 .reset_for_target(self.host_target.as_ref(), runtime);
@@ -1769,6 +1935,7 @@ impl OperationsView {
             self.container_inspect.reset();
             self.container_output.reset();
             self.container_output_target_label = None;
+            self.arm_container_data_entrance_if_changed(&previous_container_scope, cx);
             cx.emit(OperationsEvent::RootConfirmationChanged);
         }
         self.load_containers(cx);
@@ -1957,10 +2124,14 @@ impl OperationsView {
             self.compose_pending_context = None;
             self.confirmed_compose_down = None;
             self.forward_pending_delete = None;
+            // 隐藏时立即停止固定数据区的帧请求；尚未消费的目标等待保留给隐藏期结果。
+            self.settle_fixed_data_entrance();
             cx.emit(OperationsEvent::RootConfirmationChanged);
         }
         if active {
             self.request_immediate_server_sample();
+            // 隐藏期间到达的写回执在这里显示一次；同一目标重显不重放写操作。
+            self.restore_deferred_tmux_feedback();
         }
         self.publish_server_monitor_configuration();
         if !active {
@@ -1970,9 +2141,7 @@ impl OperationsView {
             if !self.is_fixed_tmux_view()
                 || self.tmux.phase() == state::SectionPhase::NotLoaded
                 || (self.tmux.phase() != state::SectionPhase::Loading
-                    && self
-                        .dirty_targets
-                        .tmux_is_dirty(&self.tmux_target().host_id))
+                    && self.dirty_targets.tmux_is_dirty(&self.tmux_target()))
             {
                 self.reload_non_server(cx);
             }
@@ -2046,6 +2215,139 @@ impl OperationsView {
         self.set_target_context(host_id, Some(target), container_target, cx);
     }
 
+    /// 按区块取得固定右栏的数据入场状态；完整工作台不接入局部动效。
+    ///
+    /// @author kongweiguang
+    fn data_entrance(&self, section: OperationsSection) -> &TargetDataEntrance {
+        match section {
+            OperationsSection::ServerInfo => &self.server_data_entrance,
+            OperationsSection::Containers => &self.container_data_entrance,
+            OperationsSection::Tmux => &self.tmux_data_entrance,
+            OperationsSection::PortForwards => &self.forward_data_entrance,
+        }
+    }
+
+    /// 只允许当前固定区块修改自己的入场状态，避免其他面板切换推进代次。
+    ///
+    /// @author kongweiguang
+    fn data_entrance_mut(&mut self, section: OperationsSection) -> &mut TargetDataEntrance {
+        match section {
+            OperationsSection::ServerInfo => &mut self.server_data_entrance,
+            OperationsSection::Containers => &mut self.container_data_entrance,
+            OperationsSection::Tmux => &mut self.tmux_data_entrance,
+            OperationsSection::PortForwards => &mut self.forward_data_entrance,
+        }
+    }
+
+    /// 目标身份真实变化时登记一次入场等待；同一目标换 pane 或普通刷新不调用。
+    ///
+    /// 只有固定区块参与；隐藏面板仍登记代次，但成功结果会以静止方式消费，
+    /// 重新显示时不会补播跨隐藏期的动画。
+    ///
+    /// @author kongweiguang
+    fn arm_fixed_data_entrance(
+        &mut self,
+        section: OperationsSection,
+        has_target: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.section_selection.is_fixed() || self.section_selection.active() != section {
+            return;
+        }
+        let allow_motion = motion_allowed(cx.reduce_motion());
+        self.data_entrance_mut(section)
+            .target_changed(has_target, allow_motion, Instant::now());
+    }
+
+    /// 当前目标首个有效成功结果消费入场；失败、取消和旧代次不调用。
+    ///
+    /// 隐藏期间成功也要消费，避免重新显示后把已存在的数据再次压暗。
+    ///
+    /// @author kongweiguang
+    pub(super) fn complete_fixed_data_entrance(
+        &mut self,
+        section: OperationsSection,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.section_selection.is_fixed() || self.section_selection.active() != section {
+            return;
+        }
+        let entrance = self.data_entrance(section);
+        let epoch = entrance.epoch();
+        let animate = self.active
+            && entrance.awaiting_result()
+            && entrance.allows_motion()
+            && motion_allowed(cx.reduce_motion());
+        self.data_entrance_mut(section)
+            .ready(epoch, Instant::now(), animate);
+    }
+
+    /// 固定容器只在 Root 提供宿主上下文时拥有可替换的列表数据。
+    ///
+    /// @author kongweiguang
+    fn container_data_entrance_has_target(&self) -> bool {
+        match self.container_panel_context.as_ref() {
+            Some(ContainerPanelContext::Host { host_id, .. }) => host_id == &self.host_target,
+            Some(ContainerPanelContext::WorkspaceHost { host_id, .. }) => {
+                Some(host_id) == self.host_target.as_ref()
+            }
+            Some(
+                ContainerPanelContext::ContainerInfo { .. }
+                | ContainerPanelContext::Unavailable { .. },
+            )
+            | None => false,
+        }
+    }
+
+    /// 容器目标身份变化后登记入场；同一宿主上下文切换或普通刷新不重播。
+    ///
+    /// @author kongweiguang
+    fn arm_container_data_entrance_if_changed(
+        &mut self,
+        previous_scope: &(Option<HostId>, ContainerRuntime),
+        cx: &mut Context<Self>,
+    ) {
+        if previous_scope == &(self.host_target.clone(), self.runtime) {
+            return;
+        }
+        self.arm_fixed_data_entrance(
+            OperationsSection::Containers,
+            self.container_data_entrance_has_target(),
+            cx,
+        );
+    }
+
+    /// 固定数据区按当前入场采样返回局部透明度；非固定工作台始终完整显示。
+    ///
+    /// @author kongweiguang
+    pub(super) fn fixed_data_entrance_opacity(&self) -> f32 {
+        if !self.section_selection.is_fixed() {
+            return 1.0;
+        }
+        self.data_entrance(self.section_selection.active())
+            .opacity(Instant::now())
+    }
+
+    /// 只有固定右栏正在播放入场时才请求后续帧，避免后台轮询空转。
+    ///
+    /// @author kongweiguang
+    pub(super) fn fixed_data_entrance_is_running(&self, now: Instant) -> bool {
+        self.section_selection.is_fixed()
+            && self
+                .data_entrance(self.section_selection.active())
+                .is_running(now)
+    }
+
+    /// 减少动效时立即落位，但保留尚未消费的目标等待供首个有效结果决定。
+    ///
+    /// @author kongweiguang
+    pub(super) fn settle_fixed_data_entrance(&mut self) {
+        if self.section_selection.is_fixed() {
+            self.data_entrance_mut(self.section_selection.active())
+                .settle();
+        }
+    }
+
     /// 目标来源、身份或容器提示改变时撤销瞬时意图并复用代次流程，拒绝旧目标迟到回执。
     ///
     /// @author kongweiguang
@@ -2062,6 +2364,14 @@ impl OperationsView {
         {
             return;
         }
+        // 目标身份变化可能同时影响四种固定数据区；先冻结旧身份，真实变化才登记入场。
+        let previous_container_scope = (self.host_target.clone(), self.runtime);
+        let previous_tmux_target = self.tmux_target();
+        let previous_tmux_available = self.tmux_target_available();
+        let previous_server_target = self.server_info_target.clone();
+        let previous_available = self.operation_target_available();
+        let previous_forward_host =
+            resolve_forward_add_host(self.tool_rail_target.as_ref(), self.host_target.as_ref());
         self.host_target = host_id;
         self.tool_rail_target = tool_rail_target;
         self.tool_rail_container_target = container_target;
@@ -2084,6 +2394,38 @@ impl OperationsView {
         self.forwards.reset(self.target_generation);
         self.sync_proxy_forward_projection(cx);
         self.clear_target_details();
+        let next_tmux_target = self.tmux_target();
+        let next_tmux_available = self.tmux_target_available();
+        self.dirty_targets.mark_tmux_dirty(next_tmux_target.clone());
+        if previous_tmux_target != next_tmux_target
+            || previous_tmux_available != next_tmux_available
+        {
+            self.arm_fixed_data_entrance(OperationsSection::Tmux, next_tmux_available, cx);
+        }
+        // 完整运维页没有后续 binding setter 清理 status，可在此消费；固定 tmux 的
+        // Root 生产顺序还会紧接着调用 binding setter，若它推进 owner 会先清 status。
+        // 为避免一次提示被先消费后清空，固定视图统一交给 binding setter 或渲染前补投。
+        if !self.is_fixed_tmux_view()
+            && (previous_tmux_target != next_tmux_target
+                || (!previous_tmux_available && next_tmux_available))
+        {
+            self.restore_deferred_tmux_feedback();
+        }
+        let next_available = self.operation_target_available();
+        if previous_server_target != self.server_info_target || previous_available != next_available
+        {
+            self.arm_fixed_data_entrance(OperationsSection::ServerInfo, next_available, cx);
+        }
+        let next_forward_host =
+            resolve_forward_add_host(self.tool_rail_target.as_ref(), self.host_target.as_ref());
+        if previous_forward_host != next_forward_host {
+            self.arm_fixed_data_entrance(
+                OperationsSection::PortForwards,
+                next_available && next_forward_host.is_some(),
+                cx,
+            );
+        }
+        self.arm_container_data_entrance_if_changed(&previous_container_scope, cx);
         cx.emit(OperationsEvent::RootConfirmationChanged);
         self.publish_server_monitor_configuration();
         if self.active && self.initialized {
@@ -2296,7 +2638,12 @@ impl OperationsView {
         cx.notify();
     }
 
-    /// pane、目标或 owner/generation 变化时撤销瞬时 attach 意图、旧读和详情；写操作仍由原 worker 收尾。
+    /// pane 变化只失效 owner 级意图；host/profile 目标变化或失效才重置会话与详情。
+    ///
+    /// 同一 ssh host 的不同 pane 共享 tmux 服务器，已加载列表和详情可以继续展示；
+    /// 视图代次仍必须递增，确保旧 pane 的确认、detach 和迟到 mutation 回执不能改写
+    /// 新焦点的 UI。写操作本身仍由原 worker 收尾，不因切换 pane 被取消或重放；
+    /// 其反馈按冻结目标暂存并在最终步骤补投，不随被抑制的视图回写一起消失。
     ///
     /// @author kongweiguang
     pub fn set_tmux_attach_binding(
@@ -2307,32 +2654,54 @@ impl OperationsView {
         if self.tmux_attach_binding == binding {
             return;
         }
-        let owner_changed = match (self.tmux_attach_binding.as_ref(), binding.as_ref()) {
-            (Some(current), Some(next)) => {
-                current.pane_id != next.pane_id
-                    || current.target != next.target
-                    || current.binding != next.binding
-            }
-            (None, None) => false,
-            _ => true,
-        };
-        if owner_changed {
+        let current_binding = self.tmux_attach_binding.clone();
+        let previous_target = self.tmux_target();
+        let previous_available = self.tmux_target_available();
+        self.tmux_attach_binding = binding;
+        let next_target = self.tmux_target();
+        let next_available = self.tmux_target_available();
+        let transition = plan_tmux_attach_transition(
+            current_binding.as_ref(),
+            self.tmux_attach_binding.as_ref(),
+            &previous_target,
+            &next_target,
+            next_available,
+            self.tmux.phase(),
+            self.active && self.initialized,
+        );
+        if transition.owner_changed {
             self.tmux_detach_pending = None;
         }
-        self.tmux_attach_binding = binding;
-        if self.is_fixed_tmux_view() && owner_changed {
+        if self.is_fixed_tmux_view() && transition.owner_changed {
             self.tmux_view_generation = self.tmux_view_generation.wrapping_add(1).max(1);
-            self.tmux.reset(self.target_generation);
-            self.tmux_details.cancel_pending_reads();
-            let generation = self.tmux_details.generation.wrapping_add(1).max(1);
-            self.tmux_details = TmuxDetailState {
-                generation,
-                ..TmuxDetailState::default()
-            };
+            if transition.reset_reads {
+                // 目标身份变化或失效时旧快照不再属于当前查询；递增列表代次并中断详情，
+                // 避免迟到回执把旧会话、窗口或 capture 应用到新目标。
+                self.target_generation = self.target_generation.wrapping_add(1).max(1);
+                self.tmux.reset(self.target_generation);
+                // 新目标在首次读取前即处于未核对状态；离开旧目标时无需保留历史 dirty。
+                self.dirty_targets.mark_tmux_dirty(next_target.clone());
+                self.tmux_details.cancel_pending_reads();
+                let generation = self.tmux_details.generation.wrapping_add(1).max(1);
+                self.tmux_details = TmuxDetailState {
+                    generation,
+                    ..TmuxDetailState::default()
+                };
+            }
             self.clear_tmux_dialog();
             self.status = None;
             cx.emit(OperationsEvent::RootConfirmationChanged);
-            if self.active && self.initialized && self.tmux_target_available() {
+            // 可用性恢复（例如同目标 Local 从无 pane 变为 Ready）不重置读取，但旧画面
+            // 曾是“目标不可用”状态；仍应把首个新成功结果当作一次内容替换。首次挂载由
+            // 入场自身的未初始化基线吸收，同 pane 普通刷新不会进入这里。
+            if previous_target != next_target || previous_available != next_available {
+                self.arm_fixed_data_entrance(OperationsSection::Tmux, next_available, cx);
+            }
+            // 回到原目标或同目标换 pane 后补投一次离开/隐藏期间到达的写回执；这里位于
+            // status 清理之后，保证 Root 两步生产顺序不会把刚恢复的提示抹掉。隐藏时
+            // restore 自行跳过，留给重新显示时消费。
+            self.restore_deferred_tmux_feedback();
+            if transition.load_sessions {
                 self.load_tmux(cx);
             }
         }
@@ -2512,3 +2881,7 @@ impl Drop for OperationsView {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/operations_tmux_binding.rs"]
+mod tmux_binding_tests;

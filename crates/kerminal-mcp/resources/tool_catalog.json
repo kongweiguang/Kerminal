@@ -247,7 +247,7 @@
     {
       "name": "kerminal.agent.target_context",
       "title": "读取 Agent 目标上下文",
-      "description": "读取内置右栏 Agent 的 targetBinding 首选目标、global scope、live/stale 状态和最近终端输出快照；外部 MCP 默认不因该上下文切换到可见 Tab。",
+      "description": "读取内置右栏 Agent 的 targetBinding 首选目标、global scope、live/stale 状态和最近终端输出快照；terminals 中 UI 会话带 tabId/paneId，显式 sessionId 读取非首选 pane 不重绑首选目标；外部 MCP 默认不因该上下文切换到可见 Tab。",
       "category": "terminal",
       "annotations": {
         "readOnlyHint": true,

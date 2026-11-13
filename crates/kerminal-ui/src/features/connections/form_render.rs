@@ -1538,6 +1538,11 @@ fn render_probe_action(
 ) -> Option<Button> {
     panel.probe_service.as_ref()?;
     let running = panel.probe_running;
+    // 协议被禁用后只能查看或保存配置，不再发起探测；运行中的取消入口保持可用。
+    let protocol_disabled = panel
+        .editor
+        .as_ref()
+        .is_some_and(|editor| !panel.hosts.protocol_enabled(editor.protocol));
     Some(
         Button::new("connections-editor-probe")
             .debug_selector(|| "connections-editor-probe".to_owned())
@@ -1554,7 +1559,9 @@ fn render_probe_action(
             } else {
                 crate::locale::text("测试连接", "Test connection")
             })
-            .disabled(!running && (saving || readonly || panel.save_outcome_unknown))
+            .disabled(
+                !running && (saving || readonly || protocol_disabled || panel.save_outcome_unknown),
+            )
             .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
                 if panel.probe_running {
                     panel.cancel_connection_probe(cx);
@@ -2446,6 +2453,33 @@ fn render_discard_confirmation(
         )
 }
 
+/// 协议候选只保留当前启用的内置类型，Local 不依赖插件启停。
+///
+/// 已锁定表单的当前协议即使刚被禁用也继续展示，避免热更新把用户正在编辑的
+/// 宿主表单强制切换到其它协议；新建或可切换表单不保留禁用协议，防止继续产生
+/// 无法连接的新配置。
+///
+/// @author kongweiguang
+pub(super) fn protocol_options(
+    mut enabled: impl FnMut(RemoteProtocol) -> bool,
+    selected: Option<RemoteProtocol>,
+) -> Vec<(Option<RemoteProtocol>, &'static str)> {
+    [
+        (Some(RemoteProtocol::Ssh), "SSH"),
+        (Some(RemoteProtocol::Sftp), "SFTP"),
+        (None, "Local"),
+        (Some(RemoteProtocol::Rdp), "RDP"),
+        (Some(RemoteProtocol::Telnet), "Telnet"),
+        (Some(RemoteProtocol::Serial), "Serial"),
+    ]
+    .into_iter()
+    .filter(|(protocol, _)| match protocol {
+        Some(protocol) => selected == Some(*protocol) || enabled(*protocol),
+        None => true,
+    })
+    .collect()
+}
+
 /// 常规窗口保留协议标签，极矮窗口收为选择器，为正文保留可滚动空间。
 /// @author kongweiguang
 fn protocol_picker(
@@ -2456,14 +2490,11 @@ fn protocol_picker(
     short: bool,
     cx: &mut Context<ConnectionsPanel>,
 ) -> gpui_kit::AnyElement {
-    let options = [
-        (Some(RemoteProtocol::Ssh), "SSH"),
-        (Some(RemoteProtocol::Sftp), "SFTP"),
-        (None, "Local"),
-        (Some(RemoteProtocol::Rdp), "RDP"),
-        (Some(RemoteProtocol::Telnet), "Telnet"),
-        (Some(RemoteProtocol::Serial), "Serial"),
-    ];
+    // 只有绑定已保存配置的编辑器才保留被禁用的当前协议；新建草稿仍从启用集合出发。
+    let preserved = selected.filter(|_| panel.editor_protocol_locked());
+    let options = protocol_options(|protocol| panel.hosts.protocol_enabled(protocol), preserved);
+    // 下拉闭包需要在渲染后仍可独立执行；只捕获 Copy 的禁用协议身份，不持有面板引用。
+    let preserved_disabled = preserved.filter(|protocol| !panel.hosts.protocol_enabled(*protocol));
     let plugin_options = panel.plugin_forms.options();
     let selected_plugin = panel.plugin_forms.active_type().map(str::to_owned);
     if short {
@@ -2472,12 +2503,13 @@ fn protocol_picker(
             .as_ref()
             .and_then(|active| plugin_options.iter().find(|(id, _)| id == active))
             .map(|(_, title)| title.clone())
-            .unwrap_or_else(|| {
-                options
-                    .iter()
-                    .find(|(protocol, _)| *protocol == selected)
-                    .map_or("Local", |(_, label)| *label)
-                    .into()
+            .unwrap_or_else(|| match selected {
+                Some(RemoteProtocol::Ssh) => "SSH".into(),
+                Some(RemoteProtocol::Sftp) => "SFTP".into(),
+                Some(RemoteProtocol::Rdp) => "RDP".into(),
+                Some(RemoteProtocol::Telnet) => "Telnet".into(),
+                Some(RemoteProtocol::Serial) => "Serial".into(),
+                None => "Local".into(),
             });
         return Button::new("connections-compact-protocol")
             .compact()
@@ -2487,11 +2519,14 @@ fn protocol_picker(
             .dropdown_caret(true)
             .disabled(disabled || panel.editor_protocol_locked())
             .dropdown_menu(move |mut menu, _, _| {
-                for (protocol, title) in options {
+                for (protocol, title) in &options {
+                    let protocol = *protocol;
+                    let title = *title;
                     let owner = owner.clone();
                     menu = menu.item(
                         PopupMenuItem::new(title)
                             .checked(selected_plugin.is_none() && protocol == selected)
+                            .disabled(disabled || protocol == preserved_disabled)
                             .on_click(move |_, window, app| {
                                 owner.update(app, |panel, cx| match protocol {
                                     Some(protocol) => {
@@ -2525,6 +2560,9 @@ fn protocol_picker(
         .p_1()
         .children(options.iter().cloned().map(|(protocol, title)| {
             let is_local = protocol.is_none();
+            // 被禁用但仍保留在表单中的原协议继续以既有禁用态呈现，不额外增加提示行。
+            let protocol_enabled =
+                protocol.is_none_or(|protocol| panel.hosts.protocol_enabled(protocol));
             let selected_item = if selected_plugin.is_some() {
                 false
             } else if is_local {
@@ -2537,7 +2575,7 @@ fn protocol_picker(
                 format!("connections-protocol-{protocol:?}"),
                 title,
                 selected_item,
-                disabled || panel.editor_protocol_locked(),
+                disabled || panel.editor_protocol_locked() || !protocol_enabled,
                 theme,
             )
             .debug_selector(move || format!("connections-protocol-{protocol:?}"))

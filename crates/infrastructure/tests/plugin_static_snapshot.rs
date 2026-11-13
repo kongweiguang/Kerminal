@@ -2,11 +2,13 @@
 //! @author kongweiguang
 
 use kerminal_domain::plugins::{
-    InstalledPlugin, PendingPluginChange, PluginId, PluginSource, PluginVersion,
+    InstalledPlugin, PendingPluginChange, PluginId, PluginInstallStatus, PluginSource,
+    PluginVersion,
 };
 use kerminal_infrastructure::{
     plugins::{
         boot::{BootPackageError, BootPackageValidator},
+        layout,
         store::PluginStore,
     },
     storage::StorageCoordinator,
@@ -37,9 +39,10 @@ fn snapshot_is_read_only_and_includes_disabled_packages() {
     let store = PluginStore::new(StorageCoordinator::new(temp.path())).unwrap();
     let id = PluginId::parse("acme.example").unwrap();
     let version = PluginVersion::parse("1.0.0").unwrap();
-    let package = temp.path().join("plugins/packages/acme.example/1.0.0");
+    let package = layout::package_directory(temp.path(), &id);
     fs::create_dir_all(&package).unwrap();
     fs::write(package.join("manifest"), b"fixture").unwrap();
+    let fingerprint = layout::fingerprint_tree(&package).unwrap();
     let before = store.load().unwrap();
     let mut state = before.state.clone();
     state.plugins.insert(
@@ -50,6 +53,9 @@ fn snapshot_is_read_only_and_includes_disabled_packages() {
             enabled: false,
             source: PluginSource::Local,
             installed_at: "2026-11-09T00:00:00Z".into(),
+            fingerprint: Some(fingerprint),
+            status: PluginInstallStatus::Ready,
+            confirmed: true,
         },
     );
     state
@@ -103,7 +109,13 @@ fn changed_state_rejects_inconsistent_snapshot() {
     let store = PluginStore::new(StorageCoordinator::new(temp.path())).unwrap();
     let id = PluginId::parse("acme.example").unwrap();
     let version = PluginVersion::parse("1.0.0").unwrap();
-    fs::create_dir_all(temp.path().join("plugins/packages/acme.example/1.0.0")).unwrap();
+    fs::create_dir_all(temp.path().join("plugins/acme.example")).unwrap();
+    fs::write(
+        temp.path().join("plugins/acme.example/manifest"),
+        b"fixture",
+    )
+    .unwrap();
+    let fingerprint = layout::fingerprint_tree(&temp.path().join("plugins/acme.example")).unwrap();
     let before = store.load().unwrap();
     let mut state = before.state.clone();
     state.plugins.insert(
@@ -114,6 +126,9 @@ fn changed_state_rejects_inconsistent_snapshot() {
             enabled: true,
             source: PluginSource::Local,
             installed_at: "2026-11-09T00:00:00Z".into(),
+            fingerprint: Some(fingerprint),
+            status: PluginInstallStatus::Ready,
+            confirmed: true,
         },
     );
     store.compare_and_swap(&before, state).unwrap();

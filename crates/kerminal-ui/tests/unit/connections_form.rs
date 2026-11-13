@@ -2,7 +2,9 @@
 //!
 //! @author kongweiguang
 
-use super::super::form_render::{endpoint_port_column_min_width_px, network_field_widths_px};
+use super::super::form_render::{
+    endpoint_port_column_min_width_px, network_field_widths_px, protocol_options,
+};
 use super::{
     HostCredentialChange, HostCredentialSlot, HostEditorField, HostEditorSection,
     HostEditorValidationIssue, append_clearable_credential_change, append_proxy_credential_change,
@@ -20,6 +22,55 @@ use kerminal_domain::connections::{
     CredentialRef, HostEndpoint, ProxyProfile, ProxyProtocol, RemoteProtocol,
 };
 use kerminal_domain::sessions::{SerialDataBits, SerialFlowControl, SerialParity, SerialStopBits};
+
+/// 新建表单只展示启用协议；Local 恒可用，已锁定表单的原协议即使刚被禁用也保留。
+/// @author kongweiguang
+#[test]
+fn disabled_protocols_leave_new_candidates_but_keep_locked_selection() {
+    let enabled =
+        |protocol: RemoteProtocol| !matches!(protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
+
+    let options = protocol_options(enabled, None);
+    let protocols = options
+        .iter()
+        .filter_map(|(protocol, _)| *protocol)
+        .collect::<Vec<_>>();
+    assert!(!protocols.contains(&RemoteProtocol::Ssh));
+    assert!(!protocols.contains(&RemoteProtocol::Sftp));
+    assert!(protocols.contains(&RemoteProtocol::Rdp));
+    assert!(protocols.contains(&RemoteProtocol::Telnet));
+    assert!(protocols.contains(&RemoteProtocol::Serial));
+    assert!(options.iter().any(|(protocol, _)| protocol.is_none()));
+
+    // 已锁定的原协议仍会出现，但调用方会把它渲染成禁用态；不强制切换用户表单。
+    let preserved = protocol_options(enabled, Some(RemoteProtocol::Ssh));
+    assert!(
+        preserved
+            .iter()
+            .any(|(protocol, _)| *protocol == Some(RemoteProtocol::Ssh))
+    );
+}
+
+/// 未禁用任何单元时协议候选保持原顺序与完整集合，回归非门禁场景的既有行为。
+/// @author kongweiguang
+#[test]
+fn all_enabled_protocols_keep_existing_candidates() {
+    let options = protocol_options(|_| true, None);
+    assert_eq!(
+        options
+            .iter()
+            .map(|(protocol, label)| (*protocol, *label))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(RemoteProtocol::Ssh), "SSH"),
+            (Some(RemoteProtocol::Sftp), "SFTP"),
+            (None, "Local"),
+            (Some(RemoteProtocol::Rdp), "RDP"),
+            (Some(RemoteProtocol::Telnet), "Telnet"),
+            (Some(RemoteProtocol::Serial), "Serial"),
+        ]
+    );
+}
 
 /// 活跃页干净时仍需保留隐藏协议的离开时 dirty，切回后才能正确提示关闭确认。
 /// @author kongweiguang

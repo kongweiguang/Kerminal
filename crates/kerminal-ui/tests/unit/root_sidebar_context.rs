@@ -5,14 +5,15 @@
 use super::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use gpui_kit::{px, size};
+use kerminal_application::plugins::{PluginId, PluginRegistryBuilder};
 use kerminal_application::preferences::{ThemeMode, ToolRailPanelPlacement, ToolRailToolId};
 use kerminal_domain::files::{DirectoryListing, FileEntryKind};
 
-#[path = "../support/root_commands_service.rs"]
-mod root_commands_service;
+// 共享命令服务 fixture 在 crate 根只声明一次，这里用 use 引入，避免重复载入。
+use crate::root_commands_service;
 
 /// 宿主命令 fixture 的返回部件较多，用别名保持函数签名可读。
 type CommandsFixture<'a> = (
@@ -50,6 +51,38 @@ fn fixture_with_commands(app: &mut TestAppContext) -> CommandsFixture<'_> {
         .expect("commands fixture attaches catalog counters");
     let (runtime, root, sessions, temporary, visual) = fixture;
     (runtime, root, sessions, temporary, visual, calls)
+}
+
+/// 以内置目录的显式启停状态创建真实 Root；仍注入命令服务，
+/// 使片段入口若漏过门禁会真正切换到 CenterPanel，而不是因服务缺失被掩盖。
+///
+/// @author kongweiguang
+fn fixture_with_disabled_builtin_units<'a>(
+    app: &'a mut TestAppContext,
+    disabled_units: &[&str],
+) -> (Runtime, Entity<RootView>, &'a mut VisualTestContext) {
+    let states = disabled_units
+        .iter()
+        .map(|unit| (PluginId::new(*unit).expect("valid builtin unit"), false))
+        .collect::<BTreeMap<_, _>>();
+    let fixture = fixture_with_configuration_and_services(
+        app,
+        Arc::new(SidebarConfiguration::default()),
+        move |services| {
+            let mut builder = PluginRegistryBuilder::new();
+            builder.register_builtins().expect("valid builtins");
+            let registry = builder
+                .freeze_with_builtin_states(&states)
+                .expect("valid builtin states");
+            let (commands, _) =
+                root_commands_service::empty_commands_service_with_calls(services.sessions.clone());
+            services
+                .with_plugins(Arc::new(registry))
+                .with_commands(Arc::new(commands))
+        },
+    );
+    let (runtime, root, _, _, visual) = fixture;
+    (runtime, root, visual)
 }
 
 /// 片段目录与终端会话无关；切换终端只重读会话相关数据，不得重启全局目录。
@@ -705,6 +738,93 @@ fn sftp_listing_survives_host_sidebar_toggle(app: &mut TestAppContext) {
         assert!(visual.debug_bounds("files-row-1-retained.txt").is_some());
     }
     drop(file_runtime);
+}
+
+/// SSH 关闭后，运维工具族的图标 toggle、快捷键和 compact 直达入口都必须拒绝，
+/// 不能只靠 Rail 列表隐藏而留下可被程序化导航打开的空白抽屉。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn ssh_disabled_operations_tools_reject_toggle_shortcut_and_compact(app: &mut TestAppContext) {
+    let (runtime, root, visual) = fixture_with_disabled_builtin_units(app, &["kerminal.ssh"]);
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            for tool in [
+                ToolRailToolId::Tmux,
+                ToolRailToolId::System,
+                ToolRailToolId::Containers,
+                ToolRailToolId::Ports,
+            ] {
+                assert!(
+                    !root.tool_rail_tool_enabled(tool),
+                    "{tool:?} must inherit the SSH unit"
+                );
+                let settings = root.current_tool_rail_settings();
+                let before = root.tool_rail_state.project(&settings).panels;
+                let collapsed_before = root.right_dock_collapsed;
+
+                root.toggle_tool_rail_panel(tool, window, cx);
+                assert_eq!(
+                    root.tool_rail_state.project(&settings).panels,
+                    before,
+                    "toggle must not open {tool:?} while SSH is disabled"
+                );
+                assert_eq!(root.right_dock_collapsed, collapsed_before);
+
+                root.activate_tool_rail_panel_from_shortcut(tool, window, cx);
+                assert!(
+                    !root.compact_tool_drawer_open,
+                    "shortcut must not open the compact drawer for {tool:?}"
+                );
+                assert_eq!(root.tool_rail_state.project(&settings).panels, before);
+
+                root.show_compact_tool_panel(tool, window, cx);
+                assert!(
+                    !root.compact_tool_drawer_open,
+                    "direct compact entry must not activate {tool:?}"
+                );
+                assert_eq!(root.tool_rail_state.project(&settings).panels, before);
+            }
+
+            for tool in [
+                ToolRailToolId::Sftp,
+                ToolRailToolId::Logs,
+                ToolRailToolId::Snippets,
+            ] {
+                assert!(
+                    root.tool_rail_tool_enabled(tool),
+                    "{tool:?} does not depend on SSH"
+                );
+            }
+        });
+    });
+}
+
+/// 关闭 commands 后，终端建议触发的 OpenSnippetPanel 程序化路径必须在入口返回：
+/// 原中心页不变，也不会把片段宿主挂到工具栏。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn commands_disabled_snippet_entry_keeps_center_panel(app: &mut TestAppContext) {
+    let (runtime, root, visual) = fixture_with_disabled_builtin_units(app, &["kerminal.commands"]);
+    settle(&runtime, visual);
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            assert!(
+                root.commands_view.is_some(),
+                "fixture keeps the snippet host so only the gate can reject the call"
+            );
+            let before = root.center_panel;
+            root.open_snippets_content(window, cx);
+            assert_eq!(
+                root.center_panel, before,
+                "disabled commands must preserve the original center panel"
+            );
+            assert_ne!(root.center_panel, CenterPanel::Commands);
+            assert!(!root.snippets_mounted_in_tool_rail(window, cx));
+        });
+    });
 }
 
 struct DrawerPluginView {

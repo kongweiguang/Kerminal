@@ -6,8 +6,11 @@
 //! @author kongweiguang
 
 use super::{
-    Confirmation, ExtensionsEvent, ExtensionsPage, Filter, Operation, cancelable_failed_change,
-    label, pending_only_failure, sample, selection,
+    Confirmation, DropInState, ExtensionsEvent, ExtensionsPage, Filter, Operation, SelectedEntry,
+    StoredActionsPolicy, builtin_display_name, builtin_enabled, builtin_pending, builtin_rows,
+    cancelable_failed_change, drop_in_confirmation_operation, drop_in_state, extension_total,
+    installed_total, is_reserved_identity, label, pending_only_failure, sample, selection,
+    stored_actions_policy, unconfirmed_drop_in,
 };
 use crate::theme::ThemeTokens;
 use gpui_kit::{
@@ -30,7 +33,7 @@ use gpui_kit::{
 use kerminal_application::extensions::{
     CatalogPlugin, CatalogSelection, ExtensionChange, InstallProgress,
 };
-use kerminal_domain::plugins::PluginId;
+use kerminal_domain::plugins::{PluginId, PluginSource};
 use std::collections::BTreeSet;
 
 impl Render for ExtensionsPage {
@@ -42,7 +45,8 @@ impl Render for ExtensionsPage {
         let theme = ThemeTokens::current(window, cx).for_settings();
         let query = self.search.read(cx).value().trim().to_lowercase();
         let state = self.state.as_ref();
-        let installed_count = state.map_or(0, |state| state.plugins.len());
+        // 内置单元也属于已安装能力；计数按身份去重，外部冲突记录不能重复计算。
+        let installed_count = installed_total(state, &self.builtin_units);
         let pending_count = state.map_or(0, |state| state.pending.len());
         let preview = self.catalog.is_none();
         let plugins: &[CatalogPlugin] = if preview {
@@ -73,7 +77,12 @@ impl Render for ExtensionsPage {
         let summary = header_summary(
             preview,
             self.refreshing,
-            plugins.len(),
+            // 预览摘要是示例数量，不能把内置单元算成示例；真实目录按身份并入总数。
+            if preview {
+                plugins.len()
+            } else {
+                extension_total(plugins, &self.builtin_units)
+            },
             installed_count,
             update_count,
             pending_count,
@@ -574,7 +583,7 @@ impl Render for ExtensionsPage {
 impl ExtensionsPage {
     /// 三类来源共用同一行结构：目录条目、目录缺失的本地安装、等待重启的首次安装。
     /// 过滤与搜索只决定可见性，不改变安装状态或行高。
-    fn visible_rows(
+    pub(super) fn visible_rows(
         &self,
         plugins: &[CatalogPlugin],
         query: &str,
@@ -584,6 +593,10 @@ impl ExtensionsPage {
         let state = self.state.as_ref();
         for plugin in plugins {
             let current = state.and_then(|state| state.plugins.get(&plugin.id));
+            // 未确认投放的目录行会绕开确认门禁；列表只保留带确认入口的记录行。
+            if unconfirmed_drop_in(state, &plugin.id).is_some() {
+                continue;
+            }
             let available = selection(plugin, &self.host_api);
             let update = current
                 .zip(available.clone())
@@ -620,7 +633,8 @@ impl ExtensionsPage {
             let broken = state.is_some_and(|state| state.failures.contains_key(&plugin.id));
             let installing = self.active_install.as_ref() == Some(&plugin.id);
             let mut row = ExtensionRow {
-                id: plugin.id.clone(),
+                element_key: plugin.id.as_str().to_owned(),
+                selection: SelectedEntry::Plugin(plugin.id.clone()),
                 name: name.to_owned(),
                 description: description.to_owned(),
                 progress: None,
@@ -628,7 +642,7 @@ impl ExtensionsPage {
                 action: None,
                 installing,
                 cancel_enabled: self.cancel.is_some(),
-                selected: self.selected.as_ref() == Some(&plugin.id),
+                selected: self.row_selected(&SelectedEntry::Plugin(plugin.id.clone())),
             };
             if installing {
                 row.progress = Some(
@@ -697,7 +711,10 @@ impl ExtensionsPage {
         // 本地安装或目录下架的插件仍属于用户的已安装列表。
         if let Some(state) = state {
             for (id, installed) in &state.plugins {
-                if plugins.iter().any(|plugin| &plugin.id == id)
+                // 未确认投放即使出现在目录中也由记录行承载确认入口，不能因同 id 被跳过。
+                let catalog_owns_row = plugins.iter().any(|plugin| &plugin.id == id)
+                    && unconfirmed_drop_in(Some(state), id).is_none();
+                if catalog_owns_row
                     || !matches!(&self.filter, Filter::All | Filter::Installed)
                     || (!query.is_empty() && !id.as_str().contains(query))
                 {
@@ -707,14 +724,85 @@ impl ExtensionsPage {
                 let installing = self.active_install.as_ref() == Some(id);
                 let pending_change = state.pending.iter().any(|change| change.plugin_id() == id);
                 let broken = state.failures.contains_key(id);
-                rows.push(ExtensionRow {
-                    id: id.clone(),
-                    name: id.as_str().to_owned(),
-                    description: crate::locale::text(
+                let inspection = self.drop_ins.iter().find(|inspection| &inspection.id == id);
+                // 只有手动投放或身份冲突记录需要读取 drop-in 证据；普通安装继续用失败标记。
+                let drop_state = (installed.source == PluginSource::DropIn
+                    || is_reserved_identity(installed))
+                .then(|| drop_in_state(installed, inspection));
+                let (status, tone) = match drop_state {
+                    // 冲突、缺失与损坏是当前磁盘事实，不能被一个陈旧 pending 覆盖成“重启生效”。
+                    Some(
+                        state @ (DropInState::ReservedIdentity
+                        | DropInState::Missing
+                        | DropInState::Corrupt
+                        | DropInState::Unsupported),
+                    ) => drop_in_status_label(state),
+                    Some(DropInState::PendingConfirmation) => {
+                        // 未确认但已排队时仍显示重启生效；未排队则保留确认入口的语义状态。
+                        if pending_change {
+                            (
+                                crate::locale::text("重启生效", "Restart required"),
+                                RowTone::Warning,
+                            )
+                        } else {
+                            drop_in_status_label(DropInState::PendingConfirmation)
+                        }
+                    }
+                    Some(DropInState::Ready) if pending_change => (
+                        crate::locale::text("重启生效", "Restart required"),
+                        RowTone::Warning,
+                    ),
+                    Some(DropInState::Ready) => (
+                        if installed.enabled {
+                            crate::locale::text("已启用", "Enabled")
+                        } else {
+                            crate::locale::text("已禁用", "Disabled")
+                        },
+                        RowTone::Muted,
+                    ),
+                    None if broken => (crate::locale::text("损坏", "Broken"), RowTone::Error),
+                    None if pending_change => (
+                        crate::locale::text("重启生效", "Restart required"),
+                        RowTone::Warning,
+                    ),
+                    None => (
+                        if installed.enabled {
+                            crate::locale::text("已启用", "Enabled")
+                        } else {
+                            crate::locale::text("已禁用", "Disabled")
+                        },
+                        RowTone::Muted,
+                    ),
+                };
+                let name = inspection
+                    .filter(|inspection| !inspection.name.is_empty())
+                    .map_or_else(
+                        || id.as_str().to_owned(),
+                        |inspection| label(&inspection.name, id.as_str()).to_owned(),
+                    );
+                let description = match drop_state {
+                    Some(DropInState::ReservedIdentity) => crate::locale::text(
+                        "占用内置单元身份，不可用",
+                        "Conflicts with a built-in identity; unavailable",
+                    ),
+                    Some(DropInState::PendingConfirmation) => crate::locale::text(
+                        "手动放入，等待确认",
+                        "Manually added; awaiting confirmation",
+                    ),
+                    Some(_) if installed.source == PluginSource::DropIn => {
+                        crate::locale::text("手动放入的扩展", "Manually added extension")
+                    }
+                    _ => crate::locale::text(
                         "本地安装或目录中不可用",
                         "Installed locally or unavailable in the catalog",
-                    )
-                    .to_string(),
+                    ),
+                }
+                .to_string();
+                rows.push(ExtensionRow {
+                    element_key: id.as_str().to_owned(),
+                    selection: SelectedEntry::Plugin(id.clone()),
+                    name,
+                    description,
                     progress: installing.then(|| {
                         self.progress
                             .as_ref()
@@ -723,28 +811,11 @@ impl ExtensionsPage {
                                 crate::locale::text("准备中", "Preparing").to_string()
                             })
                     }),
-                    status: Some((
-                        if broken {
-                            crate::locale::text("损坏", "Broken")
-                        } else if pending_change {
-                            crate::locale::text("重启生效", "Restart required")
-                        } else if installed.enabled {
-                            crate::locale::text("已启用", "Enabled")
-                        } else {
-                            crate::locale::text("已禁用", "Disabled")
-                        },
-                        if broken {
-                            RowTone::Error
-                        } else if pending_change {
-                            RowTone::Warning
-                        } else {
-                            RowTone::Muted
-                        },
-                    )),
+                    status: Some((status, tone)),
                     action: None,
                     installing,
                     cancel_enabled: self.cancel.is_some(),
-                    selected: self.selected.as_ref() == Some(id),
+                    selected: self.row_selected(&SelectedEntry::Plugin(id.clone())),
                 });
             }
         }
@@ -755,6 +826,8 @@ impl ExtensionsPage {
                 let id = change.plugin_id();
                 if state.plugins.contains_key(id)
                     || plugins.iter().any(|plugin| &plugin.id == id)
+                    // 内置单元的 pending 由内置行自己显示；再生成 pending-only 行会重复。
+                    || self.builtin_units.iter().any(|unit| &unit.id == id)
                     || !matches!(&self.filter, Filter::All)
                     || (!query.is_empty() && !id.as_str().contains(query))
                 {
@@ -762,7 +835,8 @@ impl ExtensionsPage {
                 }
                 let failed = pending_only_failure(state, id).is_some();
                 rows.push(ExtensionRow {
-                    id: id.clone(),
+                    element_key: id.as_str().to_owned(),
+                    selection: SelectedEntry::Plugin(id.clone()),
                     name: id.as_str().to_owned(),
                     description: crate::locale::text(
                         if failed {
@@ -793,9 +867,48 @@ impl ExtensionsPage {
                     action: None,
                     installing: false,
                     cancel_enabled: false,
-                    selected: self.selected.as_ref() == Some(id),
+                    selected: self.row_selected(&SelectedEntry::Plugin(id.clone())),
                 });
             }
+        }
+        // 内置单元没有目录或安装记录，单独追加到同一列表；元素键加前缀，
+        // 避免与占用同名身份的外部冲突记录产生重复 ElementId。
+        for row in builtin_rows(&self.builtin_units, state, query, &self.filter) {
+            let (status, tone) = if row.pending {
+                (
+                    crate::locale::text("重启生效", "Restart required"),
+                    RowTone::Warning,
+                )
+            } else if row.enabled {
+                (crate::locale::text("已启用", "Enabled"), RowTone::Muted)
+            } else {
+                (crate::locale::text("已禁用", "Disabled"), RowTone::Muted)
+            };
+            rows.push(ExtensionRow {
+                element_key: format!("builtin-{}", row.id.as_str()),
+                selection: SelectedEntry::Builtin(row.id.clone()),
+                name: row.name,
+                description: crate::locale::text(
+                    if row.can_disable {
+                        "内置插件"
+                    } else {
+                        // 核心单元不能停用，用同一行第二行文案说明，不新增徽标语言。
+                        "内置插件 · 核心"
+                    },
+                    if row.can_disable {
+                        "Built-in extension"
+                    } else {
+                        "Built-in extension · Core"
+                    },
+                )
+                .to_string(),
+                progress: None,
+                status: Some((status, tone)),
+                action: None,
+                installing: false,
+                cancel_enabled: false,
+                selected: self.row_selected(&SelectedEntry::Builtin(row.id.clone())),
+            });
         }
         rows
     }
@@ -822,7 +935,128 @@ impl ExtensionsPage {
             .track_scroll(&self.detail_scroll)
             .vertical_scrollbar(&self.detail_scroll);
 
-        if let Some(plugin) = self.selected_plugin().cloned() {
+        // 详情只按当前选择投影一次，避免各分支重复查询状态造成显示不一致。
+        // 每个分支都按选择来源判定：同名内置行与冲突记录各进各的详情，不能互相遮蔽。
+        let selected_reserved = self
+            .selected_reserved_record()
+            .map(|(id, installed)| (id.clone(), installed.clone()));
+        let selected_builtin = self.selected_builtin_unit().cloned();
+
+        if let Some((id, _installed)) = selected_reserved {
+            let (status, tone) = drop_in_status_label(DropInState::ReservedIdentity);
+            detail = detail
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(id.as_str().to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(theme.text_sm)
+                        .text_color(theme.foreground)
+                        .child(crate::locale::text(
+                            "该记录占用了内置单元身份，不能作为扩展加载。",
+                            "This record occupies a built-in identity and cannot be loaded as an extension.",
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(theme.text_sm)
+                        .text_color(tone.color(theme))
+                        .child(status),
+                )
+                .child(
+                    div()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "磁盘上的冲突材料仍保留；移除对应目录后才能恢复该身份。",
+                            "The conflicting material remains on disk; remove its directory to free the identity.",
+                        )),
+                );
+        } else if let Some(unit) = selected_builtin {
+            let enabled = builtin_enabled(self.state.as_ref(), &unit.id);
+            let pending = builtin_pending(self.state.as_ref(), &unit.id);
+            detail = detail
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(builtin_display_name(&unit)),
+                )
+                .child(
+                    div()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(unit.id.as_str().to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(theme.text_sm)
+                        .text_color(theme.muted)
+                        .child(if unit.can_disable {
+                            crate::locale::text(
+                                "内置插件，可在此启用或停用。",
+                                "Built-in extension; enable or disable it here.",
+                            )
+                        } else {
+                            // 核心单元始终启用，仍以 Muted 文案说明，不新增徽标或禁用按钮。
+                            crate::locale::text(
+                                "内置插件 · 核心，始终启用。",
+                                "Built-in extension · Core, always enabled.",
+                            )
+                        }),
+                );
+            let mut actions = div().w_full().flex().flex_col().gap_2();
+            if pending {
+                actions = actions.child(
+                    div()
+                        .text_size(theme.text_sm)
+                        .text_color(theme.warning)
+                        .child(crate::locale::text(
+                            "重启生效：重启后应用更改。",
+                            "Restart required: the change applies after restart.",
+                        )),
+                );
+            } else if !unit.can_disable {
+                actions = actions.child(
+                    div()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "核心插件不能停用。",
+                            "The core extension cannot be disabled.",
+                        )),
+                );
+            } else {
+                let id = unit.id.clone();
+                actions = actions.child(
+                    Button::new(format!("extension-builtin-toggle-{}", id.as_str()))
+                        .compact()
+                        .ghost()
+                        .label(if enabled {
+                            crate::locale::text("禁用", "Disable")
+                        } else {
+                            crate::locale::text("启用", "Enable")
+                        })
+                        .disabled(self.busy || pending)
+                        .on_click(cx.listener(move |page, _, _, cx| {
+                            page.run_operation(
+                                Operation::Change(if enabled {
+                                    ExtensionChange::Disable(id.clone())
+                                } else {
+                                    ExtensionChange::Enable(id.clone())
+                                }),
+                                cx,
+                            )
+                        })),
+                );
+            }
+            detail = detail.child(actions);
+        } else if let Some(plugin) = self.selected_plugin().cloned() {
             let current = self
                 .state
                 .as_ref()
@@ -1099,7 +1333,10 @@ impl ExtensionsPage {
                     readme_section(&self.readme, preview, &plugin),
                     |detail, readme| detail.child(readme),
                 );
-        } else if let Some((id, installed)) = self.selected.as_ref().and_then(|id| {
+        } else if let Some((id, installed)) = self.selected.as_ref().and_then(|entry| {
+            let SelectedEntry::Plugin(id) = entry else {
+                return None;
+            };
             self.state
                 .as_ref()?
                 .plugins
@@ -1111,127 +1348,224 @@ impl ExtensionsPage {
                 .as_ref()
                 .is_some_and(|state| state.pending.iter().any(|change| change.plugin_id() == &id));
             let enabled = installed.enabled;
-            detail = detail
-                .child(
-                    div()
-                        .text_size(px(16.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(id.as_str().to_owned()),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_sm)
-                        .text_color(theme.foreground)
-                        .child(crate::locale::text(
-                            format!(
-                                "当前版本 {} · 目录不可用",
-                                installed.active
-                            ),
-                            format!(
-                                "Current version {} · Catalog unavailable",
-                                installed.active
-                            ),
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_sm)
-                        .text_color(theme.muted)
-                        .child(crate::locale::text(
-                            "本地安装或目录中不可用的扩展仍可管理。",
-                            "Extensions installed locally or removed from the catalog remain manageable.",
-                        )),
+            let inspection = self.drop_ins.iter().find(|inspection| inspection.id == id);
+            let is_drop_in = installed.source == PluginSource::DropIn;
+            let drop_state = is_drop_in.then(|| drop_in_state(&installed, inspection));
+            let policy = stored_actions_policy(&installed, inspection);
+            let display_name = inspection
+                .filter(|inspection| !inspection.name.is_empty())
+                .map_or_else(
+                    || id.as_str().to_owned(),
+                    |inspection| label(&inspection.name, id.as_str()).to_owned(),
                 );
-            let mut buttons = div().w_full().flex().flex_wrap().items_center().gap_2();
-            let target = id.clone();
-            buttons = buttons.child(
-                Button::new("extension-toggle-local")
-                    .compact()
-                    .ghost()
-                    .label(if enabled {
-                        crate::locale::text("禁用", "Disable")
-                    } else {
-                        crate::locale::text("启用", "Enable")
-                    })
-                    .disabled(self.busy || pending_change)
-                    .on_click(cx.listener(move |page, _, _, cx| {
-                        page.run_operation(
-                            Operation::Change(if enabled {
-                                ExtensionChange::Disable(target.clone())
-                            } else {
-                                ExtensionChange::Enable(target.clone())
-                            }),
-                            cx,
-                        )
-                    })),
+            detail = detail.child(
+                div()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .child(display_name),
             );
-            if let Some(previous) = installed.previous.clone() {
+            if is_drop_in {
+                // 手动投放没有目录记录；版本来自安装记录，指纹与磁盘状态来自最近一次观察。
+                let (status, tone) = drop_state.map_or_else(
+                    || {
+                        (
+                            crate::locale::text("正在检查磁盘状态", "Checking disk state"),
+                            RowTone::Muted,
+                        )
+                    },
+                    drop_in_status_label,
+                );
+                let fingerprint = inspection
+                    .and_then(|inspection| inspection.fingerprint.as_deref())
+                    .map_or_else(
+                        || crate::locale::text("未读取", "Not read"),
+                        |_| crate::locale::text("可用", "Available"),
+                    );
+                detail = detail
+                    .child(
+                        div()
+                            .text_size(theme.text_sm)
+                            .text_color(theme.foreground)
+                            .child(crate::locale::text(
+                                format!("当前版本 {} · 手动放入", installed.active),
+                                format!("Current version {} · Manually added", installed.active),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .child(crate::locale::text(
+                                format!("指纹 · {fingerprint}"),
+                                format!("Fingerprint · {fingerprint}"),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.text_sm)
+                            .text_color(tone.color(theme))
+                            .child(status),
+                    );
+                if pending_change {
+                    detail = detail.child(
+                        div()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.warning)
+                            .child(crate::locale::text(
+                                "变更已提交，重启后生效。",
+                                "The change is committed and takes effect after restart.",
+                            )),
+                    );
+                }
+            } else {
+                detail = detail
+                    .child(
+                        div()
+                            .text_size(theme.text_sm)
+                            .text_color(theme.foreground)
+                            .child(crate::locale::text(
+                                format!(
+                                    "当前版本 {} · 目录不可用",
+                                    installed.active
+                                ),
+                                format!(
+                                    "Current version {} · Catalog unavailable",
+                                    installed.active
+                                ),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.text_sm)
+                            .text_color(theme.muted)
+                            .child(crate::locale::text(
+                                "本地安装或目录中不可用的扩展仍可管理。",
+                                "Extensions installed locally or removed from the catalog remain manageable.",
+                            )),
+                    );
+            }
+            if policy != StoredActionsPolicy::None {
+                let mut buttons = div().w_full().flex().flex_wrap().items_center().gap_2();
+                if policy == StoredActionsPolicy::Manage {
+                    let target = id.clone();
+                    buttons = buttons.child(
+                        Button::new("extension-toggle-local")
+                            .compact()
+                            .ghost()
+                            .label(if enabled {
+                                crate::locale::text("禁用", "Disable")
+                            } else {
+                                crate::locale::text("启用", "Enable")
+                            })
+                            .disabled(self.busy || pending_change)
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.run_operation(
+                                    Operation::Change(if enabled {
+                                        ExtensionChange::Disable(target.clone())
+                                    } else {
+                                        ExtensionChange::Enable(target.clone())
+                                    }),
+                                    cx,
+                                )
+                            })),
+                    );
+                    if let Some(previous) = installed.previous.clone() {
+                        let target = id.clone();
+                        buttons = buttons.child(
+                            Button::new("extension-rollback-local")
+                                .compact()
+                                .ghost()
+                                .label(crate::locale::text(
+                                    format!("回退到 {previous}"),
+                                    format!("Roll back to {previous}"),
+                                ))
+                                .disabled(self.busy || pending_change)
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    page.run_operation(
+                                        Operation::Change(ExtensionChange::Rollback(
+                                            target.clone(),
+                                        )),
+                                        cx,
+                                    )
+                                })),
+                        );
+                    }
+                } else if policy == StoredActionsPolicy::ConfirmDropIn
+                    && let Some(inspection) = inspection.cloned()
+                {
+                    // 未确认的手动投放不能直接启用；确认动作绑定当前指纹与修订。
+                    buttons = buttons.child(
+                        Button::new("extension-confirm-drop-in")
+                            .primary()
+                            .label(crate::locale::text("确认并启用", "Confirm and enable"))
+                            .disabled(
+                                self.busy
+                                    || pending_change
+                                    || drop_in_confirmation_operation(&inspection).is_none(),
+                            )
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.open_confirmation(
+                                    Confirmation::DropIn(inspection.clone()),
+                                    cx,
+                                );
+                            })),
+                    );
+                }
                 let target = id.clone();
                 buttons = buttons.child(
-                    Button::new("extension-rollback-local")
+                    Button::new("extension-uninstall-local")
                         .compact()
                         .ghost()
-                        .label(crate::locale::text(
-                            format!("回退到 {previous}"),
-                            format!("Roll back to {previous}"),
-                        ))
+                        .label(crate::locale::text("卸载", "Uninstall"))
                         .disabled(self.busy || pending_change)
                         .on_click(cx.listener(move |page, _, _, cx| {
                             page.run_operation(
-                                Operation::Change(ExtensionChange::Rollback(target.clone())),
+                                Operation::Change(ExtensionChange::Uninstall(target.clone())),
                                 cx,
                             )
                         })),
                 );
+                let target = id.clone();
+                detail = detail.child(buttons).child(
+                    div()
+                        .w_full()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .pt_3()
+                        .child(
+                            Button::new("extension-delete-local")
+                                .compact()
+                                .ghost()
+                                .text_color(theme.error)
+                                .label(crate::locale::text(
+                                    "删除扩展数据…",
+                                    "Delete extension data…",
+                                ))
+                                .disabled(self.busy)
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    page.open_confirmation(
+                                        Confirmation::DeleteData(target.clone()),
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
+                if let Some(failure) = self.failure_block(&id, theme, cx) {
+                    detail = detail.child(failure);
+                }
             }
-            let target = id.clone();
-            buttons = buttons.child(
-                Button::new("extension-uninstall-local")
-                    .compact()
-                    .ghost()
-                    .label(crate::locale::text("卸载", "Uninstall"))
-                    .disabled(self.busy || pending_change)
-                    .on_click(cx.listener(move |page, _, _, cx| {
-                        page.run_operation(
-                            Operation::Change(ExtensionChange::Uninstall(target.clone())),
-                            cx,
-                        )
-                    })),
-            );
-            let target = id.clone();
-            detail = detail.child(buttons).child(
-                div()
-                    .w_full()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .pt_3()
-                    .child(
-                        Button::new("extension-delete-local")
-                            .compact()
-                            .ghost()
-                            .text_color(theme.error)
-                            .label(crate::locale::text(
-                                "删除扩展数据…",
-                                "Delete extension data…",
-                            ))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |page, _, _, cx| {
-                                page.open_confirmation(
-                                    Confirmation::DeleteData(target.clone()),
-                                    cx,
-                                );
-                            })),
-                    ),
-            );
-            if let Some(failure) = self.failure_block(&id, theme, cx) {
-                detail = detail.child(failure);
-            }
-        } else if let Some(id) = self.selected.as_ref().filter(|id| {
-            self.state.as_ref().is_some_and(|state| {
-                !state.plugins.contains_key(*id)
-                    && state.pending.iter().any(|change| change.plugin_id() == *id)
-            })
+        } else if let Some(id) = self.selected.as_ref().and_then(|entry| {
+            let SelectedEntry::Plugin(id) = entry else {
+                return None;
+            };
+            self.state
+                .as_ref()
+                .is_some_and(|state| {
+                    !state.plugins.contains_key(id)
+                        && state.pending.iter().any(|change| change.plugin_id() == id)
+                })
+                .then_some(id)
         }) {
             let failed = self
                 .state
@@ -1617,13 +1951,46 @@ impl ExtensionsPage {
                 action_label: crate::locale::text("删除数据", "Delete data"),
                 danger: true,
             }),
+            Confirmation::DropIn(inspection) => {
+                // 指纹缺失或内容已损坏时不能构造确认意图；弹层必须关闭而不是承诺一次必然失败的启用。
+                let action = drop_in_confirmation_operation(inspection)?;
+                let name = label(&inspection.name, inspection.id.as_str()).to_owned();
+                Some(ConfirmationDialogModel {
+                    title: crate::locale::text(
+                        format!("启用手动放入的扩展「{name}」？"),
+                        format!("Enable manually added extension “{name}”?"),
+                    ),
+                    subtitle: SharedString::from(format!(
+                        "{} · v{}",
+                        inspection.id.as_str(),
+                        inspection.version
+                    )),
+                    warning: Some(crate::locale::text(
+                        "此扩展由用户手动放入，未经市场审核。",
+                        "This extension was added manually and has not been reviewed by the marketplace.",
+                    )),
+                    source: Some(crate::locale::text("手动放入", "Added manually")),
+                    full_access: inspection
+                        .permissions
+                        .iter()
+                        .any(|permission| permission == "full-access"),
+                    permissions: inspection.permissions.clone(),
+                    action,
+                    action_label: crate::locale::text("确认并启用", "Confirm and enable"),
+                    danger: false,
+                })
+            }
         }
     }
 }
 
 /// 行数据只描述当前条目，按钮动作在渲染时绑定，保证内容、筛选与安装状态共用一个来源。
-struct ExtensionRow {
-    id: PluginId,
+/// 可见性与 `visible_rows` 对齐，测试模块据此验证行数量而不暴露字段访问器。
+pub(super) struct ExtensionRow {
+    /// 元素键与插件身份分离：内置行与同名冲突记录必须能同时出现在列表里。
+    element_key: String,
+    /// 选择来源与高亮共用：同 id 的内置行和记录行只能选中各自那一行。
+    selection: SelectedEntry,
     name: String,
     description: String,
     progress: Option<String>,
@@ -1673,6 +2040,30 @@ impl RowTone {
     }
 }
 
+/// drop-in 的磁盘证据与冲突身份在列表和详情使用同一组文案与色调，避免两处判断漂移。
+fn drop_in_status_label(state: DropInState) -> (SharedString, RowTone) {
+    match state {
+        DropInState::PendingConfirmation => (
+            crate::locale::text("待确认", "Needs confirmation"),
+            RowTone::Warning,
+        ),
+        DropInState::Ready => (crate::locale::text("就绪", "Ready"), RowTone::Muted),
+        DropInState::Missing => (
+            crate::locale::text("文件缺失", "Files missing"),
+            RowTone::Error,
+        ),
+        DropInState::Corrupt => (crate::locale::text("损坏", "Broken"), RowTone::Error),
+        DropInState::Unsupported => (
+            crate::locale::text("不受支持", "Unsupported"),
+            RowTone::Muted,
+        ),
+        DropInState::ReservedIdentity => (
+            crate::locale::text("身份冲突", "Identity conflict"),
+            RowTone::Error,
+        ),
+    }
+}
+
 /// 行高由移除分隔线后的两行内容自然撑开；右侧动作与状态共用固定尾部空间。
 fn render_extension_row(
     row: ExtensionRow,
@@ -1680,7 +2071,8 @@ fn render_extension_row(
     cx: &mut Context<ExtensionsPage>,
 ) -> AnyElement {
     let ExtensionRow {
-        id,
+        element_key,
+        selection,
         name,
         description,
         progress,
@@ -1690,8 +2082,9 @@ fn render_extension_row(
         cancel_enabled,
         selected,
     } = row;
-    let id_text = id.as_str().to_owned();
-    let select_id = id.clone();
+    let id_text = element_key;
+    let select_entry = selection.clone();
+    let inner_entry = selection.clone();
     let action_name = name.clone();
     let action_button = if installing {
         Some(
@@ -1761,7 +2154,7 @@ fn render_extension_row(
         .when(!selected, |row| {
             row.hover(|style| style.bg(theme.surface_hover()))
         })
-        .on_click(cx.listener(move |page, _, _, cx| page.select(select_id.clone(), cx)))
+        .on_click(cx.listener(move |page, _, _, cx| page.select(select_entry.clone(), cx)))
         .child(
             div()
                 .w_full()
@@ -1778,9 +2171,9 @@ fn render_extension_row(
                             .py_0()
                             .max_w_full()
                             .child(div().w_full().min_w(px(0.)).truncate().child(name))
-                            .on_click(
-                                cx.listener(move |page, _, _, cx| page.select(id.clone(), cx)),
-                            ),
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.select(inner_entry.clone(), cx)
+                            })),
                     ),
                 )
                 .when_some(action_button, |line, action| line.child(action)),
@@ -2101,9 +2494,7 @@ fn external_link(
     url: String,
     cx: &mut Context<ExtensionsPage>,
 ) -> Button {
-    let permissions =
-        std::collections::BTreeSet::from([kerminal_plugin_protocol::Permission::OpenExternal]);
-    let url = crate::plugins::external::view::allowed_external_url(&permissions, &url);
+    let url = crate::plugins::external::view::allowed_external_url(&url);
     Button::new(id)
         .compact()
         .ghost()

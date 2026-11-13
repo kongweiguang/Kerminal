@@ -2,12 +2,13 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use gpui_kit::{
     AppContext as _, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
     IntoElement, Render, SharedString, Subscription, Window,
     assets::IconName,
+    base::TestSupportExt as _,
     canvas,
     component::input::{Input, InputEvent, InputState},
     component::{
@@ -37,12 +38,18 @@ use tokio_util::sync::CancellationToken;
 
 use super::history_query::{HistoryScope, PAGE_SIZE, page_window as logs_page_window};
 use crate::theme::{ThemeTokens, UiMetrics};
+use crate::ui_motion::{TargetDataEntrance, motion_allowed};
 
 #[cfg(feature = "right-rail-acceptance")]
 #[path = "logs/right_rail_acceptance.rs"]
 pub(super) mod right_rail_acceptance;
 
 const HISTORY_LIMIT: usize = 100;
+
+/// 隐藏期间收敛的写操作结果暂存上限；只覆盖快速跨目标切换的少数在途写入，
+/// 超出即淘汰最旧，避免长会话无界积累。同一时刻在途写操作入口互相门禁，
+/// 实际并发量远低于该值。
+const DEFERRED_MUTATION_LIMIT: usize = 4;
 
 /// 列表绘制与分页测量共用同一份密度投影，避免文字放大后沿用旧的固定行容量。
 #[derive(Clone, Copy)]
@@ -274,6 +281,39 @@ enum HistoryFillStatus {
     Problem(String),
 }
 
+/// 回读结果如何对待 `status`：普通刷新可能对应已被取代的旧提示，删除/清理成功后的
+/// 权威回读则只刷新列表，不能让刚写入的确认文案在下一帧消失。
+/// Preserve 携带发起写操作时的交互代次，回读落盘时若代次已变，说明新交互已经接管提示，
+/// 此时既不能清掉也不能保留旧确认，只能不动当前提示。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryStatusPolicy {
+    Replace,
+    Preserve(u64),
+}
+
+/// 写操作在面板隐藏或目标暂时离开后收敛的结果；按发起目标保存，
+/// 只有原目标重新成为当前可见视图时才交还提示，避免被无关目标冒领。
+/// 不携带交互代次：回执已经发生，重显时按当前可见视图重新归属，
+/// 之后的用户交互仍通过既有 status/error 清理规则接管。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug)]
+struct DeferredMutationOutcome {
+    target: LogsTarget,
+    message: MutationMessage,
+}
+
+/// 写操作结果的展示类别；成功确认需要列表回读配合，失败必须让用户看到。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug)]
+enum MutationMessage {
+    Confirmed(String),
+    Failed(String),
+}
+
 /// 将焦点票据和反馈状态放在一起，使列表交互只能丢弃已确认的提示。
 #[derive(Default)]
 struct HistoryFillFeedback {
@@ -333,10 +373,27 @@ pub struct LogsView {
     host_display_names: HashMap<HostId, SharedString>,
     theme_mode: ThemeMode,
     active: bool,
+    /// 数据区入场只响应“目标变化 + 首个已接纳结果”，普通刷新与迟到响应不重放。
+    data_entrance: TargetDataEntrance,
+    /// 测试只替换系统侧动效结论，应用内 reduce_motion 仍由生产门禁优先判定。
+    /// 常驻字段配合 `cfg!(test)` 读取，避免 `src` 出现测试专属属性；生产构建恒为 None。
+    #[cfg_attr(not(test), allow(dead_code))]
+    motion_allowed_for_test: Option<bool>,
+    /// 记录 `ready` 真正启动入场的次数，避免用时序或渲染采样碰运气。
+    /// 生产不读取该计数，保留常驻字段只为让外置测试能直接观察真实分支。
+    #[cfg_attr(not(test), allow(dead_code))]
+    started_entrances_for_test: usize,
+    /// 记录旧代次/旧目标回执真正走到拒绝分支的次数；测试据此确认回执已被处理，
+    /// 而不是只证明仓储 future 已完成或固定次数泵循环碰巧跑完。
+    #[cfg_attr(not(test), allow(dead_code))]
+    stale_responses_rejected_for_test: usize,
     source: Option<CommandHistorySource>,
     page: usize,
     page_size: usize,
     entries: Vec<CommandHistoryEntry>,
+    /// 成功结果对应的完整 target/query/source；只有它与当前筛选一致时，空态和计数才可信。
+    /// 用 key 而不是布尔值，避免新筛选等待期沿用旧结果；LogsTarget 比较忽略展示 detail。
+    history_snapshot_key: Option<HistoryReadKey>,
     loading: bool,
     error: Option<String>,
     status: Option<String>,
@@ -344,9 +401,13 @@ pub struct LogsView {
     fill_feedback: HistoryFillFeedback,
     fill_operation: Option<HistoryFillOperation>,
     clear_target_in_flight: Option<LogsTarget>,
+    /// 隐藏或目标离开期间收敛的删除/清理结果；每个目标最多一条，超过上限淘汰最旧，
+    /// 既保证结果不被静默丢弃，也避免长会话跨多个 pane 切换时无界积累。
+    deferred_mutations: Vec<DeferredMutationOutcome>,
     generation: u64,
     read_key: Option<HistoryReadKey>,
     /// 接受性 readiness 要区分“成功返回空列表”和“尚未返回”；不进入普通运行构建。
+    /// 它只服务 acceptance 的读取完成判定，展示可信快照仍由 history_snapshot_key 独立维护。
     #[cfg(feature = "right-rail-acceptance")]
     loaded_read_key: Option<HistoryReadKey>,
     #[cfg(feature = "right-rail-acceptance")]
@@ -390,16 +451,22 @@ impl LogsView {
             host_display_names: HashMap::new(),
             theme_mode: ThemeMode::System,
             active: false,
+            data_entrance: TargetDataEntrance::default(),
+            motion_allowed_for_test: None,
+            started_entrances_for_test: 0,
+            stale_responses_rejected_for_test: 0,
             source: None,
             page: 1,
             page_size: PAGE_SIZE,
             entries: Vec::new(),
+            history_snapshot_key: None,
             loading: false,
             error: None,
             status: None,
             fill_feedback: HistoryFillFeedback::default(),
             fill_operation: None,
             clear_target_in_flight: None,
+            deferred_mutations: Vec::new(),
             generation: 0,
             read_key: None,
             #[cfg(feature = "right-rail-acceptance")]
@@ -468,7 +535,8 @@ impl LogsView {
         cx.notify();
     }
 
-    /// pane/session generation 改变时取消旧查询与待接纳的填入，并保留仍在收敛或待核对的写入结果。
+    /// pane/session generation 改变时取消旧查询与待接纳的填入，并保留仍在收敛或待核对的写入结果；
+    /// 数据区入场只登记目标代次和中断采样，待该目标的首个有效结果消费，仅在可见时播放，不缓存旧列表。
     ///
     /// @author kongweiguang
     pub fn set_target(&mut self, target: Option<LogsTarget>, cx: &mut Context<Self>) {
@@ -487,12 +555,16 @@ impl LogsView {
         self.cancel_read();
         self.cancel_terminal_fill();
         self.fill_feedback.begin_interaction();
+        // 目标离开后，该目标隐藏期间收敛的删除/清理结果不再属于任何可见视图，
+        // 一次性作废且不补投：保留会在切换回来时展示过期的操作反馈，属于冒领。
+        self.deferred_mutations.clear();
         #[cfg(feature = "right-rail-acceptance")]
         self.acceptance
             .invalidate_pending("Logs target changed during acceptance seeding");
         self.generation = self.generation.wrapping_add(1).max(1);
         self.target = target;
         self.entries.clear();
+        self.history_snapshot_key = None;
         #[cfg(feature = "right-rail-acceptance")]
         {
             self.loaded_read_key = None;
@@ -501,6 +573,12 @@ impl LogsView {
         self.loading = false;
         self.error = None;
         self.status = None;
+        let has_target = self.target.is_some();
+        // 先完成对 self 的只读动效判断，再可变借用入场状态，避免参数求值期间重叠借用。
+        // 无目标时 armed 恒为假，allow_motion 不会被消费；跳过系统偏好查询省一次 SPI。
+        let allow_motion = has_target && self.data_motion_allowed(cx.reduce_motion());
+        self.data_entrance
+            .target_changed(has_target, allow_motion, Instant::now());
         if self.active {
             self.reload_history(cx);
         }
@@ -518,6 +596,9 @@ impl LogsView {
     }
 
     /// 隐藏时允许读取收敛，并协作取消尚未接纳的填入；返回后不能沿用旧成功提示或焦点票据。
+    /// 数据区入场立即落位并停止帧请求；仅当没有成功结果时才保留等待，隐藏期间的成功会静默消费，
+    /// 重显后的同目标刷新不再重放入场。隐藏期间收敛的删除/清理结果进入暂存区，
+    /// 重显时按原目标交还给用户，不在隐藏瞬间写入提示。
     ///
     /// @author kongweiguang
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -526,10 +607,15 @@ impl LogsView {
         }
         self.active = active;
         if active {
+            // 重显先清掉过期的等待状态，再交还本目标隐藏期间收敛的删除/清理结果；
+            // 交还只改展示，权威回读由原异步任务完成，交还成功后由 Preserve 规则保留提示。
+            self.loading = false;
+            self.deliver_deferred_mutations(cx);
             self.reload_history(cx);
         } else {
             self.cancel_terminal_fill();
             self.fill_feedback.begin_interaction();
+            self.data_entrance.settle();
             #[cfg(feature = "right-rail-acceptance")]
             if self
                 .acceptance
@@ -541,10 +627,61 @@ impl LogsView {
         cx.notify();
     }
 
+    /// 把暂存的删除/清理结果交给当前可见目标：成功写回确认（其后的权威回读按
+    /// Preserve 保留），失败写入 error；不属于当前目标的结果继续等待，不冒领。
+    ///
+    /// @author kongweiguang
+    fn deliver_deferred_mutations(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let delivered = self
+            .deferred_mutations
+            .iter()
+            .position(|outcome| outcome.target == target)
+            .map(|index| self.deferred_mutations.remove(index));
+        let Some(outcome) = delivered else {
+            return;
+        };
+        match outcome.message {
+            MutationMessage::Confirmed(text) => {
+                // 交还属于新的可见结果：先开启新的交互上下文，避免旧代次规则拦截；
+                // 其后的权威回读用该代次 Preserve，确认不会被同帧刷新清掉。
+                let interaction = self.fill_feedback.begin_interaction();
+                self.status = Some(text.clone());
+                self.fill_feedback.confirm(interaction, text);
+            }
+            MutationMessage::Failed(error) => {
+                self.error = Some(error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 动效判断始终让应用内 reduce_motion 优先；测试注入只替换系统侧结论，
+    /// 既不改变生产分支，也不能据此宣称真实 Windows SPI 或原生视觉已经验证。
+    ///
+    /// @author kongweiguang
+    fn data_motion_allowed(&self, reduce_motion: bool) -> bool {
+        if reduce_motion {
+            return false;
+        }
+        // 生产构建该字段恒为 None；用 cfg! 常量分支而非条件编译属性，保持 src 无测试专属项。
+        if cfg!(test)
+            && let Some(allowed) = self.motion_allowed_for_test
+        {
+            return allowed;
+        }
+        motion_allowed(false)
+    }
+
     /// 根据当前已确认的记录与 pane 范围取正文，避免旧行点击复制另一个目标的数据；有效操作使旧成功提示失效。
     ///
     /// @author kongweiguang
     fn copy_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+        if !self.history_snapshot_is_current() {
+            return;
+        }
         let Some(target) = self.target.as_ref().filter(|_| self.active) else {
             return;
         };
@@ -568,6 +705,7 @@ impl LogsView {
     fn fill_entry(&mut self, entry_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.active
             || self.loading
+            || !self.history_snapshot_is_current()
             || self.clear_target_in_flight.is_some()
             || self.fill_operation.is_some()
             || self.fill_feedback.unknown_target.is_some()
@@ -674,6 +812,26 @@ impl LogsView {
         }
     }
 
+    /// 暂存隐藏/目标离开期间收敛的删除/清理结果。每个目标只保留最新一条：
+    /// 同一目标不可能同时有两个合法在途写操作（入口互相门禁），重复到达只会是
+    /// 已被取代的旧结果；上限淘汰最旧条目，防止跨目标反复切换造成无界积累。
+    ///
+    /// @author kongweiguang
+    fn defer_mutation_outcome(&mut self, outcome: DeferredMutationOutcome) {
+        if let Some(existing) = self
+            .deferred_mutations
+            .iter_mut()
+            .find(|existing| existing.target == outcome.target)
+        {
+            *existing = outcome;
+            return;
+        }
+        if self.deferred_mutations.len() >= DEFERRED_MUTATION_LIMIT {
+            self.deferred_mutations.remove(0);
+        }
+        self.deferred_mutations.push(outcome);
+    }
+
     /// 仅接受当前活动 UI binding 的成功查询；空历史是有效的实际回执，未完成或失败则不通过。
     ///
     /// @author kongweiguang
@@ -694,13 +852,58 @@ impl LogsView {
             && self.loaded_read_key.as_ref() == Some(&expected_key)
     }
 
+    /// 只有成功结果仍对应当前 target/query/source 时，旧空态和范围计数才是已确认数据。
+    /// 同筛选刷新继续可信，避免等待期内容消失；新目标或新筛选不能借用旧快照。
+    ///
+    /// @author kongweiguang
+    fn history_snapshot_is_current(&self) -> bool {
+        let Some(target) = self.target.as_ref() else {
+            return false;
+        };
+        self.history_snapshot_key.as_ref().is_some_and(|trusted| {
+            trusted.target == *target
+                && trusted.query == self.query_value
+                && trusted.source == self.source
+        })
+    }
+
+    /// 新筛选或失败等待期间旧 entries 仍留在内存，但不能作为当前列表展示或开放动作。
+    /// 只有 key 仍匹配时才返回真实行；同筛选刷新因此保留可信内容，目标切换因 key 清空而隐藏。
+    ///
+    /// @author kongweiguang
+    fn displayed_entries(&self) -> &[CommandHistoryEntry] {
+        if self.history_snapshot_is_current() {
+            &self.entries
+        } else {
+            &[]
+        }
+    }
+
     /// 只查询明确 pane 目标的最近一百条；权威刷新不改变填入反馈，空结果也能证明读取完成。
+    /// 请求发起时捕获目标代次，迟到结果既受 generation 拒绝，也不能消费新目标的入场机会。
+    /// 普通刷新不承诺保留 `status`：它可能描述的是已被新交互取代的旧结果。
     ///
     /// @author kongweiguang
     fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.reload_history_with(cx, HistoryStatusPolicy::Replace);
+    }
+
+    /// 删除/清理成功后的权威回读只更新列表，不抹除刚产生的确认文案。
+    /// 记录发起时的交互代次，使回读期间发生的新交互仍能接管提示。
+    ///
+    /// @author kongweiguang
+    fn reload_history_after_mutation(&mut self, interaction: u64, cx: &mut Context<Self>) {
+        self.reload_history_with(cx, HistoryStatusPolicy::Preserve(interaction));
+    }
+
+    /// 回读共用实现：同一请求身份、代次和入场规则，只在结果落盘时按策略处理操作提示。
+    ///
+    /// @author kongweiguang
+    fn reload_history_with(&mut self, cx: &mut Context<Self>, status_policy: HistoryStatusPolicy) {
         let Some(target) = self.target.clone() else {
             self.cancel_read();
             self.entries.clear();
+            self.history_snapshot_key = None;
             self.loading = false;
             #[cfg(feature = "right-rail-acceptance")]
             {
@@ -768,6 +971,7 @@ impl LogsView {
         );
         let commands = self.commands.clone();
         let executor = self.executor.clone();
+        let entrance_epoch = self.data_entrance.epoch();
         self.loading = true;
         self.error = None;
         cx.spawn(async move |this, cx| {
@@ -785,6 +989,12 @@ impl LogsView {
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if !view.response_is_current(generation, &request_key) {
+                    // 测试用可观察计数确认旧回执确实被拒绝，而不是固定泵次数下的假通过。
+                    // 用 cfg! 常量分支代替条件编译属性，生产构建不会执行该计数。
+                    if cfg!(test) {
+                        view.stale_responses_rejected_for_test =
+                            view.stale_responses_rejected_for_test.saturating_add(1);
+                    }
                     return;
                 }
                 view.loading = false;
@@ -793,9 +1003,32 @@ impl LogsView {
                 match result {
                     Ok(entries) => {
                         view.entries = entries.into_iter().take(HISTORY_LIMIT).collect();
+                        view.history_snapshot_key = Some(request_key.clone());
                         view.page =
                             logs_page_window(view.page, view.entries.len(), view.page_size).0;
-                        view.status = None;
+                        // 只有删除/清理成功触发的这次权威回读保留刚写入的确认；
+                        // 其它刷新仍按原语义清掉可能已被新交互取代的旧提示。
+                        if status_policy == HistoryStatusPolicy::Replace {
+                            view.status = None;
+                        }
+                        // 成功结果当前就必须消费入场，隐藏读取也一样：否则等待会跨越隐藏期，
+                        // 重显后的同目标刷新会把已可见的数据再次压暗。active 只决定是否播放，
+                        // 隐藏成功以 animate=false 静默落位；尚无成功结果的等待才继续保留。
+                        // 已知禁动效的缓存先于 Windows SPI 复查，避免不必要的系统查询。
+                        // Windows 没有系统偏好实时事件，已启动的短入场可能自然完成；
+                        // 应用内 reduce_motion 变化仍会在下一帧由 render 立即落位。
+                        let animate = view.active
+                            && view.data_entrance.awaiting_result()
+                            && view.data_entrance.allows_motion()
+                            && view.data_motion_allowed(cx.reduce_motion());
+                        let entrance_started =
+                            view.data_entrance
+                                .ready(entrance_epoch, Instant::now(), animate);
+                        // 计数只在测试构建生效；cfg! 常量分支让生产代码保持普通语句。
+                        if cfg!(test) && entrance_started {
+                            view.started_entrances_for_test =
+                                view.started_entrances_for_test.saturating_add(1);
+                        }
                         #[cfg(feature = "right-rail-acceptance")]
                         {
                             view.loaded_read_key = Some(request_key.clone());
@@ -803,6 +1036,14 @@ impl LogsView {
                     }
                     Err(error) => {
                         view.error = Some(error.public_message().to_owned());
+                        // 删除/清理后的权威回读失败时，列表已不可信：刚写入的确认不能让用户误以为
+                        // 列表已被核对，相关错误必须替换它，避免“已删除”和查询失败同时出现。
+                        // 只有仍属于同一次交互才清理，避免误删用户新操作产生的提示。
+                        if let HistoryStatusPolicy::Preserve(interaction) = status_policy
+                            && view.fill_feedback.generation == interaction
+                        {
+                            view.status = None;
+                        }
                         #[cfg(feature = "right-rail-acceptance")]
                         {
                             view.loaded_read_key = None;
@@ -820,7 +1061,11 @@ impl LogsView {
     ///
     /// @author kongweiguang
     fn delete_entry(&mut self, requested_entry_id: &str, cx: &mut Context<Self>) {
-        if !self.active || self.loading || self.clear_target_in_flight.is_some() {
+        if !self.active
+            || self.loading
+            || !self.history_snapshot_is_current()
+            || self.clear_target_in_flight.is_some()
+        {
             return;
         }
         let Some(target) = self.target.clone() else {
@@ -835,6 +1080,7 @@ impl LogsView {
             return;
         };
         self.fill_feedback.begin_interaction();
+        let interaction = self.fill_feedback.generation;
         let commands = self.commands.clone();
         let executor = self.executor.clone();
         self.loading = true;
@@ -856,25 +1102,49 @@ impl LogsView {
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if !view.operation_target_is_current(&target) {
-                    return;
-                }
-                match result {
-                    Ok(true) => {
-                        view.status = Some(
+                    // 面板已隐藏或目标暂时离开：结果不得写入其它目标的视图，
+                    // 暂存到发起目标名下，待原目标重显时交还；目标被替换时整体作废。
+                    let message = match result {
+                        Ok(true) => MutationMessage::Confirmed(
                             crate::locale::text("历史记录已删除", "History entry deleted")
                                 .to_string(),
-                        );
-                        view.reload_history(cx);
-                    }
-                    Ok(false) => {
-                        view.status = Some(
+                        ),
+                        Ok(false) => MutationMessage::Confirmed(
                             crate::locale::text(
                                 "历史记录已不存在",
                                 "History entry no longer exists",
                             )
                             .to_string(),
-                        );
-                        view.reload_history(cx);
+                        ),
+                        Err(error) => MutationMessage::Failed(error.public_message().to_owned()),
+                    };
+                    view.defer_mutation_outcome(DeferredMutationOutcome { target, message });
+                    return;
+                }
+                match result {
+                    Ok(true) => {
+                        // 成功提示只属于发起删除时的交互：用户已换筛选或开始其它操作时，
+                        // 回执仍须刷新列表，但不能把旧确认写回，也不能抹掉新交互产生的提示。
+                        if view.fill_feedback.generation == interaction {
+                            view.status = Some(
+                                crate::locale::text("历史记录已删除", "History entry deleted")
+                                    .to_string(),
+                            );
+                        }
+                        // 删除成功后的回读只同步列表；否则紧随其后的成功结果会立即清空确认文案。
+                        view.reload_history_after_mutation(interaction, cx);
+                    }
+                    Ok(false) => {
+                        if view.fill_feedback.generation == interaction {
+                            view.status = Some(
+                                crate::locale::text(
+                                    "历史记录已不存在",
+                                    "History entry no longer exists",
+                                )
+                                .to_string(),
+                            );
+                        }
+                        view.reload_history_after_mutation(interaction, cx);
                     }
                     Err(error) => {
                         view.loading = false;
@@ -896,10 +1166,15 @@ impl LogsView {
         let Some(target) = self.target.clone() else {
             return;
         };
-        if self.loading || self.clear_target_in_flight.is_some() || !self.active {
+        if self.loading
+            || !self.history_snapshot_is_current()
+            || self.clear_target_in_flight.is_some()
+            || !self.active
+        {
             return;
         }
         self.fill_feedback.begin_interaction();
+        let interaction = self.fill_feedback.generation;
         let scope = target.scope().clone();
         let request = scope.clear_request();
         let commands = self.commands.clone();
@@ -932,15 +1207,19 @@ impl LogsView {
                 if view.operation_target_is_current(&target) {
                     match result {
                         Ok(count) => {
-                            view.status = Some(
-                                crate::locale::text(
-                                    format!("已清理 {count} 条历史记录"),
-                                    format!("Cleared {count} history entries"),
-                                )
-                                .to_string(),
-                            );
                             view.loading = false;
-                            view.reload_history(cx);
+                            if view.fill_feedback.generation == interaction {
+                                view.status = Some(
+                                    crate::locale::text(
+                                        format!("已清理 {count} 条历史记录"),
+                                        format!("Cleared {count} history entries"),
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            // 与删除一致：成功确认由本次权威回读保留，避免下一帧闪退；
+                            // 若用户已换筛选，Preserve 代次不匹配时同样不会改写当前提示。
+                            view.reload_history_after_mutation(interaction, cx);
                         }
                         Err(error) => {
                             view.loading = false;
@@ -948,9 +1227,21 @@ impl LogsView {
                             view.error = Some(error.public_message().to_owned());
                         }
                     }
-                } else if view.active {
+                } else {
+                    // 面板隐藏或目标暂时离开：清理结果同样暂存到发起目标名下，
+                    // 原目标重显时交还；目标被替换时随暂存区整体作废，不冒领新视图。
                     view.loading = false;
-                    view.reload_history(cx);
+                    let message = match result {
+                        Ok(count) => MutationMessage::Confirmed(
+                            crate::locale::text(
+                                format!("已清理 {count} 条历史记录"),
+                                format!("Cleared {count} history entries"),
+                            )
+                            .to_string(),
+                        ),
+                        Err(error) => MutationMessage::Failed(error.public_message().to_owned()),
+                    };
+                    view.defer_mutation_outcome(DeferredMutationOutcome { target, message });
                 }
                 cx.notify();
             });
@@ -960,6 +1251,7 @@ impl LogsView {
     }
 
     /// 搜索输入和原生验收共用同一变更入口，避免缓存提前更新绕过成功反馈及焦点失效规则。
+    /// 新搜索开启新的交互上下文，旧操作提示立即失效，不能搭新查询的等待窗口继续显示。
     ///
     /// @author kongweiguang
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -967,12 +1259,14 @@ impl LogsView {
             return;
         }
         self.fill_feedback.begin_interaction();
+        self.status = None;
         self.query_value = query;
         self.page = 1;
         self.reload_history(cx);
     }
 
     /// 改变来源时复位分页并作废旧成功反馈；旧查询会协作取消并检查 generation。
+    /// 来源与搜索同属查询身份，切换即让旧操作提示过期。
     ///
     /// @author kongweiguang
     fn set_source(&mut self, source: Option<CommandHistorySource>, cx: &mut Context<Self>) {
@@ -980,16 +1274,19 @@ impl LogsView {
             return;
         }
         self.fill_feedback.begin_interaction();
+        self.status = None;
         self.source = source;
         self.page = 1;
         self.reload_history(cx);
     }
 
     /// 只清除搜索词并保留来源筛选；先作废旧反馈并同步缓存，避免订阅重复查询。
+    /// 清空搜索同样开启新的查询身份，旧操作提示不能继续代表当前结果。
     ///
     /// @author kongweiguang
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.fill_feedback.begin_interaction();
+        self.status = None;
         self.query_value.clear();
         self.page = 1;
         self.query.update(cx, |input, cx| {
@@ -1002,10 +1299,18 @@ impl LogsView {
     /// 分页只调整现有查询结果的本地投影，同时使旧成功提示与焦点票据失效。
     ///
     /// @author kongweiguang
+    /// 分页只调整现有查询结果的本地投影，同时使旧成功提示与焦点票据失效。
+    /// 翻页属于新的用户交互，删除/清理确认不能跨页继续代表当前视图。
+    ///
+    /// @author kongweiguang
     fn set_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        if !self.history_snapshot_is_current() {
+            return;
+        }
         let (page, _, _) = logs_page_window(page, self.entries.len(), self.page_size);
         if self.page != page {
             self.fill_feedback.begin_interaction();
+            self.status = None;
             self.page = page;
             cx.notify();
         }
@@ -1091,10 +1396,19 @@ impl Render for LogsView {
     /// 历史卡占满剩余高度，按实际卡片高度分页；被动布局不作废操作反馈或焦点票据。
     /// 只有列表负责溢出滚动，分页始终留在底部。
     /// 绘制和分页共享密度几何；刷新只更新原位置反馈并保留待核对的写入结果。
+    /// 只有目标变化后的首个有效结果对数据列表做轻微透明度入场，标题与工具栏始终完整。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = ThemeTokens::current(window, cx).for_tool_panel();
+        let now = Instant::now();
+        if cx.reduce_motion() {
+            self.data_entrance.settle();
+        }
+        if self.active && !cx.reduce_motion() && self.data_entrance.is_running(now) {
+            window.request_animation_frame();
+        }
+        let data_opacity = self.data_entrance.opacity(now);
         let geometry = HistoryGeometry::from_metrics(theme.metrics);
         let target = self.target.clone();
         let selected_source = self.source;
@@ -1171,9 +1485,12 @@ impl Render for LogsView {
             });
         let status = self.status.clone();
         let unknown_target = self.fill_feedback.unknown_target.clone();
+        let history_snapshot_is_current = self.history_snapshot_is_current();
+        let visible_entries = self.displayed_entries();
+        let visible_entry_count = visible_entries.len();
         let (current_page, start, end) =
-            logs_page_window(self.page, self.entries.len(), self.page_size);
-        let page_count = self.entries.len().div_ceil(self.page_size).max(1);
+            logs_page_window(self.page, visible_entry_count, self.page_size);
+        let page_count = visible_entry_count.div_ceil(self.page_size).max(1);
         let view = cx.entity().downgrade();
         let card_measurement = canvas(
             move |bounds, _, cx| {
@@ -1182,17 +1499,24 @@ impl Render for LogsView {
                 };
                 let height = f32::from(bounds.size.height);
                 let state = entity.read(cx);
-                if state.page_size == history_page_size(height, state.entries.len(), geometry) {
+                if state.page_size
+                    == history_page_size(height, state.displayed_entries().len(), geometry)
+                {
                     return;
                 }
                 // 延后更新避免在布局阶段重入；保持页码，防止翻页清除反馈后容量增加又跳回上一页。
                 cx.defer(move |cx| {
                     entity.update(cx, |state, cx| {
-                        let page_size = history_page_size(height, state.entries.len(), geometry);
+                        let page_size =
+                            history_page_size(height, state.displayed_entries().len(), geometry);
                         if state.page_size != page_size {
                             state.page_size = page_size;
-                            state.page =
-                                logs_page_window(state.page, state.entries.len(), page_size).0;
+                            state.page = logs_page_window(
+                                state.page,
+                                state.displayed_entries().len(),
+                                page_size,
+                            )
+                            .0;
                             cx.notify();
                         }
                     });
@@ -1203,7 +1527,7 @@ impl Render for LogsView {
         .absolute()
         .inset_0();
         let page_row_count = end.saturating_sub(start);
-        let rows = self.entries[start..end]
+        let rows = visible_entries[start..end]
             .iter()
             .enumerate()
             .map(|(index, entry)| {
@@ -1351,19 +1675,29 @@ impl Render for LogsView {
             });
         let unbound = self.target.is_none();
         let error = self.error.clone();
-        let count_label = history_range_label(start, end, self.entries.len());
-        let clear_enabled =
-            self.target.is_some() && !self.entries.is_empty() && available && !loading && !clearing;
-        let show_empty_state = self.entries.is_empty() && !loading && error.is_none() && !unbound;
+        let count_label =
+            history_count_label(history_snapshot_is_current, start, end, visible_entry_count);
+        let count_aria_label =
+            history_count_aria_label(history_snapshot_is_current, start, end, visible_entry_count);
+        let clear_enabled = self.target.is_some()
+            && !visible_entries.is_empty()
+            && available
+            && !loading
+            && !clearing;
+        // 只有当前筛选的成功快照能证明列表为空；同筛选刷新沿用该快照，未加载/未知状态不能显示空态。
+        let show_empty_state = visible_entries.is_empty()
+            && error.is_none()
+            && !unbound
+            && history_snapshot_is_current;
         let empty_state_message = crate::locale::text("暂无命令历史。", "No command history.");
         let empty_state_content = div()
+            .debug_selector(|| "rr-logs-empty".into())
             .w_full()
             .flex()
             .flex_col()
             .items_center()
             .gap_1()
             .child(empty_state(empty_state_message, theme));
-        let show_loading_state = self.entries.is_empty() && loading && !unbound;
         let refresh_label = if loading {
             crate::locale::text("正在加载命令历史", "Loading command history")
         } else {
@@ -1474,6 +1808,13 @@ impl Render for LogsView {
                             .gap_1()
                             .child(
                                 Button::new("logs-refresh")
+                                    .debug_selector(|| {
+                                        if loading {
+                                            "rr-logs-refresh-loading".into()
+                                        } else {
+                                            "rr-logs-refresh-idle".into()
+                                        }
+                                    })
                                     .compact()
                                     .ghost()
                                     .icon(IconName::RefreshCw)
@@ -1483,12 +1824,22 @@ impl Render for LogsView {
                                     .tooltip(refresh_label)
                                     .disabled(unbound || !available || loading || clearing)
                                     .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                                        // 显式刷新是新的用户操作：旧操作提示立即失效，
+                                        // 不能等到本次回读成功才消失而短暂冒充当前状态。
                                         view.fill_feedback.begin_interaction();
+                                        view.status = None;
                                         view.reload_history(cx);
                                     })),
                             )
                             .child(
                                 Button::new("logs-clear")
+                                    .debug_selector(|| {
+                                        if clear_enabled {
+                                            "rr-logs-clear-enabled".into()
+                                        } else {
+                                            "rr-logs-clear-disabled".into()
+                                        }
+                                    })
                                     .compact()
                                     .ghost()
                                     .text_color(theme.error)
@@ -1522,6 +1873,7 @@ impl Render for LogsView {
                 content.child(
                     div()
                         .id("logs-action-status")
+                        .debug_selector(|| "rr-logs-action-status".into())
                         .text_size(theme.text_xs)
                         .text_color(theme.muted)
                         .child(status),
@@ -1613,9 +1965,19 @@ impl Render for LogsView {
                             )
                             .child(
                                 div()
+                                    .id("logs-history-count")
                                     .text_size(theme.text_xs)
                                     .text_color(theme.muted)
-                                    .child(count_label),
+                                    .child(count_label)
+                                    // 该节点只有 id 和 aria_label 时不会进入 AccessKit 树：
+                                    // GPUI 需要真实 role 才创建节点。范围计数是不可交互的静态文本，
+                                    // 用 Label 映射到 UIA Text、macOS StaticText 与 AT-SPI Label。
+                                    // AccessKit 规定 Label 角色的文本内容放在 value；Windows 的
+                                    // 可访问名称只读 value，只设 label 会得到无名称节点，故两者都设。
+                                    .role(gpui_kit::Role::Label)
+                                    .aria_label(count_aria_label.clone())
+                                    .aria_value(count_aria_label)
+                                    .test_support(),
                             ),
                     )
                     .child(
@@ -1628,23 +1990,8 @@ impl Render for LogsView {
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
+                            .when(data_opacity < 1.0, |list| list.opacity(data_opacity))
                             .children(rows)
-                            .when(show_loading_state, |list| {
-                                list.child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .justify_center()
-                                        .px_4()
-                                        .py_8()
-                                        .text_size(theme.text_sm)
-                                        .text_color(theme.muted)
-                                        .child(crate::locale::text(
-                                            "正在加载命令历史…",
-                                            "Loading command history…",
-                                        )),
-                                )
-                            })
                             .when(show_empty_state, move |list| {
                                 list.child(empty_state_content)
                             })
@@ -1659,7 +2006,7 @@ impl Render for LogsView {
                             }),
                     )
                     .when(
-                        pagination_visible(self.entries.len(), self.page_size),
+                        pagination_visible(visible_entry_count, self.page_size),
                         |card| {
                             card.child(
                                 div()
@@ -1890,7 +2237,34 @@ fn history_page_size(card_height: f32, total: usize, geometry: HistoryGeometry) 
     ((available / geometry.row_height.as_f32()).floor() as usize).clamp(1, HISTORY_LIMIT)
 }
 
-/// 列表卡片沿用 main 的页内范围格式；空列表始终显示 `0 / 0`。
+/// 只有成功结果仍匹配当前 target/query/source 时才显示已确认范围；否则用中性占位。
+/// 同筛选刷新沿用原计数，新筛选或新目标不能把旧数量冒充当前结果。
+///
+/// @author kongweiguang
+fn history_count_label(trusted: bool, start: usize, end: usize, total: usize) -> String {
+    if trusted {
+        history_range_label(start, end, total)
+    } else {
+        "— / —".to_owned()
+    }
+}
+
+/// 计数占位只适合视觉表达，读屏无法据此判断是“未确认”还是“空历史”。
+/// 未知状态改用明确的本地化名称；可信后仍复用实际范围，避免多一层语义。
+///
+/// @author kongweiguang
+fn history_count_aria_label(trusted: bool, start: usize, end: usize, total: usize) -> SharedString {
+    if trusted {
+        history_range_label(start, end, total).into()
+    } else {
+        crate::locale::text(
+            "命令历史数量尚未确认",
+            "Command history count not yet confirmed",
+        )
+    }
+}
+
+/// 列表卡片沿用 main 的页内范围格式；成功读取空列表时显示 `0 / 0`。
 ///
 /// @author kongweiguang
 fn history_range_label(start: usize, end: usize, total: usize) -> String {

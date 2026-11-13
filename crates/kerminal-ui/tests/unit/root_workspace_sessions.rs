@@ -11,17 +11,20 @@ use std::{
 use gpui_kit::SharedString;
 use kerminal_application::{
     PublicErrorCode,
+    plugins::{PluginId, PluginRegistry, PluginRegistryBuilder},
     workspace::{
         WorkspaceFileAccess, WorkspaceFileSource, WorkspaceLocalMachineScope,
         WorkspaceMachineStatus, WorkspacePaneMode, WorkspaceSessionDocument,
         WorkspaceSessionExpectedRevision, WorkspaceSessionInvalidReason, WorkspaceSessionLoad,
         WorkspaceSessionPane, WorkspaceSessionRevision, WorkspaceSessionSaveOutcome,
-        WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef, WorkspaceTmuxBinding,
+        WorkspaceSessionSnapshot, WorkspaceSessionTab, WorkspaceTargetRef,
+        WorkspaceTargetUnavailableReason, WorkspaceTmuxBinding,
     },
 };
 use tokio_util::sync::CancellationToken;
 
 use kerminal_domain::{
+    connections::RemoteProtocol,
     files::ContainerRuntime,
     identity::{HostId, PaneId, SessionId, TabId},
     operations::{ContainerTarget, TmuxTarget},
@@ -56,9 +59,11 @@ use crate::{
         workspace_pane_for_terminal_target,
         workspace_runtime::{OrphanCleanupInput, RuntimePanePhase, WorkspaceRuntime},
         workspace_sessions::{
-            StartupWorkspaceFocusGate, container_exec_command, initial_workspace_file_center_panel,
-            record_workspace_restore_failure, should_recover_snapshot_conflict,
-            startup_workspace_terminal_focus_target, tmux_binding_matches_target,
+            StartupWorkspaceFocusGate, container_exec_command, container_restore_gate,
+            ensure_workspace_protocol_enabled, frozen_unit_enabled,
+            initial_workspace_file_center_panel, record_workspace_restore_failure,
+            should_recover_snapshot_conflict, startup_workspace_terminal_focus_target,
+            tmux_binding_matches_target, tmux_restore_gate, workspace_protocol_disabled,
         },
         workspace_transient::without_transient_resources,
     },
@@ -1934,4 +1939,111 @@ fn failed_transient_container_session_survives_reservation_removal() {
     assert_eq!(cleanup.pane_id, pane_id);
     assert_eq!(cleanup.target, target);
     assert!(cleanup.transient);
+}
+
+/// 协议禁用复用现有不可用恢复项，避免把插件启停误报成目标被删除。
+///
+/// 未注入插件服务的测试与离线宿主仍放行；生产禁用分支由应用服务的冻结视图测试覆盖。
+///
+/// @author kongweiguang
+#[test]
+fn disabled_workspace_protocol_reuses_unavailable_restore_failure() {
+    for protocol in [
+        RemoteProtocol::Ssh,
+        RemoteProtocol::Telnet,
+        RemoteProtocol::Serial,
+    ] {
+        let (failure, error) = workspace_protocol_disabled(protocol);
+        assert_eq!(
+            failure,
+            WorkspaceRestoreFailure::UnavailableTarget(
+                WorkspaceTargetUnavailableReason::UnknownKind
+            )
+        );
+        assert_eq!(error.public_code(), PublicErrorCode::Unsupported);
+        assert!(ensure_workspace_protocol_enabled(None, protocol).is_ok());
+    }
+}
+
+/// 容器/tmux 恢复只有在对应冻结单元启用时才放行；禁用结果沿用不可用目标类别，
+/// 保留原标签和状态供重新启用后重试，不影响已有本地会话的关闭与回收。
+///
+/// @author kongweiguang
+#[test]
+fn workspace_restore_gates_reject_disabled_ssh_containers_and_tmux() {
+    for (ssh, containers) in [(false, true), (true, false), (false, false)] {
+        let (failure, error) =
+            container_restore_gate(ssh, containers).expect_err("disabled capability is rejected");
+        assert_eq!(
+            failure,
+            WorkspaceRestoreFailure::UnavailableTarget(
+                WorkspaceTargetUnavailableReason::UnknownKind
+            )
+        );
+        assert_eq!(error.public_code(), PublicErrorCode::Unsupported);
+        assert!(error.public_message().contains("已禁用"));
+        assert!(error.public_message().contains("原标签和状态仍保留"));
+    }
+    let (_, ssh_error) =
+        container_restore_gate(false, true).expect_err("missing SSH is rejected first");
+    assert!(ssh_error.public_message().contains("SSH"));
+    let (_, containers_error) =
+        container_restore_gate(true, false).expect_err("missing containers is rejected");
+    assert!(containers_error.public_message().contains("容器"));
+    assert!(container_restore_gate(true, true).is_ok());
+
+    assert!(tmux_restore_gate(true).is_ok());
+    let (failure, error) = tmux_restore_gate(false).expect_err("disabled tmux is rejected");
+    assert_eq!(
+        failure,
+        WorkspaceRestoreFailure::UnavailableTarget(WorkspaceTargetUnavailableReason::UnknownKind)
+    );
+    assert_eq!(error.public_code(), PublicErrorCode::Unsupported);
+    assert!(error.public_message().contains("tmux"));
+    assert!(error.public_message().contains("原标签和状态仍保留"));
+}
+
+/// 冻结视图只在单元已注册且被禁用时拒绝；空目录代表测试/离线宿主未接入插件，
+/// 与既有 Rail 门禁一致保持放行，生产组合根始终注入完整内置快照。
+///
+/// @author kongweiguang
+#[test]
+fn frozen_plugin_view_blocks_only_registered_disabled_units() {
+    assert!(frozen_unit_enabled(
+        &PluginRegistry::default(),
+        "kerminal.tmux"
+    ));
+
+    let registry =
+        gated_workspace_plugins(&["kerminal.ssh", "kerminal.containers", "kerminal.tmux"]);
+    assert!(!frozen_unit_enabled(&registry, "kerminal.ssh"));
+    assert!(!frozen_unit_enabled(&registry, "kerminal.containers"));
+    assert!(!frozen_unit_enabled(&registry, "kerminal.tmux"));
+    assert!(frozen_unit_enabled(&registry, "kerminal.sftp"));
+    assert!(
+        container_restore_gate(
+            frozen_unit_enabled(&registry, "kerminal.ssh"),
+            frozen_unit_enabled(&registry, "kerminal.containers"),
+        )
+        .is_err()
+    );
+    assert!(tmux_restore_gate(frozen_unit_enabled(&registry, "kerminal.tmux")).is_err());
+}
+
+/// 只关闭指定内置单元的冻结目录；其余单元保持启用，避免测试自行推断插件族。
+fn gated_workspace_plugins(disabled: &[&str]) -> PluginRegistry {
+    let mut builder = PluginRegistryBuilder::new();
+    builder.register_builtins().expect("valid builtins");
+    let states = kerminal_application::plugins::builtin_unit_ids()
+        .iter()
+        .map(|id| {
+            (
+                PluginId::new(*id).expect("valid builtin id"),
+                !disabled.contains(id),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    builder
+        .freeze_with_builtin_states(&states)
+        .expect("valid gated registry")
 }

@@ -929,6 +929,10 @@ pub struct RootView {
     _context_panel_event_subscription: Option<gpui_kit::Subscription>,
     logs_view: Option<Entity<crate::features::commands::LogsView>>,
     _logs_fill_subscription: Option<gpui_kit::Subscription>,
+    /// 无头首绘回归只读记录实际交给 LogsView 的目标，不参与调度或生产行为。
+    /// 常驻字段配合 `cfg!(test)` 写入，避免 `src` 出现测试专属属性；生产不读取该记录。
+    #[cfg_attr(not(test), allow(dead_code))]
+    projected_logs_target_for_test: Option<crate::features::commands::LogsTarget>,
     tool_rail_operations_views:
         BTreeMap<ToolRailToolId, Entity<crate::features::operations::OperationsView>>,
     _tool_rail_operations_subscriptions: BTreeMap<ToolRailToolId, gpui_kit::Subscription>,
@@ -2669,6 +2673,8 @@ impl RootView {
     }
 
     /// 点击 pane 后先同步 controller 的焦点身份，再把按键和 DECFocusReporting 发给该 SessionId。
+    /// 返回本次是否执行过首绘前同步入口，供激活入口区分“焦点路径已同步”与“仅缓存恰好是当前标签”；
+    /// 同步函数若因标签内容尚未就绪而主动 no-op，再次调用也不会把旧内容投影成新目标。
     ///
     /// @author kongweiguang
     fn focus_workspace_pane(
@@ -2677,7 +2683,7 @@ impl RootView {
         pane_id: PaneId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let result = self.workspace_controller.as_mut().map(|controller| {
             controller.apply_pane_event(&tab_id, WorkspacePaneEvent::Activate(pane_id.clone()))
         });
@@ -2702,9 +2708,9 @@ impl RootView {
             Some(Err(error)) => {
                 self.status = Some(error.public_message().to_owned().into());
                 cx.notify();
-                return;
+                return false;
             }
-            None => return,
+            None => return false,
         }
         self.pending_key_commits.clear();
         self.request_workspace_pane_focus(tab_id.clone(), pane_id.clone(), window, cx);
@@ -2719,7 +2725,11 @@ impl RootView {
         if self.workspace_runtime.pane(&pane_id).is_some() {
             self.request_workspace_pane_snapshot(tab_id, pane_id, cx);
         }
+        // Controller 已提交新焦点，但右栏投影仍在上一帧；在事件阶段提交完整目标，
+        // 才能在同一个 App update 的首个绘制帧就拒绝旧 pane 视图并挂载新视图。
+        self.sync_tool_projection_before_first_draw(window, cx);
         cx.notify();
+        true
     }
 
     /// 激活工作区 tab 后同步可见面板、pane 焦点和顶栏 active 投影，避免后台 controller active 泄漏到共享工作台。
@@ -2770,11 +2780,13 @@ impl RootView {
         self.clear_pending_pane_focus();
         self.clear_keybinding_chord();
         self.focused_agent_terminal = false;
+        let mut tool_projection_synced = false;
         match tab {
             WorkspaceSessionTab::Terminal { layout, .. } => {
                 self.center_panel = CenterPanel::Terminal;
                 if request_focus && let Some(pane_id) = layout.pane_ids().into_iter().next() {
-                    self.focus_workspace_pane(tab_id.clone(), pane_id, window, cx);
+                    tool_projection_synced =
+                        self.focus_workspace_pane(tab_id.clone(), pane_id, window, cx);
                 } else {
                     let session_id = self.workspace_controller.as_ref().and_then(|controller| {
                         controller
@@ -2878,6 +2890,11 @@ impl RootView {
         self.refresh_active_suggestion_context(cx);
         self.refresh_proxy_panel(cx);
         self.refresh_workspace_views(cx);
+        // 只跳过本次确实由 `focus_workspace_pane` 执行过的同步：request_focus=false、
+        // 标签无 pane 或焦点事件早退时，即使缓存标签恰好是当前标签也仍需在首绘前换挂目标。
+        if !tool_projection_synced {
+            self.sync_tool_projection_before_first_draw(window, cx);
+        }
         cx.notify();
     }
 
@@ -4205,6 +4222,7 @@ impl RootView {
             _context_panel_event_subscription: context_panel_event_subscription,
             logs_view,
             _logs_fill_subscription: logs_fill_subscription,
+            projected_logs_target_for_test: None,
             tool_rail_operations_views: BTreeMap::new(),
             _tool_rail_operations_subscriptions: BTreeMap::new(),
             tool_rail_proxy_panels: BTreeMap::new(),

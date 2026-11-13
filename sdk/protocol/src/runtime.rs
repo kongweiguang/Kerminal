@@ -1,11 +1,11 @@
-//! Kerminal Plugin RPC v1 的双向消息形状与权限映射。
+//! Kerminal Plugin RPC v1 的双向消息形状与宿主方法支持列表。
 //! @author kongweiguang
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Permission, ProtocolError, invalid};
+use crate::{ProtocolError, invalid};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_RPC_BYTES: usize = 4 * 1024 * 1024;
@@ -53,7 +53,7 @@ impl RpcRequest {
         }
     }
 
-    /// 只校验信封和方向，实例、代次及业务权限由收到消息的宿主校验。
+    /// 只校验信封和方向，实例、代次及参数由收到消息的宿主校验。
     pub fn validate(&self, peer: RpcPeer) -> Result<(), ProtocolError> {
         validate_header(&self.jsonrpc, &self.method, self.params.as_ref())?;
         let prefix = match peer {
@@ -414,22 +414,13 @@ pub struct ProgressParams {
     pub percent: Option<f64>,
 }
 
-/// 未知方法返回错误，避免路由器把未知能力误当成无需授权的 API。
-pub fn host_method_permission(method: &str) -> Result<Option<Permission>, ProtocolError> {
-    use Permission::*;
-    let permission = match method {
-        "view.update" | "settings.get" | "state.get" | "state.set" | "log" | "$/progress" => None,
-        "ui.notify" => Some(UiNotify),
-        "ui.confirm" | "ui.prompt" => Some(UiDialog),
-        "ui.pickFile" => Some(UiFilePicker),
-        "secrets.get" | "secrets.set" | "secrets.delete" => Some(Secrets),
-        "clipboard.read" => Some(ClipboardRead),
-        "clipboard.write" => Some(ClipboardWrite),
-        "shell.openExternal" => Some(OpenExternal),
-        "hosts.list" => Some(HostsRead),
-        "terminal.paste" => Some(TerminalWrite),
-        "events.subscribe" => Some(EventsSubscribe),
-        _ => return Err(invalid("rpc.method", "未知的宿主方法")),
-    };
-    Ok(permission)
+/// 只校验宿主是否实现该方法；插件启用后不再按权限拒绝任何已知能力。
+pub fn host_method_supported(method: &str) -> Result<(), ProtocolError> {
+    match method {
+        "view.update" | "settings.get" | "state.get" | "state.set" | "log" | "$/progress"
+        | "ui.notify" | "ui.confirm" | "ui.prompt" | "ui.pickFile" | "secrets.get"
+        | "secrets.set" | "secrets.delete" | "clipboard.read" | "clipboard.write"
+        | "shell.openExternal" | "hosts.list" | "terminal.paste" | "events.subscribe" => Ok(()),
+        _ => Err(invalid("rpc.method", "未知的宿主方法")),
+    }
 }

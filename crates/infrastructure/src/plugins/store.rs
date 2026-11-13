@@ -2,15 +2,20 @@
 //! @author kongweiguang
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
-use kerminal_domain::plugins::{PendingPluginChange, PluginStoreState};
+use kerminal_application::plugins::{CORE_PLUGIN_ID, is_builtin_unit};
+use kerminal_domain::plugins::{
+    PendingPluginChange, PluginInstallStatus, PluginSource, PluginStoreState,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::layout::{self, LayoutError};
 use crate::storage::{
     AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file,
     remove_file_with_parent_sync,
@@ -54,6 +59,16 @@ pub enum PluginStoreError {
         #[source]
         source: io::Error,
     },
+    #[error("插件目录启动事务需要人工恢复")]
+    LayoutRecoveryRequired { journal_path: PathBuf },
+    #[error("插件目录变更结果未知，请先读回核对")]
+    LayoutOutcomeUnknown {
+        operation_id: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("插件目录布局操作失败")]
+    Layout(#[source] LayoutError),
     #[error("插件存储不可用")]
     Io(#[source] io::Error),
     #[error("插件存储锁不可用")]
@@ -207,6 +222,7 @@ impl PluginStore {
     }
 
     /// 清理期间持有共享锁并重新读状态，避免删除刚被其他存储操作引用的版本。
+    #[allow(dead_code)] // 恢复单元测试与后续维护入口共用锁内读状态。
     pub(super) fn with_locked_state<T>(
         &self,
         operation: impl FnOnce(&PluginStoreState) -> T,
@@ -226,15 +242,48 @@ impl PluginStore {
         self.publish_and_compare(expected, next, || Ok(()))
     }
 
+    /// 启动事务需要把目录改名、journal 写回和状态 CAS 放在同一把锁内，
+    /// 否则安装器可在目录已换、状态未写之间排队新 pending。
+    pub(super) fn with_write_lock<T>(
+        &self,
+        operation: impl FnOnce(&PluginStoreSnapshot) -> Result<T, PluginStoreError>,
+    ) -> Result<T, PluginStoreError> {
+        let _guard = self.storage.lock().map_err(|_| PluginStoreError::Lock)?;
+        // 启动事务的职责就是消化 journal，因此这里只拦状态恢复材料；
+        // 安装器和普通 CAS 仍走完整门禁，不能在事务未完成时排队新操作。
+        self.require_no_state_recovery_unlocked()?;
+        let current = self.read_unlocked()?;
+        operation(&current)
+    }
+
+    /// 已持有写锁时的内容与 revision 联合 CAS；调用方负责在失败后还原目录。
+    pub(super) fn compare_and_swap_locked(
+        &self,
+        expected: &PluginStoreSnapshot,
+        next: PluginStoreState,
+    ) -> Result<PluginStoreSnapshot, PluginStoreError> {
+        self.publish_and_compare_locked(expected, next, || Ok(()))
+    }
+
     /// 版本发布与状态 CAS 共用同一锁；清理不能介入发布和 pending 提交之间。
     pub(super) fn publish_and_compare(
+        &self,
+        expected: &PluginStoreSnapshot,
+        next: PluginStoreState,
+        publish: impl FnOnce() -> Result<(), PluginStoreError>,
+    ) -> Result<PluginStoreSnapshot, PluginStoreError> {
+        let _guard = self.storage.lock().map_err(|_| PluginStoreError::Lock)?;
+        self.require_no_recovery_unlocked()?;
+        self.publish_and_compare_locked(expected, next, publish)
+    }
+
+    /// 锁内提交实现；调用方已持有写锁并通过恢复门禁。
+    fn publish_and_compare_locked(
         &self,
         expected: &PluginStoreSnapshot,
         mut next: PluginStoreState,
         publish: impl FnOnce() -> Result<(), PluginStoreError>,
     ) -> Result<PluginStoreSnapshot, PluginStoreError> {
-        let _guard = self.storage.lock().map_err(|_| PluginStoreError::Lock)?;
-        self.require_no_recovery_unlocked()?;
         let current = self.read_unlocked()?;
         if current.fingerprint != expected.fingerprint || current.state != expected.state {
             return Err(PluginStoreError::Conflict);
@@ -283,7 +332,30 @@ impl PluginStore {
     }
 
     /// 状态写入和版本清理必须先经过恢复门禁，即使当前权威文件仍可读取。
+    /// 目录事务只在可能未提交的阶段阻断写入；已提交阶段只剩清理，可继续启动。
     fn require_no_recovery_unlocked(&self) -> Result<(), PluginStoreError> {
+        self.require_no_state_recovery_unlocked()?;
+        match layout::scan_journals(self.root()) {
+            Ok(journals) => {
+                // Committed/Cleaned 表示状态与目录已经一致，只剩备份待删；它们不再
+                // 依赖新的 state 写入，不能因为一次清理失败就阻断启动与后续操作。
+                // 下次启动 recover_journals 仍会继续清理这些阶段。
+                if let Some((journal_path, _)) = journals.into_iter().find(|(_, journal)| {
+                    !matches!(
+                        journal.phase,
+                        layout::LayoutPhase::Committed | layout::LayoutPhase::Cleaned
+                    )
+                }) {
+                    return Err(PluginStoreError::LayoutRecoveryRequired { journal_path });
+                }
+            }
+            Err(error) => return Err(layout_error(error)),
+        }
+        Ok(())
+    }
+
+    /// 状态恢复文件无法由启动事务自动判定，必须在任何写入前显式处理。
+    fn require_no_state_recovery_unlocked(&self) -> Result<(), PluginStoreError> {
         if let Some(recovery_path) = self.find_recoveries_unlocked(1)?.into_iter().next() {
             return Err(PluginStoreError::RecoveryRequired { recovery_path });
         }
@@ -574,17 +646,19 @@ fn empty_snapshot() -> PluginStoreSnapshot {
     }
 }
 
-/// 磁盘状态中的待安装路径只能引用由身份推导出的版本目录。
+/// 待处理标识直接拼入目录名；只接受标准小写连字符形式，避免 Windows 路径别名。
+fn canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| id.hyphenated().to_string() == value)
+}
+
+/// 磁盘状态中的待安装路径只能引用由身份推导出的 UUID 暂存槽。
 pub(crate) fn validate_state(state: &PluginStoreState) -> Result<(), PluginStoreError> {
-    if state.schema != 1
+    if state.schema != 2
         || state.plugins.len() > MAX_PLUGINS
+        || state.builtins.len() > MAX_PLUGINS
         || state.failures.len() > MAX_PLUGINS
         || state.pending_failures.len() > MAX_PLUGINS
         || state.pending.len() > MAX_PENDING
-        || state
-            .plugins
-            .values()
-            .any(|plugin| plugin.installed_at.is_empty() || plugin.installed_at.len() > 64)
         || state.failures.values().any(|message| message.len() > 1024)
         || state
             .boot
@@ -592,6 +666,41 @@ pub(crate) fn validate_state(state: &PluginStoreState) -> Result<(), PluginStore
             .is_some_and(|boot| uuid::Uuid::parse_str(&boot.id).is_err())
     {
         return Err(PluginStoreError::InvalidState);
+    }
+    // 内置开关只能引用已知内置单元；未知键会随下一次写入扩散成无法解释的状态。
+    // 核心单元不可停用，否则启动后没有可承载基础能力的装配根。
+    for (id, enabled) in &state.builtins {
+        if !is_builtin_unit(id.as_str()) || (id.as_str() == CORE_PLUGIN_ID && !enabled) {
+            return Err(PluginStoreError::InvalidState);
+        }
+    }
+    for plugin in state.plugins.values() {
+        // 单版本布局没有“上一版本”；字段只为 UI 编译兼容，写入和校验都要求为空。
+        // Missing 表示目录已缺失，Unsupported 表示身份或格式拒绝加载；两者都没有
+        // 可写入的摘要，允许缺省。其余状态若能缺省摘要，启动复验就会被绕过。
+        let digest_optional = matches!(
+            plugin.status,
+            PluginInstallStatus::Missing | PluginInstallStatus::Unsupported { .. }
+        );
+        if plugin.previous.is_some()
+            || plugin.installed_at.is_empty()
+            || plugin.installed_at.len() > 64
+            || (plugin.fingerprint.is_none() && !digest_optional)
+        {
+            return Err(PluginStoreError::InvalidState);
+        }
+        // drop-in 只有在用户确认后才会启用；普通安装本身即是一次明确确认。
+        match plugin.source {
+            PluginSource::DropIn => {
+                if plugin.enabled && !plugin.confirmed {
+                    return Err(PluginStoreError::InvalidState);
+                }
+            }
+            PluginSource::Official | PluginSource::Local if !plugin.confirmed => {
+                return Err(PluginStoreError::InvalidState);
+            }
+            _ => {}
+        }
     }
     // 绑定集合是撤销入口的唯一凭据：每个 id 必须同时拥有 failure 和 pending，
     // 否则伪造或漂移的绑定会让旧失败错配到新排队操作。
@@ -602,29 +711,70 @@ pub(crate) fn validate_state(state: &PluginStoreState) -> Result<(), PluginStore
             return Err(PluginStoreError::InvalidState);
         }
     }
+    // installer/change 保证每个插件同时只有一条 pending；重复会让应用顺序
+    // 和失败绑定产生歧义，整份状态必须拒绝。
+    let mut pending_ids = BTreeSet::new();
+    for change in &state.pending {
+        if !pending_ids.insert(change.plugin_id().clone()) {
+            return Err(PluginStoreError::InvalidState);
+        }
+    }
     for change in &state.pending {
         match change {
             PendingPluginChange::Install {
-                id,
-                to,
                 staged,
+                fingerprint,
+                source,
                 installed_at,
                 ..
             } => {
-                if staged != &format!("packages/{id}/{to}")
+                if !canonical_uuid(staged)
+                    || fingerprint.is_none()
+                    || *source == PluginSource::DropIn
                     || installed_at.is_empty()
                     || installed_at.len() > 64
                 {
                     return Err(PluginStoreError::InvalidState);
                 }
             }
-            PendingPluginChange::Update { id, to, staged }
-                if staged != &format!("packages/{id}/{to}") =>
-            {
+            PendingPluginChange::Update {
+                staged,
+                fingerprint,
+                ..
+            } => {
+                if !canonical_uuid(staged) || fingerprint.is_none() {
+                    return Err(PluginStoreError::InvalidState);
+                }
+            }
+            PendingPluginChange::Uninstall { operation_id, .. } => {
+                if !canonical_uuid(operation_id) {
+                    return Err(PluginStoreError::InvalidState);
+                }
+            }
+            // 回退已从单版本布局移除；旧状态进入恢复门禁而不是被悄悄执行。
+            PendingPluginChange::Rollback { .. } => {
                 return Err(PluginStoreError::InvalidState);
             }
-            _ => {}
+            PendingPluginChange::Enable { .. } | PendingPluginChange::Disable { .. } => {}
         }
     }
     Ok(())
+}
+
+/// 布局错误统一映射到存储错误，调用方只依赖稳定类别。
+pub(super) fn layout_error(error: LayoutError) -> PluginStoreError {
+    match error {
+        LayoutError::RecoveryRequired { journal_path, .. } => {
+            PluginStoreError::LayoutRecoveryRequired { journal_path }
+        }
+        LayoutError::OutcomeUnknown {
+            operation_id,
+            source,
+        } => PluginStoreError::LayoutOutcomeUnknown {
+            operation_id,
+            source,
+        },
+        LayoutError::Io(source) => PluginStoreError::Io(source),
+        other => PluginStoreError::Layout(other),
+    }
 }

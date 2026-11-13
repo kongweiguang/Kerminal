@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
+use std::collections::BTreeSet;
+
 use kerminal_application::{
+    preferences::ToolRailToolId,
     sessions::{TerminalCommandContext, UiSessionBinding},
     workspace::{FileWorkspaceItem, WorkspaceSessionSnapshot, WorkspaceSessionTab},
 };
@@ -28,6 +31,9 @@ pub struct QuickOpenOpenContext {
     pub terminal_binding: Option<UiSessionBinding>,
     /// 启动快照中的插件命令和面板打开时的目标一起固定，确认时不追随其它标签。
     pub plugin_commands: Vec<QuickOpenPluginCommand>,
+    /// 面板打开时冻结的禁用工具身份；动作映射据此隐藏入口。
+    /// 只保存纯身份集合，不把插件目录或运行时带进搜索实体，避免视图层持有第二份启停状态。
+    pub disabled_tools: BTreeSet<ToolRailToolId>,
 }
 
 /// UI 目录边界只保存稳定命令身份和安全上下文，不传递插件运行时或主机配置。

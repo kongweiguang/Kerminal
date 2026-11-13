@@ -2,7 +2,7 @@
 //!
 //! @author kongweiguang
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use async_trait::async_trait;
 use gpui_kit::{
@@ -10,10 +10,15 @@ use gpui_kit::{
 };
 use kerminal_application::{
     AppResult, ApplicationTaskExecutor,
-    connections::management::{
-        HostDocumentRevision, HostDraft, HostGroupDeletionReceipt, HostGroupDraft,
-        HostGroupSnapshot, HostManagementRepository, HostManagementService,
+    connections::{
+        host_types::{HostConfigurationCatalog, PluginHost, PluginHostService},
+        management::{
+            HostDocumentRevision, HostDraft, HostGroupDeletionReceipt, HostGroupDraft,
+            HostGroupSnapshot, HostManagementRepository, HostManagementService,
+        },
     },
+    plugins::{PluginId, PluginRegistry, PluginRegistryBuilder},
+    workspace::WorkspaceTargetRef,
 };
 use kerminal_domain::preferences::{ConfigurationMode, ConfigurationRecoveryState};
 use tokio::runtime::{Builder, Runtime};
@@ -24,6 +29,7 @@ use super::{ConfigRevision, HostGroup, HostId, HostNavigationEvent, ManagedHost,
 /// 目录只返回固定快照；任何写操作都代表菜单测试越过范围。
 struct MenuDirectory {
     rows: Vec<ManagedHost>,
+    plugin_rows: Vec<PluginHost>,
     groups: Vec<HostGroup>,
 }
 
@@ -42,6 +48,11 @@ impl HostManagementRepository for MenuDirectory {
     /// 按稳定身份读取快照，不打开用户配置。
     async fn load_host(&self, host_id: &HostId) -> AppResult<Option<ManagedHost>> {
         Ok(self.rows.iter().find(|host| &host.id == host_id).cloned())
+    }
+
+    /// 扩展主机与内置主机来自同一隔离快照，导航据此复核插件启停。
+    async fn list_plugin_hosts(&self) -> AppResult<Vec<PluginHost>> {
+        Ok(self.plugin_rows.clone())
     }
 
     /// 测试不提交任何新建或编辑草稿。
@@ -101,9 +112,35 @@ fn fixture(
     Subscription,
     &mut VisualTestContext,
 ) {
+    fixture_with_plugins(app, rows, Vec::new(), groups, mode, events, None)
+}
+
+/// 可注入冻结插件视图的同一挂载入口；插件主机仍经过生产仓储与导航 reload。
+fn fixture_with_plugins(
+    app: &mut TestAppContext,
+    rows: Vec<ManagedHost>,
+    plugin_rows: Vec<PluginHost>,
+    groups: Vec<HostGroup>,
+    mode: ConfigurationMode,
+    events: Rc<RefCell<Vec<HostNavigationEvent>>>,
+    plugins: Option<Arc<PluginRegistry>>,
+) -> (
+    Runtime,
+    Entity<HostNavigation>,
+    Subscription,
+    &mut VisualTestContext,
+) {
     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
     let executor = ApplicationTaskExecutor::new(runtime.handle().clone());
-    let hosts = HostManagementService::new(Arc::new(MenuDirectory { rows, groups }));
+    let hosts = HostManagementService::new(Arc::new(MenuDirectory {
+        rows,
+        plugin_rows,
+        groups,
+    }));
+    let hosts = match plugins {
+        Some(plugins) => hosts.with_plugins(plugins),
+        None => hosts,
+    };
     let slot = Rc::new(RefCell::new(None));
     let mounted = slot.clone();
     let (_, visual) = app.add_window_view(move |window, cx| {
@@ -139,6 +176,37 @@ fn fixture(
         assert!(navigation.status.is_none(), "隔离目录读取不能失败");
     });
     (runtime, navigation, subscription, visual)
+}
+
+/// 构造只关闭指定内置单元的冻结视图，复用生产声明与归属映射。
+fn registry_with_disabled(disabled: &[&str]) -> Arc<PluginRegistry> {
+    let mut builder = PluginRegistryBuilder::new();
+    builder.register_builtins().expect("内置声明应可注册");
+    let states: BTreeMap<PluginId, bool> = disabled
+        .iter()
+        .map(|id| (PluginId::new(*id).expect("插件 ID 应合法"), false))
+        .collect();
+    Arc::new(
+        builder
+            .freeze_with_builtin_states(&states)
+            .expect("内置状态应可冻结"),
+    )
+}
+
+/// 插件主机快照保持最小可运行身份，供导航与 PluginHostService 使用同一 provider/type。
+fn plugin_host(provider_id: &str, type_id: &str) -> PluginHost {
+    PluginHost {
+        id: HostId::new(),
+        provider_id: provider_id.to_owned(),
+        type_id: type_id.to_owned(),
+        name: "Plugin fixture".to_owned(),
+        group_id: None,
+        sort_order: 0,
+        configuration_version: 1,
+        configuration: Some(toml::from_str("text = 'fixture'").expect("合法测试配置")),
+        runtime_available: true,
+        revision: ConfigRevision::from_sha256("plugin-fixture-revision".to_owned()),
+    }
 }
 
 /// Kit 全局初始化只做一次；参数化场景可在同一测试应用中创建多个窗口。
@@ -553,4 +621,352 @@ fn pinned_container_menu_keeps_details_files_and_remove_on_clicked_pin(app: &mut
         click_menu_item(visual, &label);
         assert_eq!(&*events.borrow(), &[expected]);
     }
+}
+
+/// SSH 禁用后固定容器仍保留详情与移除，但“打开文件”经 SSH 执行必然失败，菜单中隐藏。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn pinned_container_menu_hides_files_when_ssh_disabled(app: &mut TestAppContext) {
+    init(app);
+    let row = super::host("fixture", "fixture.invalid", None, &[]);
+    let pin = super::WorkspacePinnedContainer {
+        target: super::ContainerTarget {
+            host_id: Some(row.id.clone()),
+            runtime: super::ContainerRuntime::Podman,
+            container_id: "sidebar-container".into(),
+        },
+        name: "api".into(),
+        description: "fixture".into(),
+        group_id: None,
+    };
+    let stable_id = pin.stable_id();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (_runtime, navigation, _subscription, visual) = fixture_with_plugins(
+        app,
+        vec![row],
+        Vec::new(),
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events,
+        Some(registry_with_disabled(&["kerminal.ssh"])),
+    );
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.pinned_containers = vec![pin];
+            cx.notify();
+        })
+    });
+    let labels = open_menu(visual, &format!("host-navigation-container-{stable_id}"));
+    assert!(labels.contains(&crate::locale::text("查看容器详情", "Container details").to_string()));
+    assert!(
+        !labels.contains(&crate::locale::text("打开文件", "Open files").to_string()),
+        "SSH 禁用时不得保留必然失败的打开文件入口"
+    );
+    assert!(labels.contains(&crate::locale::text("从侧栏移除", "Remove from sidebar").to_string()));
+}
+
+/// 禁用 SSH 后既有主机仍完整列出，但不再进入分屏候选，双击也不产生连接意图。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn disabled_protocol_keeps_host_listed_but_rejects_connect_and_split(app: &mut TestAppContext) {
+    init(app);
+    let registry = registry_with_disabled(&["kerminal.ssh"]);
+    let row = super::host("ssh-host", "ssh.invalid", None, &[]);
+    let host_id = row.id.clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (_runtime, navigation, _subscription, visual) = fixture_with_plugins(
+        app,
+        vec![row],
+        Vec::new(),
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events.clone(),
+        Some(registry),
+    );
+
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert_eq!(navigation.rows.len(), 1, "禁用协议不能删除既有主机行");
+        assert!(
+            navigation
+                .split_target_options("")
+                .iter()
+                .all(|option| option.target
+                    != WorkspaceTargetRef::Ssh {
+                        host_id: host_id.clone()
+                    }),
+            "禁用协议不能成为分屏目标"
+        );
+    });
+
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.request_connect(host_id.clone(), cx)
+        });
+    });
+    draw(visual);
+    assert!(
+        events.borrow().is_empty(),
+        "禁用协议必须在导航层拒绝连接，不创建会话意图"
+    );
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert!(
+            navigation
+                .feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.is_error)
+        );
+        assert!(
+            navigation.selected_host.is_none(),
+            "被拒绝的连接不能改变选择"
+        );
+    });
+}
+
+/// SSH 单元禁用时，SSH 主机的文件与传输动作都依赖同一连接能力，必须一并隐藏。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn disabled_ssh_hides_sftp_actions_on_ssh_host(app: &mut TestAppContext) {
+    init(app);
+    let registry = registry_with_disabled(&["kerminal.ssh"]);
+    let row = super::host("ssh-host", "ssh.invalid", None, &[]);
+    let selector = format!("host-navigation-host-{}", row.id.as_str());
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (_runtime, _navigation, _subscription, visual) = fixture_with_plugins(
+        app,
+        vec![row],
+        Vec::new(),
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events,
+        Some(registry),
+    );
+
+    let labels = open_menu(visual, &selector);
+    for (zh, en) in [
+        ("打开文件", "Open files"),
+        ("新建传输标签", "New transfer tab"),
+        ("复制为 SSH 主机…", "Duplicate as SSH host…"),
+    ] {
+        assert!(
+            !labels.contains(&crate::locale::text(zh, en).to_string()),
+            "SSH 禁用时不应出现 {zh}"
+        );
+    }
+}
+
+/// 菜单闭包或旧帧在插件停用后仍可能调用动作入口；SFTP 与独立传输请求必须按当前
+/// 启用视图拒绝，且不能改变既有选择。SSH 主机的文件动作依赖 SSH，即使 SFTP 仍启用
+/// 也不能绕过硬性连接能力。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn stale_sftp_requests_are_rejected_when_required_units_disabled(app: &mut TestAppContext) {
+    init(app);
+    for disabled in [&["kerminal.sftp"][..], &["kerminal.ssh"][..]] {
+        let row = super::host("fixture", "fixture.invalid", None, &[]);
+        let host_id = row.id.clone();
+        let unchanged = HostId::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (_runtime, navigation, _subscription, visual) = fixture_with_plugins(
+            app,
+            vec![row],
+            Vec::new(),
+            Vec::new(),
+            ConfigurationMode::ReadWrite,
+            events.clone(),
+            Some(registry_with_disabled(disabled)),
+        );
+        for (action, label) in [("sftp", "打开文件"), ("transfer", "新建传输标签")] {
+            visual.update(|_, app| {
+                navigation.update(app, |navigation, cx| {
+                    navigation.selected_host = Some(unchanged.clone());
+                    match action {
+                        "sftp" => navigation.request_open_sftp(host_id.clone(), cx),
+                        _ => navigation.request_create_sftp_transfer_tab(host_id.clone(), cx),
+                    }
+                });
+            });
+            assert!(
+                events.borrow().is_empty(),
+                "disabled {disabled:?}: {label}不得派发事件"
+            );
+            visual.update(|_, app| {
+                let navigation = navigation.read(app);
+                assert!(
+                    navigation
+                        .feedback
+                        .as_ref()
+                        .is_some_and(|feedback| feedback.is_error),
+                    "disabled {disabled:?}: {label}应给出错误状态"
+                );
+                assert_eq!(
+                    navigation.selected_host.as_ref(),
+                    Some(&unchanged),
+                    "disabled {disabled:?}: {label}不得改变选择"
+                );
+            });
+        }
+    }
+}
+
+/// 纯 SFTP 主机不依赖 SSH 单元，SSH 禁用时仍保留自己的打开文件与传输入口。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn disabled_ssh_keeps_sftp_only_host_file_actions(app: &mut TestAppContext) {
+    init(app);
+    let registry = registry_with_disabled(&["kerminal.ssh"]);
+    let mut row = super::host("sftp-host", "sftp.invalid", None, &[]);
+    row.protocol = RemoteProtocol::Sftp;
+    row.sftp_options.enabled = true;
+    let host_id = row.id.clone();
+    let selector = format!("host-navigation-host-{}", row.id.as_str());
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (_runtime, navigation, _subscription, visual) = fixture_with_plugins(
+        app,
+        vec![row],
+        Vec::new(),
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events.clone(),
+        Some(registry),
+    );
+
+    let labels = open_menu(visual, &selector);
+    assert!(
+        labels.contains(&crate::locale::text("打开文件", "open files").to_string()),
+        "纯 SFTP 主机的打开文件入口不应受 SSH 单元影响"
+    );
+    assert!(
+        labels.contains(&crate::locale::text("新建传输标签", "New transfer tab").to_string()),
+        "纯 SFTP 主机的传输标签入口不应受 SSH 单元影响"
+    );
+    assert!(
+        !labels.contains(
+            &crate::locale::text("复制为 SSH 主机…", "Duplicate as SSH host…").to_string()
+        ),
+        "SSH 禁用时复制为 SSH 入口应隐藏"
+    );
+
+    // 旧帧入口仍需实际派发确认，不能只凭菜单可见推断动作仍可用。
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.request_open_sftp(host_id.clone(), cx);
+        });
+    });
+    assert!(
+        events
+            .borrow()
+            .contains(&HostNavigationEvent::OpenSftpRequested {
+                host_id: host_id.clone(),
+            }),
+        "纯 SFTP 主机在 SSH 禁用时仍应允许打开文件"
+    );
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            // 连续动作共用重复双击保护；测试显式清空以分别验证两个入口。
+            navigation.last_open_request = None;
+            navigation.request_create_sftp_transfer_tab(host_id.clone(), cx);
+        });
+    });
+    assert!(
+        events
+            .borrow()
+            .contains(&HostNavigationEvent::CreateSftpTransferTabRequested {
+                host_id: host_id.clone(),
+            }),
+        "纯 SFTP 主机在 SSH 禁用时仍应允许新建传输标签"
+    );
+}
+
+/// 禁用插件后扩展主机仍保留在树中，但打开和选择入口都不派发运行意图。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn disabled_plugin_host_remains_listed_but_cannot_open_or_select(app: &mut TestAppContext) {
+    init(app);
+    let registry = registry_with_disabled(&["kerminal.sftp"]);
+    let host = plugin_host("kerminal", "sftp");
+    let host_id = host.id.clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (_runtime, navigation, _subscription, visual) = fixture_with_plugins(
+        app,
+        Vec::new(),
+        vec![host],
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events.clone(),
+        Some(registry),
+    );
+
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert_eq!(navigation.plugin_rows.len(), 1, "禁用插件不能删除配置行");
+    });
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.request_plugin_host_open(host_id.clone(), cx);
+            navigation.select_plugin_host(host_id.clone(), cx);
+        });
+    });
+    draw(visual);
+    assert!(events.borrow().is_empty(), "禁用插件不得发出打开或选择事件");
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert!(
+            navigation
+                .feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.is_error)
+        );
+        assert!(navigation.selected_host.is_none());
+    });
+}
+
+/// PluginHostService 与主机管理服务复用同一冻结视图，避免打开入口各自维护启停映射。
+///
+/// @author kongweiguang
+#[test]
+fn plugin_host_service_reuses_the_same_frozen_gate() {
+    let host = plugin_host("kerminal", "sftp");
+    let registry = registry_with_disabled(&["kerminal.sftp"]);
+    let hosts = HostManagementService::new(Arc::new(MenuDirectory {
+        rows: Vec::new(),
+        plugin_rows: vec![host.clone()],
+        groups: Vec::new(),
+    }))
+    .with_plugins(registry);
+    assert!(!hosts.plugin_host_enabled(&host));
+
+    let plugin_service = PluginHostService::new(
+        hosts,
+        Arc::new(HostConfigurationCatalog::new(std::iter::empty()).expect("空目录应有效")),
+    );
+    assert!(!plugin_service.host_enabled(&host));
+}
+
+/// SFTP 单元禁用时导航头不再渲染工作台入口；按钮隐藏与 Root 事件门禁形成双层
+/// 防护，旧帧点击或其它快捷键路径仍会被拒绝。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn disabled_sftp_hides_workbench_entry(app: &mut TestAppContext) {
+    init(app);
+    let registry = registry_with_disabled(&["kerminal.sftp"]);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (_runtime, _navigation, _subscription, visual) = fixture_with_plugins(
+        app,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        events,
+        Some(registry),
+    );
+    draw(visual);
+    let selector: gpui_kit::ElementId = "host-navigation-sftp-workbench".into();
+    let present = visual
+        .update(|window, _| gpui_kit::base::test_support::find(window, &[], &selector).is_some());
+    assert!(!present, "SFTP 禁用时不应渲染工作台入口");
 }

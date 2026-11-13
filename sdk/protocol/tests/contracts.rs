@@ -83,39 +83,70 @@ fn manifest_fields_validate_independently() {
 }
 
 #[test]
-/// 启动激活和完全访问取决于插件形态，不依赖插件自己的解释。
-fn runtime_permissions_and_activation_are_checked() {
+/// 旧权限字符串仍可解析，但不再决定运行形态或授予任何网络能力。
+fn legacy_permission_strings_parse_without_grants() {
     let mut value = valid_manifest();
     value["runtime"] = json!({"kind":"script","main":"dist/main.js","activation":"startup"});
     assert!(parse(&value).is_err());
-    value["permissions"] = json!(["events.subscribe", "network:*.example.com"]);
-    assert!(parse(&value).is_ok());
-    for invalid_permission in [
+    value["runtime"] = json!({"kind":"none"});
+    value["permissions"] = json!([
+        "events.subscribe",
+        "network:*.example.com",
         "network:*",
-        "network:",
-        "network:*.com/path",
-        "network:user@example.com",
-        "network:example.com:443",
-        "full-access",
-    ] {
-        value["permissions"] = json!([invalid_permission]);
-        assert!(parse(&value).is_err(), "permission {invalid_permission}");
-    }
+        "unknown",
+        "unknown"
+    ]);
+    let parsed = parse(&value).expect("descriptive permissions");
+    assert_eq!(
+        parsed.permissions,
+        [
+            "events.subscribe",
+            "network:*.example.com",
+            "network:*",
+            "unknown",
+            "unknown"
+        ]
+    );
+    // 完全访问不再限定 Sidecar：没有运行时也可以声明，且不产生任何授权。
+    value["permissions"] = json!(["full-access"]);
+    assert!(parse(&value).is_ok());
     value["runtime"] =
         json!({"kind":"sidecar","main":{"windows-x86_64":"bin/app.exe"},"activation":"startup"});
     value["permissions"] = json!([]);
-    assert!(
-        parse(&value)
-            .unwrap()
-            .effective_permissions()
-            .contains(&Permission::FullAccess)
-    );
+    assert!(parse(&value).is_ok());
     value["runtime"]["main"] = json!({"any":"bin/app"});
     assert!(parse(&value).is_err());
-    let permission: Permission = "network:*.example.com".parse().unwrap();
-    assert!(permission.allows_network_host("sub.example.com"));
-    assert!(!permission.allows_network_host("example.com"));
-    assert!(!permission.allows_network_host("evil-example.com"));
+}
+
+#[test]
+/// 协议 v1 只承认 none 与 sidecar；旧 script 清单必须在解析边界拒绝，不能悄悄按无进程插件运行。
+fn script_runtime_is_rejected() {
+    let mut value = valid_manifest();
+    value["runtime"] = json!({"kind":"script","main":"dist/main.js"});
+    assert!(parse(&value).is_err());
+    let schema = schema::manifest_json_schema();
+    assert!(!jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+}
+
+#[test]
+/// 旧清单中的 network 与 csp 可以继续解析，但不会授予联网或改变视图语义。
+fn legacy_permissions_and_csp_parse_without_effect() {
+    let mut value = valid_manifest();
+    value["permissions"] = json!(["ui.notify", "network:example.com"]);
+    value["views"] = json!({
+        "page": {"kind":"webview","entry":"web/index.html","csp":"https://example.com"}
+    });
+    value["contributes"] = json!({
+        "commands": [{"id":"refresh","title":"Refresh","keybinding":"ctrl+r"}],
+        "settings": {"schema":"schemas/settings.json"},
+        "tools": [{"id":"panel","title":"Panel","view":"page","scope":"tab"}]
+    });
+    let parsed = parse(&value).expect("legacy manifest");
+    assert_eq!(parsed.permissions, ["ui.notify", "network:example.com"]);
+    assert!(matches!(
+        parsed.views.get("page"),
+        Some(ViewDefinition::Webview { .. })
+    ));
 }
 
 #[test]
@@ -197,6 +228,7 @@ fn all_native_node_kinds_parse() {
         json!({"type":"icon","icon":"file"}),
         json!({"type":"code","code":"x"}),
         json!({"type":"progress","value":1}),
+        json!({"type":"qrcode","matrix":"$qr","label":"%scan%"}),
         json!({"type":"empty","title":"None"}),
         json!({"type":"notice","text":"x"}),
         json!({"type":"input","bind":"form.name"}),
@@ -206,6 +238,7 @@ fn all_native_node_kinds_parse() {
         json!({"type":"switch","bind":"form.flag"}),
         json!({"type":"checkbox","bind":"form.flag"}),
         json!({"type":"path","bind":"form.path"}),
+        json!({"type":"path","bind":"form.directory","mode":"directory"}),
         json!({"type":"secret","bind":"form.secret"}),
         json!({"type":"button","label":"Run","action":"run","variant":"primary"}),
         json!({"type":"toolbar","children":[]}),
@@ -223,6 +256,48 @@ fn all_native_node_kinds_parse() {
             "node {kind}"
         );
     }
+}
+
+#[test]
+/// 二维码矩阵只接受不含静区的 21+4n 方阵，目录选择模式不改变既有 open/save 契约。
+fn qrcode_matrix_and_directory_picker_follow_contract() {
+    let matrix = |side: usize| {
+        (0..side)
+            .map(|row| {
+                (0..side)
+                    .map(|column| if (row + column) % 3 == 0 { '1' } else { '0' })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for side in [21, 25, 177] {
+        assert!(validate_qr_matrix(&matrix(side)).is_ok(), "side {side}");
+    }
+    for side in [19, 20, 22, 23, 178, 181] {
+        assert!(validate_qr_matrix(&matrix(side)).is_err(), "side {side}");
+    }
+    let valid = matrix(21);
+    assert!(validate_qr_matrix(&valid.replace("1", "2")).is_err());
+    assert!(validate_qr_matrix(&(valid.clone() + "\n" + &valid)).is_err());
+    assert!(validate_qr_matrix(&format!("{valid}\n{}", "0".repeat(20))).is_err());
+    assert!(validate_qr_matrix("").is_err());
+
+    let view = json!({"schema":1,"data":{"qr":valid},"root":{"type":"qrcode","matrix":"$qr"}});
+    assert!(parse_native_view(&serde_json::to_vec(&view).unwrap()).is_ok());
+    for matrix in ["qr", "$"] {
+        let view = json!({"schema":1,"root":{"type":"qrcode","matrix":matrix}});
+        assert!(parse_native_view(&serde_json::to_vec(&view).unwrap()).is_err());
+    }
+    for mode in ["open", "save", "directory"] {
+        let view = json!({"schema":1,"root":{"type":"path","bind":"form.path","mode":mode}});
+        assert!(
+            parse_native_view(&serde_json::to_vec(&view).unwrap()).is_ok(),
+            "mode {mode}"
+        );
+    }
+    let view = json!({"schema":1,"root":{"type":"path","bind":"form.path","mode":"folder"}});
+    assert!(parse_native_view(&serde_json::to_vec(&view).unwrap()).is_err());
 }
 
 #[test]
@@ -264,21 +339,21 @@ fn package_checks_real_files_and_platform() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let mut manifest = valid_manifest();
-    manifest["runtime"] = json!({"kind":"script","main":"dist/main.js"});
+    manifest["runtime"] = json!({"kind":"sidecar","main":{"windows-x86_64":"bin/app.exe"}});
     write_file(
         root,
         MANIFEST_FILE_NAME,
         &serde_json::to_vec(&manifest).unwrap(),
     );
     assert!(validate_package(root, ManifestPolicy::ThirdParty).is_err());
-    write_file(root, "dist/main.js", b"export default {};");
+    write_file(root, "bin/app.exe", b"sidecar");
     let package = validate_package(root, ManifestPolicy::ThirdParty).unwrap();
-    assert!(package.validate_for_platform(Platform::Any).is_ok());
     assert!(
         package
             .validate_for_platform(Platform::WindowsX86_64)
-            .is_err()
+            .is_ok()
     );
+    assert!(package.validate_for_platform(Platform::Any).is_err());
 }
 
 #[test]
@@ -317,11 +392,8 @@ fn rpc_envelopes_handshake_and_permission_mapping() {
         )
         .is_err()
     );
-    assert_eq!(
-        host_method_permission("ui.pickFile").unwrap(),
-        Some(Permission::UiFilePicker)
-    );
-    assert!(host_method_permission("unexpected.method").is_err());
+    assert!(host_method_supported("ui.pickFile").is_ok());
+    assert!(host_method_supported("unexpected.method").is_err());
     let request = InitializeParams {
         protocol: 1,
         host_api: "1.0".into(),
@@ -689,43 +761,26 @@ fn rpc_envelope_schema_matches_runtime_header_validation() {
 }
 
 #[test]
-/// DNS 主机名的标签、总长与通配符限制应与权限解析保持一致。
-fn permission_schema_matches_network_host_validation() {
+/// 权限在 schema 中只是字符串数组；旧网络写法、未知值和重复项都不再被拒绝。
+fn permissions_schema_is_descriptive_string_array() {
     let schema = schema::manifest_json_schema();
-    let validator =
-        jsonschema::validator_for(&json!({"$defs":schema["$defs"],"$ref":"#/$defs/Permission"}))
-            .unwrap();
-    let label63 = "a".repeat(63);
-    let label64 = "a".repeat(64);
-    let host253 = format!("{}.{}.{}.{}", label63, label63, label63, "a".repeat(61));
-    let host254 = format!("{}.{}.{}.{}", label63, label63, label63, "a".repeat(62));
-    for permission in [
-        "ui.notify".to_string(),
-        "network:api.example.com".into(),
-        "network:*.EXAMPLE.com".into(),
-        format!("network:{label63}.com"),
-        format!("network:{label64}.com"),
-        format!("network:{host253}"),
-        format!("network:*.{host253}"),
-        format!("network:{host254}"),
-        format!("network:*.{host254}"),
-        "network:bad..host".into(),
-        "network:-bad.host".into(),
-        "network:bad-.host".into(),
-        "network:bad.host\n".into(),
-        "network:*.".into(),
-        "network:*".into(),
-        "network:a:b".into(),
-        "network:foo/bar".into(),
-        "unknown".into(),
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut value = valid_manifest();
+    for permissions in [
+        json!([]),
+        json!(["ui.notify"]),
+        json!(["network:api.example.com", "network:*"]),
+        json!(["unknown"]),
+        json!(["ui.notify", "ui.notify"]),
+        json!(["full-access"]),
     ] {
-        let runtime_valid = permission.parse::<Permission>().is_ok();
-        assert_eq!(
-            validator.is_valid(&json!(permission)),
-            runtime_valid,
-            "permission: {permission:?}"
-        );
+        value["permissions"] = permissions.clone();
+        assert!(parse(&value).is_ok(), "runtime: {permissions}");
+        assert!(validator.is_valid(&value), "schema: {permissions}");
     }
+    value["permissions"] = json!([1]);
+    assert!(parse(&value).is_err());
+    assert!(!validator.is_valid(&value));
 }
 
 #[test]
@@ -825,7 +880,7 @@ fn manifest_schema_matches_local_runtime_constraints() {
         ("description", json!({"en":" "})),
         ("repository", json!("http://example.com")),
         ("categories", json!(["bad/category"])),
-        ("permissions", json!(["ui.notify", "ui.notify"])),
+        ("permissions", json!([1])),
         ("runtime", json!({"kind":"sidecar","main":{"any":"app"}})),
         ("runtime", json!({"kind":"sidecar","main":{}})),
         (
@@ -953,6 +1008,84 @@ fn extension_keys_use_the_same_prefix_rule_in_schema_and_runtime() {
             .unwrap()
             .is_valid(&manifest)
     );
+}
+
+#[test]
+/// 清单身份保留名必须与宿主 PluginId::parse 同判，市场才能构建出宿主可反序列化的条目。
+fn manifest_id_reserved_names_match_host_identity_rules() {
+    let schema = schema::manifest_json_schema();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    // Windows 保留设备名只看第一个点前的段，所以整份 ID 与宿主目录名冲突的样本都要拒绝。
+    let reserved_publishers = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "conin$",
+        "conout$",
+    ];
+    for publisher in reserved_publishers {
+        let mut manifest = valid_manifest();
+        manifest["id"] = json!(format!("{publisher}.notes"));
+        manifest["publisher"] = json!(publisher);
+        assert!(
+            parse(&manifest).is_err(),
+            "runtime reserved publisher: {publisher}"
+        );
+        assert!(
+            !validator.is_valid(&manifest),
+            "schema reserved publisher: {publisher}"
+        );
+    }
+    for id in [
+        "state.json",
+        "state-recovery-1.json",
+        "state-recovery-.json",
+    ] {
+        let mut manifest = valid_manifest();
+        manifest["id"] = json!(id);
+        manifest["publisher"] = json!(id.split('.').next().unwrap());
+        assert!(parse(&manifest).is_err(), "runtime state file: {id}");
+        assert!(!validator.is_valid(&manifest), "schema state file: {id}");
+    }
+    // 保留名只看第一个点前的段：设备名出现在 name 位或带前缀时仍是合法身份；
+    // `com0` 不在任何一侧的保留列表里，也不能被 Schema 额外收紧。
+    for id in [
+        "acme.notes",
+        "acme.con",
+        "acme.com1",
+        "acme.lpt9",
+        "console.notes",
+        "companion.notes",
+        "com0.notes",
+        "stateless.json",
+        "state-recovery.json",
+    ] {
+        let mut manifest = valid_manifest();
+        manifest["id"] = json!(id);
+        manifest["publisher"] = json!(id.split('.').next().unwrap());
+        assert!(parse(&manifest).is_ok(), "runtime legal id: {id}");
+        assert!(validator.is_valid(&manifest), "schema legal id: {id}");
+    }
+    // `kerminal` 不是设备名，`kerminal.con` 不触发保留名规则：Official 接受、
+    // ThirdParty 只因官方命名空间策略拒绝。保留名分支的 location 同为 manifest.id，
+    // 所以必须连 reason 一起断言，避免把身份规则拒绝误当策略拒绝。Schema 只约束
+    // 身份形状，不参与来源信任判断。
+    let mut official = valid_manifest();
+    official["id"] = json!("kerminal.con");
+    official["publisher"] = json!("kerminal");
+    let official_bytes = serde_json::to_vec(&official).unwrap();
+    assert!(parse_manifest(&official_bytes, ManifestPolicy::Official).is_ok());
+    match parse_manifest(&official_bytes, ManifestPolicy::ThirdParty) {
+        Err(ProtocolError::Invalid { location, reason })
+            if location == "manifest.id" && reason.contains("官方命名空间") => {}
+        other => panic!("官方命名空间拒绝应来自 manifest.id 策略: {other:?}"),
+    }
+    assert!(validator.is_valid(&official));
+    // `state-recovery-` 前缀与 `.json` 后缀之间的字符只能来自身份语法允许的集合，
+    // 越界的样本在两侧都因语法拒绝，而不是因保留名拒绝。
+    let mut manifest = valid_manifest();
+    manifest["id"] = json!("acme.state.json");
+    manifest["publisher"] = json!("acme");
+    assert!(parse(&manifest).is_err(), "runtime syntax: extra dot");
+    assert!(!validator.is_valid(&manifest), "schema syntax: extra dot");
 }
 
 #[test]

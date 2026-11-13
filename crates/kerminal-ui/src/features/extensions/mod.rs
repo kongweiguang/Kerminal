@@ -12,13 +12,16 @@ use gpui_kit::{
 use kerminal_application::{
     ApplicationTaskExecutor, PublicErrorCode,
     extensions::{
-        CatalogPlugin, CatalogSelection, CatalogSnapshot, ExtensionChange, ExtensionsService,
-        InstallProgress, LocalPackageInspection,
+        BuiltinUnit, CatalogPlugin, CatalogSelection, CatalogSnapshot, DropInInspection,
+        ExtensionChange, ExtensionsService, InstallProgress, LocalPackageInspection,
     },
 };
-use kerminal_domain::plugins::{PendingPluginChange, PluginId, PluginStoreState};
+use kerminal_domain::plugins::{
+    InstalledPlugin, PendingPluginChange, PluginId, PluginInstallStatus, PluginSource,
+    PluginStoreState, PluginUnsupportedReason,
+};
 use kerminal_plugin_protocol::Platform;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 mod markdown;
@@ -42,12 +45,33 @@ enum Filter {
     Category(String),
 }
 
+/// 选择必须带来源：内置单元与磁盘冲突记录可能共用同一身份，
+/// 只按 id 记录会让两行同时高亮，并让先匹配的详情分支挡住另一个入口。
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SelectedEntry {
+    /// 注册表内置行，详情走内置启停而非磁盘记录。
+    Builtin(PluginId),
+    /// 目录、安装记录或 pending 行，详情按目录与记录规则投影。
+    Plugin(PluginId),
+}
+
+impl SelectedEntry {
+    /// 列表、README 回执与详情查询只需要稳定身份，来源由调用方另行判断。
+    fn id(&self) -> &PluginId {
+        match self {
+            Self::Builtin(id) | Self::Plugin(id) => id,
+        }
+    }
+}
+
 /// 未经市场审核的文件以及不可逆数据删除必须经过明确确认。
 #[derive(Clone)]
 enum Confirmation {
     File(PathBuf, LocalPackageInspection),
     Install(CatalogSelection),
     DeleteData(PluginId),
+    /// 手动投放记录在确认时仍绑定观察到的指纹与修订，目录被替换就不能继续。
+    DropIn(DropInInspection),
 }
 
 /// 实例拥有搜索焦点与异步代次；服务和 executor 由组合根注入。
@@ -60,8 +84,17 @@ pub struct ExtensionsPage {
     catalog: Option<CatalogSnapshot>,
     offline: bool,
     state: Option<PluginStoreState>,
+    /// 内置单元名单来自静态注册表，只提供身份与可关闭性；实际启停仍看 state.builtins。
+    builtin_units: Vec<BuiltinUnit>,
+    /// 手动投放记录的只读观察；确认按钮必须使用这里的指纹与修订。
+    drop_ins: Vec<DropInInspection>,
+    /// drop-in 观察有独立代次，不能被目录刷新或普通写入的代次推进误作废。
+    drop_in_generation: u64,
+    drop_in_cancel: Option<CancellationToken>,
+    /// 本次 drop-in 重读是否持有页面 busy；离开分类时据它释放读盘占用的忙态。
+    reloading_drop_ins: bool,
     filter: Filter,
-    selected: Option<PluginId>,
+    selected: Option<SelectedEntry>,
     readme: Option<String>,
     readme_cancel: Option<CancellationToken>,
     readme_generation: u64,
@@ -121,6 +154,11 @@ impl ExtensionsPage {
             catalog: None,
             offline: false,
             state: None,
+            builtin_units: Vec::new(),
+            drop_ins: Vec::new(),
+            drop_in_generation: 0,
+            drop_in_cancel: None,
+            reloading_drop_ins: false,
             filter: Filter::All,
             selected: None,
             readme: None,
@@ -161,6 +199,9 @@ impl ExtensionsPage {
     }
 
     /// 首次进入先读可信缓存与权威状态；失败保留现有展示并提供重试。
+    ///
+    /// drop-in 观察在权威状态落地后单独读取：它只补充磁盘证据，失败不应阻塞
+    /// 列表与详情，也不能借用目录刷新或写操作的代次把自己作废。
     pub fn activate(&mut self, cx: &mut Context<Self>) {
         self.active = true;
         // 切回设置或重新进入时，遗留的窗口级确认必须先关闭，不能让它覆盖新页面状态。
@@ -169,12 +210,28 @@ impl ExtensionsPage {
         if self.busy {
             return;
         }
+        // 内置名单是编译期静态数据；读取失败说明注册表自身无效，不能带着空名单继续。
+        match self.service.builtin_units() {
+            Ok(units) => self.builtin_units = units,
+            Err(error) => {
+                self.status = Some(error.public_message().to_owned());
+                self.status_is_warning = false;
+                cx.notify();
+                return;
+            }
+        }
+        self.supersede_drop_in_inspection();
+        let drop_in_generation = self.drop_in_generation;
+        let drop_in_token = CancellationToken::new();
+        self.drop_in_cancel = Some(drop_in_token.clone());
         self.busy = true;
         self.refreshing = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let service = self.service.clone();
         let executor = self.executor.clone();
+        let inspect_service = self.service.clone();
+        let inspect_executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |_| async move {
@@ -183,32 +240,62 @@ impl ExtensionsPage {
                     Ok((state, catalog))
                 })
                 .await;
+            let loaded = this
+                .update(cx, |page, cx| {
+                    if page.generation != generation {
+                        return false;
+                    }
+                    page.busy = false;
+                    page.refreshing = false;
+                    match result {
+                        Ok((state, catalog)) => {
+                            let previous_preview = page.catalog.is_none();
+                            page.state = Some(state);
+                            page.offline = catalog.as_ref().is_some_and(|snapshot| snapshot.stale);
+                            page.catalog = catalog;
+                            page.status = None;
+                            page.status_is_warning = false;
+                            page.prune_selection(cx);
+                            page.reconcile_catalog_change(previous_preview, cx);
+                            // 每次进入分类都会 activate；日常刷新按 24 小时缓存判断，不能重复打网络。
+                            page.refresh_if_due(cx);
+                            true
+                        }
+                        Err(error) => {
+                            // 取消属于页面的正常空闲路径，不留下错误文案、离线标记或重试入口。
+                            if error.public_code() != PublicErrorCode::Cancelled {
+                                page.retry_operation = None;
+                                page.status = Some(error.public_message().to_owned());
+                                page.status_is_warning = false;
+                            }
+                            false
+                        }
+                    }
+                })
+                .unwrap_or(false);
+            if !loaded {
+                return;
+            }
+            let inspections = inspect_executor
+                .run_cancellable(drop_in_token, move |cancel| async move {
+                    inspect_service.inspect_drop_ins(cancel).await
+                })
+                .await;
             let _ = this.update(cx, |page, cx| {
-                if page.generation != generation {
+                if page.drop_in_generation != drop_in_generation {
                     return;
                 }
-                page.busy = false;
-                page.refreshing = false;
-                match result {
-                    Ok((state, catalog)) => {
-                        let previous_preview = page.catalog.is_none();
-                        page.state = Some(state);
-                        page.offline = catalog.as_ref().is_some_and(|snapshot| snapshot.stale);
-                        page.catalog = catalog;
-                        page.status = None;
-                        page.status_is_warning = false;
+                page.drop_in_cancel = None;
+                match inspections {
+                    Ok(items) => {
+                        page.drop_ins = items;
                         page.prune_selection(cx);
-                        page.reconcile_catalog_change(previous_preview, cx);
-                        // 每次进入分类都会 activate；日常刷新按 24 小时缓存判断，不能重复打网络。
-                        page.refresh_if_due(cx);
                     }
+                    // 页面离开或被新一次激活取代时静默收尾，不把取消写成可重试错误。
+                    Err(error) if error.public_code() == PublicErrorCode::Cancelled => {}
                     Err(error) => {
-                        // 取消属于页面的正常空闲路径，不留下错误文案、离线标记或重试入口。
-                        if error.public_code() != PublicErrorCode::Cancelled {
-                            page.retry_operation = None;
-                            page.status = Some(error.public_message().to_owned());
-                            page.status_is_warning = false;
-                        }
+                        page.status = Some(error.public_message().to_owned());
+                        page.status_is_warning = false;
                     }
                 }
                 cx.notify();
@@ -218,11 +305,27 @@ impl ExtensionsPage {
         cx.notify();
     }
 
+    /// 新的状态读取或写入会覆盖旧观察；使在途 drop-in 检查按代次作废并释放取消 token。
+    fn supersede_drop_in_inspection(&mut self) {
+        self.drop_in_generation = self.drop_in_generation.wrapping_add(1);
+        if let Some(token) = self.drop_in_cancel.take() {
+            token.cancel();
+        }
+    }
+
     /// 离开扩展分类或关闭设置时立即失去可见性；迟到的文件预检不能弹出窗口级确认。
     /// 只取消预检 token，安装、刷新和写操作仍按原有回执与退出门禁收尾。
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {
         self.active = false;
         self.close_open_confirmation(cx);
+        // 离开分类后 drop-in 观察没有展示目标，继续读取只会占用工作线程。
+        self.supersede_drop_in_inspection();
+        // drop-in 重读的完成回调会因代次失配而提前返回，不能指望它清 busy；
+        // 读盘 busy 由发起者自己释放，否则重新进入分类会被 busy 永久挡住。
+        if self.reloading_drop_ins {
+            self.reloading_drop_ins = false;
+            self.busy = false;
+        }
         if self.inspecting
             && let Some(token) = &self.cancel
         {
@@ -280,6 +383,11 @@ impl ExtensionsPage {
                         page.status_is_warning = false;
                         page.prune_selection(cx);
                         page.reconcile_catalog_change(previous_preview, cx);
+                        // 用户显式刷新后重读磁盘观察，修好或移除投放文件无需离开分类再回来；
+                        // 进入分类的按需刷新已由 activate 的后继观察覆盖，避免并发读取。
+                        if !due_only {
+                            page.reload_drop_in_state(cx);
+                        }
                     }
                     Err(error) => {
                         // 用户取消刷新时静默回到空闲；只有真实失败才把页面标成离线并保留重试文案。
@@ -345,6 +453,8 @@ impl ExtensionsPage {
         if self.busy {
             return;
         }
+        // 预检会推进页面代次；旧 drop-in 观察不能跨这次操作继续落地。
+        self.supersede_drop_in_inspection();
         self.busy = true;
         self.inspecting = true;
         self.retry_operation = None;
@@ -409,16 +519,24 @@ impl ExtensionsPage {
     }
 
     /// README 只能通过签名目录对应的应用接口读取，迟到结果不得覆盖新选中的插件。
-    fn select(&mut self, id: PluginId, cx: &mut Context<Self>) {
+    fn select(&mut self, entry: SelectedEntry, cx: &mut Context<Self>) {
         // 详情内容随选择整体替换，沿用上一个插件的滚动位置会让人误以为没切换成功。
         self.detail_scroll.set_offset(Default::default());
         if let Some(previous) = self.readme_cancel.take() {
             previous.cancel();
         }
-        self.selected = Some(id.clone());
+        let id = entry.id().clone();
+        self.selected = Some(entry);
         self.readme_generation = self.readme_generation.wrapping_add(1);
         let generation = self.readme_generation;
         self.readme = None;
+        // 详情优先级已由 selected_plugin 统一判定：内置、未确认投放和目录缺席都没有目录条目，
+        // 选它们只切换详情；已确认的 drop-in 若同时出现在市场目录，详情由目录条目接管，
+        // 仍需加载签名 README，不能仅凭安装来源提前跳过。
+        if self.selected_plugin().is_none() {
+            cx.notify();
+            return;
+        }
         // 示例条目只带内嵌元数据，没有可验签的 README 地址，不能为预览发起网络请求。
         if self.catalog.is_none() && sample::contains(&id) {
             cx.notify();
@@ -437,7 +555,10 @@ impl ExtensionsPage {
             let _ = this.update(cx, |page, cx| {
                 if let Ok((id, text)) = result
                     && page.readme_generation == generation
-                    && page.selected.as_ref() == Some(&id)
+                    && matches!(
+                        page.selected.as_ref(),
+                        Some(SelectedEntry::Plugin(selected)) if selected == &id
+                    )
                 {
                     page.readme = text;
                     page.readme_cancel = None;
@@ -469,6 +590,8 @@ impl ExtensionsPage {
         if self.busy {
             return;
         }
+        // 写操作基于当前观察；在途 drop-in 检查不能把旧指纹重新写回页面。
+        self.supersede_drop_in_inspection();
         self.busy = true;
         self.inspecting = false;
         // 写操作尚未收到权威回读时退出会丢失提交结果，只有这一阶段需要阻止退出。
@@ -520,6 +643,7 @@ impl ExtensionsPage {
                         Operation::Install(selection) => service.install(selection, progress_tx, token).await.map(|receipt| receipt.cleanup_warning),
                         Operation::File(path, inspected) => service.install_file(path, inspected, true, progress_tx, token).await.map(|receipt| receipt.cleanup_warning),
                         Operation::Change(change) => service.change(change).await.map(|receipt| receipt.cleanup_warning),
+                        Operation::ConfirmDropIn { id, fingerprint, revision } => service.confirm_drop_in(id, fingerprint, revision).await.map(|receipt| receipt.cleanup_warning),
                         Operation::Delete(id) => service.delete_data(id, true).await.map(|()| None),
                     };
                     Ok(match write {
@@ -537,23 +661,44 @@ impl ExtensionsPage {
                 page.cancel = None;
                 page.progress = None;
                 page.active_install = None;
+                let confirm_drop_in = matches!(&retry_candidate, Operation::ConfirmDropIn { .. });
                 match result {
                     Ok(Ok((state, warning))) => {
                         page.state = Some(state);
                         page.status_is_warning = warning.is_some();
                         page.status = warning.map(|error| error.public_message().to_owned());
+                        // 任何写入都会改变磁盘记录；重读观察才能更新指纹、损坏与待确认状态，
+                        // 否则确认入口会拿着旧观察必然冲突，修好的文件也要离开分类才可见。
+                        page.reload_drop_in_state(cx);
                     }
                     Ok(Err((error, committed, warning))) => {
                         // 取消安装属于用户主动结束，不写错误、不提供重试，也不把页面标成失败。
                         if error.public_code() != PublicErrorCode::Cancelled {
-                            if !committed && !matches!(error.public_code(), PublicErrorCode::OutcomeUnknown)
-                                && !matches!(retry_candidate, Operation::Delete(_) | Operation::File(_, _) | Operation::Change(ExtensionChange::CancelFailedChange { .. })) {
-                                page.retry_operation = Some(retry_candidate);
+                            let stale_drop_in = confirm_drop_in
+                                && !committed
+                                && error.public_code() == PublicErrorCode::Conflict;
+                            if stale_drop_in {
+                                // 指纹或修订已过期；旧值重试只会继续冲突，必须按最新状态刷新。
+                                page.retry_operation = None;
+                                page.status_is_warning = true;
+                                page.status = Some(
+                                    crate::locale::text(
+                                        "状态已更改，请刷新",
+                                        "The state has changed; refresh to continue.",
+                                    )
+                                    .to_string(),
+                                );
+                                page.reload_drop_in_state(cx);
+                            } else {
+                                if !committed && !matches!(error.public_code(), PublicErrorCode::OutcomeUnknown)
+                                    && !matches!(retry_candidate, Operation::Delete(_) | Operation::File(_, _) | Operation::Change(ExtensionChange::CancelFailedChange { .. }) | Operation::ConfirmDropIn { .. }) {
+                                    page.retry_operation = Some(retry_candidate);
+                                }
+                                page.status_is_warning = false;
+                                page.status = Some(if committed {
+                                    format!("{}{}", crate::locale::text("操作已提交，但读取状态失败；请刷新状态。", "The operation was committed, but its state could not be read. Refresh the state."), warning.map(|value| format!(" {}", value.public_message())).unwrap_or_default())
+                                } else { error.public_message().to_owned() });
                             }
-                            page.status_is_warning = false;
-                            page.status = Some(if committed {
-                                format!("{}{}", crate::locale::text("操作已提交，但读取状态失败；请刷新状态。", "The operation was committed, but its state could not be read. Refresh the state."), warning.map(|value| format!(" {}", value.public_message())).unwrap_or_default())
-                            } else { error.public_message().to_owned() });
                         }
                     }
                     Err(error) => {
@@ -573,6 +718,60 @@ impl ExtensionsPage {
         cx.notify();
     }
 
+    /// 确认冲突或确认成功后重新读取权威状态与 drop-in 观察。
+    ///
+    /// 只刷新数据，不覆盖调用方刚写入的提示：冲突提示需要留在页面上解释
+    /// 为什么列表已经变化；成功路径本来就没有提示，刷新后详情会撤下确认入口。
+    fn reload_drop_in_state(&mut self, cx: &mut Context<Self>) {
+        // 页面已离开时观察没有展示目标；下次 activate 会重新读取，不能把 busy 留在无人页面。
+        if self.busy || !self.active {
+            return;
+        }
+        self.busy = true;
+        self.reloading_drop_ins = true;
+        self.inspecting = false;
+        self.supersede_drop_in_inspection();
+        let drop_in_generation = self.drop_in_generation;
+        let token = CancellationToken::new();
+        self.drop_in_cancel = Some(token.clone());
+        let service = self.service.clone();
+        let executor = self.executor.clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run_cancellable(token, move |cancel| async move {
+                    let state = service.state().await?;
+                    let inspections = service.inspect_drop_ins(cancel).await?;
+                    Ok((state, inspections))
+                })
+                .await;
+            let _ = this.update(cx, |page, cx| {
+                // 代次失配说明 deactivate 已释放本次读盘忙态；这里只负责丢弃旧结果，
+                // 不能覆盖新的激活或写入已经占用的状态。
+                if page.drop_in_generation != drop_in_generation {
+                    return;
+                }
+                page.busy = false;
+                page.reloading_drop_ins = false;
+                page.drop_in_cancel = None;
+                match result {
+                    Ok((state, inspections)) => {
+                        page.state = Some(state);
+                        page.drop_ins = inspections;
+                        page.prune_selection(cx);
+                    }
+                    Err(error) if error.public_code() == PublicErrorCode::Cancelled => {}
+                    Err(error) => {
+                        page.status = Some(error.public_message().to_owned());
+                        page.status_is_warning = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// 验收读取真实页面和服务回执投影，不能用构造数据替代安装结果。
     #[cfg(feature = "right-rail-acceptance")]
     pub fn acceptance_snapshot(&self) -> ExtensionsAcceptanceSnapshot {
@@ -581,11 +780,14 @@ impl ExtensionsPage {
                 .catalog
                 .as_ref()
                 .map_or(0, |value| value.catalog.plugins.len()),
-            installed: self.state.as_ref().map_or(0, |value| value.plugins.len()),
+            installed: installed_total(self.state.as_ref(), &self.builtin_units),
             pending: self.state.as_ref().map_or(0, |value| value.pending.len()),
             offline: self.offline,
             busy: self.busy,
-            selected: self.selected.as_ref().map(|id| id.as_str().to_owned()),
+            selected: self
+                .selected
+                .as_ref()
+                .map(|entry| entry.id().as_str().to_owned()),
             error: self.status.clone(),
             confirmation_visible: self.confirmation.is_some(),
             confirmation_kind: self
@@ -595,12 +797,14 @@ impl ExtensionsPage {
                     Confirmation::File(_, _) => "file",
                     Confirmation::Install(_) => "install",
                     Confirmation::DeleteData(_) => "delete_data",
+                    Confirmation::DropIn(_) => "drop_in",
                 }),
             confirmation_id: self.confirmation.as_ref().map(|confirmation| {
                 match confirmation {
                     Confirmation::File(_, inspection) => inspection.id.as_str(),
                     Confirmation::Install(selection) => selection.id.as_str(),
                     Confirmation::DeleteData(id) => id.as_str(),
+                    Confirmation::DropIn(inspection) => inspection.id.as_str(),
                 }
                 .to_owned()
             }),
@@ -619,6 +823,7 @@ impl ExtensionsPage {
                         })
                         .map_or_else(Vec::new, |plugin| plugin.permissions.clone()),
                     Confirmation::DeleteData(_) => Vec::new(),
+                    Confirmation::DropIn(inspection) => inspection.permissions.clone(),
                 }
             }),
             pending_restart: self
@@ -741,9 +946,10 @@ impl ExtensionsPage {
     /// 目录替换后留下的选择会展示另一份目录的旧详情，必须按当前目录与安装集合重新核对。
     /// 无真实目录时示例就是当前展示源，示例选择仍然有效。
     fn prune_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.as_ref() else {
+        let Some(entry) = self.selected.as_ref() else {
             return;
         };
+        let id = entry.id();
         let in_catalog = match &self.catalog {
             Some(catalog) => catalog
                 .catalog
@@ -756,7 +962,13 @@ impl ExtensionsPage {
             state.plugins.contains_key(id)
                 || state.pending.iter().any(|change| change.plugin_id() == id)
         });
-        if in_catalog || in_store {
+        // 内置行与磁盘记录可能共用身份，剪枝必须按选择来源判断，不能把仅存于另一来源的选择清掉。
+        let in_builtin = self.builtin_units.iter().any(|unit| &unit.id == id);
+        let valid = match entry {
+            SelectedEntry::Builtin(_) => in_builtin,
+            SelectedEntry::Plugin(_) => in_catalog || in_store,
+        };
+        if valid {
             return;
         }
         if let Some(token) = self.readme_cancel.take() {
@@ -784,25 +996,34 @@ impl ExtensionsPage {
                     .any(|plugin| plugin.categories.contains(category))
         );
         let reselect = previous_preview
-            && self.selected.as_ref().is_some_and(|id| {
-                catalog
-                    .catalog
-                    .plugins
-                    .iter()
-                    .any(|plugin| &plugin.id == id)
-            });
+            && matches!(
+                &self.selected,
+                Some(SelectedEntry::Plugin(id))
+                    if catalog
+                        .catalog
+                        .plugins
+                        .iter()
+                        .any(|plugin| &plugin.id == id)
+            );
         if category_removed {
             self.filter = Filter::All;
         }
-        if reselect && let Some(id) = self.selected.clone() {
-            self.select(id, cx);
+        if reselect && let Some(entry) = self.selected.clone() {
+            self.select(entry, cx);
         }
     }
 
     /// 列表和详情共用同一受信目录记录，避免使用未校验的界面 URL 作为安装目标。
     /// 仅在真实目录缺席时回退到内嵌示例，示例永远不会成为安装目标。
     fn selected_plugin(&self) -> Option<&CatalogPlugin> {
-        let id = self.selected.as_ref()?;
+        // 内置详情和未确认投放记录都有自己的详情分支；只有普通 Plugin 选择才允许目录条目优先。
+        let SelectedEntry::Plugin(id) = self.selected.as_ref()? else {
+            return None;
+        };
+        // 未确认的手动投放即使与目录同 id，也必须先展示确认入口；目录行同步隐藏，避免两个入口竞争。
+        if unconfirmed_drop_in(self.state.as_ref(), id).is_some() {
+            return None;
+        }
         if let Some(plugin) = self.catalog.as_ref().and_then(|catalog| {
             catalog
                 .catalog
@@ -828,6 +1049,28 @@ impl ExtensionsPage {
         }
         None
     }
+
+    /// 内置详情只在选择来自内置行时成立；同身份记录行不能借用它显示启停按钮。
+    fn selected_builtin_unit(&self) -> Option<&BuiltinUnit> {
+        let SelectedEntry::Builtin(id) = self.selected.as_ref()? else {
+            return None;
+        };
+        self.builtin_units.iter().find(|unit| &unit.id == id)
+    }
+
+    /// 冲突记录详情只在选择来自记录行时成立，避免遮蔽同名内置行的启用入口。
+    fn selected_reserved_record(&self) -> Option<(&PluginId, &InstalledPlugin)> {
+        let SelectedEntry::Plugin(id) = self.selected.as_ref()? else {
+            return None;
+        };
+        let installed = self.state.as_ref()?.plugins.get(id)?;
+        is_reserved_identity(installed).then_some((id, installed))
+    }
+
+    /// 行高亮按完整选择来源比较；同 id 的内置行与记录行不能同时选中。
+    fn row_selected(&self, entry: &SelectedEntry) -> bool {
+        self.selected.as_ref() == Some(entry)
+    }
 }
 
 #[derive(Clone)]
@@ -835,6 +1078,12 @@ enum Operation {
     Install(CatalogSelection),
     File(PathBuf, LocalPackageInspection),
     Change(ExtensionChange),
+    /// 确认使用观察时冻结的指纹与修订；任一变化都视为冲突而不是重试。
+    ConfirmDropIn {
+        id: PluginId,
+        fingerprint: String,
+        revision: u64,
+    },
     Delete(PluginId),
 }
 
@@ -916,6 +1165,217 @@ fn label<'a>(map: &'a std::collections::BTreeMap<String, String>, fallback: &'a 
             }
         })
         .map_or(fallback, String::as_str)
+}
+
+/// 应用层 DTO 只带注册表英文名；中文界面按稳定 id 本地化，未知 id 才回落到注册表名称。
+fn builtin_name_pair(id: &PluginId, registry_name: &str) -> (String, String) {
+    let pair = match id.as_str() {
+        "kerminal.core" => ("核心", "Core"),
+        "kerminal.ssh" => ("SSH", "SSH"),
+        "kerminal.sftp" => ("SFTP", "SFTP"),
+        "kerminal.telnet" => ("Telnet", "Telnet"),
+        "kerminal.serial" => ("串口", "Serial"),
+        "kerminal.rdp" => ("远程桌面", "RDP"),
+        "kerminal.agents" => ("Agent", "Agents"),
+        "kerminal.commands" => ("命令", "Commands"),
+        "kerminal.tmux" => ("tmux", "tmux"),
+        "kerminal.containers" => ("容器", "Containers"),
+        "kerminal.ports" => ("端口转发", "Port forwarding"),
+        "kerminal.system" => ("系统", "System"),
+        "kerminal.logs" => ("日志", "Logs"),
+        _ => return (registry_name.to_owned(), registry_name.to_owned()),
+    };
+    (pair.0.to_owned(), pair.1.to_owned())
+}
+
+/// 行与详情共用同一个展示名，避免列表中文、详情英文的割裂。
+fn builtin_display_name(unit: &BuiltinUnit) -> String {
+    let (zh_cn, en_us) = builtin_name_pair(&unit.id, &unit.name);
+    crate::locale::text(zh_cn, en_us).to_string()
+}
+
+/// 内置启停状态只认权威 `builtins` 表；缺省表示启用，界面不能自行推断。
+fn builtin_enabled(state: Option<&PluginStoreState>, id: &PluginId) -> bool {
+    state
+        .and_then(|state| state.builtins.get(id))
+        .copied()
+        .unwrap_or(true)
+}
+
+/// 任一 pending 变更都意味着运行态尚未切换，行与详情都要提示重启。
+fn builtin_pending(state: Option<&PluginStoreState>, id: &PluginId) -> bool {
+    state.is_some_and(|state| state.pending.iter().any(|change| change.plugin_id() == id))
+}
+
+/// 内置行只投影身份、名称与启停状态；抽出后过滤、搜索和状态可直接单测。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BuiltinRow {
+    id: PluginId,
+    name: String,
+    can_disable: bool,
+    enabled: bool,
+    pending: bool,
+}
+
+/// 内置单元属于已安装能力，只在“全部”和“已安装”出现；分类筛选没有它们的归属。
+/// 搜索同时匹配稳定身份与当前语言展示名，界面看到什么就能搜到什么。
+fn builtin_rows(
+    units: &[BuiltinUnit],
+    state: Option<&PluginStoreState>,
+    query: &str,
+    filter: &Filter,
+) -> Vec<BuiltinRow> {
+    if !matches!(filter, Filter::All | Filter::Installed) {
+        return Vec::new();
+    }
+    let query = query.trim().to_lowercase();
+    units
+        .iter()
+        .filter_map(|unit| {
+            let name = builtin_display_name(unit);
+            let matches = query.is_empty()
+                || unit.id.as_str().to_lowercase().contains(&query)
+                || name.to_lowercase().contains(&query);
+            matches.then(|| BuiltinRow {
+                id: unit.id.clone(),
+                name,
+                can_disable: unit.can_disable,
+                enabled: builtin_enabled(state, &unit.id),
+                pending: builtin_pending(state, &unit.id),
+            })
+        })
+        .collect()
+}
+
+/// 已安装计数取安装记录与内置身份的并集；使用同一身份的外部冲突记录不能重复计数。
+fn installed_total(state: Option<&PluginStoreState>, units: &[BuiltinUnit]) -> usize {
+    let mut ids = BTreeSet::new();
+    if let Some(state) = state {
+        ids.extend(state.plugins.keys().map(PluginId::as_str));
+    }
+    ids.extend(units.iter().map(|unit| unit.id.as_str()));
+    ids.len()
+}
+
+/// 页头总数同样按稳定身份去重，目录与内置名单出现同名身份时只算一个。
+fn extension_total(plugins: &[CatalogPlugin], units: &[BuiltinUnit]) -> usize {
+    let mut ids: BTreeSet<&str> = plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+    ids.extend(units.iter().map(|unit| unit.id.as_str()));
+    ids.len()
+}
+
+/// 占用内置身份的记录是磁盘上的冲突材料，不是可加载的扩展；状态优先于普通失败标记。
+fn is_reserved_identity(installed: &InstalledPlugin) -> bool {
+    matches!(
+        installed.status,
+        PluginInstallStatus::Unsupported {
+            reason: PluginUnsupportedReason::ReservedIdentity
+        }
+    )
+}
+
+/// drop-in 行与详情共用的语义状态；与本地化文案分离，便于测试和复用。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DropInState {
+    PendingConfirmation,
+    Ready,
+    Missing,
+    Corrupt,
+    Unsupported,
+    ReservedIdentity,
+}
+
+/// 未确认的手动投放即使同 id 出现在市场目录，也必须由记录行提供确认入口。
+fn unconfirmed_drop_in<'a>(
+    state: Option<&'a PluginStoreState>,
+    id: &PluginId,
+) -> Option<&'a InstalledPlugin> {
+    state?
+        .plugins
+        .get(id)
+        .filter(|installed| installed.source == PluginSource::DropIn && !installed.confirmed)
+}
+
+/// 记录状态来自启动复验，观察结果补充当前磁盘证据；两者都不可信时才回退到记录。
+fn drop_in_state(
+    installed: &InstalledPlugin,
+    inspection: Option<&DropInInspection>,
+) -> DropInState {
+    if is_reserved_identity(installed) {
+        return DropInState::ReservedIdentity;
+    }
+    let status = inspection.map_or(installed.status, |value| value.status);
+    match status {
+        PluginInstallStatus::Ready
+            if installed.source == PluginSource::DropIn && !installed.confirmed =>
+        {
+            DropInState::PendingConfirmation
+        }
+        PluginInstallStatus::Ready => DropInState::Ready,
+        PluginInstallStatus::Missing => DropInState::Missing,
+        PluginInstallStatus::Corrupt => DropInState::Corrupt,
+        PluginInstallStatus::Unsupported { .. } => DropInState::Unsupported,
+    }
+}
+
+/// 只有就绪、具备指纹且尚未确认的观察结果能进入确认流程；损坏内容不能伪装成可确认。
+fn drop_in_confirmable(inspection: &DropInInspection) -> bool {
+    !inspection.confirmed
+        && inspection.status == PluginInstallStatus::Ready
+        && inspection.fingerprint.is_some()
+}
+
+/// 详情动作策略集中判定：冲突记录无动作，未确认 drop-in 只暴露确认，其余沿用现有管理入口。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredActionsPolicy {
+    None,
+    ConfirmDropIn,
+    Unavailable,
+    Manage,
+}
+
+fn stored_actions_policy(
+    installed: &InstalledPlugin,
+    inspection: Option<&DropInInspection>,
+) -> StoredActionsPolicy {
+    if is_reserved_identity(installed) {
+        return StoredActionsPolicy::None;
+    }
+    if installed.source != PluginSource::DropIn {
+        return StoredActionsPolicy::Manage;
+    }
+    let state = drop_in_state(installed, inspection);
+    if !installed.confirmed {
+        // 未确认的普通启用会绕过确认门禁；这里只允许绑定当前观察的确认动作。
+        return if state == DropInState::PendingConfirmation
+            && inspection.is_some_and(drop_in_confirmable)
+        {
+            StoredActionsPolicy::ConfirmDropIn
+        } else {
+            StoredActionsPolicy::Unavailable
+        };
+    }
+    if state == DropInState::Ready {
+        StoredActionsPolicy::Manage
+    } else {
+        // 已确认但目录缺失/损坏时仍保留卸载入口，但不能再次启用。
+        StoredActionsPolicy::Unavailable
+    }
+}
+
+/// 确认操作冻结观察时的指纹与修订；两者缺一都不能构造可执行意图。
+fn drop_in_confirmation_operation(inspection: &DropInInspection) -> Option<Operation> {
+    if !drop_in_confirmable(inspection) {
+        return None;
+    }
+    inspection
+        .fingerprint
+        .clone()
+        .map(|fingerprint| Operation::ConfirmDropIn {
+            id: inspection.id.clone(),
+            fingerprint,
+            revision: inspection.revision,
+        })
 }
 
 #[cfg(test)]

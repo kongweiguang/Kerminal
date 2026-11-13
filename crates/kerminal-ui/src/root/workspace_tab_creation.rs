@@ -48,6 +48,29 @@ impl RootView {
             self.create_terminal_for_target(TerminalTargetRequest::ProfileDefaultLocal, window, cx);
             return;
         };
+        // 菜单可能来自刷新前快照；目录之外再按当前启用视图拒绝禁用协议，避免误建会话。
+        let requested_protocol = match target {
+            WorkspaceTargetRef::Ssh { .. } => Some(RemoteProtocol::Ssh),
+            WorkspaceTargetRef::Telnet { .. } => Some(RemoteProtocol::Telnet),
+            WorkspaceTargetRef::Serial { .. } => Some(RemoteProtocol::Serial),
+            WorkspaceTargetRef::Local { .. }
+            | WorkspaceTargetRef::DockerContainer { .. }
+            | WorkspaceTargetRef::Unavailable { .. } => None,
+        };
+        if let Some(protocol) = requested_protocol
+            && self
+                .services
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| !hosts.protocol_enabled(protocol))
+        {
+            self.status = Some(crate::locale::text(
+                "该协议已禁用，无法新建终端。",
+                "This protocol is disabled; a new terminal cannot be created.",
+            ));
+            cx.notify();
+            return;
+        }
         let available = self.host_navigation.as_ref().is_some_and(|navigation| {
             let navigation = navigation.read(cx);
             !navigation.split_target_loading()

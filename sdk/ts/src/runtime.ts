@@ -9,7 +9,7 @@ import type {
 
 export type JsonObject = { [key: string]: JsonValue };
 export type RuntimeHandler<Params, Result> = (params: Params) => Result | Promise<Result>;
-/** 请求取消携带协作信号；脚本宿主仅支持基础 AbortSignal 能力。 */
+/** 请求取消携带协作信号；宿主只保证基础 AbortSignal，不承诺中断正在进行的网络或磁盘调用。 */
 export type CancellableRuntimeHandler<Params, Result> = (params: Params, signal: AbortSignal) => Result | Promise<Result>;
 /** 可选信号只取消当前请求，不会隐式重试。 */
 export interface RuntimeRequestOptions { readonly signal?: AbortSignal }
@@ -40,8 +40,6 @@ export interface HostNotifications {
 
 export interface Kerminal {
   readonly environment: KerminalEnvironment;
-  /** 脚本宿主提供本地存储；网页桥接必须先确认能力存在。 */
-  readonly storage?: ScriptStorage;
   onRequest<Method extends keyof HostRequests>(
     method: Method,
     handler: RuntimeHandler<HostRequests[Method]["params"], HostRequests[Method]["result"]>,
@@ -86,22 +84,7 @@ export interface Kerminal {
   readonly events: { readonly subscribe: RemoteCall };
 }
 
-/** 本地存储只存在于脚本进程；网页桥接尚无文件句柄协议。 */
-export interface ScriptStorage {
-  get(key: string): Promise<JsonValue>;
-  set(key: string, value: JsonValue): Promise<null>;
-  delete(key: string): Promise<boolean>;
-  readFile(path: string): Promise<Uint8Array>;
-  writeFile(path: string, data: string | ArrayBuffer | ArrayBufferView): Promise<null>;
-  removeFile(path: string): Promise<boolean>;
-  list(path?: string): Promise<string[]>;
-}
-
-/** 只给脚本全局对象承诺本地存储，避免网页端获得尚未接入的能力。 */
-export interface ScriptKerminal extends Kerminal { readonly storage: ScriptStorage }
-
 declare global {
-  const kerminal: ScriptKerminal;
   interface Window {
     readonly kerminal: Kerminal;
   }

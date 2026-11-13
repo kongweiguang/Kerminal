@@ -54,6 +54,7 @@ impl OperationsView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let snapshot = self.server.data().cloned();
+        let data_opacity = self.fixed_data_entrance_opacity();
         let empty = snapshot.is_none();
         let show_feedback = should_render_server_feedback(&self.server);
         let target = snapshot
@@ -78,7 +79,7 @@ impl OperationsView {
                 ))
             });
         if let Some(snapshot) = snapshot {
-            body = body.child(match self.server_info_panel {
+            let data = match self.server_info_panel {
                 ServerInfoPanel::Overview => self
                     .render_server_overview(&snapshot, theme)
                     .into_any_element(),
@@ -88,7 +89,14 @@ impl OperationsView {
                 ServerInfoPanel::Processes => self
                     .render_server_processes(&snapshot, theme, cx)
                     .into_any_element(),
-            });
+            };
+            // 只让采样正文入场；页头、目标状态、页签和刷新控件保持完整亮度。
+            body = body.child(
+                div()
+                    .w_full()
+                    .when(data_opacity < 1.0, |data| data.opacity(data_opacity))
+                    .child(data),
+            );
         }
         server_section_page(
             body,

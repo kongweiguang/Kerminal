@@ -1,0 +1,19 @@
+# @author kongweiguang
+[package]
+name = "kerminal-fixture-notes-1-0"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "kerminal-plugin-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+# 与宿主使用同一 reqwest/rustls 配对，避免夹具引入第二套 TLS 栈。
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# 夹具独立构建，不能误并入仓库工作区或继承宿主的依赖解析。
+[workspace]

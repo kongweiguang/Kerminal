@@ -36,7 +36,7 @@ function hasCode(code) {
   return (error) => error instanceof BridgeError && error.code === code;
 }
 
-/** 浏览器与 QuickJS 的业务错误必须同义，且不能接受插件伪造的宿主协议错误。 */
+/** 浏览器桥保留业务错误码，且不能接受插件伪造的宿主协议错误。 */
 test("handler errors preserve business codes and reject reserved codes", async () => {
   const transport = new FakeTransport();
   const bridge = createBrowserBridge(transport, { view_instance: "tab-1", generation: 7 });

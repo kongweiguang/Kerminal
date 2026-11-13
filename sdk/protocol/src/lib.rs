@@ -1,6 +1,7 @@
 //! 外部插件声明与线协议的唯一来源，不依赖宿主或界面实现。
 //! @author kongweiguang
 
+pub mod asset_url;
 pub mod configuration;
 pub mod manifest;
 pub mod native;
@@ -8,6 +9,7 @@ pub mod package;
 pub mod runtime;
 pub mod schema;
 
+pub use asset_url::*;
 pub use configuration::*;
 pub use manifest::*;
 pub use native::*;

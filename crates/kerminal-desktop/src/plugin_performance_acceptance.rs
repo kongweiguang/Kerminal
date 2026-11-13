@@ -125,6 +125,8 @@ pub(crate) fn acceptance_catalogs(
         &plugins.into_values().collect::<Vec<_>>(),
         &startup.enabled,
         locale,
+        // 验收窗口沿用生产启动的持久内置状态，避免验收目录与正常启动给出不同门禁答案。
+        &startup.builtin_states()?,
         true,
     )
 }

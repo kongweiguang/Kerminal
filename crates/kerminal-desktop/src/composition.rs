@@ -326,12 +326,16 @@ impl DesktopComposition {
             host_management_repository,
             credential_service.clone(),
         )
+        // 主机新建/探测必须使用与 UI、MCP 相同的冻结启用视图；各服务自行冻结会
+        // 让禁用插件在某个入口仍被放行，因此这里只注入组合根已校验的同一实例。
+        .with_plugins(plugins.clone())
         .with_credential_cleanup(Arc::new(AtomicHostCredentialCleanup::new(
             configuration.clone(),
         )))
         .with_local_environment_resolver(vault_credential_resolver.clone());
         let plugin_hosts =
-            PluginHostService::new(host_management.clone(), configuration.host_types().clone());
+            PluginHostService::new(host_management.clone(), configuration.host_types().clone())
+                .with_plugins(plugins.clone());
         if writable {
             // 恢复失败保留本地主机写门禁；整个工作台仍可启动，并由主机面板展示重试入口。
             match host_management.recover_pending_local_host_save().await {
@@ -487,11 +491,15 @@ impl DesktopComposition {
             remote_connections.clone(),
             remote_suggestion_policy.clone(),
         ));
-        let history_suggestions: Arc<dyn CommandSuggestionProvider> =
-            Arc::new(HistoryCommandSuggestionProvider::new(
+        let history_suggestions: Arc<dyn CommandSuggestionProvider> = Arc::new(
+            HistoryCommandSuggestionProvider::new(
                 history_repository.clone(),
                 snippet_repository.clone(),
-            ));
+            )
+            // 片段建议入口与片段面板、MCP 共用同一冻结启用视图；各服务自行
+            // 判断 commands 单元会让禁用后的候选与面板门禁给出相反答案。
+            .with_plugins(plugins.clone()),
+        );
         let spec_suggestions: Arc<dyn CommandSuggestionProvider> =
             Arc::new(StaticSpecSuggestionProvider::new()?);
         let local_suggestions: Arc<dyn CommandSuggestionProvider> =
@@ -588,6 +596,9 @@ impl DesktopComposition {
                 agent_workspace_repository,
                 Arc::new(preferences.clone()),
             )
+            // Agent 模板与主机门禁沿用同一冻结视图，禁止在会话服务内二次冻结出
+            // 另一份启停答案；注入顺序不影响既有 profile/launcher 配置。
+            .with_plugins(plugins.clone())
             .with_profile_service(Arc::new(profiles.clone()))
             .with_launcher_installation_probe(Arc::new(
                 kerminal_infrastructure::agents::PathAgentLauncherInstallationProbe,
@@ -608,7 +619,10 @@ impl DesktopComposition {
             .with_operations(operations.as_ref().clone())
             .with_commands(commands.as_ref().clone())
             .with_profiles(profiles.clone())
-            .with_configuration_validation(configuration_validation.clone());
+            .with_configuration_validation(configuration_validation.clone())
+            // MCP 目录与请求门禁必须和桌面 UI 使用同一个冻结实例；未注入会让
+            // McpServices 认定运行门禁不可用，并在重配置冲突测试中拒绝执行。
+            .with_plugins(plugins.clone());
         let mcp_runtime: Arc<dyn McpRuntimeControl> =
             Arc::new(McpRuntimeController::with_preferences(
                 runtime.clone(),

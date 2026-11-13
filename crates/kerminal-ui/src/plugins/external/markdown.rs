@@ -1,4 +1,4 @@
-//! 插件 Markdown 只允许文本与经权限校验的链接，禁用 HTML 和图片加载。
+//! 插件 Markdown 只允许文本与合法 HTTPS 链接，禁用 HTML 和图片加载。
 //!
 //! @author kongweiguang
 
@@ -10,8 +10,6 @@ use gpui_kit::{
         markdown_ast,
     },
 };
-use kerminal_plugin_protocol::Permission;
-use std::collections::BTreeSet;
 
 struct StripUnsafe {
     block: bool,
@@ -40,19 +38,16 @@ impl MarkdownPlugin for StripUnsafe {
     }
 }
 
-/// 所有链接都经过声明权限和 HTTPS 约束；拦截器阻止 HTML 与图片被解析成资源。
-pub(super) fn render_markdown(
-    id: String,
-    text: String,
-    permissions: BTreeSet<Permission>,
-) -> AnyElement {
+/// 链接统一走 HTTPS 输入校验，不再按权限集合放行；拦截器仅保留内容渲染安全，
+/// 阻止 HTML 与图片被解析成宿主资源，这不是能力门禁。
+pub(super) fn render_markdown(id: String, text: String) -> AnyElement {
     let extensions = MarkdownExtensions::default()
         .plugin(StripUnsafe { block: false })
         .plugin(StripUnsafe { block: true });
     TextView::markdown(id, text)
         .markdown_extensions(extensions)
         .on_link_click(move |url, _, _, cx| {
-            if let Some(url) = allowed_external_url(&permissions, url) {
+            if let Some(url) = allowed_external_url(url) {
                 cx.open_url(url.as_str());
             }
         })

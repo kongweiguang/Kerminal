@@ -2,7 +2,6 @@
 //! @author kongweiguang
 
 use std::{
-    ffi::OsString,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -66,17 +65,7 @@ impl DesktopPlugins {
     ) -> AppResult<Self> {
         let root = configuration.root().to_path_buf();
         let host_types = configuration.host_types().clone();
-        let executable = std::env::current_exe()
-            .map_err(|source| AppError::infrastructure_with_source("定位脚本宿主失败", source))?;
-        let host = executable
-            .parent()
-            .ok_or_else(|| AppError::invalid("脚本宿主目录无效"))?
-            .join(if cfg!(windows) {
-                "kerminal-plugin-host.exe"
-            } else {
-                "kerminal-plugin-host"
-            });
-        let specs = process_specs(&startup, &root, &host, &locale, &theme)?;
+        let specs = process_specs(&startup, &root, &locale, &theme)?;
         let process: Arc<dyn PluginProcessPort> =
             Arc::new(ProcessSupervisor::new(specs, executor.clone())?);
         let settings = PluginSettingsService::new(
@@ -193,10 +182,7 @@ impl DesktopPlugins {
         for plugin in &self.startup.enabled {
             if matches!(
                 plugin.package.manifest.runtime,
-                RuntimeKind::Script {
-                    activation: Activation::Startup,
-                    ..
-                } | RuntimeKind::Sidecar {
+                RuntimeKind::Sidecar {
                     activation: Activation::Startup,
                     ..
                 }
@@ -253,7 +239,6 @@ impl DesktopPlugins {
 fn process_specs(
     startup: &StartupPlugins,
     root: &Path,
-    host: &Path,
     locale: &str,
     theme: &str,
 ) -> AppResult<Vec<PluginProcessSpec>> {
@@ -262,13 +247,6 @@ fn process_specs(
     for plugin in &startup.enabled {
         let (executable, arguments) = match &plugin.package.manifest.runtime {
             RuntimeKind::None { .. } => continue,
-            RuntimeKind::Script { .. } => {
-                let mut args = vec![plugin.directory.as_os_str().to_os_string()];
-                if plugin.id.as_str().starts_with("kerminal.") {
-                    args.push(OsString::from("--official"));
-                }
-                (host.to_path_buf(), args)
-            }
             RuntimeKind::Sidecar { main, .. } => (
                 plugin.directory.join(
                     main.get(&platform)

@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "revision": 11,
+  "plugins": {
+    "acme.notes": {
+      "active": "1.0.0",
+      "previous": "0.9.0",
+      "enabled": true,
+      "source": "official",
+      "installed_at": "2026-02-03T04:05:06Z"
+    }
+  },
+  "pending": [
+    {
+      "op": "install",
+      "id": "acme.discarded",
+      "to": "1.0.0",
+      "staged": "00000000-0000-4000-8000-000000000001",
+      "fingerprint": "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source": "official",
+      "installed_at": "2026-02-03T04:05:06Z"
+    },
+    {
+      "op": "update",
+      "id": "acme.update",
+      "to": "1.1.0",
+      "staged": "00000000-0000-4000-8000-000000000002",
+      "fingerprint": "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "op": "rollback",
+      "id": "acme.rollback",
+      "to": "0.9.0"
+    },
+    {
+      "op": "enable",
+      "id": "acme.notes"
+    },
+    {
+      "op": "uninstall",
+      "id": "acme.removed",
+      "operation_id": "00000000-0000-4000-8000-000000000003"
+    }
+  ],
+  "failures": {
+    "acme.discarded": "旧安装失败",
+    "acme.update": "旧更新失败",
+    "acme.notes": "旧启用失败"
+  },
+  "pending_failures": [
+    "acme.discarded",
+    "acme.update",
+    "acme.notes"
+  ],
+  "boot": null
+}

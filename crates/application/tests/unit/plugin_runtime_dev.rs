@@ -155,7 +155,7 @@ fn prepared(id: &str, declarative: bool) -> Arc<PreparedPlugin> {
     let manifest = parse_manifest(&serde_json::to_vec(&json!({
         "schema":1,"id":id,"version":"1.0.0","api":"^1.0","publisher":"acme",
         "name":{"en":"Notes"},"description":{"en":"Notes"},
-        "runtime":if declarative { json!({"kind":"none"}) } else { json!({"kind":"script","main":"main.js"}) },
+        "runtime":if declarative { json!({"kind":"none"}) } else { json!({"kind":"sidecar","main":{"windows-x86_64":"bin/app.exe","linux-x86_64":"bin/app","macos-x86_64":"bin/app"}}) },
         "views":{"editor":{"kind":"native","file":"editor.json"}}
     })).expect("json"), ManifestPolicy::ThirdParty).expect("manifest");
     Arc::new(PreparedPlugin {

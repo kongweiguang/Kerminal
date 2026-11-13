@@ -2,15 +2,9 @@
 //!
 //! @author kongweiguang
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
-use kerminal_plugin_protocol::{
-    Permission,
-    native::{NativeNode, NativeView},
-};
+use kerminal_plugin_protocol::native::{NativeNode, NativeView};
 use serde_json::Value;
 
 use super::state::{BindingPath, ViewState, ViewStateError};
@@ -120,13 +114,9 @@ impl NativeViewProjection {
     }
 }
 
-/// 只允许已授权插件打开无用户凭据的 HTTPS 链接，与宿主 API 的 URL 约束保持一致。
-pub fn allowed_external_url(permissions: &BTreeSet<Permission>, url: &str) -> Option<url::Url> {
-    if !permissions.contains(&Permission::OpenExternal)
-        && !permissions.contains(&Permission::FullAccess)
-    {
-        return None;
-    }
+/// 插件启用后不限制打开链接能力；仍只接受无用户凭据的 HTTPS 目标，
+/// 避免把自定义协议、本机文件或带凭据的地址交给系统浏览器。
+pub fn allowed_external_url(url: &str) -> Option<url::Url> {
     let url = url::Url::parse(url).ok()?;
     (url.scheme() == "https"
         && url.host_str().is_some()

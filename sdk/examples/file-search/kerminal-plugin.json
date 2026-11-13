@@ -18,10 +18,9 @@
     },
     "activation": "on-demand"
   },
-  "permissions": [],
   "contributes": {
     "tabs": [{"id": "search-tab", "title": "%search.title%", "view": "search.page", "state_version": 1}]
   },
-  "views": {"search.page": {"kind": "webview", "entry": "web/index.html", "csp": "default"}},
+  "views": {"search.page": {"kind": "webview", "entry": "web/index.html"}},
   "l10n": "l10n"
 }

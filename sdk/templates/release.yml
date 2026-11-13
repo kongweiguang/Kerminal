@@ -58,10 +58,10 @@ jobs:
                   {'platform': 'macos-x86_64', 'runner': 'macos-15-intel', 'target': 'x86_64-apple-darwin'},
                   {'platform': 'macos-aarch64', 'runner': 'macos-15', 'target': 'aarch64-apple-darwin'},
               ]
-          elif runtime in ('script', 'none'):
+          elif runtime == 'none':
               include = [{'platform': 'any', 'runner': 'ubuntu-22.04', 'target': ''}]
           else:
-              raise SystemExit('未知 runtime.kind；支持 sidecar、script 和 none')
+              raise SystemExit('未知 runtime.kind；支持 sidecar 和 none')
           repository = os.environ['SDK_REPOSITORY']
           revision = os.environ['SDK_REF']
           if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):

@@ -28,7 +28,9 @@ use kerminal_domain::{
 };
 use tokio_util::sync::CancellationToken;
 
-struct UnusedHistoryRepository;
+struct UnusedHistoryRepository {
+    calls: Arc<CatalogCalls>,
+}
 struct UnusedCommandCatalog {
     calls: Arc<CatalogCalls>,
 }
@@ -39,6 +41,8 @@ struct UnusedSuggestions;
 pub struct CatalogCalls {
     pub snippet_lists: AtomicUsize,
     pub workflow_lists: AtomicUsize,
+    /// 历史 list 计数供右栏接线测试区分“空结果成功”和“根本没有发起查询”。
+    pub history_lists: AtomicUsize,
 }
 
 /// 暴露片段目录读取次数，供宿主测试确认切换终端不重启全局目录。
@@ -46,8 +50,39 @@ pub fn empty_commands_service_with_calls(
     sessions: Arc<dyn SessionService>,
 ) -> (CommandsService, Arc<CatalogCalls>) {
     let calls = Arc::new(CatalogCalls::default());
-    let service = CommandsService::new(
-        Arc::new(UnusedHistoryRepository),
+    let service = build_commands_service(
+        Arc::new(UnusedHistoryRepository {
+            calls: calls.clone(),
+        }),
+        sessions,
+        calls.clone(),
+    );
+    (service, calls)
+}
+
+/// 注入带脚本或门控的历史仓储，同时复用隔离的空目录与会话端口。
+/// 该 support 文件会被多个 `#[path]` 测试模块编译，只有右栏接线测试使用此入口；
+/// 这里按函数单独放行未使用警告，不用模块级屏蔽掩盖其他真实问题。
+///
+/// @author kongweiguang
+#[allow(dead_code)]
+pub fn commands_service_with_history(
+    history: Arc<dyn CommandHistoryRepository>,
+    sessions: Arc<dyn SessionService>,
+) -> (CommandsService, Arc<CatalogCalls>) {
+    let calls = Arc::new(CatalogCalls::default());
+    let service = build_commands_service(history, sessions, calls.clone());
+    (service, calls)
+}
+
+/// 目录计数由调用方持有；历史仓储由不同测试按需注入。
+fn build_commands_service(
+    history: Arc<dyn CommandHistoryRepository>,
+    sessions: Arc<dyn SessionService>,
+    calls: Arc<CatalogCalls>,
+) -> CommandsService {
+    CommandsService::new(
+        history,
         Arc::new(UnusedCommandCatalog {
             calls: calls.clone(),
         }),
@@ -56,8 +91,7 @@ pub fn empty_commands_service_with_calls(
         }),
         Arc::new(UnusedSuggestions),
         sessions,
-    );
-    (service, calls)
+    )
 }
 
 #[async_trait]
@@ -67,11 +101,12 @@ impl CommandHistoryRepository for UnusedHistoryRepository {
         CommandHistoryAvailability::Available
     }
 
-    /// 空历史允许真实视图完成初始加载，其他历史写操作仍被拒绝。
+    /// 空历史允许真实视图完成初始加载，同时记录查询次数以排除零请求伪成功。
     async fn list(
         &self,
         _request: CommandHistoryListRequest,
     ) -> AppResult<Vec<CommandHistoryEntry>> {
+        self.calls.history_lists.fetch_add(1, Ordering::AcqRel);
         Ok(Vec::new())
     }
 
