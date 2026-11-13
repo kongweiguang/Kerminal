@@ -56,6 +56,8 @@ fn service() -> Arc<dyn SessionService> {
 /// 轮询 bounded engine snapshot 直到标记真实输出或在有限时间内报告失败。
 /// 交互命令已确认完成后再等终端文本；真实 PowerShell/PSReadLine 在慢速 CI 上回显可能明显晚于命令完成，
 /// 因此这里只把等待上限放宽到 45 秒，断言内容保持不变，避免把慢机时序抖动误判为失败。
+/// 超时消息附带最近一次快照尾部，便于 CI 失败时直接看到真实输出（例如编码把中文写成 `?`），
+/// 同时限制长度，避免整屏内容淹没日志。
 ///
 /// @author kongweiguang
 async fn wait_for_text(
@@ -63,7 +65,9 @@ async fn wait_for_text(
     session_id: SessionId,
     marker: &str,
 ) -> String {
-    tokio::time::timeout(Duration::from_secs(45), async {
+    // 快照要在超时后仍可读取，因此保存在 timeout future 之外；只保留文本，不复制引擎快照结构。
+    let mut last_snapshot = String::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let snapshot = service
                 .plaintext_snapshot(
@@ -79,11 +83,27 @@ async fn wait_for_text(
             if snapshot.text.contains(marker) {
                 return snapshot.text;
             }
+            last_snapshot = snapshot.text;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("terminal marker appeared before deadline")
+    .await;
+
+    match outcome {
+        Ok(text) => text,
+        Err(_) => {
+            // 按字符边界截取尾部，避免在多字节中文中间切开导致 panic 掩盖真实诊断。
+            let tail_start = last_snapshot
+                .char_indices()
+                .rev()
+                .nth(1999)
+                .map_or(0, |(index, _)| index);
+            panic!(
+                "terminal marker {marker:?} did not appear before deadline; last snapshot tail: {}",
+                &last_snapshot[tail_start..]
+            );
+        }
+    }
 }
 
 /// 在有限时间内从真实终端输出中读取后代 PID；返回值让调用测试先清理会话再断言。
@@ -874,11 +894,13 @@ async fn powershell_integration_runs_multiline_script_in_current_shell() {
     assert!(metadata.shell_integration_enabled);
     assert_eq!(metadata.shell_dialect, RemoteShellDialect::PowerShell);
 
+    // CI runner 的控制台代码页可能不是 UTF-8，[Console]::WriteLine 会把中文写成 `?`，导致 marker 永不匹配；
+    // 在真实 PowerShell 会话里显式固定控制台与管道输出编码，断言仍验证真实输出。
     let first = service.execute_shell_command(ShellCommandRequest {
         session_id: info.session_id.clone(),
         expected_ui_binding: None,
         command_id: "powershell-multiline-1".into(),
-        command: "$global:KerminalWorkflowValue = 'first ''quoted'' 世界'\nSet-Location -LiteralPath $env:TEMP\n[Console]::WriteLine(\"MULTILINE_FIRST:$global:KerminalWorkflowValue\")".into(),
+        command: "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()\n$OutputEncoding = [System.Text.UTF8Encoding]::new()\n$global:KerminalWorkflowValue = 'first ''quoted'' 世界'\nSet-Location -LiteralPath $env:TEMP\n[Console]::WriteLine(\"MULTILINE_FIRST:$global:KerminalWorkflowValue\")".into(),
         timeout: Duration::from_secs(20),
     }, tokio_util::sync::CancellationToken::new()).await.expect("execute first workflow step");
     assert_eq!(
