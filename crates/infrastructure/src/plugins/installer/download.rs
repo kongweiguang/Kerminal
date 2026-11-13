@@ -636,6 +636,9 @@ async fn ensure_single_link(file: &tokio::fs::File, metadata: &std::fs::Metadata
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        // Unix 的 nlink 已由 metadata 完整给出，句柄参数只为与 Windows 分支共用
+        // 签名；显式消费它，避免 `-D warnings` 把跨平台未用参数判成错误。
+        let _ = file;
         metadata.nlink() == 1
     }
     #[cfg(windows)]

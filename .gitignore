@@ -1,6 +1,8 @@
 # Logs
 /logs
 *.log
+# 插件布局迁移的测试夹具包含日志样本，测试会断言其存在，不能被 *.log 排除。
+!tests/fixtures/**/*.log
 
 # Build and smoke artifacts
 /target/
