@@ -1,7 +1,11 @@
 //! 双向 RPC 的帧限制、背压、取消和来源身份回归。
 //! @author kongweiguang
 
-use kerminal_infrastructure::plugins::{process, rpc, supervisor};
+// process/supervisor 只服务于 Windows 的真实进程回收用例；Unix 上无条件导入会触发
+// `-D warnings` 的 unused_imports，因此按平台收窄，rpc 仍供跨平台用例使用。
+use kerminal_infrastructure::plugins::rpc;
+#[cfg(windows)]
+use kerminal_infrastructure::plugins::{process, supervisor};
 
 use std::{
     sync::{
