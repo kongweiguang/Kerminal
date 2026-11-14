@@ -2,7 +2,12 @@
 //!
 //! @author kongweiguang
 
-use std::{io, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    io,
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::process_tree::{
     ProcessTreeGuard,
@@ -605,6 +610,33 @@ async fn send_output(
     }
 }
 
+/// 在绝对 deadline 内轮询确认直接子进程退出，不依赖平台 SIGCHLD 唤醒。
+///
+/// tokio 的 `Child::wait()` 在 Unix 上依赖子进程 reaper 的 SIGCHLD 唤醒；macOS 上该唤醒
+/// 在多线程 runtime 中可能丢失，导致 `timeout_at(deadline, wait())` 把整段清理预算耗尽并
+/// 误报 `CleanupPending`。`try_wait` 走 `waitpid(WNOHANG)`（Windows 为 `GetExitCodeProcess`），
+/// 不依赖信号投递，因此按短间隔轮询到同一 deadline：既保留原有超时语义，又让已退出的子进程
+/// 能及时被确认回收。
+/// @author kongweiguang
+async fn wait_child_until(
+    child: &mut ManagedTokioChild,
+    deadline: Instant,
+) -> AppResult<ExitStatus> {
+    const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|source| {
+            AppError::infrastructure_with_source("本机运维命令回收失败", source)
+        })? {
+            return Ok(status);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(AppError::timeout("本机命令子进程回收"));
+        }
+        sleep_until((now + REAP_POLL_INTERVAL).min(deadline)).await;
+    }
+}
+
 /// 初始化管道失败时持有 managed child 与进程树，只有明确 wait/reap 后才释放 worker permit。
 async fn retry_child_cleanup(
     child: &mut ManagedTokioChild,
@@ -621,12 +653,7 @@ async fn retry_child_cleanup(
                 .map_err(|source| {
                     AppError::infrastructure_with_source("本机命令进程树终止失败", source)
                 })?;
-            timeout_at(deadline, child.wait())
-                .await
-                .map_err(|_| AppError::timeout("本机命令子进程回收"))?
-                .map_err(|source| {
-                    AppError::infrastructure_with_source("本机运维命令回收失败", source)
-                })?;
+            wait_child_until(child, deadline).await?;
             Ok::<(), AppError>(())
         };
         match cleanup.await {
@@ -679,14 +706,7 @@ where
             })?;
     }
     if status.is_none() {
-        *status = Some(
-            timeout_at(deadline, child.wait())
-                .await
-                .map_err(|_| AppError::timeout("本机命令子进程回收"))?
-                .map_err(|source| {
-                    AppError::infrastructure_with_source("本机运维命令回收失败", source)
-                })?,
-        );
+        *status = Some(wait_child_until(child, deadline).await?);
     }
     if !*stdout_done {
         match timeout_at(deadline, drain_pipe(stdout)).await {
