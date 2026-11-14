@@ -281,7 +281,12 @@ mod windows_process {
     use crate::{process::PluginProcessSpec, supervisor::ProcessSupervisor};
     use kerminal_application::{ApplicationTaskExecutor, plugin_ports::PluginProcessPort};
     use kerminal_domain::plugins::{PluginRuntimeState, PluginVersion};
-    use std::{ffi::OsString, os::windows::process::CommandExt, path::PathBuf, process::Command};
+    use std::{
+        ffi::OsString,
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        path::PathBuf,
+        process::Command,
+    };
 
     /// 使用测试宿主已安装的 pwsh 作为真实 Sidecar，避免假造进程回收结果。
     fn powershell() -> PathBuf {
@@ -360,6 +365,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             .expect("action");
         assert_eq!(response["ok"], true);
         let pid = std::fs::read_to_string(root.path().join("data/child.pid")).expect("child pid");
+        // 关闭前固定孙进程身份；关闭后按 PID 查询会被系统复用出的新进程误判。
+        let watch = ProcessWatch::open(&pid).expect("open child process watch");
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(6))
             .await
@@ -368,16 +375,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             supervisor.state(&id).expect("state"),
             PluginRuntimeState::Idle
         );
-        let check = format!(
-            "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}",
-            pid.trim()
-        );
-        let status = Command::new(powershell())
-            .creation_flags(0x08000000)
-            .args(["-NoProfile", "-NonInteractive", "-Command", &check])
-            .status()
-            .expect("check child");
-        assert!(status.success(), "child process remained after shutdown");
+        assert_reaped(watch);
     }
 
     #[tokio::test]
@@ -438,11 +436,17 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
 
     /// 只等待夹具主动写入的 PID 文件，避免用固定延时猜测握手是否开始。
+    ///
+    /// `WriteAllText` 会先创建空文件再写入，负载高时读取方可能看到空内容；
+    /// 只有解析成正整数才算发布完成，否则继续轮询。
     async fn wait_for_pid(root: &std::path::Path) -> String {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if let Ok(pid) = tokio::fs::read_to_string(root.join("data/self.pid")).await {
-                    return pid;
+                    let pid = pid.trim();
+                    if !pid.is_empty() && pid.parse::<u32>().is_ok() {
+                        return pid.to_owned();
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -451,11 +455,90 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         .expect("fixture pid")
     }
 
-    /// 按系统进程表确认直接进程已消失，关闭回执不能替代实际回收。
-    fn assert_reaped(pid: &str) {
+    /// 关闭前固定目标进程身份：持有同步句柄后，关闭后等待的是原进程本身，
+    /// 同时阻止 PID 在断言期间被系统复用给无关进程。
+    ///
+    /// CI 并行负载下，夹具退出后 PID 会立刻被新的 pwsh/conhost 复用；只按 PID 查询
+    /// 会把无关进程误判为未回收。句柄等待一旦进程退出就立即返回，不会放宽
+    /// “关闭后必须真实回收”的语义：进程仍存活时等待超时，测试照样失败。
+    struct ProcessWatch {
+        pid: String,
+        handle: std::os::windows::io::OwnedHandle,
+    }
+
+    impl ProcessWatch {
+        /// 进程已提前消失时返回 None；夹具会睡眠 60 秒，提前消失只可能是已被回收。
+        fn open(pid: &str) -> std::io::Result<Option<Self>> {
+            use std::os::windows::io::{FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+            let pid = pid.trim();
+            let process_id = pid.parse::<u32>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("fixture PID is not numeric: {error}"),
+                )
+            })?;
+            // SAFETY: OpenProcess only requests wait access for a PID published by this test.
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+            if raw.is_null() {
+                // SAFETY: GetLastError reads the thread-local error from the preceding call.
+                let error = unsafe { GetLastError() };
+                if error == ERROR_INVALID_PARAMETER {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::from_raw_os_error(error as i32));
+            }
+            // SAFETY: successful OpenProcess returned one owned handle, adopted exactly once.
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+            Ok(Some(Self {
+                pid: pid.to_owned(),
+                handle,
+            }))
+        }
+
+        /// 有界等待该精确进程退出；进程一退出立即返回，只有超时才判定为仍未回收。
+        fn wait_for_exit(&self, timeout: Duration) -> std::io::Result<bool> {
+            use windows_sys::Win32::Foundation::{GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+            // SAFETY: the handle is owned by this value and remains valid for the call.
+            let result = unsafe {
+                WaitForSingleObject(
+                    self.handle.as_raw_handle() as _,
+                    timeout.as_millis().min(u128::from(u32::MAX)) as u32,
+                )
+            };
+            if result == WAIT_OBJECT_0 {
+                Ok(true)
+            } else if result == WAIT_TIMEOUT {
+                Ok(false)
+            } else {
+                // SAFETY: GetLastError reports the unexpected wait result from this thread.
+                Err(std::io::Error::from_raw_os_error(
+                    unsafe { GetLastError() } as i32
+                ))
+            }
+        }
+    }
+
+    /// 关闭后必须确认原进程真实退出，关闭回执不能替代实际回收。
+    ///
+    /// 句柄仍持有期间 PID 不会被复用，此时再查进程表才能确认该 PID 已不可见。
+    fn assert_reaped(watch: Option<ProcessWatch>) {
+        let Some(watch) = watch else {
+            return;
+        };
+        assert!(
+            watch
+                .wait_for_exit(Duration::from_secs(5))
+                .expect("wait for fixture process"),
+            "fixture process remained after shutdown"
+        );
         let check = format!(
             "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}",
-            pid.trim()
+            watch.pid
         );
         let status = Command::new(powershell())
             .creation_flags(0x08000000)
@@ -488,11 +571,12 @@ Start-Sleep -Seconds 60
                 .is_err()
         );
         let pid = wait_for_pid(root.path()).await;
+        let watch = ProcessWatch::open(&pid).expect("open fixture process watch");
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(6))
             .await
             .expect("reap failed handshake");
-        assert_reaped(&pid);
+        assert_reaped(watch);
     }
 
     #[tokio::test]
@@ -518,12 +602,13 @@ Start-Sleep -Seconds 60
                 .await
         });
         let pid = wait_for_pid(root.path()).await;
+        let watch = ProcessWatch::open(&pid).expect("open fixture process watch");
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(6))
             .await
             .expect("shutdown during handshake");
         assert!(activation.await.expect("activation task").is_err());
-        assert_reaped(&pid);
+        assert_reaped(watch);
     }
 
     #[tokio::test]
