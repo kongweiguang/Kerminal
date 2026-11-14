@@ -1723,7 +1723,9 @@ async fn run_continuity_agent_session(
     // 第二个受控阶段只证明后台 PTY 能再次响应同一触发文件；这是有界的两阶段验证，
     // 不把两次成功夸大为“无限持续输出”。模板每次消费触发文件后都会再输出一个 stage 标记。
     publish_continuity_stage(services, stage_path).await?;
-    let hidden_text = wait_for_hidden_stage_count(
+    // 第二次调用只验证后台 PTY 能再次响应同一触发文件，输出内容已由上一阶段断言覆盖；
+    // 超时或读取失败仍由函数内部返回错误，因此这里丢弃返回值是安全的。
+    let _hidden_text = wait_for_hidden_stage_count(
         cx,
         services,
         &agent_session_id,
@@ -2184,7 +2186,8 @@ async fn verify_same_tab_second_pane(
     // 重试，期限已到或其它错误必须失败，不能把“读不到”推断成已关闭。
     let convergence_deadline = Instant::now() + super::PANEL_FRAME_TIMEOUT;
     let mut last_registry: Option<ContinuitySessionIdentity> = None;
-    let mut last_removal: Result<(), String> = Ok(());
+    // 不预置成功值：只有轮询真正执行过才有“最近一次”结果，避免把未观测当成已收敛。
+    let mut last_removal: Option<Result<(), String>>;
     let a2_closed_lifecycle = loop {
         let registry = read_continuity_session_identity(services, &a2_session).await;
         let deadline_reached = Instant::now() >= convergence_deadline;
@@ -2204,7 +2207,7 @@ async fn verify_same_tab_second_pane(
             .is_some_and(|registry| registry.lifecycle == SessionLifecycle::Closed);
         let panes_converged = panes == vec![(a1_pane.clone(), a1_session.clone())];
         last_registry = registry.or(last_registry);
-        last_removal = removal.clone();
+        last_removal = Some(removal.clone());
         if registry_converged && removal.is_ok() && panes_converged {
             break SessionLifecycle::Closed;
         }

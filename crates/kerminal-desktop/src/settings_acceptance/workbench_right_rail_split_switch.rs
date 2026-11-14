@@ -1763,6 +1763,10 @@ async fn capture_switch(
                     ))
                     .into());
                 }
+                // `settled_frame` 随后会被移入 TransitionEvidence，而 settled_hash 借用它的
+                // 区域快照；必须在 move 前把比较结果固化成布尔值，否则构造结构体后再次比较
+                // 会因借用已失效而无法通过编译。
+                let target_hash_changed = source_hash != settled_hash;
                 let first_hash = region_sha256(&first_sample.regions, "logsList")?;
                 let mut intermediate_frame_count = 0_usize;
                 let mut first_intermediate_elapsed_ms = None;
@@ -1825,7 +1829,7 @@ async fn capture_switch(
                     } else {
                         NO_INTERMEDIATE_LIMITATION
                     },
-                    target_hash_changed: source_hash != settled_hash,
+                    target_hash_changed,
                     fixed_geometry_stable: true,
                     data_transition_passed: true,
                 });
