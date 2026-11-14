@@ -310,7 +310,10 @@ fn open_view(ctx: &Ctx, params: &Value) -> RpcResult {
         .get("state")
         .and_then(|state| state.get("text"))
         .and_then(Value::as_str);
-    let text = note_text(restored.or(saved_text.as_deref()));
+    // 实例快照优先；没有宿主附带状态时才回退到已截断的持久化文本，避免重复截断丢失来源。
+    let text = restored
+        .map(|value| note_text(Some(value)))
+        .unwrap_or_else(|| saved_text.clone());
     ctx.shared
         .instances
         .lock()
@@ -329,7 +332,7 @@ fn open_view(ctx: &Ctx, params: &Value) -> RpcResult {
             .get("showPreview")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        Ok(json!({"data":{"saved":saved_text.unwrap_or_default(),"showPreview":show_preview}}))
+        Ok(json!({"data":{"saved":saved_text,"showPreview":show_preview}}))
     } else {
         Ok(json!({"data":{"text":text}}))
     }
@@ -343,11 +346,12 @@ fn action(ctx: &Ctx, params: &Value) -> RpcResult {
         .and_then(Value::as_str)
         .ok_or_else(|| (-32602, "action required".into()))?
         .to_owned();
-    let text = params
+    // 局部变量不能与文案函数 text 同名，否则后续 toast 调用会被遮蔽成非函数值。
+    let draft_text = params
         .get("data")
         .and_then(|data| data.get("text"))
         .and_then(Value::as_str)
-        .map(note_text);
+        .map(|value| note_text(Some(value)));
     let session = {
         let mut instances = ctx
             .shared
@@ -357,7 +361,7 @@ fn action(ctx: &Ctx, params: &Value) -> RpcResult {
         let session = instances
             .get_mut(&instance)
             .ok_or_else(|| (-32004, "stale instance".into()))?;
-        if let Some(text) = text {
+        if let Some(text) = draft_text {
             session.text = text;
         }
         session.clone()
@@ -431,7 +435,7 @@ fn snapshot(ctx: &Ctx, params: &Value, close: bool) -> RpcResult {
         .get("data")
         .and_then(|data| data.get("text"))
         .and_then(Value::as_str)
-        .map(note_text);
+        .map(|value| note_text(Some(value)));
     let mut instances = ctx
         .shared
         .instances
