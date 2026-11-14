@@ -3,7 +3,16 @@
 //! 该模块已由 `process_tree.rs` 注册，运维命令和 RDP 连接共用同一 spawn wrapper。
 //! @author kongweiguang
 
-use std::{future::Future, io, pin::Pin, process::ExitStatus};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    process::ExitStatus,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 /// 子进程平台选项；Windows 创建标志必须经 process-wrap wrapper 合并，不能直接写回 Command。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -18,6 +27,12 @@ pub(crate) struct ProcessSpawnOptions {
 pub(crate) struct ManagedTokioChild {
     inner: Box<dyn process_wrap::tokio::ChildWrapper>,
     kill_on_drop: bool,
+    /// 是否已确认直接子进程被回收；Drop 只在尚未确认时补发终止。
+    ///
+    /// 用 `Arc` 而非普通 bool，是因为 `wait()` 返回借用式 future，需要在 future
+    /// 完成后从外部写入该标志；确认回收后再次 killpg 可能命中已被复用的 pgid，
+    /// 误杀属于其它进程组的进程。
+    reaped: Arc<AtomicBool>,
 }
 
 /// Drop 必须先让 wrapper 终止整个进程组或 Job，再交给字段析构。
@@ -25,10 +40,11 @@ pub(crate) struct ManagedTokioChild {
 /// process-wrap 的 `KillOnDrop` 只是把 `kill_on_drop` 写进 Tokio Command；Tokio 在 Child
 /// 析构时仅向直接子进程发信号。Unix 上直接子进程是进程组组长，孙进程仍留在组内继续运行，
 /// 会逃过回收并占住继承的管道；Windows 上 Job 句柄关闭虽会兜底，但显式终止能让回收时机确定。
-/// Drop 无法传播错误，进程组已消失（ESRCH）或 Job 已空都属于正常情况。
+/// 只有在尚未确认回收时才补发终止：组长已退出后 pgid 可能被系统复用，再次 killpg 会误杀
+/// 无关进程组。Drop 无法传播错误，进程组已消失（ESRCH）或 Job 已空都属于正常情况。
 impl Drop for ManagedTokioChild {
     fn drop(&mut self) {
-        if self.kill_on_drop {
+        if self.kill_on_drop && !self.reaped.load(Ordering::Acquire) {
             let _ = self.inner.start_kill();
         }
     }
@@ -50,6 +66,7 @@ impl super::ProcessTreeGuard {
             wrapped.spawn().map(|inner| ManagedTokioChild {
                 inner,
                 kill_on_drop: options.kill_on_drop,
+                reaped: Arc::new(AtomicBool::new(false)),
             })
         }
         #[cfg(windows)]
@@ -74,6 +91,7 @@ impl super::ProcessTreeGuard {
             wrapped.spawn().map(|inner| ManagedTokioChild {
                 inner,
                 kill_on_drop: options.kill_on_drop,
+                reaped: Arc::new(AtomicBool::new(false)),
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -106,15 +124,30 @@ impl ManagedTokioChild {
     }
 
     /// 查看直接 child 的退出状态，不消费拥有 Job/process group 的 wrapper。
+    ///
+    /// 一旦观察到退出状态就记录“已确认回收”，避免后续 Drop 对可能被复用的 pgid 再次 killpg。
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.inner.try_wait()
+        let status = self.inner.try_wait()?;
+        if status.is_some() {
+            self.reaped.store(true, Ordering::Release);
+        }
+        Ok(status)
     }
 
     /// 返回借用式 wait future；deadline 超时只丢 future，调用方仍持有 child 可重试清理。
+    ///
+    /// future 成功返回后写入“已确认回收”标志；Drop 需要看到该标志才能跳过重复终止。
     pub(crate) fn wait(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
-        self.inner.wait()
+        let reaped = Arc::clone(&self.reaped);
+        Box::pin(async move {
+            let result = self.inner.wait().await;
+            if result.is_ok() {
+                reaped.store(true, Ordering::Release);
+            }
+            result
+        })
     }
 
     /// Windows Job 的立即终止路径；调用方仍须在原 deadline 内 wait/reap。
@@ -125,24 +158,29 @@ impl ManagedTokioChild {
     }
 
     /// Unix 先向进程组发送 HUP，再在 deadline 内等待原有宽限期并 KILL；Windows 直接终止 Job。
+    ///
+    /// 成功发出终止后记录“已确认回收”：进程组已收到 SIGKILL，Drop 再补一次 killpg 没有收益，
+    /// 反而可能命中已被复用的 pgid。失败时保留标志为 false，让 Drop 仍能兜底。
     pub(crate) async fn terminate_tree_until(
         &mut self,
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
         #[cfg(unix)]
-        {
-            terminate_tokio_process_group(&mut *self.inner, deadline).await
-        }
+        let result = terminate_tokio_process_group(&mut *self.inner, deadline).await;
         #[cfg(windows)]
-        {
+        let result = {
             let _ = deadline;
             self.start_kill_tree()
-        }
+        };
         #[cfg(not(any(unix, windows)))]
-        {
+        let result = {
             let _ = deadline;
             Err(unsupported_platform())
+        };
+        if result.is_ok() {
+            self.reaped.store(true, Ordering::Release);
         }
+        result
     }
 }
 
