@@ -1234,7 +1234,7 @@ fn commit_state(plugins: &Path, journal_value: &PluginMigrationJournal) -> AppRe
     match read_bounded_regular(&stage, MAX_STATE_BYTES)? {
         Some(existing) if journal::sha256(&existing) == journal_value.target_state_sha256 => {}
         Some(_) => return Err(AppError::conflict("插件状态 staging 与 journal 不一致")),
-        None => journal::write_new_file(&stage, &bytes)?,
+        None => journal::write_new_file(plugins, &stage, &bytes)?,
     }
     // 状态 staging 位于操作目录而目标在插件根；MoveStagedNoReplace 允许跨父目录且先同步内容。
     match commit_staged_file(&stage, &target, CommitMode::MoveStagedNoReplace) {
@@ -1415,7 +1415,7 @@ fn write_journal(
     if bytes.len() as u64 > MAX_JOURNAL_BYTES {
         return Err(AppError::conflict("插件迁移 journal 超过限额"));
     }
-    journal::write_new_file(&stage, &bytes)?;
+    journal::write_new_file(plugins, &stage, &bytes)?;
     let mode = if create {
         CommitMode::CreateNew
     } else {

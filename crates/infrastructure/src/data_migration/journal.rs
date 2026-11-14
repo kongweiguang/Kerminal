@@ -165,7 +165,7 @@ pub(super) fn archive_committed_journal(root: &Path, journal: &MigrationJournal)
     let stage = directory.join(format!(".committed-{}.tmp", Uuid::new_v4().simple()));
     let bytes = serde_json::to_vec(journal)
         .map_err(|_| AppError::infrastructure("编码迁移完成收据失败"))?;
-    if let Err(error) = write_new_file(&stage, &bytes) {
+    if let Err(error) = write_new_file(root, &stage, &bytes) {
         remove_owned_stage(&stage);
         return Err(error);
     }
@@ -288,7 +288,7 @@ fn write_journal_with_commit(
     let stage = directory.join(format!(".active-{}.tmp", Uuid::new_v4().simple()));
     let bytes = serde_json::to_vec(journal)
         .map_err(|_| AppError::infrastructure("编码迁移 journal 失败"))?;
-    if let Err(error) = write_new_file(&stage, &bytes) {
+    if let Err(error) = write_new_file(root, &stage, &bytes) {
         remove_owned_stage(&stage);
         return Err(error);
     }
@@ -472,8 +472,11 @@ pub(super) fn sha256(bytes: &[u8]) -> String {
 }
 
 /// 以独占方式创建 journal、staging 或备份文件，并同步其内容后才返回。
-pub(super) fn write_new_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    ensure_parent_directories(path)?;
+///
+/// 受信根必须由调用方传入：链接检查只覆盖根以下分量，根之上的系统路径
+/// （如 macOS 的 `/var` 指向 `/private/var`）不归应用控制，逐级检查会误伤所有迁移写入。
+pub(super) fn write_new_file(root: &Path, path: &Path, bytes: &[u8]) -> AppResult<()> {
+    ensure_parent_directories(root, path)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     crate::vault::profile_migration::private_creation_mode(&mut options);
@@ -511,30 +514,31 @@ pub(super) fn ensure_directory(root: &Path, directory: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 创建不越过根目录的父目录链，便于测试和事务 staging 复用同一链接保护。
-fn ensure_parent_directories(file: &Path) -> AppResult<()> {
+/// 从受信根开始创建父目录链，只拒绝根以下的链接，避免 staging 被重定向到数据根之外。
+///
+/// 根之上的系统路径可能天然包含链接（macOS 的 `/var` 即指向 `/private/var`），
+/// 这些分量在应用权限之外且不会把写入引出数据根，因此不再逐级检查；
+/// 根以下的分量仍必须是真实目录，否则链接目标可能落在数据根之外，必须拒绝。
+fn ensure_parent_directories(root: &Path, file: &Path) -> AppResult<()> {
     let parent = file
         .parent()
         .ok_or_else(|| AppError::invalid("迁移文件没有父目录"))?;
-    let mut current = PathBuf::new();
-    for component in parent.components() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::Normal(part) => {
-                current.push(part);
-                match fs::symlink_metadata(&current) {
-                    Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
-                    Ok(_) => return Err(AppError::conflict("迁移文件父目录包含链接或非目录项")),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        fs::create_dir(&current)
-                            .map_err(|source| io_error("创建迁移目录失败", source))?;
-                    }
-                    Err(source) => return Err(io_error("检查迁移目录失败", source)),
-                }
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| AppError::conflict("迁移文件越过数据根"))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(AppError::conflict("迁移文件父目录路径无效"));
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+            Ok(_) => return Err(AppError::conflict("迁移文件父目录包含链接或非目录项")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|source| io_error("创建迁移目录失败", source))?;
             }
-            Component::CurDir => {}
-            Component::ParentDir => return Err(AppError::conflict("迁移文件父目录路径无效")),
+            Err(source) => return Err(io_error("检查迁移目录失败", source)),
         }
     }
     Ok(())

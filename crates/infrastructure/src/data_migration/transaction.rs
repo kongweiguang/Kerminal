@@ -450,10 +450,10 @@ fn prepare_file_journal(
         }
         ensure_file_state(root, &entry, false)?;
         let stage = staged_path(&operation_dir, &entry.relative_path)?;
-        journal::write_new_file(&stage, &edit.after)?;
+        journal::write_new_file(root, &stage, &edit.after)?;
         if let Some(before) = edit.before.as_deref() {
             let backup = backup_path(&operation_dir, &entry.relative_path)?;
-            journal::write_new_file(&backup, before)?;
+            journal::write_new_file(root, &backup, before)?;
         }
         entries.push(entry);
     }

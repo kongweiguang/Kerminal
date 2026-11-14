@@ -75,7 +75,8 @@ fn migration_staging_protects_long_relative_paths() {
         .expect("读取测试工作目录")
         .join(&path);
     assert!(absolute.as_os_str().len() > 260);
-    journal::write_new_file(&path, b"isolated test data").expect("长路径文件可建立私有 ACL");
+    journal::write_new_file(Path::new("."), &path, b"isolated test data")
+        .expect("长路径文件可建立私有 ACL");
     assert_eq!(
         fs::read(&path).expect("已保护文件可读"),
         b"isolated test data"

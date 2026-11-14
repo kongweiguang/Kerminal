@@ -216,3 +216,35 @@ fn legacy_forward_source_must_be_a_noop_cas_entry() {
     journal.files[0].after_sha256 = sha256(b"rewritten summary");
     assert!(!validate_journal(&journal));
 }
+
+/// macOS 的临时目录位于 `/var`（指向 `/private/var`）之下，根之上的系统链接不能阻断迁移；
+/// 根内的链接仍必须拒绝，否则 staging 会被重定向到数据根之外，同时越根路径也要拒绝。
+#[cfg(unix)]
+#[test]
+fn trusted_root_allows_links_above_it_but_rejects_links_inside_and_paths_outside() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::tempdir().expect("创建隔离容器");
+    let real = container.path().join("real");
+    fs::create_dir_all(real.join("root")).expect("创建真实数据根");
+    let linked = container.path().join("linked");
+    symlink(&real, &linked).expect("模拟 /var 这类根之上的系统链接");
+    let root = linked.join("root");
+
+    let file = root.join("staged").join("value.bin");
+    write_new_file(&root, &file, b"migrated").expect("根之上的链接不应阻断写入");
+    assert_eq!(
+        fs::read(real.join("root/staged/value.bin")).expect("写入落在真实数据根"),
+        b"migrated"
+    );
+
+    let outside = container.path().join("outside");
+    fs::create_dir(&outside).expect("创建根外目录");
+    let escape = real.join("root").join("escape");
+    symlink(&outside, &escape).expect("在数据根内创建链接");
+    assert!(write_new_file(&root, &escape.join("value.bin"), b"escaped").is_err());
+    assert!(!outside.join("value.bin").exists());
+
+    assert!(write_new_file(&root, &outside.join("value.bin"), b"outside").is_err());
+    assert!(!outside.join("value.bin").exists());
+}
