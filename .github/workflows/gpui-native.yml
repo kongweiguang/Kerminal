@@ -21,9 +21,9 @@ jobs:
   native:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    # macOS 全量构建与测试（含 WebView 探针）耗时明显长于其他平台，
-    # 90 分钟会在测试接近完成时被取消，因此保留更长的窗口。
-    timeout-minutes: 150
+    # macOS 全量构建与测试（含 WebView 探针）耗时明显长于其他平台：150 分钟窗口
+    # 仍会在测试接近完成时被取消，GitHub 的 Intel runner 尤其慢，因此放宽到 300 分钟。
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 2
