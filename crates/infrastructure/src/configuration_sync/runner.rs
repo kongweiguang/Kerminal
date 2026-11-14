@@ -29,6 +29,13 @@ use super::git::{GitCommandError, GitOutput, classify_failure};
 
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(super) const INITIAL_CLEANUP_BUDGET: Duration = Duration::from_secs(1);
+/// 清理重试的绝对上限；取固定天花板与命令预算中较小者。
+///
+/// macOS 上清理确认依赖的 SIGCHLD 唤醒可能丢失，整段清理预算被耗尽后只会发布
+/// `CleanupPending`。若此时继续无限等待 retry 信号，阻塞 worker 会永久占住仓库 gate
+/// （CI 曾因此挂起数小时）。给等待本身设上限后，调用方能在有限时间内看到明确超时，
+/// 同时保留 `PendingCleanup` 状态，让后续 `begin_operation` 仍可提交新期限回收同一 worker。
+const GIT_CLEANUP_CEILING: Duration = Duration::from_secs(30);
 const MAX_GIT_STDOUT_BYTES: usize = 64 * 1024 * 1024;
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 
@@ -482,6 +489,11 @@ impl GitCommandRuntime {
     }
 
     /// 先尝试短清理预算；超时后让调用方看见 PendingBusy，同时保留 stream 等待未来 deadline。
+    ///
+    /// 等待 retry 信号本身必须有绝对上限：清理确认可能因为平台唤醒丢失而永远不完成，
+    /// 无限等待会让整个阻塞 worker 连同仓库 gate 一起卡死，调用方连超时错误都拿不到。
+    /// 超时只结束本次等待并保留 `PendingCleanup`，后续 `begin_operation` 仍会唤醒同一 worker。
+    /// @author kongweiguang
     async fn close_with_retry(
         &self,
         stream: &mut OperationsCommandStream,
@@ -493,6 +505,7 @@ impl GitCommandRuntime {
             return Ok(());
         }
         self.state.send_replace(GitWorkerState::PendingCleanup);
+        let ceiling = tokio::time::Instant::now() + GIT_CLEANUP_CEILING.min(self.command_timeout);
         let mut last_generation = retry_generation;
         loop {
             if let Some(request) = *retry.borrow_and_update()
@@ -504,11 +517,21 @@ impl GitCommandRuntime {
                     return Ok(());
                 }
             }
-            retry.changed().await.map_err(|_| {
-                GitCommandError::Executor(kerminal_application::AppError::infrastructure(
-                    "Git 清理 deadline 订阅已关闭",
-                ))
-            })?;
+            match timeout_at(ceiling, retry.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(GitCommandError::Executor(
+                        kerminal_application::AppError::infrastructure(
+                            "Git 清理 deadline 订阅已关闭",
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    return Err(GitCommandError::Executor(
+                        kerminal_application::AppError::timeout("Git 清理重试等待"),
+                    ));
+                }
+            }
         }
     }
 
