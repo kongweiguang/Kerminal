@@ -764,6 +764,80 @@ fn cleanup_pending_with_inflight_eof_releases_writer_before_retry() {
     worker.join().expect("Git runner 管理线程应正常返回");
 }
 
+/// 清理永远不确认时，runner 必须在清理天花板的绝对期限内返回超时，而不是无限等待 retry。
+///
+/// macOS 的 SIGCHLD 唤醒丢失会让清理预算整段耗尽并持续发布 PendingCleanup；旧实现在
+/// `retry.changed().await` 上永久挂起，CI 因此卡住数小时。这里用永不确认的 fixture 把
+/// 命令预算压到 1 秒（清理天花板取固定值与命令预算的较小者），锁住“有界失败并保留
+/// PendingCleanup”的行为：超时只结束本次等待，后续 begin_operation 仍能回收同一 worker。
+/// @author kongweiguang
+#[test]
+fn cleanup_ceiling_returns_timeout_instead_of_waiting_forever() {
+    let root = TestRoot::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("创建隔离 runner runtime");
+    let execution_starts = Arc::new(AtomicUsize::new(0));
+    let executor: Arc<dyn OperationsCommandExecutor> = Arc::new(PendingCleanupExecutor {
+        starts: execution_starts.clone(),
+        pending_after_eof: None,
+    });
+    let runner = Arc::new(GitCommandRuntime::with_configuration(
+        executor,
+        runtime.handle().clone(),
+        "fake-git-with-stuck-cleanup".to_owned(),
+        BTreeMap::new(),
+        Duration::from_secs(1),
+        1024,
+    ));
+    let thread_runner = runner.clone();
+    let working_directory = root.path().to_path_buf();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = run_fake_git(
+            &thread_runner,
+            &working_directory,
+            "unused",
+            &CancellationToken::new(),
+        );
+        let _ = result_sender.send(result);
+    });
+
+    assert!(
+        wait_for_worker_state(
+            &runner,
+            GitWorkerState::PendingCleanup,
+            Duration::from_secs(4),
+        ),
+        "清理未确认时应先发布 PendingCleanup，实际状态: {:?}",
+        runner.state(),
+    );
+    let result = result_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("清理等待必须有绝对上限，不能在 retry 信号上永久挂起");
+    assert!(
+        matches!(
+            &result,
+            Err(GitCommandError::Executor(error))
+                if error.public_code() == PublicErrorCode::Timeout
+        ),
+        "清理天花板到期应返回明确超时: {result:?}"
+    );
+    assert_eq!(
+        runner.state(),
+        GitWorkerState::PendingCleanup,
+        "超时只结束本次等待，后续 begin_operation 仍需看到 PendingCleanup 才能回收同一 worker",
+    );
+    assert_eq!(
+        execution_starts.load(Ordering::Acquire),
+        1,
+        "清理等待超时不能启动第二条 Git 命令",
+    );
+    worker.join().expect("Git runner 管理线程应正常返回");
+}
+
 /// 真实 Git runner 收到 exit 0 但 stdin EOF 未确认时只能返回未知，并保留有界回执且不重跑。
 #[test]
 fn commit_with_unconfirmed_stdin_exit_zero_keeps_receipt_without_replay() {
