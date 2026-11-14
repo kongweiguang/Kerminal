@@ -64,6 +64,22 @@ function conditionalType(schema, inheritedProperties) {
   return "JsonValue";
 }
 
+/**
+ * 仅描述字符串运行时规则的 not 视为纯值约束：类型层无法表达否定模式，
+ * 交给协议校验器执行；其余 not 形态仍走显式拒绝，避免放宽整体严格性。
+ */
+function isRuntimeValueNot(notSchema) {
+  if (!notSchema || typeof notSchema !== "object" || Array.isArray(notSchema)) return false;
+  const keys = Object.keys(notSchema);
+  if (keys.length === 1 && keys[0] === "pattern") return typeof notSchema.pattern === "string";
+  if (keys.length === 1 && keys[0] === "anyOf") {
+    return Array.isArray(notSchema.anyOf) && notSchema.anyOf.length > 0
+      && notSchema.anyOf.every((item) => item && typeof item === "object" && !Array.isArray(item)
+        && Object.keys(item).length === 1 && typeof item.pattern === "string");
+  }
+  return false;
+}
+
 /** 保留对象的必填字段与 x- 扩展键；值约束仍由协议校验器执行。 */
 function objectType(schema, inheritedProperties) {
   const properties = schema.properties ?? {};
@@ -77,11 +93,15 @@ function objectType(schema, inheritedProperties) {
     fields.push(`${JSON.stringify(name)}${required.has(name) ? "" : "?"}: ${typeOfSchema(property)};`);
   }
   if (schema.not !== undefined) {
-    const excluded = schema.not.required;
-    if (Object.keys(schema.not).length !== 1 || !Array.isArray(excluded) || excluded.length !== 1) {
-      throw new Error("不支持的 Schema not 约束");
+    if (isRuntimeValueNot(schema.not)) {
+      // 纯值约束不影响对象形状，忽略而不是拒绝；运行时校验仍会拦截非法值。
+    } else {
+      const excluded = schema.not.required;
+      if (Object.keys(schema.not).length !== 1 || !Array.isArray(excluded) || excluded.length !== 1) {
+        throw new Error("不支持的 Schema not 约束");
+      }
+      fields.push(`${JSON.stringify(excluded[0])}?: never;`);
     }
-    fields.push(`${JSON.stringify(excluded[0])}?: never;`);
   }
   if (schema.patternProperties !== undefined) {
     const entries = Object.entries(schema.patternProperties);
@@ -109,8 +129,9 @@ function typeOfSchema(schema, inheritedProperties = {}) {
     }
     return conditionalType(schema, inheritedProperties);
   }
-  if (schema.not && Object.keys(schema).length === 1 && typeof schema.not.pattern === "string"
-      && Object.keys(schema.not).length === 1) return "JsonValue";
+  if (schema.not !== undefined && Object.keys(schema).length === 1 && isRuntimeValueNot(schema.not)) {
+    return "JsonValue";
+  }
   if (schema.contains !== undefined) throw new Error("contains 只支持在条件谓词中使用");
   if (schema.$ref !== undefined) {
     const match = /^#\/\$defs\/([A-Za-z_$][\w$]*)$/.exec(schema.$ref);
@@ -139,7 +160,8 @@ function typeOfSchema(schema, inheritedProperties = {}) {
     } else {
       parts.push(`Array<${item}>`);
     }
-  } else if (schema.type === "object" || schema.properties || schema.required || schema.not) {
+  } else if (schema.type === "object" || schema.properties || schema.required
+      || (schema.not !== undefined && !isRuntimeValueNot(schema.not))) {
     parts.push(objectType(schema, inheritedProperties));
   } else if (schema.type !== undefined) {
     throw new Error(`不支持的 Schema 类型: ${schema.type}`);
