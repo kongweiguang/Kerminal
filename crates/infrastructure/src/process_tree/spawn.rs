@@ -17,6 +17,21 @@ pub(crate) struct ProcessSpawnOptions {
 /// 拥有 Tokio child 和平台进程树 wrapper 的单一回收句柄。
 pub(crate) struct ManagedTokioChild {
     inner: Box<dyn process_wrap::tokio::ChildWrapper>,
+    kill_on_drop: bool,
+}
+
+/// Drop 必须先让 wrapper 终止整个进程组或 Job，再交给字段析构。
+///
+/// process-wrap 的 `KillOnDrop` 只是把 `kill_on_drop` 写进 Tokio Command；Tokio 在 Child
+/// 析构时仅向直接子进程发信号。Unix 上直接子进程是进程组组长，孙进程仍留在组内继续运行，
+/// 会逃过回收并占住继承的管道；Windows 上 Job 句柄关闭虽会兜底，但显式终止能让回收时机确定。
+/// Drop 无法传播错误，进程组已消失（ESRCH）或 Job 已空都属于正常情况。
+impl Drop for ManagedTokioChild {
+    fn drop(&mut self) {
+        if self.kill_on_drop {
+            let _ = self.inner.start_kill();
+        }
+    }
 }
 
 impl super::ProcessTreeGuard {
@@ -32,7 +47,10 @@ impl super::ProcessTreeGuard {
             if options.kill_on_drop {
                 wrapped.wrap(process_wrap::tokio::KillOnDrop);
             }
-            wrapped.spawn().map(|inner| ManagedTokioChild { inner })
+            wrapped.spawn().map(|inner| ManagedTokioChild {
+                inner,
+                kill_on_drop: options.kill_on_drop,
+            })
         }
         #[cfg(windows)]
         {
@@ -53,7 +71,10 @@ impl super::ProcessTreeGuard {
             if options.kill_on_drop {
                 wrapped.wrap(process_wrap::tokio::KillOnDrop);
             }
-            wrapped.spawn().map(|inner| ManagedTokioChild { inner })
+            wrapped.spawn().map(|inner| ManagedTokioChild {
+                inner,
+                kill_on_drop: options.kill_on_drop,
+            })
         }
         #[cfg(not(any(unix, windows)))]
         {
