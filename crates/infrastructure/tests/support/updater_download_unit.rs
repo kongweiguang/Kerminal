@@ -230,7 +230,9 @@ async fn cancels_while_waiting_for_next_body_chunk() {
     .await;
     let cancellation = CancellationToken::new();
     let (download_task, mut progress) = start_download(url, cancellation.clone(), 16);
-    tokio::time::timeout(Duration::from_millis(300), async {
+    // 这里只是等本地 TLS 握手和首块到达，属于环境准备，不参与取消语义断言；
+    // 高负载 CI runner 上 300ms 不足以完成连接，放宽到 5s 避免偶发误报。
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if progress.borrow_and_update().received_bytes > 0 {
                 break;
