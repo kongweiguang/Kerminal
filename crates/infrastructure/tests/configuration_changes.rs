@@ -36,12 +36,15 @@ impl Drop for TemporaryConfigRoot {
 }
 
 /// 读取变更流直到收到指定恢复态，过滤同一次文件替换产生的多条平台事件。
+///
+/// 等待上限只约束测试环境，不改变断言内容；macOS FSEvents 在慢 runner 上可能
+/// 晚于 8 秒才投递事件，过紧的上限会把平台调度延迟误报成 watcher 缺陷。
 async fn wait_for_mode(
     subscription: &mut kerminal_application::configuration_changes::ConfigurationChangeSubscription,
     expected: ConfigurationMode,
 ) {
     let cancellation = CancellationToken::new();
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match subscription.recv(cancellation.clone()).await {
                 ConfigurationChangeMessage::Changed(event)
@@ -194,6 +197,9 @@ async fn assert_configuration_watcher_quiet(
 
 /// 等待真实文件变更的精确相对路径，不能用 watcher 自己的全目录重扫冒充写入回执。
 ///
+/// 与恢复态等待同样只放宽环境上限：慢 runner 上平台事件投递可能明显晚于 8 秒，
+/// 断言仍要求收到包含目标路径的真实变更事件。
+///
 /// @author kongweiguang
 #[cfg(target_os = "linux")]
 async fn wait_for_changed_configuration_path(
@@ -201,7 +207,7 @@ async fn wait_for_changed_configuration_path(
     expected_path: &str,
 ) -> Result<(), String> {
     let cancellation = CancellationToken::new();
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match subscription.recv(cancellation.clone()).await {
                 ConfigurationChangeMessage::Changed(event)
