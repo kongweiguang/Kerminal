@@ -52,15 +52,29 @@ impl StorageCoordinator {
 
         // 同进程可能为同一根创建多个协调器；不同协调器的进程互斥不共享，但 OS 锁共享。
         // 短暂持有会在另一个协调器释放后立刻可用，因此有界重试，而不是把正常启动顺序误报为活锁。
+        // 回收与发布还会让锁路径短暂进入 Windows delete-pending，其他协调器此时按名打开
+        // 会收到 ERROR_ACCESS_DENIED；这类瞬时冲突单独计数，耗尽后原样返回，避免把真实
+        // 权限或磁盘故障伪装成 Locked。
         let mut contention_attempts = 0;
+        let mut transient_attempts = 0;
         let file = loop {
-            ensure_safe_lock_path(&path)?;
+            match ensure_safe_lock_path(&path) {
+                Ok(()) => {}
+                Err(StorageLockError::Io(error)) if is_transient_path_conflict(&error) => {
+                    retry_transient_lock_conflict(&mut transient_attempts, error)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             match publish_lock_metadata(&self.root, &path, &owner) {
                 Ok(file) => break file,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     match reclaim_stale_lock(&self.root, &path, &owner)? {
                         StaleLockRecovery::Acquired(file) => break file,
                         StaleLockRecovery::Retry => continue,
+                        StaleLockRecovery::RetryTransient(error) => {
+                            retry_transient_lock_conflict(&mut transient_attempts, error)?;
+                        }
                         StaleLockRecovery::Locked => {
                             contention_attempts += 1;
                             if contention_attempts >= 100 {
@@ -69,6 +83,9 @@ impl StorageCoordinator {
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     }
+                }
+                Err(error) if is_transient_path_conflict(&error) => {
+                    retry_transient_lock_conflict(&mut transient_attempts, error)?;
                 }
                 Err(error) => return Err(StorageLockError::Io(error)),
             }
@@ -319,7 +336,9 @@ fn publish_lock_metadata(
 ) -> io::Result<LockedStorageFile> {
     let encoded = toml::to_string_pretty(owner)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    let pending_path = root.join(format!("{STORAGE_LOCK_FILE}.pending-{}", owner.nonce));
+    // 每次发布都用独立 staging 名：回收重试会复用同一 owner nonce，若上一次清理失败，
+    // 固定名字会让 create_new 永远返回 AlreadyExists，并被误判成锁文件已被占用。
+    let pending_path = root.join(format!("{STORAGE_LOCK_FILE}.pending-{}", Uuid::new_v4()));
     let mut pending = OpenOptions::new()
         .read(true)
         .write(true)
@@ -484,7 +503,65 @@ fn probe_target_pid(_pid: u32) -> TargetPidStatus {
 enum StaleLockRecovery {
     Acquired(LockedStorageFile),
     Retry,
+    /// 另一个协调器正在删除或发布同一路径；保留原始错误供有界重试耗尽后显式返回。
+    RetryTransient(io::Error),
     Locked,
+}
+
+impl StaleLockRecovery {
+    /// 把回收路径上的 I/O 错误分成瞬时目录项竞争与不可恢复故障，避免把权限问题伪装成重试。
+    fn from_io(error: io::Error) -> Result<Self, StorageLockError> {
+        if is_transient_path_conflict(&error) {
+            Ok(Self::RetryTransient(error))
+        } else {
+            Err(StorageLockError::Io(error))
+        }
+    }
+}
+
+/// 判断错误是否可能来自另一个协调器同时回收/发布同一锁路径造成的瞬时目录项竞争。
+///
+/// Windows 删除中的文件会以 delete-pending 状态继续占用名字，此时按名打开、再次删除
+/// 或创建硬链接会返回 `ERROR_ACCESS_DENIED` / `ERROR_SHARING_VIOLATION`；这些错误在
+/// 锁协议里只表示“路径正在换主”，重试即可。调用方必须保留有界重试，耗尽后把原始错误
+/// 交还，避免把真正的 ACL 或磁盘故障伪装成锁竞争。
+fn is_transient_path_conflict(error: &io::Error) -> bool {
+    if error.kind() == ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+            ERROR_SHARING_VIOLATION,
+        };
+        matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32
+                    || code == ERROR_FILE_NOT_FOUND as i32
+                    || code == ERROR_PATH_NOT_FOUND as i32
+                    || code == ERROR_SHARING_VIOLATION as i32
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 对瞬时路径竞争做有界退避；耗尽后返回原始 I/O 错误，避免把真实故障伪装成锁竞争。
+fn retry_transient_lock_conflict(
+    attempts: &mut u32,
+    error: io::Error,
+) -> Result<(), StorageLockError> {
+    const MAX_TRANSIENT_ATTEMPTS: u32 = 100;
+    *attempts += 1;
+    if *attempts >= MAX_TRANSIENT_ATTEMPTS {
+        return Err(StorageLockError::Io(error));
+    }
+    std::thread::sleep(Duration::from_millis(1));
+    Ok(())
 }
 
 /// 持有旧文件对象的 OS 排他锁期间验证 owner、身份与路径，再原子接管 v1 锁文件。
@@ -493,29 +570,44 @@ fn reclaim_stale_lock(
     lock_path: &Path,
     replacement: &LockMetadata,
 ) -> Result<StaleLockRecovery, StorageLockError> {
-    ensure_safe_lock_path(lock_path)?;
+    match ensure_safe_lock_path(lock_path) {
+        Ok(()) => {}
+        Err(StorageLockError::Io(error)) => return StaleLockRecovery::from_io(error),
+        Err(error) => return Err(error),
+    }
     let file = match OpenOptions::new().read(true).open(lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(StaleLockRecovery::Retry),
-        Err(error) => return Err(StorageLockError::Io(error)),
+        Err(error) => return StaleLockRecovery::from_io(error),
     };
     let mut locked_file = match LockedStorageFile::try_acquire(file) {
         Ok(file) => file,
         Err(AdvisoryLockError::WouldBlock) => return Ok(StaleLockRecovery::Locked),
-        Err(AdvisoryLockError::Io(error)) => return Err(StorageLockError::Io(error)),
+        Err(AdvisoryLockError::Io(error)) => return StaleLockRecovery::from_io(error),
     };
 
-    if !path_refers_to_open_file(lock_path, locked_file.as_file())? {
-        return Ok(StaleLockRecovery::Retry);
+    match path_refers_to_open_file(lock_path, locked_file.as_file()) {
+        Ok(true) => {}
+        Ok(false) => return Ok(StaleLockRecovery::Retry),
+        Err(StorageLockError::Io(error)) => return StaleLockRecovery::from_io(error),
+        Err(error) => return Err(error),
     }
-    let first_source = read_locked_owner_source(locked_file.as_file_mut())?;
+    let first_source = match read_locked_owner_source(locked_file.as_file_mut()) {
+        Ok(source) => source,
+        Err(StorageLockError::Io(error)) => return StaleLockRecovery::from_io(error),
+        Err(error) => return Err(error),
+    };
     let first_owner =
         decode_lock_metadata(&first_source).map_err(|_| StorageLockError::InvalidMetadata)?;
     if !owner_is_provably_dead(&first_owner) {
         return Ok(StaleLockRecovery::Locked);
     }
 
-    let confirmed_source = read_locked_owner_source(locked_file.as_file_mut())?;
+    let confirmed_source = match read_locked_owner_source(locked_file.as_file_mut()) {
+        Ok(source) => source,
+        Err(StorageLockError::Io(error)) => return StaleLockRecovery::from_io(error),
+        Err(error) => return Err(error),
+    };
     let confirmed_owner =
         decode_lock_metadata(&confirmed_source).map_err(|_| StorageLockError::InvalidMetadata)?;
     if confirmed_source != first_source
@@ -524,8 +616,11 @@ fn reclaim_stale_lock(
     {
         return Ok(StaleLockRecovery::Locked);
     }
-    if !path_refers_to_open_file(lock_path, locked_file.as_file())? {
-        return Ok(StaleLockRecovery::Retry);
+    match path_refers_to_open_file(lock_path, locked_file.as_file()) {
+        Ok(true) => {}
+        Ok(false) => return Ok(StaleLockRecovery::Retry),
+        Err(StorageLockError::Io(error)) => return StaleLockRecovery::from_io(error),
+        Err(error) => return Err(error),
     }
 
     match fs::remove_file(lock_path) {
@@ -533,16 +628,22 @@ fn reclaim_stale_lock(
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(StaleLockRecovery::Retry);
         }
-        Err(error) => return Err(StorageLockError::Io(error)),
+        Err(error) => return StaleLockRecovery::from_io(error),
     }
-    if let Some(parent) = lock_path.parent() {
-        sync_commit_directories(None, Some(parent)).map_err(StorageLockError::Io)?;
+    // 旧文件删除后立即关闭句柄：Windows 的 delete-pending 名字要等所有句柄关闭才释放，
+    // 继续持有会让其他协调器按名打开时收到 ERROR_ACCESS_DENIED。删除后不再需要旧句柄，
+    // 后续接管仍由 hard-link 的 no-clobber 语义保证只有一方成功。
+    drop(locked_file);
+    if let Some(parent) = lock_path.parent()
+        && let Err(error) = sync_commit_directories(None, Some(parent))
+    {
+        return StaleLockRecovery::from_io(error);
     }
 
     match publish_lock_metadata(root, lock_path, replacement) {
         Ok(file) => Ok(StaleLockRecovery::Acquired(file)),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(StaleLockRecovery::Locked),
-        Err(error) => Err(StorageLockError::Io(error)),
+        Err(error) => StaleLockRecovery::from_io(error),
     }
 }
 
