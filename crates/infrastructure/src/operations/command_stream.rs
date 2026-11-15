@@ -610,13 +610,14 @@ async fn send_output(
     }
 }
 
-/// 在绝对 deadline 内轮询确认直接子进程退出，不依赖平台 SIGCHLD 唤醒。
+/// 在绝对 deadline 内通过重建 `wait()` future 确认直接子进程退出，不依赖 SIGCHLD 唤醒。
 ///
-/// tokio 的 `Child::wait()` 在 Unix 上依赖子进程 reaper 的 SIGCHLD 唤醒；macOS 上该唤醒
-/// 在多线程 runtime 中可能丢失，导致 `timeout_at(deadline, wait())` 把整段清理预算耗尽并
-/// 误报 `CleanupPending`。`try_wait` 走 `waitpid(WNOHANG)`（Windows 为 `GetExitCodeProcess`），
-/// 不依赖信号投递，因此按短间隔轮询到同一 deadline：既保留原有超时语义，又让已退出的子进程
-/// 能及时被确认回收。
+/// `process-wrap` 的 `try_wait` 在 `wait_imp` 返回 ECHILD 且没有缓存状态时会给出
+/// `Ok(None)`，不能作为“已退出”判据；而 tokio 的 `Child::wait` 内部先 `inner.wait()`
+/// （成功时写入 process-wrap 的 `exit_status` 缓存）再走平台 `wait_imp`，最终仍以
+/// `try_wait` 轮询结束。每 10ms 重建一次 future 会强制 tokio Reaper 重新 `try_wait`，
+/// 因此即使 macOS 的 SIGCHLD 唤醒丢失，已退出的子进程也能在下一轮被确认。deadline
+/// 语义与错误分类保持不变：超时仍返回 `Timeout`，等待失败仍保留底层 source。
 /// @author kongweiguang
 async fn wait_child_until(
     child: &mut ManagedTokioChild,
@@ -624,16 +625,23 @@ async fn wait_child_until(
 ) -> AppResult<ExitStatus> {
     const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
     loop {
-        if let Some(status) = child.try_wait().map_err(|source| {
-            AppError::infrastructure_with_source("本机运维命令回收失败", source)
-        })? {
-            return Ok(status);
-        }
         let now = Instant::now();
         if now >= deadline {
             return Err(AppError::timeout("本机命令子进程回收"));
         }
-        sleep_until((now + REAP_POLL_INTERVAL).min(deadline)).await;
+        let poll_deadline = (now + REAP_POLL_INTERVAL).min(deadline);
+        tokio::select! {
+            result = child.wait() => {
+                return result.map_err(|source| {
+                    AppError::infrastructure_with_source("本机运维命令回收失败", source)
+                });
+            }
+            _ = sleep_until(poll_deadline) => {
+                if Instant::now() >= deadline {
+                    return Err(AppError::timeout("本机命令子进程回收"));
+                }
+            }
+        }
     }
 }
 
