@@ -35,16 +35,22 @@ impl Drop for TemporaryConfigRoot {
     }
 }
 
-/// 读取变更流直到收到指定恢复态，过滤同一次文件替换产生的多条平台事件。
+/// 单次平台事件等待窗口；超时后由调用方重写文件制造新事件，而不是继续空等。
+const MODE_WAIT_WINDOW: Duration = Duration::from_secs(5);
+/// 恢复态切换的总 deadline；超出后仍未见目标状态才判定 watcher 失败。
+const MODE_WAIT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// 在给定窗口内等待指定恢复态，把超时作为 `Elapsed` 交还调用方决定是否重试。
 ///
-/// 等待上限只约束测试环境，不改变断言内容；macOS FSEvents 在慢 runner 上可能
-/// 晚于 8 秒才投递事件，过紧的上限会把平台调度延迟误报成 watcher 缺陷。
-async fn wait_for_mode(
+/// 拆出非 panic 版本是因为 macOS FSEvents 在 `watch()` 注册初期可能漏掉紧接着的
+/// 写入事件；固定 sleep 无法区分平台投递延迟和 watcher 缺陷，调用方需要有界重试。
+async fn try_wait_for_mode(
     subscription: &mut kerminal_application::configuration_changes::ConfigurationChangeSubscription,
     expected: ConfigurationMode,
-) {
+    window: Duration,
+) -> Result<(), tokio::time::error::Elapsed> {
     let cancellation = CancellationToken::new();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(window, async {
         loop {
             match subscription.recv(cancellation.clone()).await {
                 ConfigurationChangeMessage::Changed(event)
@@ -60,7 +66,25 @@ async fn wait_for_mode(
         }
     })
     .await
-    .expect("等待配置状态变更");
+}
+
+/// 在总 deadline 内等待指定恢复态；单次窗口超时就重写同一内容触发新的平台事件。
+///
+/// 重写只改变文件时间戳、不改变内容，因此不改变断言（仍必须观察到目标恢复态），
+/// 也不会把损坏或修复后的配置语义带偏；总 deadline 到了仍失败才 panic。
+async fn wait_for_mode_retrying(
+    subscription: &mut kerminal_application::configuration_changes::ConfigurationChangeSubscription,
+    expected: ConfigurationMode,
+    deadline: Instant,
+    retrigger: impl Fn(),
+) {
+    loop {
+        match try_wait_for_mode(subscription, expected, MODE_WAIT_WINDOW).await {
+            Ok(()) => return,
+            Err(_) if Instant::now() < deadline => retrigger(),
+            Err(error) => panic!("等待配置状态变更超时: {error}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -73,8 +97,18 @@ async fn external_invalid_configuration_enters_and_leaves_recovery_mode() {
     let mut watcher =
         ConfigurationChangeWatcher::start(configuration.clone()).expect("启动隔离配置 watcher");
 
-    fs::write(temp.0.join("settings.toml"), "schema_version = [\n").expect("写入损坏设置 fixture");
-    wait_for_mode(&mut changes, ConfigurationMode::ReadOnlyRecovery).await;
+    let settings_path = temp.0.join("settings.toml");
+    let corrupt = "schema_version = [\n";
+    fs::write(&settings_path, corrupt).expect("写入损坏设置 fixture");
+    // FSEvents 可能漏掉 watch 注册后紧接着的写入；重写同一损坏内容制造新事件，
+    // 断言仍是必须进入只读恢复态，不把平台启动竞态当成 watcher 缺陷。
+    wait_for_mode_retrying(
+        &mut changes,
+        ConfigurationMode::ReadOnlyRecovery,
+        Instant::now() + MODE_WAIT_DEADLINE,
+        || fs::write(&settings_path, corrupt).expect("重写损坏设置 fixture"),
+    )
+    .await;
     let blocked = configuration
         .write(
             ConfigDocumentPath::Settings,
@@ -85,8 +119,16 @@ async fn external_invalid_configuration_enters_and_leaves_recovery_mode() {
         .expect_err("损坏文件存在时阻止应用写入");
     assert_eq!(blocked.public_code().as_str(), "configuration_corrupt");
 
-    fs::write(temp.0.join("settings.toml"), "schema_version = 1\n").expect("修复设置 fixture");
-    wait_for_mode(&mut changes, ConfigurationMode::ReadWrite).await;
+    let repaired = "schema_version = 1\n";
+    fs::write(&settings_path, repaired).expect("修复设置 fixture");
+    // 离开恢复态同样依赖平台事件投递，用同一有界重写策略等待，断言不变。
+    wait_for_mode_retrying(
+        &mut changes,
+        ConfigurationMode::ReadWrite,
+        Instant::now() + MODE_WAIT_DEADLINE,
+        || fs::write(&settings_path, repaired).expect("重写修复后的设置 fixture"),
+    )
+    .await;
     let current = configuration
         .read(ConfigDocumentPath::Settings)
         .await
