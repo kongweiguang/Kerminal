@@ -506,6 +506,20 @@ impl OperationsCommandStream {
         )
     }
 
+    /// 返回最近一次清理失败的错误，供调用方判断卡住的具体清理步骤。
+    ///
+    /// `close_until` 的 deadline 与 worker 发布 `CleanupPending` 可能同时到期，此时它只会
+    /// 返回自身的超时文案；调用方需要读取 worker 已发布的真实错误，才能在最终超时里保留
+    /// “进程树终止 / 子进程回收 / 管道回收 / stdin worker 回收”等步骤信息。
+    ///
+    /// @author kongweiguang
+    pub fn cleanup_pending_error(&self) -> Option<AppError> {
+        match &*self.completion.borrow() {
+            CommandStreamState::CleanupPending { error, .. } => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     /// 取消后停止接收输出并等待资源清理；请求 deadline 受共享 shutdown ceiling 限制。
     pub async fn close_until(&mut self, requested_deadline: tokio::time::Instant) -> AppResult<()> {
         let shutdown_ceiling = { *self.shutdown_ceiling.borrow() };

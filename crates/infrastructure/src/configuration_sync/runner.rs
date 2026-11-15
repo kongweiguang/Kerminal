@@ -493,6 +493,8 @@ impl GitCommandRuntime {
     /// 等待 retry 信号本身必须有绝对上限：清理确认可能因为平台唤醒丢失而永远不完成，
     /// 无限等待会让整个阻塞 worker 连同仓库 gate 一起卡死，调用方连超时错误都拿不到。
     /// 超时只结束本次等待并保留 `PendingCleanup`，后续 `begin_operation` 仍会唤醒同一 worker。
+    /// ceiling 到期时把最近一次清理失败步骤放进超时操作名，CI 才能直接看到是进程树终止、
+    /// 子进程回收、管道回收还是 stdin worker 回收卡住；否则所有超时都只显示“操作超时”。
     /// @author kongweiguang
     async fn close_with_retry(
         &self,
@@ -501,9 +503,10 @@ impl GitCommandRuntime {
         retry: &mut watch::Receiver<Option<RetryRequest>>,
     ) -> Result<(), GitCommandError> {
         let first_deadline = tokio::time::Instant::now() + INITIAL_CLEANUP_BUDGET;
-        if stream.close_until(first_deadline).await.is_ok() {
-            return Ok(());
-        }
+        let mut last_cleanup_step = match stream.close_until(first_deadline).await {
+            Ok(()) => return Ok(()),
+            Err(error) => cleanup_step(&error),
+        };
         self.state.send_replace(GitWorkerState::PendingCleanup);
         let ceiling = tokio::time::Instant::now() + GIT_CLEANUP_CEILING.min(self.command_timeout);
         let mut last_generation = retry_generation;
@@ -512,9 +515,12 @@ impl GitCommandRuntime {
                 && request.generation > last_generation
             {
                 last_generation = request.generation;
-                if stream.close_until(request.deadline).await.is_ok() {
-                    self.state.send_replace(GitWorkerState::Running);
-                    return Ok(());
+                match stream.close_until(request.deadline).await {
+                    Ok(()) => {
+                        self.state.send_replace(GitWorkerState::Running);
+                        return Ok(());
+                    }
+                    Err(error) => last_cleanup_step = cleanup_step(&error),
                 }
             }
             match timeout_at(ceiling, retry.changed()).await {
@@ -527,8 +533,14 @@ impl GitCommandRuntime {
                     ));
                 }
                 Err(_) => {
+                    // worker 已发布的步骤比 close_until 自身的超时更具体；两者竞争时优先读状态。
+                    let step = stream
+                        .cleanup_pending_error()
+                        .as_ref()
+                        .map(cleanup_step)
+                        .unwrap_or(last_cleanup_step);
                     return Err(GitCommandError::Executor(
-                        kerminal_application::AppError::timeout("Git 清理重试等待"),
+                        kerminal_application::AppError::timeout(step),
                     ));
                 }
             }
@@ -585,6 +597,16 @@ impl Drop for GitOperationPermit {
             self.runtime.state.send_replace(GitWorkerState::Idle);
         }
     }
+}
+
+/// 提取清理失败的稳定步骤名；超时错误优先使用操作名，其它错误使用安全文案。
+///
+/// `AppError::public_message` 对所有超时统一返回“操作超时”，无法指出卡住的步骤，
+/// 因此这里优先读取超时操作名，让清理 ceiling 的错误直接带上最近一次失败步骤。
+fn cleanup_step(error: &AppError) -> &'static str {
+    error
+        .timeout_operation()
+        .unwrap_or_else(|| error.public_message())
 }
 
 /// 表示 join worker 时遇到的可重试超时或保留 source 的致命失败。

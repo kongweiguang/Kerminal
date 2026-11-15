@@ -403,7 +403,10 @@ fn cancellation_terminates_descendant_and_preserves_cancel_result() {
     worker.join().expect("Git runner 管理线程应正常返回");
 }
 
-/// 验证生产命令预算会终止仍运行的进程树并保留 timeout 分类。
+/// 验证生产命令预算会终止仍运行的进程树，并保留命令超时而非清理 ceiling 超时。
+///
+/// 命令预算与清理 ceiling 都取 5 秒，单看 `Executor + Timeout` 无法区分两者；这里再比对
+/// 超时操作名，确保失败来自命令流本身，而不是清理重试耗尽。
 #[test]
 fn command_deadline_terminates_running_descendant() {
     let root = TestRoot::new();
@@ -428,13 +431,19 @@ fn command_deadline_terminates_running_descendant() {
     let result = result_receiver
         .recv_timeout(Duration::from_secs(10))
         .expect("命令预算到期后应在期限内回收进程树");
-    assert!(
-        matches!(
-            &result,
-            Err(GitCommandError::Executor(error))
-                if error.public_code() == PublicErrorCode::Timeout
-        ),
+    let error = match &result {
+        Err(GitCommandError::Executor(error)) => error,
+        other => panic!("命令预算到期应返回执行器错误: {other:?}"),
+    };
+    assert_eq!(
+        error.public_code(),
+        PublicErrorCode::Timeout,
         "应保留命令超时分类: {result:?}"
+    );
+    assert_eq!(
+        error.timeout_operation(),
+        Some("本机运维命令流"),
+        "必须由命令预算到期结束，而不是清理重试 ceiling: {result:?}"
     );
     worker.join().expect("Git runner 管理线程应正常返回");
 }

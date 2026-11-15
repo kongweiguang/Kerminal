@@ -217,6 +217,19 @@ impl AppError {
         Self::Timeout { operation }
     }
 
+    /// 返回超时错误记录的操作名，供清理诊断区分具体失败步骤。
+    ///
+    /// `public_message` 对所有超时统一返回“操作超时”，仅凭公开文案无法判断是命令预算
+    /// 还是某个清理步骤耗尽；操作名本身是源码常量，可安全用于内部诊断和 CI 断言。
+    ///
+    /// @author kongweiguang
+    pub const fn timeout_operation(&self) -> Option<&'static str> {
+        match self {
+            Self::Timeout { operation } => Some(operation),
+            _ => None,
+        }
+    }
+
     /// 保留远端退出状态供命令结果使用，避免把非零退出误判成连接故障。
     pub fn remote_exit(status: Option<i32>) -> Self {
         Self::RemoteExit { status }
