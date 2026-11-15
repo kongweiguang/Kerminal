@@ -46,6 +46,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # GitHub 托管的 ubuntu-22.04 镜像预装了 .NET、Android、GHC、CodeQL 等大量与本项目
+      # 无关的 SDK，占用十余 GB 根盘空间。cargo xtask ci 的全量构建与测试会写满 runner，
+      # 触发 "No space left on device"；这些目录在 Linux 任务中不会被用到，先删除腾出空间。
+      - name: Free disk space on Linux runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/.ghcup \
+            /opt/az \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /opt/microsoft/msedge \
+            /opt/microsoft/powershell \
+            /usr/lib/powershell || true
+          df -h /
+
       - name: Install Linux GPUI dependencies
         if: runner.os == 'Linux'
         run: |
