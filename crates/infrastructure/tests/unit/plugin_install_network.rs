@@ -33,6 +33,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// 回环网络用例的绝对期限：macOS 慢 runner 上建立连接、读取响应头或完成三跳
+/// 重定向可能停顿数秒，5 秒会把环境抖动误报成 Timeout。这里只放宽等待上限，
+/// 各用例对状态码、重定向次数、body 超时和拒绝语义的断言都不变。
+const SLOW_RUNNER_DEADLINE: Duration = Duration::from_secs(30);
+
 /// 仅测试使用的连接超时构造器：连接超时是单次尝试预算而非安全边界，测试需要
 /// 缩短它才能确定性触发连接阶段超时；生产入口仍固定 10 秒。构造器定义在测试
 /// 模块里，让该入口在生产目标里不参与编译，也避免 src 保留 cfg(test) 项。
@@ -408,7 +413,7 @@ async fn mixed_public_and_private_dns_is_rejected_before_connecting() {
         .get(
             "http://mixed.test:9/asset",
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -441,7 +446,7 @@ async fn prohibited_dns_answers_are_rejected_before_connecting() {
         .get(
             "http://prohibited.test:9/asset",
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -465,7 +470,7 @@ async fn empty_dns_answer_is_a_resolve_failure() {
         .get(
             "http://empty.test:9/asset",
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -502,7 +507,7 @@ async fn signed_loopback_source_is_allowed_and_resolution_stays_pinned_across_re
             .get(
                 &url,
                 HeaderMap::new(),
-                Instant::now() + Duration::from_secs(5),
+                Instant::now() + SLOW_RUNNER_DEADLINE,
                 &CancellationToken::new(),
             )
             .await
@@ -540,7 +545,7 @@ async fn three_redirects_are_followed_and_a_fourth_is_rejected() {
         .get(
             &format!("http://redirect.test:{port}/start"),
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -561,7 +566,7 @@ async fn three_redirects_are_followed_and_a_fourth_is_rejected() {
         .get(
             &format!("http://redirect.test:{port}/start"),
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -657,7 +662,7 @@ async fn redirect_without_location_is_rejected() {
         .get(
             &format!("http://127.0.0.1:{port}/start"),
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -747,7 +752,7 @@ async fn mixed_dns_including_misclassified_v6_ranges_is_rejected() {
             .get(
                 &format!("http://{host}:9/asset"),
                 HeaderMap::new(),
-                Instant::now() + Duration::from_secs(5),
+                Instant::now() + SLOW_RUNNER_DEADLINE,
                 &CancellationToken::new(),
             )
             .await
@@ -819,7 +824,7 @@ async fn same_origin_redirect_keeps_authorization_cookie_and_range() {
         .get(
             &format!("http://127.0.0.1:{port}/start"),
             headers,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -884,7 +889,7 @@ async fn cross_origin_redirect_strips_credentials_but_keeps_range() {
         .get(
             &format!("http://127.0.0.1:{origin_port}/start"),
             headers,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -963,7 +968,7 @@ async fn dns_wait_observes_cancellation_and_absolute_deadline() {
         .get(
             "http://pending.test/asset",
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &cancellation,
         )
         .await
@@ -983,13 +988,13 @@ async fn body_read_observes_absolute_deadline() {
     let server = serve_stalled_body(listener);
 
     let mut session = AssetNetworkSession::system();
-    // 5 秒预算只是给 macOS 慢 runner 留出建立回环连接和读完响应头的环境余量；
+    // 放宽后的预算只是给 macOS 慢 runner 留出建立回环连接和读完响应头的环境余量；
     // 被验证的语义仍是 body 读取受同一绝对期限约束，而不是放宽超时判断。
     let mut response = session
         .get(
             &format!("http://127.0.0.1:{port}/stalled"),
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &CancellationToken::new(),
         )
         .await
@@ -1023,7 +1028,7 @@ async fn body_read_observes_cancellation() {
         .get(
             &format!("http://127.0.0.1:{port}/stalled"),
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + SLOW_RUNNER_DEADLINE,
             &cancellation,
         )
         .await
