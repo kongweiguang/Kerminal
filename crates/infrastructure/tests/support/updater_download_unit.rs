@@ -2,12 +2,12 @@
 //!
 //! @author kongweiguang
 
-use std::{future::Future, time::Duration};
+use std::{error::Error as StdError, future::Future, time::Duration};
 
 use cargo_packager_updater::reqwest::{Url, header::HeaderMap};
 use kerminal_application::{AppError, UpdateProgress};
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     task::JoinHandle,
 };
@@ -25,9 +25,39 @@ const FIXTURE_SIGNATURE: &str = concat!(
     "y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg=="
 );
 
+/// 在调用 handler 前读走客户端请求头，避免服务器带着未读数据关闭连接。
+///
+/// macOS 在 close 时若接收缓冲区仍有未读数据会发送 RST；RST 可能让客户端丢弃已经
+/// 到达但尚未读取的响应，表现为偶发的传输层错误（“更新包下载失败”）。先把请求读干净，
+/// 关闭时就是正常 FIN。读取失败或超时直接返回，让测试以传输错误暴露问题而不是挂起。
+async fn drain_request<S>(stream: &mut S)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 1024];
+    let mut received = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    received.extend_from_slice(&buffer[..read]);
+                    if received.windows(4).any(|window| window == b"\r\n\r\n")
+                        || received.len() > 16 * 1024
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
 /// 创建仅供当前测试使用的 HTTPS 服务，保持与产品相同的 TLS 验证路径。
 ///
-/// 连接接收或 TLS 握手失败时测试任务自然结束，只有握手成功才调用 handler。
+/// 连接接收或 TLS 握手失败时打印诊断并结束测试任务，只有握手成功才调用 handler。
 async fn local_server<F, Fut>(handler: F) -> (Url, JoinHandle<()>)
 where
     F: FnOnce(TlsStream<TcpStream>) -> Fut + Send + 'static,
@@ -36,13 +66,32 @@ where
     let (listener, address) = tls::bind_loopback().await;
     let acceptor = tls::test_tls_acceptor();
     let task = tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await
-            && let Ok(stream) = acceptor.accept(stream).await
-        {
-            handler(stream).await;
+        match listener.accept().await {
+            Ok((stream, _)) => match acceptor.accept(stream).await {
+                Ok(mut stream) => {
+                    drain_request(&mut stream).await;
+                    handler(stream).await;
+                }
+                Err(error) => eprintln!("updater test TLS handshake failed: {error}"),
+            },
+            Err(error) => eprintln!("updater test listener accept failed: {error}"),
         }
     });
     (tls::https_url(address, "/update"), task)
+}
+
+/// 展开 AppError 的底层 source 链，便于 CI 区分超时、TLS 证书和连接重置。
+///
+/// AppError 的 Display/Debug 只输出脱敏文案，断言失败时仅看到“更新包下载失败”无法
+/// 判断根因；这里只在测试断言中逐层读取 source，不改变生产错误展示。
+fn error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut chain = vec![error.to_string()];
+    let mut current = error.source();
+    while let Some(source) = current {
+        chain.push(source.to_string());
+        current = source.source();
+    }
+    chain.join(" <- ")
 }
 
 /// 按 cargo-packager-updater 的双层 Base64 契约准备公开测试密钥，不包含私钥材料。
@@ -69,9 +118,10 @@ where
 
 /// 将固定测试参数映射到生产私有输入结构，保持同一传输与验签路径及原测试约束。
 ///
-/// 超时只作为测试环境余量：macOS 慢 runner 上 TLS 握手加首包可能超过 2 秒，
+/// 超时只作为测试环境余量：macOS 慢 runner 上 TLS 握手加首包可能超过 10 秒，
 /// 过紧的上限会让客户端在读到 302 之前先报传输层错误，掩盖被验证的降级拒绝语义。
-/// 其余用例断言的是协议或校验错误，都在首包之后立即返回，放宽上限不影响其结论。
+/// 放宽到 30 秒给慢 runner 留足余量；其余用例断言的是协议或校验错误，都在首包
+/// 之后立即返回，放宽上限不影响其结论。
 ///
 /// @author kongweiguang
 fn start_download(
@@ -94,7 +144,7 @@ fn start_download(
                 public_key,
                 signature,
                 headers: HeaderMap::new(),
-                timeout: Some(Duration::from_secs(10)),
+                timeout: Some(Duration::from_secs(30)),
                 max_bytes,
                 additional_trust_roots: &trust_roots,
             },
@@ -178,7 +228,12 @@ async fn https_download_client_does_not_follow_loopback_http_redirect() {
         .await
         .expect_err("HTTP downgrade redirect must not return a package");
     server.await.expect("join downgrade redirect server");
-    assert_eq!(error.public_message(), "更新服务器未能提供安装包");
+    assert_eq!(
+        error.public_message(),
+        "更新服务器未能提供安装包",
+        "unexpected download error chain: {}",
+        error_chain(&error)
+    );
 }
 
 /// Content-Length 超出策略时在读取响应体前拒绝，避免预留或缓存超限更新。
