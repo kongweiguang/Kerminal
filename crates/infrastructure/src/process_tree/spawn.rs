@@ -159,8 +159,10 @@ impl ManagedTokioChild {
 
     /// Unix 先向进程组发送 HUP，再在 deadline 内等待原有宽限期并 KILL；Windows 直接终止 Job。
     ///
-    /// 成功发出终止后记录“已确认回收”：进程组已收到 SIGKILL，Drop 再补一次 killpg 没有收益，
-    /// 反而可能命中已被复用的 pgid。失败时保留标志为 false，让 Drop 仍能兜底。
+    /// 这里不能因为 `Ok(())` 就把 `reaped` 置位：`terminate_tokio_process_group` 在 SIGHUP
+    /// 返回 ESRCH 时会提前返回，尚未发送 SIGKILL；Windows 的 Job 终止也只表示请求已提交。
+    /// 只有 `try_wait` 观察到 Some 或 `wait` 成功才代表直接子进程确实被回收，未确认时 Drop
+    /// 仍需要按平台兜底终止，否则残留的进程组或 Job 可能继续占用管道。
     pub(crate) async fn terminate_tree_until(
         &mut self,
         deadline: tokio::time::Instant,
@@ -177,9 +179,6 @@ impl ManagedTokioChild {
             let _ = deadline;
             Err(unsupported_platform())
         };
-        if result.is_ok() {
-            self.reaped.store(true, Ordering::Release);
-        }
         result
     }
 }
