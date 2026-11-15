@@ -34,7 +34,12 @@ if [[ ${__kerminal_shell_integration_active-0} != 1 ]]; then
             __ke_char=${__ke_text:__ke_i:1}
             case $__ke_char in
                 [a-zA-Z0-9/._~-]) __kerminal_edit_encoded+=$__ke_char ;;
-                *) builtin printf -v __ke_hex '%%%02X' "'$__ke_char"; __kerminal_edit_encoded+=$__ke_hex ;;
+                *)
+                    # macOS 自带 bash 3.2 把 >=0x80 的字节当有符号数，%02X 只保证最小宽度，
+                    # 会输出 %FFFFFFFFFFFFFFE4 这类非法转义；只取低字节的最后两位。
+                    builtin printf -v __ke_hex '%02X' "'$__ke_char"
+                    __kerminal_edit_encoded+=%${__ke_hex: -2}
+                    ;;
             esac
         done
     }
@@ -104,7 +109,11 @@ if [[ ${__kerminal_shell_integration_active-0} != 1 ]]; then
             __kerminal_char=${__kerminal_directory:__kerminal_index:1}
             case $__kerminal_char in
                 [a-zA-Z0-9/._~-]) __kerminal_uri+=$__kerminal_char ;;
-                *) builtin printf -v __kerminal_encoded '%%%02X' "'$__kerminal_char"; __kerminal_uri+=$__kerminal_encoded ;;
+                *)
+                    # 同 __kerminal_edit_encode：bash 3.2 对非 ASCII 字节做符号扩展，只取低字节两位。
+                    builtin printf -v __kerminal_encoded '%02X' "'$__kerminal_char"
+                    __kerminal_uri+=%${__kerminal_encoded: -2}
+                    ;;
             esac
         done
         builtin printf '\e]7;file://%s\a' "$__kerminal_uri"

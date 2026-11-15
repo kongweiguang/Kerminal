@@ -18,7 +18,11 @@ if [[ -o interactive && ${__kerminal_shell_integration_active-0} != 1 ]]; then
             __ke_char=${__ke_text[__ke_i]}
             case $__ke_char in
                 [a-zA-Z0-9/._~-]) __kerminal_edit_encoded+=$__ke_char ;;
-                *) builtin printf -v __ke_hex '%%%02X' "'$__ke_char"; __kerminal_edit_encoded+=$__ke_hex ;;
+                *)
+                    # 与 bash 保持一致只保留低字节两位；不同平台/zsh 组合对高位字节的符号处理不同。
+                    builtin printf -v __ke_hex '%02X' "'$__ke_char"
+                    __kerminal_edit_encoded+=%${__ke_hex: -2}
+                    ;;
             esac
         done
     }
@@ -77,7 +81,11 @@ if [[ -o interactive && ${__kerminal_shell_integration_active-0} != 1 ]]; then
             __kerminal_char=${__kerminal_directory[__kerminal_index]}
             case $__kerminal_char in
                 [a-zA-Z0-9/._~-]) __kerminal_uri+=$__kerminal_char ;;
-                *) builtin printf -v __kerminal_encoded '%%%02X' "'$__kerminal_char"; __kerminal_uri+=$__kerminal_encoded ;;
+                *)
+                    # 同 __kerminal_edit_encode：统一截取低字节，避免 URI 中出现超宽十六进制。
+                    builtin printf -v __kerminal_encoded '%02X' "'$__kerminal_char"
+                    __kerminal_uri+=%${__kerminal_encoded: -2}
+                    ;;
             esac
         done
         builtin printf '\e]7;file://%s\a' "$__kerminal_uri"

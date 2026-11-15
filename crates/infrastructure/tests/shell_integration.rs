@@ -223,6 +223,11 @@ fn bash_hook_reports_uri_encoded_directory() {
     let fixture = tempfile::tempdir().expect("create private cwd fixture");
     let directory = fixture.path().join("cwd 中文 #%");
     std::fs::create_dir(&directory).expect("create special-character cwd");
+    // macOS 的 /var 是指向 /private/var 的符号链接，bash 的 $PWD 来自 getcwd()；
+    // 期望值必须按物理路径构造，否则逻辑路径与钩子上报的 URI 不一致。
+    let directory = directory
+        .canonicalize()
+        .expect("canonicalize special-character cwd");
     let mut expected = String::from("\x1b]7;file://");
     for byte in directory.to_str().expect("UTF-8 fixture path").bytes() {
         if byte.is_ascii_alphanumeric() || b"/._~-".contains(&byte) {
@@ -259,6 +264,11 @@ fn fish_hook_reports_directory_after_user_prompt_changes_it() {
     let fixture = tempfile::tempdir().expect("create private Fish cwd fixture");
     let directory = fixture.path().join("prompt 中文 #%");
     std::fs::create_dir(&directory).expect("create prompt target directory");
+    // fish 的 cd 默认解析符号链接，macOS 上 /var 会落到 /private/var；
+    // 让 fixture 与期望值都使用物理路径，避免与 PWD 的逻辑路径不一致。
+    let directory = directory
+        .canonicalize()
+        .expect("canonicalize prompt target directory");
     let mut rendered = String::from("user-before\nuser-after\x1b]7;file://");
     for byte in directory.to_str().expect("UTF-8 fixture path").bytes() {
         if byte.is_ascii_alphanumeric() || b"/._~-".contains(&byte) {
