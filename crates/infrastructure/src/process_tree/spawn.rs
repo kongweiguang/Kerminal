@@ -160,7 +160,7 @@ impl ManagedTokioChild {
     /// Unix 先向进程组发送 HUP，再在 deadline 内等待原有宽限期并 KILL；Windows 直接终止 Job。
     ///
     /// 这里不能因为 `Ok(())` 就把 `reaped` 置位：`terminate_tokio_process_group` 在 SIGHUP
-    /// 返回 ESRCH 时会提前返回，尚未发送 SIGKILL；Windows 的 Job 终止也只表示请求已提交。
+    /// 返回 ESRCH/EPERM 时会提前返回，尚未发送 SIGKILL；Windows 的 Job 终止也只表示请求已提交。
     /// 只有 `try_wait` 观察到 Some 或 `wait` 成功才代表直接子进程确实被回收，未确认时 Drop
     /// 仍需要按平台兜底终止，否则残留的进程组或 Job 可能继续占用管道。
     pub(crate) async fn terminate_tree_until(
@@ -179,11 +179,21 @@ impl ManagedTokioChild {
             let _ = deadline;
             Err(unsupported_platform())
         };
+        if result.is_ok() {
+            // 终止路径可能已在宽限期后观察到直接子进程退出；同步“已回收”标志，避免 Drop
+            // 对可能被复用的 pgid 再补发信号。确认失败时保持未回收状态，交给 wait/reap 路径。
+            let _ = self.try_wait();
+        }
         result
     }
 }
 
 /// Unix 上 signal 仅命中由 ProcessGroup wrapper 创建的子进程组，宽限等待不越过共享 deadline。
+///
+/// 宽限之后先确认直接子进程是否已退出：`ProcessGroupChild::try_wait` 只有在整个进程组
+/// 都被回收（`waitpid` 返回 ECHILD）时才给出 `Some`，此时 pgid 可能已被系统复用，再发
+/// SIGKILL 会误伤无关进程组。`try_wait` 自身失败时不阻断终止，仍按原路径尝试关闭进程组，
+/// 由信号侧对 ESRCH/EPERM 的容错兜底。
 #[cfg(unix)]
 async fn terminate_tokio_process_group(
     child: &mut dyn process_wrap::tokio::ChildWrapper,
@@ -191,7 +201,7 @@ async fn terminate_tokio_process_group(
 ) -> io::Result<()> {
     match child.signal(libc::SIGHUP) {
         Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+        Err(error) if process_group_is_gone(&error) => return Ok(()),
         Err(error) => return Err(error),
     }
 
@@ -200,15 +210,27 @@ async fn terminate_tokio_process_group(
     if !grace.is_zero() {
         tokio::time::sleep(grace).await;
     }
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return Ok(());
+    }
     start_kill_tokio(child)
 }
 
-/// 对 Tokio child 统一映射 process-wrap 的进程树 kill，并只忽略进程组已消失的 ESRCH。
+/// 判断进程组信号失败是否只表示“组已消失或不再属于我们”。
+///
+/// 进程组由本模块创建并拥有，正常路径不会出现 EPERM；一旦出现，说明组长退出后 pgid
+/// 已被系统复用或组已脱离，继续发信号只会误伤无关进程。其它错误仍原样返回，不吞掉。
+#[cfg(unix)]
+fn process_group_is_gone(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM))
+}
+
+/// 对 Tokio child 统一映射 process-wrap 的进程树 kill；进程组已消失或不再属于我们时视为成功。
 fn start_kill_tokio(child: &mut dyn process_wrap::tokio::ChildWrapper) -> io::Result<()> {
     match child.start_kill() {
         Ok(()) => Ok(()),
         #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) if process_group_is_gone(&error) => Ok(()),
         Err(error) => Err(error),
     }
 }

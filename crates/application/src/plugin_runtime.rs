@@ -710,7 +710,11 @@ impl PluginRuntime for PluginRuntimeService {
                     {
                         Ok(value) => parse_state(&value)?,
                         Err(error) => {
-                            let timed_out = matches!(error, AppError::Timeout { .. });
+                            // 带动态步骤细节的超时同样属于 Timeout 分类，不能漏判为普通失败。
+                            let timed_out = matches!(
+                                error,
+                                AppError::Timeout { .. } | AppError::TimeoutDetail { .. }
+                            );
                             let process_gone = shared.process.state(&identity.plugin).is_ok_and(|state| {
                                 !matches!(state, PluginRuntimeState::Ready { generation: current } if current == generation)
                             });

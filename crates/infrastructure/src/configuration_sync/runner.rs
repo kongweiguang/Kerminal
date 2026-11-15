@@ -540,7 +540,7 @@ impl GitCommandRuntime {
                         .map(cleanup_step)
                         .unwrap_or(last_cleanup_step);
                     return Err(GitCommandError::Executor(
-                        kerminal_application::AppError::timeout(step),
+                        kerminal_application::AppError::timeout_owned(step),
                     ));
                 }
             }
@@ -602,11 +602,16 @@ impl Drop for GitOperationPermit {
 /// 提取清理失败的稳定步骤名；超时错误优先使用操作名，其它错误使用安全文案。
 ///
 /// `AppError::public_message` 对所有超时统一返回“操作超时”，无法指出卡住的步骤，
-/// 因此这里优先读取超时操作名，让清理 ceiling 的错误直接带上最近一次失败步骤。
-fn cleanup_step(error: &AppError) -> &'static str {
-    error
-        .timeout_operation()
-        .unwrap_or_else(|| error.public_message())
+/// 因此这里优先读取超时操作名；基础设施错误再附加受控的系统诊断后缀（如 errno），
+/// 让清理 ceiling 的错误直接带上最近一次失败步骤和系统错误码。
+fn cleanup_step(error: &AppError) -> String {
+    if let Some(operation) = error.timeout_operation() {
+        return operation.to_owned();
+    }
+    match error.diagnostic_detail() {
+        Some(detail) => format!("{}（{detail}）", error.public_message()),
+        None => error.public_message().to_owned(),
+    }
 }
 
 /// 表示 join worker 时遇到的可重试超时或保留 source 的致命失败。

@@ -72,6 +72,15 @@ pub enum AppError {
         context: &'static str,
         source: Option<Arc<dyn Error + Send + Sync>>,
     },
+    /// 基础设施失败并附带受控的动态诊断后缀（如系统错误 kind/errno）。
+    ///
+    /// 公开文案仍只使用固定 `context`；`detail` 只供内部清理步骤名与 CI 定位，不进入
+    /// Display/Debug，避免把路径、命令或凭据带出系统错误码之外。
+    InfrastructureDetail {
+        context: &'static str,
+        detail: String,
+        source: Option<Arc<dyn Error + Send + Sync>>,
+    },
     /// 远端已建立的交互连接意外断开；只有具备此显式类型的错误可触发会话重连。
     RetryableRemoteDisconnect {
         source: Arc<dyn Error + Send + Sync>,
@@ -88,6 +97,10 @@ pub enum AppError {
     AuthenticationFailed,
     Timeout {
         operation: &'static str,
+    },
+    /// 超时操作名需要携带动态清理步骤细节（如 errno）时使用；分类与公开文案保持 Timeout。
+    TimeoutDetail {
+        operation: String,
     },
     RemoteExit {
         status: Option<i32>,
@@ -148,6 +161,23 @@ impl AppError {
     {
         Self::Infrastructure {
             context,
+            source: Some(Arc::new(source)),
+        }
+    }
+
+    /// 记录固定业务上下文并附带受控的系统诊断后缀；后缀不进入公开文案。
+    ///
+    /// 目前只用于把错误 kind 与 errno 带进清理步骤名，让 CI 失败直接看到系统错误码，
+    /// 同时避免路径、命令或凭据进入消息。
+    ///
+    /// @author kongweiguang
+    pub fn infrastructure_with_detail<E>(context: &'static str, detail: String, source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::InfrastructureDetail {
+            context,
+            detail,
             source: Some(Arc::new(source)),
         }
     }
@@ -217,15 +247,37 @@ impl AppError {
         Self::Timeout { operation }
     }
 
+    /// 超时操作名需要携带动态清理步骤细节时使用；分类与公开文案与固定 `timeout` 一致。
+    ///
+    /// @author kongweiguang
+    pub fn timeout_owned(operation: String) -> Self {
+        Self::TimeoutDetail { operation }
+    }
+
     /// 返回超时错误记录的操作名，供清理诊断区分具体失败步骤。
     ///
     /// `public_message` 对所有超时统一返回“操作超时”，仅凭公开文案无法判断是命令预算
-    /// 还是某个清理步骤耗尽；操作名本身是源码常量，可安全用于内部诊断和 CI 断言。
+    /// 还是某个清理步骤耗尽；操作名本身是源码常量或受控步骤名，可安全用于内部诊断和
+    /// CI 断言。
     ///
     /// @author kongweiguang
-    pub const fn timeout_operation(&self) -> Option<&'static str> {
+    pub fn timeout_operation(&self) -> Option<&str> {
         match self {
             Self::Timeout { operation } => Some(operation),
+            Self::TimeoutDetail { operation } => Some(operation),
+            _ => None,
+        }
+    }
+
+    /// 返回基础设施错误的受控动态诊断后缀，供内部清理步骤名和 CI 定位系统错误码。
+    ///
+    /// 该细节不进入 `public_message`/Display/Debug，避免把系统错误码之外的动态文本暴露
+    /// 给 UI 或 MCP；只有明确需要诊断的内部路径读取它。
+    ///
+    /// @author kongweiguang
+    pub fn diagnostic_detail(&self) -> Option<&str> {
+        match self {
+            Self::InfrastructureDetail { detail, .. } => Some(detail),
             _ => None,
         }
     }
@@ -251,13 +303,13 @@ impl AppError {
             Self::CapabilityNotSupported { .. } => PublicErrorCode::CapabilityNotSupported,
             Self::Conflict { .. } => PublicErrorCode::Conflict,
             Self::Cancelled { .. } => PublicErrorCode::Cancelled,
-            Self::Infrastructure { .. } | Self::RetryableRemoteDisconnect { .. } => {
-                PublicErrorCode::Infrastructure
-            }
+            Self::Infrastructure { .. }
+            | Self::InfrastructureDetail { .. }
+            | Self::RetryableRemoteDisconnect { .. } => PublicErrorCode::Infrastructure,
             Self::OutcomeUnknown { .. } => PublicErrorCode::OutcomeUnknown,
             Self::DiagnosticSource { code, .. } => *code,
             Self::AuthenticationFailed => PublicErrorCode::AuthenticationFailed,
-            Self::Timeout { .. } => PublicErrorCode::Timeout,
+            Self::Timeout { .. } | Self::TimeoutDetail { .. } => PublicErrorCode::Timeout,
             Self::RemoteExit { .. } => PublicErrorCode::RemoteExit,
             Self::ConfigurationCorrupt { .. } => PublicErrorCode::ConfigurationCorrupt,
         }
@@ -274,12 +326,13 @@ impl AppError {
             | Self::Conflict { context }
             | Self::Cancelled { context }
             | Self::Infrastructure { context, .. }
+            | Self::InfrastructureDetail { context, .. }
             | Self::OutcomeUnknown { context, .. } => context,
             Self::RetryableRemoteDisconnect { .. } => "远端终端连接意外中断，可重试",
             Self::DiagnosticSource { message, .. } => message,
             Self::CapabilityNotSupported { .. } => "当前连接不支持此能力",
             Self::AuthenticationFailed => "连接认证失败",
-            Self::Timeout { .. } => "操作超时",
+            Self::Timeout { .. } | Self::TimeoutDetail { .. } => "操作超时",
             Self::RemoteExit { .. } => "远端命令已退出",
             Self::ConfigurationCorrupt { .. } => "配置文件损坏，需要恢复",
         }
@@ -318,6 +371,10 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Infrastructure {
+                source: Some(source),
+                ..
+            }
+            | Self::InfrastructureDetail {
                 source: Some(source),
                 ..
             }

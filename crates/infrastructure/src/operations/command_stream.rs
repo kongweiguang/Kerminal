@@ -645,6 +645,20 @@ async fn wait_child_until(
     }
 }
 
+/// 把进程树终止失败映射为带系统错误码的固定提示，便于 CI 直接定位 errno。
+///
+/// 只拼接 `ErrorKind` 与 `raw_os_error`：两者是稳定的系统枚举/整数，不含路径、命令或
+/// 凭据；底层错误仍作为 source 保留，不吞掉其它错误。
+///
+/// @author kongweiguang
+fn process_tree_termination_error(source: io::Error) -> AppError {
+    let os = source
+        .raw_os_error()
+        .map_or_else(|| "none".to_owned(), |code| code.to_string());
+    let detail = format!("kind={:?}, os={os}", source.kind());
+    AppError::infrastructure_with_detail("本机命令进程树终止失败", detail, source)
+}
+
 /// 初始化管道失败时持有 managed child 与进程树，只有明确 wait/reap 后才释放 worker permit。
 async fn retry_child_cleanup(
     child: &mut ManagedTokioChild,
@@ -658,9 +672,7 @@ async fn retry_child_cleanup(
             child
                 .terminate_tree_until(deadline)
                 .await
-                .map_err(|source| {
-                    AppError::infrastructure_with_source("本机命令进程树终止失败", source)
-                })?;
+                .map_err(process_tree_termination_error)?;
             wait_child_until(child, deadline).await?;
             Ok::<(), AppError>(())
         };
@@ -709,9 +721,7 @@ where
         child
             .terminate_tree_until(deadline)
             .await
-            .map_err(|source| {
-                AppError::infrastructure_with_source("本机命令进程树终止失败", source)
-            })?;
+            .map_err(process_tree_termination_error)?;
     }
     if status.is_none() {
         *status = Some(wait_child_until(child, deadline).await?);
