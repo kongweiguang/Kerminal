@@ -509,8 +509,13 @@ fn reject_reparse_components(path: &Path, trusted_root: &Path) -> FixtureResult<
                 let canonical_link = current
                     .canonicalize()
                     .map_err(|_| "无法解析 fixture 路径链接")?;
-                // 只有受信根本身或它的祖先允许是链接；根以下一律拒绝。
-                if !canonical_root.starts_with(&canonical_link) {
+                // 父目录已在根内说明链接本身位于根以下，即使它指回根的祖先也拒绝，
+                // 避免路径别名；只有受信根本身或它的祖先允许是链接。
+                let link_is_below_root = current
+                    .parent()
+                    .and_then(|parent| parent.canonicalize().ok())
+                    .is_some_and(|parent| parent.starts_with(&canonical_root));
+                if link_is_below_root || !canonical_root.starts_with(&canonical_link) {
                     return Err("fixture 路径不能经过受信根以下的符号链接或 reparse point");
                 }
             }
