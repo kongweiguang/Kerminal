@@ -3,12 +3,12 @@
 //! @author kongweiguang
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kerminal_application::configuration_changes::{
-    ConfigurationChangeMessage, ConfigurationChangeService,
+    ConfigurationChangeMessage, ConfigurationChangeService, ConfigurationChangeSubscription,
 };
 use kerminal_application::preferences::ConfigurationRepository;
 use kerminal_domain::preferences::{ConfigDocumentPath, ConfigurationMode};
@@ -44,22 +44,25 @@ const MODE_WAIT_DEADLINE: Duration = Duration::from_secs(30);
 ///
 /// 拆出非 panic 版本是因为 macOS FSEvents 在 `watch()` 注册初期可能漏掉紧接着的
 /// 写入事件；固定 sleep 无法区分平台投递延迟和 watcher 缺陷，调用方需要有界重试。
+/// 观察到的每个恢复态都记入 `observed`，超时诊断据此区分“事件根本没到”和
+/// “事件到了但状态未切换”。
 async fn try_wait_for_mode(
-    subscription: &mut kerminal_application::configuration_changes::ConfigurationChangeSubscription,
+    subscription: &mut ConfigurationChangeSubscription,
     expected: ConfigurationMode,
     window: Duration,
+    observed: &mut Vec<ConfigurationMode>,
 ) -> Result<(), tokio::time::error::Elapsed> {
     let cancellation = CancellationToken::new();
     tokio::time::timeout(window, async {
         loop {
             match subscription.recv(cancellation.clone()).await {
-                ConfigurationChangeMessage::Changed(event)
-                    if event.recovery_state.mode == expected =>
-                {
-                    return;
+                ConfigurationChangeMessage::Changed(event) => {
+                    observed.push(event.recovery_state.mode);
+                    if event.recovery_state.mode == expected {
+                        return;
+                    }
                 }
-                ConfigurationChangeMessage::Changed(_)
-                | ConfigurationChangeMessage::RescanRequired => {}
+                ConfigurationChangeMessage::RescanRequired => {}
                 ConfigurationChangeMessage::Cancelled => panic!("测试取消 token 意外触发"),
                 ConfigurationChangeMessage::Closed => panic!("配置变更通道意外关闭"),
             }
@@ -71,18 +74,40 @@ async fn try_wait_for_mode(
 /// 在总 deadline 内等待指定恢复态；单次窗口超时就重写同一内容触发新的平台事件。
 ///
 /// 重写只改变文件时间戳、不改变内容，因此不改变断言（仍必须观察到目标恢复态），
-/// 也不会把损坏或修复后的配置语义带偏；总 deadline 到了仍失败才 panic。
+/// 也不会把损坏或修复后的配置语义带偏；总 deadline 到了仍失败才 panic，并在
+/// panic 前输出诊断，区分平台事件未投递、事件路径归一失败和状态机未切换。
 async fn wait_for_mode_retrying(
-    subscription: &mut kerminal_application::configuration_changes::ConfigurationChangeSubscription,
+    subscription: &mut ConfigurationChangeSubscription,
     expected: ConfigurationMode,
     deadline: Instant,
+    configuration: &ConfigurationStore,
+    settings_path: &Path,
     retrigger: impl Fn(),
 ) {
+    let mut observed = Vec::new();
+    let mut rewrites = 0usize;
     loop {
-        match try_wait_for_mode(subscription, expected, MODE_WAIT_WINDOW).await {
+        match try_wait_for_mode(subscription, expected, MODE_WAIT_WINDOW, &mut observed).await {
             Ok(()) => return,
-            Err(_) if Instant::now() < deadline => retrigger(),
-            Err(error) => panic!("等待配置状态变更超时: {error}"),
+            Err(_) if Instant::now() < deadline => {
+                rewrites += 1;
+                retrigger();
+            }
+            Err(error) => {
+                let recovery = configuration.recovery_state();
+                let settings = fs::metadata(settings_path).ok();
+                eprintln!(
+                    "配置 watcher 等待超时: expected={expected:?}, current_mode={:?}, \
+                     changed_events={}, changed_modes={observed:?}, rewrites={rewrites}, \
+                     settings_path={}, settings_exists={}, settings_bytes={:?}, error={error}",
+                    recovery.mode,
+                    observed.len(),
+                    settings_path.display(),
+                    settings.is_some(),
+                    settings.map(|metadata| metadata.len()),
+                );
+                panic!("等待配置状态变更超时: {error}");
+            }
         }
     }
 }
@@ -106,6 +131,8 @@ async fn external_invalid_configuration_enters_and_leaves_recovery_mode() {
         &mut changes,
         ConfigurationMode::ReadOnlyRecovery,
         Instant::now() + MODE_WAIT_DEADLINE,
+        &configuration,
+        &settings_path,
         || fs::write(&settings_path, corrupt).expect("重写损坏设置 fixture"),
     )
     .await;
@@ -126,6 +153,8 @@ async fn external_invalid_configuration_enters_and_leaves_recovery_mode() {
         &mut changes,
         ConfigurationMode::ReadWrite,
         Instant::now() + MODE_WAIT_DEADLINE,
+        &configuration,
+        &settings_path,
         || fs::write(&settings_path, repaired).expect("重写修复后的设置 fixture"),
     )
     .await;

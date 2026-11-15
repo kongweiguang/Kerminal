@@ -37,6 +37,11 @@ impl ConfigurationChangeWatcher {
     /// 订阅配置根目录并启动有界事件合并线程，避免 GPUI 主线程执行目录扫描。
     pub fn start(configuration: ConfigurationStore) -> AppResult<Self> {
         let root = configuration.root().to_path_buf();
+        // macOS 的 FSEvents 上报的是真实路径（如 `/private/var/...`），而配置根可能
+        // 是带符号链接的 `/var/...`；notify 内部按规范化路径过滤事件，但把原始
+        // FSEvents 路径交给回调。启动时只规范化一次并保存，避免每个事件都做一次
+        // 系统调用，也避免事件因前缀不匹配被整体丢弃。
+        let canonical_root = root.canonicalize().ok();
         let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let overflowed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
@@ -58,7 +63,16 @@ impl ConfigurationChangeWatcher {
         let worker_overflow = Arc::clone(&overflowed);
         let worker = thread::Builder::new()
             .name("kerminal-configuration-watch".to_owned())
-            .spawn(move || run_worker(configuration, root, receiver, worker_stop, worker_overflow))
+            .spawn(move || {
+                run_worker(
+                    configuration,
+                    root,
+                    canonical_root,
+                    receiver,
+                    worker_stop,
+                    worker_overflow,
+                )
+            })
             .map_err(|source| {
                 AppError::infrastructure_with_source("无法启动配置变更线程", source)
             })?;
@@ -136,9 +150,13 @@ fn enqueue_rescan(sender: &SyncSender<WatchInput>, overflowed: &AtomicBool) {
 }
 
 /// 在独立线程中合并短时间内的保存事件，再统一刷新恢复态和订阅通知。
+///
+/// `canonical_root` 是启动时规范化的配置根，用于匹配 macOS FSEvents 上报的
+/// 真实路径；为 `None` 时只按原始根匹配。
 fn run_worker(
     configuration: ConfigurationStore,
     root: PathBuf,
+    canonical_root: Option<PathBuf>,
     receiver: Receiver<WatchInput>,
     stop: Arc<AtomicBool>,
     overflowed: Arc<AtomicBool>,
@@ -151,12 +169,24 @@ fn run_worker(
         };
         let mut paths = BTreeSet::new();
         let mut full_rescan = false;
-        merge_input(first, &root, &mut paths, &mut full_rescan);
+        merge_input(
+            first,
+            &root,
+            canonical_root.as_deref(),
+            &mut paths,
+            &mut full_rescan,
+        );
         let deadline = Instant::now() + DEBOUNCE_WINDOW;
         while Instant::now() < deadline {
             let timeout = deadline.saturating_duration_since(Instant::now());
             match receiver.recv_timeout(timeout) {
-                Ok(input) => merge_input(input, &root, &mut paths, &mut full_rescan),
+                Ok(input) => merge_input(
+                    input,
+                    &root,
+                    canonical_root.as_deref(),
+                    &mut paths,
+                    &mut full_rescan,
+                ),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -185,9 +215,15 @@ fn run_worker(
 }
 
 /// 把批次内路径归一到配置根，只接受配置资产与本地 profile 恢复 journal。
+///
+/// 同时尝试原始根与启动时规范化的根：macOS FSEvents 上报 `/private/var/...`
+/// 这类真实路径，而配置根可能仍是 `/var/...` 符号链接路径，只按原始根
+/// `strip_prefix` 会把所有事件静默丢弃。事件路径本身不再逐个规范化，避免
+/// 每个事件一次系统调用。
 fn merge_input(
     input: WatchInput,
     root: &Path,
+    canonical_root: Option<&Path>,
     paths: &mut BTreeSet<PathBuf>,
     full_rescan: &mut bool,
 ) {
@@ -195,7 +231,10 @@ fn merge_input(
         WatchInput::Rescan => *full_rescan = true,
         WatchInput::Paths(event_paths) => {
             for absolute in event_paths {
-                let Ok(relative) = absolute.strip_prefix(root) else {
+                let relative = absolute.strip_prefix(root).ok().or_else(|| {
+                    canonical_root.and_then(|canonical| absolute.strip_prefix(canonical).ok())
+                });
+                let Some(relative) = relative else {
                     continue;
                 };
                 if is_relevant_path(relative, full_rescan) {
