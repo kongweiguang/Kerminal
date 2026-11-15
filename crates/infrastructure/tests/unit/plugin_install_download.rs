@@ -35,6 +35,12 @@ use super::{
 };
 use reqwest::header::{ETAG, HeaderMap, HeaderValue};
 
+/// 注入 deadline 的慢 runner 余量：CI 上线程调度可能停顿数十到数百毫秒，
+/// 50ms 级窗口会在用例断言“deadline 尚未到期”之前就过期，把真实超时路径
+/// 误判成环境抖动。这些用例随后都显式 sleep 到 deadline，放宽只增加等待上限，
+/// 不改变“到期后必须报 Timeout”的断言。
+const INJECTED_DEADLINE_SLACK: Duration = Duration::from_secs(1);
+
 /// 按 RFC 9110 entity-tag 语法直接判别 `classify_etag` 的三态分类。
 ///
 /// 合法强值、含逗号强值、obs-text 强值都判定为 Strong；弱值、内部引号、
@@ -1279,7 +1285,7 @@ async fn expired_deadline_between_chunk_and_write_prevents_the_write() {
     use std::task::Poll;
     let (flush_released, flush_gate) = oneshot::channel::<()>();
     let cancellation = CancellationToken::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + INJECTED_DEADLINE_SLACK;
     let mut check = std::pin::pin!(await_sync_then_verify(
         async {
             let _ = flush_gate.await;
@@ -1756,7 +1762,7 @@ async fn deadline_expiring_during_sync_is_reported_after_completion() {
     use std::task::Poll;
     let (release, gate) = oneshot::channel::<()>();
     let cancellation = CancellationToken::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + INJECTED_DEADLINE_SLACK;
     let mut check = std::pin::pin!(await_sync_then_verify(
         async {
             let _ = gate.await;
@@ -2023,7 +2029,7 @@ async fn expired_deadline_during_staging_truncation_is_reported_after_side_effec
         .await
         .expect("verified existing staging");
     let cancellation = CancellationToken::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + INJECTED_DEADLINE_SLACK;
     let (release, gate) = oneshot::channel::<()>();
     let (started_sender, started) = oneshot::channel::<()>();
     let guarded = tokio::spawn({
@@ -2633,15 +2639,18 @@ async fn body_error_at_full_size_is_a_failure_not_success() {
     let root = tempfile::tempdir().expect("temporary root");
     let path = root.path().join("download");
     let (progress, _) = watch::channel(InstallProgress::Preparing);
-    // 注入短 deadline 验证超时路径，不等待真实下载预算。
+    // 注入 deadline 验证超时路径，不等待真实下载预算；5 秒是慢 runner 的
+    // 环境余量（macOS CI 上客户端可能在 800ms 内还没发完请求头就断开，
+    // 服务端会因此看不到完整请求）。服务端不发终止块，deadline 仍必然在
+    // body 读取阶段到期，断言内容不变；外层窗口相应留出 5 秒收尾余量。
     let error = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(10),
         download_until(
             &asset(format!("http://{address}/plugin"), 6),
             &path,
             &progress,
             &CancellationToken::new(),
-            tokio::time::Instant::now() + Duration::from_millis(800),
+            tokio::time::Instant::now() + Duration::from_secs(5),
         ),
     )
     .await
