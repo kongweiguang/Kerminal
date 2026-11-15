@@ -69,6 +69,10 @@ where
 
 /// 将固定测试参数映射到生产私有输入结构，保持同一传输与验签路径及原测试约束。
 ///
+/// 超时只作为测试环境余量：macOS 慢 runner 上 TLS 握手加首包可能超过 2 秒，
+/// 过紧的上限会让客户端在读到 302 之前先报传输层错误，掩盖被验证的降级拒绝语义。
+/// 其余用例断言的是协议或校验错误，都在首包之后立即返回，放宽上限不影响其结论。
+///
 /// @author kongweiguang
 fn start_download(
     url: Url,
@@ -90,7 +94,7 @@ fn start_download(
                 public_key,
                 signature,
                 headers: HeaderMap::new(),
-                timeout: Some(Duration::from_secs(2)),
+                timeout: Some(Duration::from_secs(10)),
                 max_bytes,
                 additional_trust_roots: &trust_roots,
             },
