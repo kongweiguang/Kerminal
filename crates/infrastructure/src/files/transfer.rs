@@ -1553,41 +1553,53 @@ impl SftpTransferBackend {
                 .begin_commit(destination.clone(), total_bytes, Some(total_bytes), None)
                 .await
                 .map_err(|error| transfer_error(error, None, Some(destination.clone())))?;
-            if let Err(error) = apply_staging_directory_modes(
+            let deferred_root_mode = match apply_staging_directory_modes(
                 destination_session,
                 &staging_directories_postorder,
+                &staging,
                 &source_directory_modes,
                 &source_directory_mtimes,
                 options.preserve_mtime,
             )
             .await
             {
-                if let Err(restore_error) = restore_staging_directory_modes(
-                    destination_session,
-                    &staging_directories_postorder,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error_code = restore_error.public_code().as_str(),
-                        "目录权限应用失败后，暂存权限恢复仍待清理 owner 重试"
-                    );
-                }
-                context
-                    .progress
-                    .confirm_no_change()
+                Ok(mode) => mode,
+                Err(error) => {
+                    if let Err(restore_error) = restore_staging_directory_modes(
+                        destination_session,
+                        &staging_directories_postorder,
+                    )
                     .await
-                    .map_err(|acknowledgment| {
-                        transfer_error(acknowledgment, None, Some(destination.clone()))
-                    })?;
-                return Err(Box::new(transfer_error(error, None, Some(destination))));
-            }
+                    {
+                        tracing::warn!(
+                            error_code = restore_error.public_code().as_str(),
+                            "目录权限应用失败后，暂存权限恢复仍待清理 owner 重试"
+                        );
+                    }
+                    context
+                        .progress
+                        .confirm_no_change()
+                        .await
+                        .map_err(|acknowledgment| {
+                            transfer_error(acknowledgment, None, Some(destination.clone()))
+                        })?;
+                    return Err(Box::new(transfer_error(error, None, Some(destination))));
+                }
+            };
             match destination_session
                 .commit_directory(&staging, &destination)
                 .await
             {
                 Ok(()) => {
                     staging_tracker.mark_committed(&staging);
+                    // macOS 禁止重命名无写位的目录，根目录权限只能在原子发布后应用到正式目标；
+                    // 数据已经发布，权限应用失败必须报告提交结果未知，不能伪成功或回滚已发布内容。
+                    if let Err(error) = destination_session
+                        .set_permissions(&destination, deferred_root_mode)
+                        .await
+                    {
+                        return Err(Box::new(unknown_commit(error, Some(destination))));
+                    }
                     context
                         .progress
                         .record_committed_entry(total_bytes)
@@ -3133,15 +3145,19 @@ async fn inspect_recovery_destination(
 }
 
 /// 在原子发布前按后序恢复源目录 mtime 与权限，确保子项完成后设置时间且收紧权限前可写。
+/// 根目录的最终权限必须留到 rename 之后应用：macOS 禁止重命名任何无写位的目录，
+/// 即使目标父目录不变；其它平台沿用同一顺序，让 Linux 用例覆盖发布后应用路径。
 ///
 /// @author kongweiguang
 async fn apply_staging_directory_modes(
     session: &EndpointSession,
     postorder: &[FileEndpoint],
+    root: &FileEndpoint,
     source_modes: &HashMap<FileEndpoint, Option<u32>>,
     source_mtimes: &HashMap<FileEndpoint, Option<u64>>,
     preserve_mtime: bool,
-) -> AppResult<()> {
+) -> AppResult<Option<u32>> {
+    let mut deferred_root_mode = None;
     for directory in postorder {
         let mode = source_modes
             .get(directory)
@@ -3157,9 +3173,13 @@ async fn apply_staging_directory_modes(
                 .set_modified_time(directory, modified_seconds)
                 .await?;
         }
+        if directory == root {
+            deferred_root_mode = mode;
+            continue;
+        }
         session.set_permissions(directory, mode).await?;
     }
-    Ok(())
+    Ok(deferred_root_mode)
 }
 
 /// 发布前失败时从根到叶恢复 staging 的写权限，确保清理 owner 仍能递归回收暂存树。

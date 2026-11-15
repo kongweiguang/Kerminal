@@ -707,7 +707,11 @@ async fn local_directory_transfer_preserves_read_only_source_modes() {
         .await
         .expect("directory transfer workers release before shutdown");
 
-    assert_eq!(published_summary.status, TransferStatus::Succeeded);
+    assert_eq!(
+        published_summary.status,
+        TransferStatus::Succeeded,
+        "只读源目录发布未完成: {published_summary:?}",
+    );
     let (published_entries, published_bytes) =
         published_snapshot.expect("published tree is traversable");
     assert_eq!(
@@ -737,7 +741,11 @@ async fn local_directory_transfer_preserves_read_only_source_modes() {
     assert_eq!(published_new_mode, Some(0o550));
     assert_eq!(published_nested_mode, Some(0o500));
 
-    assert_eq!(merged_summary.status, TransferStatus::Succeeded);
+    assert_eq!(
+        merged_summary.status,
+        TransferStatus::Succeeded,
+        "只读源目录合并未完成: {merged_summary:?}",
+    );
     let (merged_entries, merged_bytes) = merged_snapshot.expect("merged tree is traversable");
     assert_eq!(
         merged_entries,
