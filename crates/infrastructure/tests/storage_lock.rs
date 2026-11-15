@@ -298,6 +298,9 @@ fn concurrent_stale_recovery_is_serialized_across_coordinators() {
     let successes = Arc::new(AtomicUsize::new(0));
     let locked = Arc::new(AtomicUsize::new(0));
     let unexpected = Arc::new(AtomicUsize::new(0));
+    // 并发回收在 Windows 上可能把 delete-pending 的瞬时冲突暴露成 I/O 错误；
+    // 记录错误种类与 errno，让失败信息能区分路径竞争和真实权限/磁盘故障。
+    let unexpected_details = Arc::new(Mutex::new(Vec::<String>::new()));
     let overlap_detected = Arc::new(AtomicBool::new(false));
     let release_owner = Arc::new((Mutex::new(false), Condvar::new()));
     let (attempt_tx, attempt_rx) = mpsc::channel();
@@ -310,6 +313,7 @@ fn concurrent_stale_recovery_is_serialized_across_coordinators() {
         let successes = Arc::clone(&successes);
         let locked = Arc::clone(&locked);
         let unexpected = Arc::clone(&unexpected);
+        let unexpected_details = Arc::clone(&unexpected_details);
         let overlap_detected = Arc::clone(&overlap_detected);
         let release_owner = Arc::clone(&release_owner);
         let attempt_tx = attempt_tx.clone();
@@ -327,8 +331,22 @@ fn concurrent_stale_recovery_is_serialized_across_coordinators() {
                     locked.fetch_add(1, Ordering::SeqCst);
                     None
                 }
-                Err(_) => {
+                Err(error) => {
                     unexpected.fetch_add(1, Ordering::SeqCst);
+                    let detail = match &error {
+                        StorageLockError::Io(io) => {
+                            format!(
+                                "Io(kind={:?}, raw_os_error={:?})",
+                                io.kind(),
+                                io.raw_os_error()
+                            )
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    unexpected_details
+                        .lock()
+                        .expect("record unexpected lock error")
+                        .push(detail);
                     None
                 }
             };
@@ -356,6 +374,10 @@ fn concurrent_stale_recovery_is_serialized_across_coordinators() {
     let observed_successes = successes.load(Ordering::SeqCst);
     let observed_locked = locked.load(Ordering::SeqCst);
     let observed_unexpected = unexpected.load(Ordering::SeqCst);
+    let observed_unexpected_details = unexpected_details
+        .lock()
+        .expect("read unexpected lock errors")
+        .clone();
     let observed_active = active.load(Ordering::SeqCst);
     let observed_overlap = overlap_detected.load(Ordering::SeqCst);
 
@@ -367,8 +389,16 @@ fn concurrent_stale_recovery_is_serialized_across_coordinators() {
     }
 
     assert_eq!(observed_successes, 1);
+    // 先断言“没有意外错误”，否则 locked 计数失败会掩盖具体 errno，无法区分瞬时竞争与真实故障。
+    assert_eq!(
+        observed_unexpected, 0,
+        "unexpected lock errors must be zero; observed: {observed_unexpected_details:?}"
+    );
+    assert!(
+        observed_unexpected_details.is_empty(),
+        "unexpected lock error kinds: {observed_unexpected_details:?}"
+    );
     assert_eq!(observed_locked, WORKERS - 1);
-    assert_eq!(observed_unexpected, 0);
     assert_eq!(
         observed_active, 1,
         "the winning owner stays held through all attempts"
