@@ -297,24 +297,24 @@ fn fixture_layout() -> FixtureResult<FixtureLayout> {
         .canonicalize()
         .map_err(|_| "无法校验工作区根目录")?;
     let target_path = workspace_root.join("target");
-    reject_reparse_components(&target_path)?;
+    reject_reparse_components(&target_path, &workspace_root)?;
     let target_root = target_path
         .canonicalize()
         .map_err(|_| "target 目录不存在")?;
     let acceptance_path = target_root.join("acceptance");
-    reject_reparse_components(&acceptance_path)?;
+    reject_reparse_components(&acceptance_path, &target_root)?;
     let acceptance_root = acceptance_path
         .canonicalize()
         .map_err(|_| "验收 fixture 根目录不存在")?;
     let output_path = acceptance_root.join("ui-refresh-fixture");
-    reject_reparse_components(&output_path)?;
+    reject_reparse_components(&output_path, &target_root)?;
     let output_parent = output_path
         .canonicalize()
         .map_err(|_| "验收输出父目录不存在")?;
     let seed_path = env::var_os(SEED_ROOT_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| output_parent.join("r20-seed-20261017T170523Z"));
-    reject_reparse_components(&seed_path)?;
+    reject_reparse_components(&seed_path, &output_parent)?;
     let seed_root = seed_path
         .canonicalize()
         .map_err(|_| "公开展示 seed 不存在")?;
@@ -323,7 +323,9 @@ fn fixture_layout() -> FixtureResult<FixtureLayout> {
     if !source_path.is_absolute() {
         return Err("SSH fixture 源目录必须为绝对路径");
     }
-    reject_reparse_components(&source_path)?;
+    // 外部源目录本身就是信任锚点：其之上的系统路径链接由 canonicalize 解析，
+    // 根以下文件由 validate_source_file 继续检查。
+    reject_reparse_components(&source_path, &source_path)?;
     let source_metadata =
         fs::symlink_metadata(&source_path).map_err(|_| "任务私有 SSH fixture 源目录不可用")?;
     if !source_metadata.is_dir() || is_link_or_reparse_point(&source_metadata) {
@@ -358,10 +360,10 @@ fn validated_fixture_input(variable: &str, layout: &FixtureLayout) -> FixtureRes
     validate_source_file(&path, &layout.ssh_source_root)
 }
 
-/// 拒绝路径中的链接组件，再用规范化路径二次确认源文件归属。
+/// 拒绝受信根以下的链接组件，再用规范化路径二次确认源文件归属。
 /// @author kongweiguang
 fn validate_source_file(path: &Path, source_root: &Path) -> FixtureResult<PathBuf> {
-    reject_reparse_components(path)?;
+    reject_reparse_components(path, source_root)?;
     let metadata = fs::symlink_metadata(path).map_err(|_| "SSH fixture 输入文件不可用")?;
     if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
         return Err("SSH fixture 输入必须是普通文件");
@@ -381,7 +383,7 @@ fn copy_r20_seed(seed_root: &Path, config_root: &Path, target_root: &Path) -> Fi
     let mut copied = 0;
     for relative in R20_SEED_FILES {
         let source = seed_root.join(relative);
-        reject_reparse_components(&source)?;
+        reject_reparse_components(&source, seed_root)?;
         let metadata = fs::symlink_metadata(&source).map_err(|_| "r20 seed 文件缺失")?;
         if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
             return Err("r20 seed 仅允许普通配置文件");
@@ -418,10 +420,10 @@ fn copy_known_hosts(
     Ok(())
 }
 
-/// 在创建验收文件前验证路径位于工作树 target、父级无链接且最终组件不存在。
+/// 在创建验收文件前验证路径位于工作树 target、根以下父级无链接且最终组件不存在。
 /// @author kongweiguang
 fn validate_output_path(path: &Path, target_root: &Path) -> FixtureResult<()> {
-    reject_reparse_components(path)?;
+    reject_reparse_components(path, target_root)?;
     let canonical_target_root = target_root
         .canonicalize()
         .map_err(|_| "无法校验验收 target 根目录")?;
@@ -468,12 +470,25 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
-/// 检查已存在路径的每个组件，避免 junction/reparse point 改变验收输入或输出的实际位置。
+/// 只拒绝受信根以下的链接组件，根及其之上的系统路径链接放行。
+///
+/// macOS 的 `/var` 是指向 `/private/var` 的系统符号链接，而测试与验收目录通常位于
+/// `/var/folders/...`。若从文件系统根开始一律拒绝链接，合法路径会被误判越界。
+/// 根之上的链接由系统维护，最终位置由调用方的 `canonicalize` 统一解析并再次校验，
+/// 因此这里放行；根以下的链接仍必须拒绝，因为它能把读写重定向到任意位置，即使
+/// 暂时指回根内也会引入路径别名和竞态。
+///
+/// 判断链接是否位于根之上时比较规范化路径：调用方可能传入 `/var/...` 拼写，而受信
+/// 根是 `/private/var/...`，直接做字符串前缀比较不可靠。
+///
 /// @author kongweiguang
-fn reject_reparse_components(path: &Path) -> FixtureResult<()> {
+fn reject_reparse_components(path: &Path, trusted_root: &Path) -> FixtureResult<()> {
     if !path.is_absolute() {
         return Err("fixture 路径必须为绝对路径");
     }
+    let canonical_root = trusted_root
+        .canonicalize()
+        .map_err(|_| "无法校验 fixture 受信根目录")?;
 
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -491,7 +506,13 @@ fn reject_reparse_components(path: &Path) -> FixtureResult<()> {
 
         match fs::symlink_metadata(&current) {
             Ok(metadata) if is_link_or_reparse_point(&metadata) => {
-                return Err("fixture 路径不能经过符号链接或 reparse point");
+                let canonical_link = current
+                    .canonicalize()
+                    .map_err(|_| "无法解析 fixture 路径链接")?;
+                // 只有受信根本身或它的祖先允许是链接；根以下一律拒绝。
+                if !canonical_root.starts_with(&canonical_link) {
+                    return Err("fixture 路径不能经过受信根以下的符号链接或 reparse point");
+                }
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,

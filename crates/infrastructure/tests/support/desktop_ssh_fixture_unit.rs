@@ -166,3 +166,29 @@ fn source_file_rejects_symlink_alias() {
 
     assert!(validate_source_file(&alias, &canonical_root).is_err());
 }
+
+/// 受信根之上的系统链接（如 macOS 的 /var -> /private/var）必须放行。
+///
+/// 该用例固定“根以上链接允许、根以下链接拒绝”的边界，避免以后又把系统路径
+/// 误判为越界；根以下链接的拒绝由上面的别名用例覆盖。
+/// @author kongweiguang
+#[cfg(unix)]
+#[test]
+fn source_file_allows_symlink_above_trusted_root() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let real_root = temporary.path().join("real");
+    let source_root = real_root.join("task-private-source");
+    fs::create_dir_all(&source_root).expect("create source root");
+    let allowed = source_root.join("known-hosts.fixture");
+    fs::write(&allowed, b"test-only-known-host-data\n").expect("write test fixture");
+    let alias = temporary.path().join("alias");
+    symlink(&real_root, &alias).expect("create ancestor symlink");
+    let canonical_root = source_root
+        .canonicalize()
+        .expect("canonicalize source root");
+    let aliased_path = alias.join("task-private-source/known-hosts.fixture");
+
+    assert!(validate_source_file(&aliased_path, &canonical_root).is_ok());
+}
