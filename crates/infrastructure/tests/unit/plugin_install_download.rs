@@ -248,7 +248,11 @@ async fn prohibited_redirect_target_is_rejected_without_retry() {
     let counter = Arc::clone(&requests);
     let server = tokio::spawn(async move {
         // 策略拒绝发生在第二跳连接之前，因此只能观察到第一跳请求。
-        while let Some(mut stream) = accept_before(&listener, Duration::from_millis(500)).await {
+        // 首跳窗口是环境准备余量：慢 runner 上客户端完成 URL 校验、pinning 和
+        // 建 client 可能远超 500ms，窗口过短会让连接错误（Infrastructure）冒充
+        // 策略拒绝（Invalid），把用例变成环境抖动；这里只放宽等待时间，
+        // “策略拒绝不重试”仍由请求次数断言保证，不涉及任何超时语义。
+        while let Some(mut stream) = accept_before(&listener, Duration::from_secs(5)).await {
             counter.fetch_add(1, Ordering::SeqCst);
             read_request_head(&mut stream).await;
             stream
