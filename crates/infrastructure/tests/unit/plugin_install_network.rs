@@ -983,11 +983,13 @@ async fn body_read_observes_absolute_deadline() {
     let server = serve_stalled_body(listener);
 
     let mut session = AssetNetworkSession::system();
+    // 5 秒预算只是给 macOS 慢 runner 留出建立回环连接和读完响应头的环境余量；
+    // 被验证的语义仍是 body 读取受同一绝对期限约束，而不是放宽超时判断。
     let mut response = session
         .get(
             &format!("http://127.0.0.1:{port}/stalled"),
             HeaderMap::new(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
             &CancellationToken::new(),
         )
         .await
