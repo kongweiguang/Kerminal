@@ -36,7 +36,9 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
-const TEST_DEADLINE: Duration = Duration::from_secs(180);
+// macOS CI 慢 runner 上背压 producer 的稳定观测可能超过 180 秒，放宽到 300 秒留出环境余量；
+// 只影响总期限，不改变背压、关闭和回收断言的窗口逻辑。
+const TEST_DEADLINE: Duration = Duration::from_secs(300);
 const CLOSE_DEADLINE: Duration = Duration::from_secs(12);
 const ACTIVE_OUTPUT_THRESHOLD: u64 = 64 * 1024;
 const OUTPUT_SAMPLE_LIMIT: usize = 16 * 1024;
