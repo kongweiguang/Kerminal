@@ -260,7 +260,9 @@ fn dirty_and_saving_file_reject_readonly_restriction(app: &mut TestAppContext) {
         assert!(!files.workspace_file_requires_readonly(&endpoint));
     });
 
-    visual.simulate_keystrokes("ctrl-s");
+    // 保存绑定使用 secondary 修饰键（macOS 为 cmd、其它平台为 ctrl），
+    // 直接模拟 ctrl-s 在 macOS 上不会触发保存，会让后续断言误判为“未保存”。
+    visual.simulate_keystrokes("secondary-s");
     visual.run_until_parked();
     visual.update(|_, cx| {
         let error = files
