@@ -212,7 +212,10 @@ fn source_fingerprint_rejects_symlink_paths() {
 }
 
 /// 非 UTF-8 Git 路径无法跨平台规范化时应失败关闭，而非用有损路径摘要。
-#[cfg(unix)]
+///
+/// macOS 的 APFS/HFS+ 要求文件名是合法 UTF-8，`fs::write` 会直接返回 EILSEQ，
+/// 无法构造该夹具；拒绝逻辑仍由 Linux 覆盖，因此仅在非 macOS 的 Unix 上运行。
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn source_fingerprint_rejects_non_utf8_paths() {
     use std::os::unix::ffi::OsStringExt;
