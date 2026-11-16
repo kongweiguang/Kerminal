@@ -154,8 +154,16 @@ jobs:
         run: |
           set -euo pipefail
           export KERMINAL_CONFIG_ROOT="${RUNNER_TEMP}/plugin-webview-config"
+          # 探针只接受绝对路径，且要求输出目录在启动前不存在（见
+          # crates/kerminal-desktop/src/webview_probe.rs 的 parse_options 校验），
+          # 因此这里显式拼出工作区绝对路径，并在每个主题运行前清理自己的子目录；
+          # 只删 webview-* 子目录，保留同目录下 plugin-examples 的验收产物。
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          mkdir -p "$workspace/target/diagnostics"
           for theme in light dark system; do
-            target/debug/kerminal --webview-probe --headless-check --theme "$theme" --output "target/diagnostics/webview-$theme"
+            output="$workspace/target/diagnostics/webview-$theme"
+            rm -rf "$output"
+            target/debug/kerminal --webview-probe --headless-check --theme "$theme" --output "$output"
           done
 
       - name: Preserve native verification evidence
