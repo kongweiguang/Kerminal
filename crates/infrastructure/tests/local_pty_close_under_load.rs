@@ -1863,8 +1863,10 @@ async fn close_with_output_consumer_backpressure(
         ),
     );
     let first_stability_result = if pause_result.is_ok() && Instant::now() < total_deadline {
+        // 超时预算必须严格大于被等待的稳定窗口：两者相等时 timeout 与 sleep 会在同一时刻到期，
+        // 慢 runner 上定时器实现稍有延迟就会先触发 timeout，把正常的 100ms 稳定观测误报为失败。
         match timeout_at(
-            stage_deadline(total_deadline, BACKPRESSURE_STABILITY_WINDOW),
+            stage_deadline(total_deadline, BACKPRESSURE_STABILITY_WINDOW * 2),
             sleep(BACKPRESSURE_STABILITY_WINDOW),
         )
         .await
@@ -1997,8 +1999,9 @@ async fn close_with_output_consumer_backpressure(
     .await;
     let second_stability_result = if second_pause_result.is_ok() && Instant::now() < total_deadline
     {
+        // 与首次暂停相同：预算留出余量，避免 timeout 与 sleep 同刻到期在慢 runner 上误报。
         match timeout_at(
-            stage_deadline(total_deadline, BACKPRESSURE_STABILITY_WINDOW),
+            stage_deadline(total_deadline, BACKPRESSURE_STABILITY_WINDOW * 2),
             sleep(BACKPRESSURE_STABILITY_WINDOW),
         )
         .await
