@@ -547,7 +547,7 @@ function Assert-Installation {
     )
 
     $entries = @(Get-InstalledKerminal -Hive HKCU)
-    Assert-True ($entries.Count -eq 1) "期望恰好一个 HKCU Kerminal 卸载项，实际 $($entries.Count) 个：$($entries.KeyPath -join ', ')"
+    Assert-True ($entries.Count -eq 1) "期望恰好一个 HKCU Kerminal 卸载项，实际 $($entries.Count) 个：$(($entries | ForEach-Object { $_.KeyPath }) -join ', ')"
     $entry = $entries[0]
     Assert-True ([string]$entry.DisplayVersion -eq $ExpectedVersion) "DisplayVersion 不是 $ExpectedVersion：$($entry.DisplayVersion)"
     Assert-True (-not [string]::IsNullOrWhiteSpace($entry.InstallLocation)) 'InstallLocation 为空'
@@ -598,7 +598,8 @@ function Assert-Installation {
     }
 
     $machineEntries = @(Get-InstalledKerminal -Hive HKLM)
-    Assert-True ($machineEntries.Count -eq 0) "currentUser 安装不应写 HKLM 卸载项：$($machineEntries.KeyPath -join ', ')"
+    # 严格模式下不能对空数组做成员枚举；正常的 currentUser 安装没有 HKLM 卸载项。
+    Assert-True ($machineEntries.Count -eq 0) "currentUser 安装不应写 HKLM 卸载项：$(($machineEntries | ForEach-Object { $_.KeyPath }) -join ', ')"
 
     return $entry
 }
