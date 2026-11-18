@@ -44,18 +44,18 @@ impl DataMigrationRepository for RejectingMigration {
 /// @author kongweiguang
 #[test]
 fn legacy_source_is_only_enabled_for_the_formal_default_root() {
-    for development in [false, true] {
+    for formal_build in [false, true] {
         for explicit_root in [false, true] {
             for environment_override in [false, true] {
                 for formal_root in [false, true] {
                     assert_eq!(
                         legacy_window_state_enabled(
-                            development,
+                            formal_build,
                             explicit_root,
                             environment_override,
                             formal_root
                         ),
-                        formal_root && !development && !explicit_root && !environment_override,
+                        formal_root && formal_build && !explicit_root && !environment_override,
                     );
                 }
             }

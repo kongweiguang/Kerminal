@@ -104,6 +104,13 @@ impl PackagedMigrationWrapper {
     ///
     /// @author kongweiguang
     fn run(&self, root: &OsStr, mode: &str) -> Output {
+        let mut command = self.command();
+        command.arg("-Root").arg(root).arg(mode);
+        run_bounded(command)
+    }
+
+    /// 将宿主和脚本路径固定在测试布局，允许每个子进程单独覆盖数据根。
+    fn command(&self) -> Command {
         let mut command = Command::new("powershell.exe");
         command
             .args([
@@ -113,11 +120,8 @@ impl PackagedMigrationWrapper {
                 "Bypass",
                 "-File",
             ])
-            .arg(&self.script_path)
-            .arg("-Root")
-            .arg(root)
-            .arg(mode);
-        run_bounded(command)
+            .arg(&self.script_path);
+        command
     }
 
     /// 用 PowerShell 的 `-Name:value` 形式把 flag 外观字符串明确绑定为根目录参数值。
@@ -188,13 +192,16 @@ impl PackagedUnixMigrationWrapper {
     ///
     /// @author kongweiguang
     fn run(&self, root: &OsStr, mode: &str) -> Output {
-        let mut command = Command::new("sh");
-        command
-            .arg(&self.script_path)
-            .arg("--root")
-            .arg(root)
-            .arg(mode);
+        let mut command = self.command();
+        command.arg("--root").arg(root).arg(mode);
         run_bounded(command)
+    }
+
+    /// 从同一个打包布局构造两类调用，不依赖当前工作目录选择脚本。
+    fn command(&self) -> Command {
+        let mut command = Command::new("sh");
+        command.arg(&self.script_path);
+        command
     }
 }
 
@@ -472,6 +479,36 @@ fn powershell_wrapper_dry_run_preserves_chinese_spaced_trailing_separator_root()
     assert_eq!(result["inspection"]["readiness"], "fresh");
     assert!(!root.exists());
     assert_eq!(snapshot(fixture.path()), before);
+}
+
+/// 包装器省略根参数时必须遵守真实 helper 的隔离覆写；用已初始化根区分错误选中的空目录。
+#[test]
+fn packaged_wrapper_without_root_honors_isolated_override() {
+    #[cfg(windows)]
+    let (wrapper, mode) = (PackagedMigrationWrapper::new(), "-DryRun");
+    #[cfg(unix)]
+    let (wrapper, mode) = (PackagedUnixMigrationWrapper::new(), "--dry-run");
+
+    let fixture = tempfile::tempdir().expect("isolated wrapper home");
+    let root = fixture.path().join("中文 覆写目录");
+    assert!(run_migration(&root, "--apply").status.success());
+    let before = snapshot(&root);
+    let home = fixture.path().join("unused home");
+    let mut command = wrapper.command();
+    command
+        .arg(mode)
+        .env("KERMINAL_CONFIG_ROOT", &root)
+        .env("USERPROFILE", &home)
+        .env("HOME", &home);
+    let output = run_bounded(command);
+    assert!(output.status.success());
+    assert_eq!(document(&output)["inspection"]["readiness"], "current");
+    assert!(
+        snapshot(&root) == before,
+        "dry-run modified the overridden root"
+    );
+    assert!(!home.join(".kerminal").exists());
+    assert!(!home.join(".kerminal-gpui").exists());
 }
 
 /// Windows PowerShell wrapper 必须真实透传 apply 终态和 helper 的中文 JSON 错误。

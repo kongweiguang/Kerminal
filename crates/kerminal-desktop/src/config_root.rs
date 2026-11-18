@@ -1,4 +1,4 @@
-//! 用户数据目录解析。GPUI 测试期默认使用 `~/.kerminal-gpui`，与旧版正式数据隔离。
+//! 正式版与开发版在同一入口选择数据根；预发布包不接管正式配置。
 //!
 //! @author kongweiguang
 
@@ -17,14 +17,26 @@ const CONFIG_ROOT_ENV: &str = "KERMINAL_CONFIG_ROOT";
 pub struct ConfigRoot(PathBuf);
 
 impl ConfigRoot {
-    /// GPUI 两种构建模式共用独立目录，允许旧版继续运行；显式覆盖用于其它隔离验收。
+    /// 桌面与维护工具共用发布身份和显式覆盖规则，避免预检与启动落入不同的根。
     ///
     /// @author kongweiguang
     pub fn resolve() -> Result<Self, ConfigRootError> {
         let override_path = env::var_os(CONFIG_ROOT_ENV);
-        let home = current_home_dir();
-        let path = resolve_from_inputs(override_path, home)?;
+        let formal_build = Self::uses_formal_default();
+        let home = override_path.is_none().then(|| {
+            if formal_build {
+                dirs::home_dir()
+            } else {
+                development_home_dir()
+            }
+        });
+        let path = resolve_from_inputs(override_path, home.flatten(), formal_build)?;
         Ok(Self(path))
+    }
+
+    /// 普通开发构建和任何预发布包都不触碰旧版正式根；是否安装不依赖可执行文件路径猜测。
+    pub(crate) const fn uses_formal_default() -> bool {
+        !cfg!(debug_assertions) && env!("CARGO_PKG_VERSION_PRE").is_empty()
     }
 
     /// 供配置、vault 与数据库 adapter 共用同一个已解析根目录。
@@ -36,16 +48,17 @@ impl ConfigRoot {
     ///
     /// @author kongweiguang
     pub(crate) fn points_to_formal_default(path: &Path) -> bool {
-        points_to_formal_default_from_inputs(path, current_home_dir(), env::current_dir().ok())
+        points_to_formal_default_from_inputs(path, dirs::home_dir(), env::current_dir().ok())
     }
 }
 
-/// GPUI 默认根与旧版正式根分开；显式覆盖仍优先，旧版根身份另由迁移门禁检查。
+/// 显式覆盖优先；正式构建复用旧版根，以便迁移同一份数据而不是创建空工作区。
 ///
 /// @author kongweiguang
 fn resolve_from_inputs(
     override_path: Option<OsString>,
     home_dir: Option<PathBuf>,
+    formal_build: bool,
 ) -> Result<PathBuf, ConfigRootError> {
     if let Some(path) = override_path {
         if path.is_empty() {
@@ -54,12 +67,16 @@ fn resolve_from_inputs(
         return Ok(PathBuf::from(path));
     }
 
-    home_dir
-        .map(|home| home.join(".kerminal-gpui"))
-        .ok_or(ConfigRootError::HomeDirectoryUnavailable)
+    if formal_build {
+        formal_default_root(home_dir)
+    } else {
+        home_dir
+            .map(|home| home.join(".kerminal-gpui"))
+            .ok_or(ConfigRootError::HomeDirectoryUnavailable)
+    }
 }
 
-/// 保持既有 home/.kerminal 选择规则集中；此处只拼接路径，不查询文件系统。
+/// 使用与 0.3 相同的系统主目录拼接规则，不受 Windows `USERPROFILE` 自定义值影响。
 ///
 /// @author kongweiguang
 fn formal_default_root(home_dir: Option<PathBuf>) -> Result<PathBuf, ConfigRootError> {
@@ -79,7 +96,7 @@ fn points_to_formal_default_from_inputs(
     let Ok(formal_root) = formal_default_root(home_dir) else {
         return true;
     };
-    // USERPROFILE/HOME 必须是绝对路径；相对 home 无法证明与旧版使用的正式目录相同。
+    // 相对 home 无法证明与旧版使用的正式目录相同。
     if !formal_root.is_absolute() {
         return true;
     }
@@ -228,8 +245,8 @@ fn paths_may_match_formal_root(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-/// Windows 使用 USERPROFILE，Unix 使用 HOME；缺失时显式失败，不猜测另一个账户目录。
-fn current_home_dir() -> Option<PathBuf> {
+/// 开发构建保留环境选根，供隔离调试启动；正式根不从可改写的 Windows 环境值推断。
+fn development_home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let key = "USERPROFILE";
     #[cfg(not(windows))]

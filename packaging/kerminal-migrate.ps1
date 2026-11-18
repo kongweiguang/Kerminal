@@ -78,15 +78,6 @@ if ($PSBoundParameters.ContainsKey('Root') -and [string]::IsNullOrWhiteSpace($Ro
     exit 2
 }
 
-if (-not $PSBoundParameters.ContainsKey('Root')) {
-    $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
-    if ([string]::IsNullOrWhiteSpace($userProfile)) {
-        [Console]::Error.WriteLine('The current user profile directory is unavailable.')
-        exit 2
-    }
-    $Root = Join-Path -Path $userProfile -ChildPath '.kerminal'
-}
-
 $helperPath = Join-Path -Path $PSScriptRoot -ChildPath 'kerminal-migrate.exe'
 if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
     [Console]::Error.WriteLine("Migration helper is missing beside this script: $helperPath")
@@ -99,7 +90,11 @@ if ($helperItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
 }
 
 $modeArgument = if ($DryRun.IsPresent) { '--dry-run' } else { '--apply' }
-$processArguments = @('--root', $Root, $modeArgument)
+$processArguments = if ($PSBoundParameters.ContainsKey('Root')) {
+    @('--root', $Root, $modeArgument)
+} else {
+    @($modeArgument)
+}
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $helperPath
 $startInfo.Arguments = (($processArguments | ForEach-Object {

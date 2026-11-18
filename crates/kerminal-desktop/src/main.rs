@@ -451,6 +451,7 @@ fn source_raw_os_error(error: &(dyn Error + 'static)) -> Option<i32> {
 }
 
 /// 主实例独占启动事务，先准备冻结目录和迁移，再装配业务服务；次实例只发送激活请求。
+/// 正式构建即使指定隔离根也执行同一门禁，使安装验收能覆盖真实的迁移决策。
 /// @author kongweiguang
 fn run_application(
     runtime: &ApplicationRuntime,
@@ -484,8 +485,8 @@ fn run_application(
                 legacy_window_state.as_deref(),
                 migration_catalogs.1.clone(),
             );
-            let allow_beta_contract =
-                !crate::config_root::ConfigRoot::points_to_formal_default(config_root.as_path());
+            let allow_beta_contract = !config_root::ConfigRoot::uses_formal_default()
+                && !config_root::ConfigRoot::points_to_formal_default(config_root.as_path());
             bootstrap::run_after_migration(&migration, allow_beta_contract, |_| {
                 // 先建立已验证的数据格式，避免新建日志目录让干净根变成未知非空根。
                 *log_guard = Some(logging::initialize(config_root.as_path()).map_err(|error| {

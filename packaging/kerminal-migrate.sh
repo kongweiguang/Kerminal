@@ -47,14 +47,6 @@ if [ -z "$mode" ]; then
     exit 2
 fi
 
-if [ "$root_was_set" -eq 0 ]; then
-    if [ -z "${HOME-}" ]; then
-        printf '%s\n' 'The current user home directory is unavailable.' >&2
-        exit 2
-    fi
-    root=$HOME/.kerminal
-fi
-
 script_path=$0
 case "$script_path" in
     /*) ;;
@@ -68,4 +60,7 @@ if [ -L "$helper_path" ] || [ ! -f "$helper_path" ] || [ ! -x "$helper_path" ]; 
     exit 127
 fi
 
-exec "$helper_path" --root "$root" "$mode"
+if [ "$root_was_set" -eq 1 ]; then
+    exec "$helper_path" --root "$root" "$mode"
+fi
+exec "$helper_path" "$mode"

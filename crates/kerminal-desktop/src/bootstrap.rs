@@ -38,8 +38,7 @@ pub(crate) fn migration_service(
 }
 
 /// 迁移成功后才调用后继动作，形成可验证的装配屏障；未知或失败结果不得创建任何运行态资源。
-/// 正式发版前，GPUI 默认测试根把契约 3 与当前契约视为同一代，可直接读取现有 beta 数据；
-/// 该例外只接受无恢复事务的明确契约 3，不自动迁移、不覆盖文件，正式根仍走严格门禁。
+/// 仅非正式构建的隔离开发根保留契约 3 的旧测试入口；正式构建和维护工具不得跳过失败的迁移。
 ///
 /// @author kongweiguang
 pub(crate) fn run_after_migration<T>(
@@ -53,6 +52,7 @@ pub(crate) fn run_after_migration<T>(
             let inspection = service.inspect()?;
             // 插件布局仍为 schema 1 或留有迁移 journal 时，beta 豁免也不能绕过迁移屏障。
             if inspection.migration_contract == Some(BETA_CONTRACT)
+                && inspection.blockers.is_empty()
                 && !inspection.recovery_pending
                 && inspection.plugin_layout.is_settled()
             {
@@ -71,7 +71,7 @@ pub(crate) fn run_after_migration<T>(
     }
 }
 
-/// GPUI beta 数据仍使用契约 3；正式发版提升契约后删除该豁免。
+/// 只为非正式构建保留已知测试数据的契约代次。
 const BETA_CONTRACT: u32 = 3;
 
 /// GPUI 默认测试根不读取旧 Tauri 窗口资料，避免旧版仍在运行时共享其状态文件。
@@ -80,7 +80,7 @@ const BETA_CONTRACT: u32 = 3;
 /// @author kongweiguang
 pub(crate) fn legacy_window_state_path(explicit_root: bool) -> Option<PathBuf> {
     if !legacy_window_state_enabled(
-        cfg!(debug_assertions),
+        ConfigRoot::uses_formal_default(),
         explicit_root,
         std::env::var_os("KERMINAL_CONFIG_ROOT").is_some(),
         ConfigRoot::resolve()
@@ -96,16 +96,16 @@ pub(crate) fn legacy_window_state_path(explicit_root: bool) -> Option<PathBuf> {
     })
 }
 
-/// 来源权限同时检查目录身份和调用方式，使 release 的 GPUI 测试根也保持隔离。
+/// 只有正式默认启动可读旧系统窗口资料；即使显式试验根指回正式目录也不隐式选取外部来源。
 ///
 /// @author kongweiguang
 fn legacy_window_state_enabled(
-    development: bool,
+    formal_build: bool,
     explicit_root: bool,
     environment_override: bool,
     formal_root: bool,
 ) -> bool {
-    formal_root && !development && !explicit_root && !environment_override
+    formal_build && formal_root && !explicit_root && !environment_override
 }
 
 #[cfg(test)]

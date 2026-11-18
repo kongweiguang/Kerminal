@@ -5,7 +5,7 @@
   <h1>Kerminal</h1>
   <p><strong>把终端、远程服务器、文件传输、容器运维与 AI Agent 放进同一个原生桌面工作台。</strong></p>
   <p>
-    <a href="https://github.com/kongweiguang/Kerminal/releases/tag/v0.4.0-beta.7">下载 GPUI 测试版</a>
+    <a href="https://github.com/kongweiguang/Kerminal/releases">下载安装包</a>
     ·
     <a href="#快速开始">快速开始</a>
     ·
@@ -13,7 +13,7 @@
     ·
     <a href="#源码开发">源码开发</a>
   </p>
-  <p><sub>0.4.0-beta.7 · Rust + GPUI · Windows / Linux / macOS</sub></p>
+  <p><sub>0.4 · Rust + GPUI · Windows / Linux / macOS</sub></p>
 </div>
 
 ![Kerminal GPUI 完整应用窗口：本机终端与已进入会话的 Codex AI 助手](docs/assets/kerminal-hero.png)
@@ -22,7 +22,7 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。围绕�
 
 `main` 是使用 Rust、GPUI 与 GPUI Kit 重建的 **0.4 原生桌面版本**；[tauri 分支](https://github.com/kongweiguang/Kerminal/tree/tauri) 保留 0.3.x Tauri 实现。新版本不再使用旧版的 WebView / xterm.js 界面，开发也不需要先启动 Node.js 前端。
 
-> **当前为 beta 测试版，功能迁移与跨平台原生验收仍在进行，请勿用于生产环境。** GPUI 默认使用 `~/.kerminal-gpui`，与旧版 `~/.kerminal` 隔离。下面的截图来自 GPUI 开发版隔离窗口，使用演示数据，均保留完整应用窗口，仅遮盖必要的本机信息；首图为真实 Codex CLI 已进入会话的画面。不是 Tauri 版截图，也不代表全功能验收通过。
+GPUI 开发版与 Beta 默认使用 `~/.kerminal-gpui`；0.4 正式包沿用 `~/.kerminal`。截图来自 GPUI 开发版隔离窗口，使用演示数据；首图为真实 Codex CLI 已进入会话的画面。
 
 ## 当前能力
 
@@ -42,7 +42,7 @@ Kerminal 是一个本地优先的桌面终端和远程运维工作台。围绕�
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases) 选择 **GPUI beta**，不要用只指向稳定版的 `releases/latest` 判断 0.4 版本。当前 `v0.4.0-beta.7` 的下载入口：
+前往 [GitHub Releases](https://github.com/kongweiguang/Kerminal/releases) 查看已经公开的版本；0.4 正式版公开后选择 `v0.4.0`。正式版公开前，仍可手动下载 `v0.4.0-beta.7`：
 
 | 平台 | 安装包 |
 | --- | --- |
@@ -201,9 +201,9 @@ workflows/*.toml
 
 ## 从 0.3.x 导入与数据迁移
 
-**试用时保留旧目录，不把 GPUI 直接指向真实的 `~/.kerminal`。** debug / release 默认都使用 `~/.kerminal-gpui`，单实例身份按数据根隔离，可以与旧版数据实例并存。
+**升级到 0.4 正式版前，完全退出 0.3，包括托盘里的后台实例。** 正式版直接使用 `~/.kerminal`；新版第一次打开时，识别数据格式并在业务启动前备份、迁移旧数据。已是当前格式时不重复转换。不要再同时运行会读写同一目录的旧版。正式版不支持降级读取，也不会读取、复制或合并 `~/.kerminal-gpui` 下的 Beta 数据。
 
-导入已有连接时，只将旧根的主机 / 分组、Profile、`known_hosts`、加密 Vault 及配套 key 复制到新根，并在**新根**完成迁移。保留 key 原访问权限，不转换成明文；旧会话、历史数据库、Git 仓库和运行态不随这次连接导入复制。两个目录之后独立保存，不自动同步。
+开发试用需要导入已有连接时，只将旧根的主机 / 分组、Profile、`known_hosts`、加密 Vault 及配套 key 复制到隔离根，并在该根完成迁移。两个目录独立保存，不自动同步；这不是正式版原地升级的步骤。
 
 0.4 正常业务只读写当前格式；旧数据转换集中到一次性迁移用例。普通启动与独立 `kerminal-migrate` helper 共用转换逻辑，按格式标记和实际结构预检，提供备份、校验、幂等重试与中断恢复；损坏或未来版本的数据保留原文件并报告原因。
 

@@ -294,6 +294,7 @@ fn explicit_root_is_used_without_normalizing_it() {
     let result = resolve_from_inputs(
         Some(OsString::from("sandbox/config")),
         Some(PathBuf::from("home")),
+        true,
     );
 
     assert_eq!(
@@ -307,29 +308,27 @@ fn explicit_root_is_used_without_normalizing_it() {
 /// @author kongweiguang
 #[test]
 fn empty_override_is_rejected() {
-    let result = resolve_from_inputs(Some(OsString::new()), Some(PathBuf::from("home")));
+    let result = resolve_from_inputs(Some(OsString::new()), Some(PathBuf::from("home")), true);
 
     assert!(matches!(result, Err(ConfigRootError::EmptyOverride)));
 }
 
-/// GPUI 两种构建模式均选择独立目录，且该目录不能误触发旧版正式根的迁移门禁。
+/// 两条发布路径都须与旧根身份检查一致，避免正式包漏迁或开发包意外迁移。
 ///
 /// @author kongweiguang
 #[test]
-fn default_uses_separate_gpui_home() {
-    let result = resolve_from_inputs(None, Some(PathBuf::from("home")));
-
-    assert_eq!(
-        result.expect("default needs an available home directory"),
-        PathBuf::from("home/.kerminal-gpui"),
-    );
+fn defaults_separate_stable_and_development_data() {
     let fixture = tempfile::tempdir().expect("隔离用户 home");
-    let root = resolve_from_inputs(None, Some(fixture.path().to_path_buf())).unwrap();
-    assert!(!points_to_formal_default_from_inputs(
-        &root,
-        Some(fixture.path().to_path_buf()),
-        None,
-    ));
+    let home = fixture.path().to_path_buf();
+    for (formal_build, directory) in [(true, ".kerminal"), (false, ".kerminal-gpui")] {
+        let root = resolve_from_inputs(None, Some(home.clone()), formal_build).unwrap();
+        assert_eq!(root, home.join(directory));
+        assert_eq!(
+            points_to_formal_default_from_inputs(&root, Some(home.clone()), None),
+            formal_build
+        );
+        assert!(!root.exists());
+    }
 }
 
 /// home 不可用时拒绝默认启动，但显式隔离根仍可用，避免静默写入其它账户目录。
@@ -337,8 +336,8 @@ fn default_uses_separate_gpui_home() {
 /// @author kongweiguang
 #[test]
 fn missing_home_requires_explicit_root() {
-    let path = resolve_from_inputs(Some(OsString::from("sandbox/config")), None);
-    let missing_home = resolve_from_inputs(None, None);
+    let path = resolve_from_inputs(Some(OsString::from("sandbox/config")), None, true);
+    let missing_home = resolve_from_inputs(None, None, true);
 
     assert_eq!(
         path.expect("explicit root does not need a home"),
