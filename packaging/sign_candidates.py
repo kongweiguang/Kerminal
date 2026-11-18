@@ -20,12 +20,15 @@ import updater_key
 PURPOSE_GPUI = "gpui"
 PURPOSE_LEGACY = "legacy"
 
+_STAGE_SIGNER = "signer"
 _STAGE_SIGNING = "signing"
 _STAGE_PUBLIC_KEY = "public-key-verification"
 _STAGE_CREDENTIALS = "credentials"
 
 # 失败分类全部是固定代码，避免把路径、命令输出、密码或私钥片段带进 CI 日志。
 _FAILURE_CODES = {
+    (PURPOSE_GPUI, _STAGE_SIGNER): "gpui-signer-unavailable",
+    (PURPOSE_LEGACY, _STAGE_SIGNER): "legacy-signer-unavailable",
     (PURPOSE_GPUI, _STAGE_SIGNING): "gpui-signing-failed",
     (PURPOSE_LEGACY, _STAGE_SIGNING): "legacy-signing-failed",
     (PURPOSE_GPUI, _STAGE_PUBLIC_KEY): "gpui-public-key-verification-failed",
@@ -47,9 +50,23 @@ _PROBE_NAMES = {
 _FIXED_CODES = frozenset(_FAILURE_CODES.values()) | {
     "candidate-signatures-directory-present",
     "signature-sidecar-present",
-    "signer-unavailable",
     "signing-credentials-not-independent",
     "signing-public-keys-not-independent",
+}
+
+# GPUI 密钥由 cargo-packager 生成，旧版密钥由 Tauri CLI 生成；两套 CLI 的密钥格式和
+# 环境变量互不兼容，必须按信任根选择对应工具，否则旧版密钥会被误报为密码错误。
+_SIGNING_TOOLS = {
+    PURPOSE_GPUI: {
+        "key": "CARGO_PACKAGER_SIGN_PRIVATE_KEY",
+        "password": "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD",
+        "arguments": ("signer", "-q", "sign"),
+    },
+    PURPOSE_LEGACY: {
+        "key": "TAURI_SIGNING_PRIVATE_KEY",
+        "password": "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+        "arguments": ("signer", "sign"),
+    },
 }
 
 
@@ -64,12 +81,20 @@ class CandidateSigningError(ValueError):
         self.code = code
 
 
-def _resolve_signer(signer: str) -> str:
-    """提前解析绝对路径，避免子进程因工作目录或 PATH 变化调用到其他程序。"""
+def _resolve_signer(signer: str, purpose: str) -> str:
+    """按用途解析绝对路径；分别分类缺失工具，避免把工具问题误报成密钥问题。"""
     signer_path = shutil.which(signer)
     if signer_path is None:
-        raise CandidateSigningError("signer-unavailable")
+        raise CandidateSigningError(_FAILURE_CODES[(purpose, _STAGE_SIGNER)])
     return os.path.abspath(signer_path)
+
+
+def _resolve_signers(signer: str, legacy_signer: str) -> dict[str, str]:
+    """两条更新链使用不同签名工具，提前解析各自路径以免运行时 PATH 串用。"""
+    return {
+        PURPOSE_GPUI: _resolve_signer(signer, PURPOSE_GPUI),
+        PURPOSE_LEGACY: _resolve_signer(legacy_signer, PURPOSE_LEGACY),
+    }
 
 
 def _load_credentials() -> dict[str, tuple[str, str, set[str]]]:
@@ -102,6 +127,8 @@ def _signing_environment() -> dict[str, str]:
         "KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD",
         "TAURI_SIGNING_PRIVATE_KEY",
         "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+        # 只清理路径变量，防止继承的密钥文件覆盖本用途显式注入的私钥内容。
+        "TAURI_SIGNING_PRIVATE_KEY_PATH",
         "CARGO_PACKAGER_SIGN_PRIVATE_KEY",
         "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD",
     }
@@ -111,7 +138,7 @@ def _signing_environment() -> dict[str, str]:
 
 
 def _sign_artifact(
-    signer_path: str,
+    signer_paths: dict[str, str],
     artifact: Path,
     private_key: str,
     password: str,
@@ -120,15 +147,16 @@ def _sign_artifact(
     working_directory: Path,
 ) -> Path:
     """在只含本用途私钥的子进程里签名；抑制原始输出并把失败收敛为固定分类。"""
+    tool = _SIGNING_TOOLS[purpose]
     child_environment = dict(base_environment)
-    child_environment["CARGO_PACKAGER_SIGN_PRIVATE_KEY"] = private_key
-    child_environment["CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD"] = password
+    child_environment[tool["key"]] = private_key
+    child_environment[tool["password"]] = password
     generated = artifact.with_name(artifact.name + ".sig")
     if generated.exists() or generated.is_symlink():
         raise CandidateSigningError("signature-sidecar-present")
     try:
         result = subprocess.run(
-            [signer_path, "signer", "-q", "sign", str(artifact)],
+            [signer_paths[purpose], *tool["arguments"], str(artifact)],
             check=False,
             env=child_environment,
             cwd=working_directory,
@@ -173,9 +201,9 @@ def _legacy_public_key(public_key_path: Path) -> str:
         raise CandidateSigningError(_FAILURE_CODES[(PURPOSE_LEGACY, _STAGE_PUBLIC_KEY)]) from error
 
 
-def probe_signing(signer: str, legacy_public_key_path: Path) -> None:
+def probe_signing(signer: str, legacy_signer: str, legacy_public_key_path: Path) -> None:
     """用固定临时小文件实际签名并独立验签，在完整矩阵前暴露凭据或公钥错配。"""
-    signer_path = _resolve_signer(signer)
+    signer_paths = _resolve_signers(signer, legacy_signer)
     credentials = _load_credentials()
     base_environment = _signing_environment()
     public_keys = {
@@ -191,19 +219,19 @@ def probe_signing(signer: str, legacy_public_key_path: Path) -> None:
             artifact = root / _PROBE_NAMES[purpose]
             artifact.write_bytes(_PROBE_PAYLOAD)
             generated = _sign_artifact(
-                signer_path, artifact, private_key, password, base_environment, purpose, root
+                signer_paths, artifact, private_key, password, base_environment, purpose, root
             )
             _verify_public_key(artifact, generated, public_keys[purpose], purpose, base_environment)
 
 
-def sign_candidates(candidate_directory: Path, signer: str) -> None:
-    """只签发当前候选矩阵的必需对象；新旧私钥仅注入各自的子进程环境。"""
+def sign_candidates(candidate_directory: Path, signer: str, legacy_signer: str) -> None:
+    """只签发当前候选矩阵的必需对象；新旧私钥仅注入各自工具的子进程环境。"""
     summary = build_candidate_inventory.validate_unsigned_candidate_set(candidate_directory)
     root = candidate_directory.resolve(strict=True)
     signatures = root / "signatures"
     if signatures.exists() or signatures.is_symlink():
         raise CandidateSigningError("candidate-signatures-directory-present")
-    signer_path = _resolve_signer(signer)
+    signer_paths = _resolve_signers(signer, legacy_signer)
     credentials = _load_credentials()
     base_environment = _signing_environment()
     for purpose, (private_key, password, kinds) in credentials.items():
@@ -221,7 +249,7 @@ def sign_candidates(candidate_directory: Path, signer: str) -> None:
                 raise CandidateSigningError("signature-sidecar-present")
             destination.parent.mkdir(parents=True, exist_ok=True)
             generated = _sign_artifact(
-                signer_path, artifact, private_key, password, base_environment, purpose, root
+                signer_paths, artifact, private_key, password, base_environment, purpose, root
             )
             os.rename(generated, destination)
 
@@ -231,6 +259,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-dir", type=Path)
     parser.add_argument("--signer", default="cargo-packager")
+    parser.add_argument(
+        "--legacy-signer",
+        default="tauri",
+        help="Tauri CLI used for the legacy updater key; must match that key's format",
+    )
     parser.add_argument(
         "--probe",
         action="store_true",
@@ -246,9 +279,9 @@ def main() -> int:
         parser.error("--candidate-dir is required unless --probe is used")
     try:
         if arguments.probe:
-            probe_signing(arguments.signer, arguments.legacy_public_key)
+            probe_signing(arguments.signer, arguments.legacy_signer, arguments.legacy_public_key)
         else:
-            sign_candidates(arguments.candidate_dir, arguments.signer)
+            sign_candidates(arguments.candidate_dir, arguments.signer, arguments.legacy_signer)
     except (
         CandidateSigningError,
         build_candidate_inventory.CandidateInventoryError,

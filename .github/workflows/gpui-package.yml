@@ -37,13 +37,19 @@ jobs:
         with:
           toolchain: 1.98.0
 
-      - name: Install pinned signer and Minisign verifier
+      - name: Install pinned signers and Minisign verifier
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends minisign
           cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
+          # 旧版密钥由 Tauri CLI 生成，固定版 cargo-packager 会把这类密钥误判为密码错误。
+          # 使用官方 npm prebuilt 并禁用 lifecycle scripts，安装到独立目录后只以绝对路径调用。
+          npm install --prefix target/tools/tauri-cli --ignore-scripts --no-audit --no-fund --no-progress --no-save @tauri-apps/cli@2.11.3
+          TAURI_CLI="$GITHUB_WORKSPACE/target/tools/tauri-cli/node_modules/.bin/tauri"
+          test -x "$TAURI_CLI"
+          "$TAURI_CLI" --version
 
       - name: Probe both signing credentials against their public keys
         shell: bash
@@ -57,7 +63,8 @@ jobs:
           set -euo pipefail
           python packaging/sign_candidates.py \
             --probe \
-            --signer target/tools/cargo-packager/bin/cargo-packager
+            --signer target/tools/cargo-packager/bin/cargo-packager \
+            --legacy-signer "$GITHUB_WORKSPACE/target/tools/tauri-cli/node_modules/.bin/tauri"
           printf '%s\n' 'Signing probe passed with a fixed temporary fixture; no key material or signature was uploaded.' >> "$GITHUB_STEP_SUMMARY"
 
   package:
@@ -284,13 +291,19 @@ jobs:
             --version "$PACKAGE_VERSION" \
             --public-key-file target/keys/gpui-updater.pub
 
-      - name: Install pinned signer and Minisign verifier
+      - name: Install pinned signers and Minisign verifier
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends minisign
           cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
+          # GPUI 与旧版密钥由不同工具生成；旧版改用配套 Tauri CLI 才能正确解密。
+          # npm prebuilt 固定在独立目录、禁用 lifecycle scripts，调用时使用绝对路径。
+          npm install --prefix target/tools/tauri-cli --ignore-scripts --no-audit --no-fund --no-progress --no-save @tauri-apps/cli@2.11.3
+          TAURI_CLI="$GITHUB_WORKSPACE/target/tools/tauri-cli/node_modules/.bin/tauri"
+          test -x "$TAURI_CLI"
+          "$TAURI_CLI" --version
 
       - name: Sign required updater packages
         shell: bash
@@ -303,7 +316,8 @@ jobs:
           set -euo pipefail
           python packaging/sign_candidates.py \
             --candidate-dir target/candidate-set \
-            --signer target/tools/cargo-packager/bin/cargo-packager
+            --signer target/tools/cargo-packager/bin/cargo-packager \
+            --legacy-signer "$GITHUB_WORKSPACE/target/tools/tauri-cli/node_modules/.bin/tauri"
 
       - name: Verify signatures and prepare GitHub release assets
         shell: bash

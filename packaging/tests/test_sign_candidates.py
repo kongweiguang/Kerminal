@@ -36,7 +36,7 @@ class CandidateSigningTests(unittest.TestCase):
     """不使用实际签名私钥，验证唯一输出路径和敏感环境传递。"""
 
     def test_separates_trust_roots_and_moves_signatures_without_overwrite(self) -> None:
-        """Windows 包需分别签名，两个子进程不能拿到对方的凭据。"""
+        """Windows 包需分别签名，两个子进程不能拿到对方的凭据或工具。"""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "x86_64-pc-windows-msvc"
@@ -45,9 +45,11 @@ class CandidateSigningTests(unittest.TestCase):
             artifact.write_bytes(b"unsigned test payload")
             summary = [{"target": target.name, "kind": "nsis", "path": f"{target.name}/{artifact.name}"}]
             environments = []
+            commands = []
 
             def simulate_signer(command: list[str], **kwargs: object) -> SimpleNamespace:
                 """模拟官方工具输出，检查实际传入的参数和隔离环境。"""
+                commands.append(list(command))
                 environments.append(kwargs["env"])
                 signed_file = Path(command[-1])
                 signed_file.with_name(signed_file.name + ".sig").write_bytes(b"test sidecar")
@@ -55,21 +57,34 @@ class CandidateSigningTests(unittest.TestCase):
 
             test_environment = {
                 "KERMINAL_GPUI_SIGNING_PRIVATE_KEY": "isolated-new-key",
+                "KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD": "new-password",
                 "TAURI_SIGNING_PRIVATE_KEY": "isolated-legacy-key",
+                "TAURI_SIGNING_PRIVATE_KEY_PASSWORD": "legacy-password",
+                "TAURI_SIGNING_PRIVATE_KEY_PATH": "inherited-path-must-not-leak",
             }
             with (
                 patch.dict(os.environ, test_environment, clear=True),
                 patch.object(sign_candidates.build_candidate_inventory, "validate_unsigned_candidate_set", return_value=summary),
-                patch.object(sign_candidates.shutil, "which", return_value="cargo-packager"),
+                patch.object(sign_candidates.shutil, "which", side_effect=lambda name: name),
                 patch.object(sign_candidates.subprocess, "run", side_effect=simulate_signer),
             ):
-                sign_candidates.sign_candidates(root, "cargo-packager")
+                sign_candidates.sign_candidates(root, "cargo-packager", "tauri")
             self.assertEqual(len(environments), 2)
             self.assertEqual(environments[0]["CARGO_PACKAGER_SIGN_PRIVATE_KEY"], "isolated-new-key")
-            self.assertEqual(environments[1]["CARGO_PACKAGER_SIGN_PRIVATE_KEY"], "isolated-legacy-key")
+            self.assertEqual(environments[0]["CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD"], "new-password")
+            self.assertEqual(environments[1]["TAURI_SIGNING_PRIVATE_KEY"], "isolated-legacy-key")
+            self.assertEqual(environments[1]["TAURI_SIGNING_PRIVATE_KEY_PASSWORD"], "legacy-password")
             for environment in environments:
                 self.assertNotIn("KERMINAL_GPUI_SIGNING_PRIVATE_KEY", environment)
-                self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY", environment)
+                self.assertNotIn("KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD", environment)
+                self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY_PATH", environment)
+            self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY", environments[0])
+            self.assertNotIn("CARGO_PACKAGER_SIGN_PRIVATE_KEY", environments[1])
+            # GPUI 仍走固定版 cargo-packager，旧版密钥必须交给 Tauri CLI 才能识别。
+            self.assertEqual(commands[0][1:4], ["signer", "-q", "sign"])
+            self.assertEqual(commands[1][1:4], ["signer", "sign", str(artifact)])
+            self.assertEqual(Path(commands[0][0]).name, "cargo-packager")
+            self.assertEqual(Path(commands[1][0]).name, "tauri")
             self.assertTrue((root / "signatures/new" / target.name / (artifact.name + ".sig")).is_file())
             self.assertTrue((root / "signatures/legacy" / target.name / (artifact.name + ".sig")).is_file())
             self.assertFalse(artifact.with_name(artifact.name + ".sig").exists())
@@ -81,6 +96,7 @@ class CandidateSigningTests(unittest.TestCase):
         signer_calls = []
         verify_calls = []
         environments = []
+        commands = []
         run_options = []
 
         def simulate_signer(command: list[str], **kwargs: object) -> SimpleNamespace:
@@ -88,6 +104,7 @@ class CandidateSigningTests(unittest.TestCase):
             artifact = Path(command[-1])
             signer_calls.append((artifact.name, artifact.read_bytes()))
             environments.append(kwargs["env"])
+            commands.append(list(command))
             run_options.append(kwargs)
             artifact.with_name(artifact.name + ".sig").write_bytes(b"probe sidecar")
             return SimpleNamespace(returncode=0)
@@ -102,16 +119,19 @@ class CandidateSigningTests(unittest.TestCase):
             legacy_key_path.write_text(legacy_text, encoding="ascii")
             test_environment = {
                 "KERMINAL_GPUI_SIGNING_PRIVATE_KEY": "probe-new-key",
+                "KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD": "new-password",
                 "TAURI_SIGNING_PRIVATE_KEY": "probe-legacy-key",
+                "TAURI_SIGNING_PRIVATE_KEY_PASSWORD": "legacy-password",
+                "TAURI_SIGNING_PRIVATE_KEY_PATH": "inherited-path-must-not-leak",
                 "KERMINAL_GPUI_UPDATER_PUBLIC_KEY": _encoded_public_key(gpui_text),
             }
             with (
                 patch.dict(os.environ, test_environment, clear=True),
-                patch.object(sign_candidates.shutil, "which", return_value="cargo-packager"),
+                patch.object(sign_candidates.shutil, "which", side_effect=lambda name: name),
                 patch.object(sign_candidates.subprocess, "run", side_effect=simulate_signer),
                 patch.object(sign_candidates.build_manifests, "verify_signature", side_effect=record_verify),
             ):
-                sign_candidates.probe_signing("cargo-packager", legacy_key_path)
+                sign_candidates.probe_signing("cargo-packager", "tauri", legacy_key_path)
 
         self.assertEqual(
             [name for name, _ in signer_calls],
@@ -125,10 +145,20 @@ class CandidateSigningTests(unittest.TestCase):
         )
         self.assertEqual([verifier for _, _, verifier in verify_calls], ["minisign", "minisign"])
         self.assertEqual(environments[0]["CARGO_PACKAGER_SIGN_PRIVATE_KEY"], "probe-new-key")
-        self.assertEqual(environments[1]["CARGO_PACKAGER_SIGN_PRIVATE_KEY"], "probe-legacy-key")
+        self.assertEqual(environments[0]["CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD"], "new-password")
+        self.assertEqual(environments[1]["TAURI_SIGNING_PRIVATE_KEY"], "probe-legacy-key")
+        self.assertEqual(environments[1]["TAURI_SIGNING_PRIVATE_KEY_PASSWORD"], "legacy-password")
         for environment in environments:
             self.assertNotIn("KERMINAL_GPUI_SIGNING_PRIVATE_KEY", environment)
-            self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY", environment)
+            self.assertNotIn("KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD", environment)
+            self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY_PATH", environment)
+        self.assertNotIn("TAURI_SIGNING_PRIVATE_KEY", environments[0])
+        self.assertNotIn("CARGO_PACKAGER_SIGN_PRIVATE_KEY", environments[1])
+        self.assertEqual(commands[0][1:4], ["signer", "-q", "sign"])
+        self.assertEqual(commands[1][1:3], ["signer", "sign"])
+        self.assertEqual(Path(commands[1][-1]).name, "legacy-signing-probe.bin")
+        self.assertEqual(Path(commands[0][0]).name, "cargo-packager")
+        self.assertEqual(Path(commands[1][0]).name, "tauri")
         for options in run_options:
             self.assertIs(options["stdout"], subprocess.DEVNULL)
             self.assertIs(options["stderr"], subprocess.DEVNULL)
@@ -155,12 +185,12 @@ class CandidateSigningTests(unittest.TestCase):
             }
             with (
                 patch.dict(os.environ, test_environment, clear=True),
-                patch.object(sign_candidates.shutil, "which", return_value="cargo-packager"),
+                patch.object(sign_candidates.shutil, "which", side_effect=lambda name: name),
                 patch.object(sign_candidates.subprocess, "run", side_effect=fail_legacy_signing),
                 patch.object(sign_candidates.build_manifests, "verify_signature"),
             ):
                 with self.assertRaises(sign_candidates.CandidateSigningError) as raised:
-                    sign_candidates.probe_signing("cargo-packager", legacy_key_path)
+                    sign_candidates.probe_signing("cargo-packager", "tauri", legacy_key_path)
         self.assertEqual(raised.exception.code, "legacy-signing-failed")
 
     def test_probe_classifies_public_key_verification_failure_by_purpose(self) -> None:
@@ -188,12 +218,12 @@ class CandidateSigningTests(unittest.TestCase):
             }
             with (
                 patch.dict(os.environ, test_environment, clear=True),
-                patch.object(sign_candidates.shutil, "which", return_value="cargo-packager"),
+                patch.object(sign_candidates.shutil, "which", side_effect=lambda name: name),
                 patch.object(sign_candidates.subprocess, "run", side_effect=simulate_signer),
                 patch.object(sign_candidates.build_manifests, "verify_signature", side_effect=reject_gpui_verify),
             ):
                 with self.assertRaises(sign_candidates.CandidateSigningError) as raised:
-                    sign_candidates.probe_signing("cargo-packager", legacy_key_path)
+                    sign_candidates.probe_signing("cargo-packager", "tauri", legacy_key_path)
         self.assertEqual(raised.exception.code, "gpui-public-key-verification-failed")
 
     def test_missing_legacy_credentials_is_classified(self) -> None:
@@ -202,10 +232,29 @@ class CandidateSigningTests(unittest.TestCase):
             os.environ,
             {"KERMINAL_GPUI_SIGNING_PRIVATE_KEY": "probe-new-key"},
             clear=True,
-        ), patch.object(sign_candidates.shutil, "which", return_value="cargo-packager"):
+        ), patch.object(sign_candidates.shutil, "which", side_effect=lambda name: name):
             with self.assertRaises(sign_candidates.CandidateSigningError) as raised:
-                sign_candidates.probe_signing("cargo-packager", Path("unused.pub"))
+                sign_candidates.probe_signing("cargo-packager", "tauri", Path("unused.pub"))
         self.assertEqual(raised.exception.code, "legacy-signing-credentials-missing")
+
+    def test_missing_signer_is_classified_by_trust_root(self) -> None:
+        """两条链使用不同工具；缺失时必须指出具体用途，不能误报成凭据或密码问题。"""
+        credentials = {
+            "KERMINAL_GPUI_SIGNING_PRIVATE_KEY": "probe-new-key",
+            "TAURI_SIGNING_PRIVATE_KEY": "probe-legacy-key",
+        }
+        for missing, expected in (
+            ("cargo-packager", "gpui-signer-unavailable"),
+            ("tauri", "legacy-signer-unavailable"),
+        ):
+            with self.subTest(missing=missing), patch.dict(os.environ, credentials, clear=True), patch.object(
+                sign_candidates.shutil,
+                "which",
+                side_effect=lambda name, missing=missing: None if name == missing else name,
+            ):
+                with self.assertRaises(sign_candidates.CandidateSigningError) as raised:
+                    sign_candidates.probe_signing("cargo-packager", "tauri", Path("unused.pub"))
+            self.assertEqual(raised.exception.code, expected)
 
 
 if __name__ == "__main__":
