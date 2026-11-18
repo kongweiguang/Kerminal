@@ -8,7 +8,8 @@ use super::*;
 
 const TRANSACTION_ROOT: &str = ".storage-transactions";
 
-/// 未知、活动或混合恢复材料继续阻断；只有独立终态文件且总清单确认完成的存档可忽略。
+/// 未知、活动或混合恢复材料继续阻断；旧版删除 staged 文件后留下的空目录不代表未完成事务。
+/// @author kongweiguang
 pub(super) fn inspect_archives(
     root: &Path,
     blockers: &mut Vec<DataMigrationBlocker>,
@@ -40,10 +41,33 @@ pub(super) fn inspect_archives(
             .map_err(io_error("读取旧事务存档失败"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(io_error("读取旧事务存档失败"))?;
-        let Some(receipt) = children.first().filter(|_| children.len() == 1) else {
+        let receipts: Vec<_> = children
+            .iter()
+            .filter(|child| {
+                matches!(
+                    child.file_name().to_str(),
+                    Some("committed.toml" | "rolled-back.toml")
+                )
+            })
+            .collect();
+        let [receipt] = receipts.as_slice() else {
             blockers.push(pending_archive());
             continue;
         };
+        let mut unexpected = false;
+        for child in &children {
+            if child.path() == receipt.path() {
+                continue;
+            }
+            if child.file_name() != "staged" || !empty_directory_tree(&child.path())? {
+                unexpected = true;
+                break;
+            }
+        }
+        if unexpected {
+            blockers.push(pending_archive());
+            continue;
+        }
         let receipt_name = receipt.file_name();
         let (phase, status) = match receipt_name.to_str() {
             Some("committed.toml") => ("committed", "applied"),
@@ -71,6 +95,29 @@ pub(super) fn inspect_archives(
         }
     }
     Ok(())
+}
+
+/// 旧版逐个删除暂存文件但保留父目录；只接受无链接、无文件的有限目录树，避免忽略恢复材料。
+/// @author kongweiguang
+fn empty_directory_tree(root: &Path) -> AppResult<bool> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut count = 0usize;
+    while let Some(directory) = pending.pop() {
+        count += 1;
+        if count > 4096 {
+            return Ok(false);
+        }
+        let metadata =
+            fs::symlink_metadata(&directory).map_err(io_error("读取旧事务暂存目录失败"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        for child in fs::read_dir(&directory).map_err(io_error("读取旧事务暂存目录失败"))?
+        {
+            pending.push(child.map_err(io_error("读取旧事务暂存目录失败"))?.path());
+        }
+    }
+    Ok(true)
 }
 
 /// 统一使用固定相对目录提示，未知条目和未完成事务都保留原材料交由旧版恢复。

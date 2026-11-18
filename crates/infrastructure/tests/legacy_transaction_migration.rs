@@ -39,12 +39,19 @@ fn terminal_archive(root: &Path, rolled_back: bool) -> (String, String) {
     (manifest, journal)
 }
 
-/// 通过公开入口验证 inspect 不写入，apply 保留旧存档且不回放历史 after，随后保持幂等。
+/// 通过公开入口验证旧版空暂存目录可迁移、历史存档保持原样且重复执行幂等。
+/// @author kongweiguang
 #[test]
 fn completed_legacy_archives_migrate_without_replaying_or_deleting_them() {
     for rolled_back in [false, true] {
         let root = tempfile::tempdir().expect("创建隔离根");
         let (manifest, journal) = terminal_archive(root.path(), rolled_back);
+        let staged = root
+            .path()
+            .join(".storage-transactions")
+            .join(CHANGE_ID)
+            .join("staged/profiles");
+        fs::create_dir_all(&staged).expect("模拟旧版删除文件后保留的空目录");
         let repository = FileDataMigrationRepository::new(root.path());
         let inspection = repository.inspect().expect("只读预检");
         assert_eq!(inspection.readiness, DataMigrationReadiness::Legacy);
@@ -80,10 +87,12 @@ fn completed_legacy_archives_migrate_without_replaying_or_deleting_them() {
             DataMigrationReadiness::Current
         );
         assert_eq!(repository.migrate().unwrap().changed_file_count, 0);
+        assert!(staged.is_dir());
     }
 }
 
-/// 即使存在终态收据，同目录的 pending 或未知材料也不能被误当作可忽略的历史存档。
+/// 即使存在终态收据，同目录的 pending、未知材料或暂存文件也不能被误当作历史存档。
+/// @author kongweiguang
 #[test]
 fn pending_or_unknown_material_beside_terminal_receipt_still_blocks() {
     for name in ["pending.toml", "unknown.txt", "staged"] {
@@ -96,6 +105,7 @@ fn pending_or_unknown_material_beside_terminal_receipt_still_blocks() {
             .join(name);
         if name == "staged" {
             fs::create_dir(&extra).unwrap();
+            fs::write(extra.join("pending-data"), "preserve recovery evidence").unwrap();
         } else {
             fs::write(&extra, "preserve recovery evidence").unwrap();
         }
