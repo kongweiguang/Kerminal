@@ -193,7 +193,8 @@ jobs:
     name: Sign and verify GPUI and legacy update contracts
     if: inputs.signed_candidate == true
     needs: validate-candidate-set
-    runs-on: ubuntu-22.04
+    # Noble 提供官方 Minisign 包；构建矩阵仍使用原发行版，保持 Linux 安装包兼容性。
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout the same source revision

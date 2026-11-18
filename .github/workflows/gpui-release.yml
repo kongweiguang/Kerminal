@@ -350,7 +350,8 @@ jobs:
     name: Verify signed candidate and create stable draft
     needs: preflight
     if: needs.preflight.outputs.release_class == 'stable'
-    runs-on: ubuntu-22.04
+    # 草稿复验与候选验签共用 Noble 的官方 Minisign 包，不改变安装包的构建环境。
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       actions: read
