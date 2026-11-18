@@ -1,0 +1,116 @@
+# @author kongweiguang
+name: GPUI Windows install acceptance
+
+# 只读验收：候选来源用 actions:read 下载，Release 来源用 contents:read 读取；
+# 不申请 write 权限、不接触签名私钥、不创建或修改 Release。
+on:
+  workflow_dispatch:
+    inputs:
+      asset_source:
+        description: "candidate-artifact (actions:read) or draft-release (requires draft visibility)"
+        type: choice
+        default: candidate-artifact
+        options:
+          - candidate-artifact
+          - draft-release
+      candidate_run_id:
+        description: "Successful signed candidate workflow run ID"
+        type: string
+        default: "44341234343"
+      release_tag:
+        description: "Release tag under acceptance"
+        type: string
+        default: "v0.4.0"
+      expected_windows_sha256:
+        description: "Pinned SHA-256 for the Windows NSIS installer"
+        type: string
+        default: "ae51d48324cc2256ccc109451ef189774d9a59271337b2be97d27ce8192b6c8f"
+      old_release_tag:
+        description: "Previous official release installed before the upgrade"
+        type: string
+        default: "v0.3.48"
+      old_expected_windows_sha256:
+        description: "Pinned SHA-256 for the old Windows NSIS installer"
+        type: string
+        default: "ab304d8c000b3559b78385c457b15d29625e8d9e348d9ab8bd9ad755857fb8a1"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: gpui-windows-install-acceptance
+  cancel-in-progress: false
+
+jobs:
+  windows-install-acceptance:
+    name: Hosted Windows install and upgrade acceptance
+    # 真实安装只在一次性托管 Windows runner 上执行；脚本自身也会拒绝非 github-hosted 环境。
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout trusted harness
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify provenance and stage installers
+        shell: pwsh
+        env:
+          ASSET_SOURCE: ${{ inputs.asset_source }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_WINDOWS_SHA256: ${{ inputs.expected_windows_sha256 }}
+          OLD_RELEASE_TAG: ${{ inputs.old_release_tag }}
+          OLD_EXPECTED_WINDOWS_SHA256: ${{ inputs.old_expected_windows_sha256 }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $base = Join-Path $env:RUNNER_TEMP 'kerminal-acceptance'
+          if (Test-Path -LiteralPath $base) { throw "Refusing to reuse $base" }
+          & "$env:GITHUB_WORKSPACE\scripts\acceptance\windows-release-provenance.ps1" `
+            -AssetSource $env:ASSET_SOURCE `
+            -ExpectedRepository 'kongweiguang/Kerminal' `
+            -ReleaseTag $env:RELEASE_TAG `
+            -ExpectedInstallerSha256 $env:EXPECTED_WINDOWS_SHA256 `
+            -OldReleaseTag $env:OLD_RELEASE_TAG `
+            -OldInstallerSha256 $env:OLD_EXPECTED_WINDOWS_SHA256 `
+            -DownloadRoot (Join-Path $base 'downloads') `
+            -StagingRoot (Join-Path $base 'staging') `
+            -EvidenceRoot (Join-Path $base 'evidence') `
+            -CandidateRunId $env:CANDIDATE_RUN_ID
+
+      - name: Run real NSIS install and upgrade acceptance
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          OLD_RELEASE_TAG: ${{ inputs.old_release_tag }}
+          EXPECTED_WINDOWS_SHA256: ${{ inputs.expected_windows_sha256 }}
+          OLD_EXPECTED_WINDOWS_SHA256: ${{ inputs.old_expected_windows_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $base = Join-Path $env:RUNNER_TEMP 'kerminal-acceptance'
+          $newVersion = $env:RELEASE_TAG.Substring(1)
+          $oldVersion = $env:OLD_RELEASE_TAG.Substring(1)
+          & "$env:GITHUB_WORKSPACE\scripts\acceptance\windows-install-acceptance.ps1" `
+            -NewInstaller (Join-Path $base 'staging\new-setup.exe') `
+            -OldInstaller (Join-Path $base 'staging\old-setup.exe') `
+            -WorkRoot (Join-Path $base 'work') `
+            -EvidenceRoot (Join-Path $base 'evidence') `
+            -FixtureSettings (Join-Path $env:GITHUB_WORKSPACE 'tests\fixtures\configuration\settings-v0.3.45.toml') `
+            -ExpectedNewVersion $newVersion `
+            -ExpectedOldVersion $oldVersion `
+            -ExpectedNewSha256 $env:EXPECTED_WINDOWS_SHA256 `
+            -ExpectedOldSha256 $env:OLD_EXPECTED_WINDOWS_SHA256
+
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpui-windows-install-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kerminal-acceptance/evidence
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
