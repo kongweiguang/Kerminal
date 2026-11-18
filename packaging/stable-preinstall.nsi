@@ -24,8 +24,9 @@ Section "-Kerminal migration preflight"
   Pop $0
   Pop $1
   ${If} $0 != 0
+    DetailPrint "Kerminal data preflight failed (exit code: $0). Close all Kerminal instances and retry; if the error persists, report this code to support."
     IfSilent +2 0
-      MessageBox MB_OK|MB_ICONSTOP "Kerminal data preflight failed. Close all Kerminal instances and inspect the migration report before retrying."
+      MessageBox MB_OK|MB_ICONSTOP "Kerminal data preflight failed (exit code: $0). Close all Kerminal instances and retry. If the error persists, report this code to support. Your existing installation has not been changed."
     SetErrorLevel 1
     Abort
   ${EndIf}

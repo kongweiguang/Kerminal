@@ -306,6 +306,13 @@ fn stable_windows_preflight_uses_current_target_helper() {
     assert!(!template_text.contains("nsis_tauri_utils::KillProcess"));
     assert!(template_text.contains("nsis_tauri_utils::SemverCompare $R0 \"0.0.0\""));
     assert!(template_text.contains("nsis_tauri_utils::SemverCompare \"${VERSION}\" $R0"));
+    let protocol_command = r#"$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""#;
+    let registration = template_text
+        .lines()
+        .find(|line| line.contains("WriteRegStr SHCTX") && line.contains("shell\\open\\command"))
+        .expect("协议注册命令存在");
+    assert!(registration.ends_with(&format!("\"{protocol_command}\"")));
+    assert!(template_text.contains(&format!("${{If}} $R7 == \"{protocol_command}\"")));
     assert!(
         command::configure_stable_windows_preflight(
             &mut stable,
