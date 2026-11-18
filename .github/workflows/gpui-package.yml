@@ -17,8 +17,54 @@ permissions:
   contents: read
 
 jobs:
+  # 签名凭据和公钥错配会让四个平台白等构建；先跑固定小文件探针，失败即阻断矩阵。
+  signing-probe:
+    name: Probe signing credentials and public keys
+    if: inputs.signed_candidate == true && github.repository == 'kongweiguang/Kerminal'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up probe Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+
+      - name: Install pinned signer and Minisign verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends minisign
+          cargo install cargo-packager --version 0.11.8 --locked --root target/tools/cargo-packager
+
+      - name: Probe both signing credentials against their public keys
+        shell: bash
+        env:
+          KERMINAL_GPUI_SIGNING_PRIVATE_KEY: ${{ secrets.KERMINAL_GPUI_SIGNING_PRIVATE_KEY }}
+          KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.KERMINAL_GPUI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          KERMINAL_GPUI_UPDATER_PUBLIC_KEY: ${{ vars.KERMINAL_GPUI_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          python packaging/sign_candidates.py \
+            --probe \
+            --signer target/tools/cargo-packager/bin/cargo-packager
+          printf '%s\n' 'Signing probe passed with a fixed temporary fixture; no key material or signature was uploaded.' >> "$GITHUB_STEP_SUMMARY"
+
   package:
     name: ${{ matrix.name }}
+    # 探针在未签名运行中会跳过；仅在成功或跳过时放行，失败仍阻断整个矩阵。
+    needs: signing-probe
+    if: always() && (needs.signing-probe.result == 'success' || needs.signing-probe.result == 'skipped')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
