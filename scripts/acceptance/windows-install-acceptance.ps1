@@ -603,7 +603,7 @@ function Assert-Installation {
 
 function Assert-CleanRunner {
     <#
-    全新安装和卸载后都要求真实 HKCU/HKLM、默认目录、协议和正式数据根保持干净；
+    全新安装和卸载后都要求真实 HKCU/HKLM、默认目录、协议、固定快捷方式和正式数据根保持干净；
     正式数据根存在时拒绝继续，避免安装预检或迁移触碰真实用户数据。
     @author kongweiguang
     #>
@@ -616,6 +616,10 @@ function Assert-CleanRunner {
     Assert-True (-not (Test-Path -LiteralPath $script:DefaultInstallDir)) "默认安装目录仍存在：$script:DefaultInstallDir"
     Assert-True (-not (Test-Path -LiteralPath $script:ProtocolKey)) "协议键仍存在：$script:ProtocolKey"
     Assert-True (-not (Test-Path -LiteralPath $script:ManufacturerKey)) "厂商键仍存在：$script:ManufacturerKey"
+    # 一个干净 runner 不应预置这三个固定快捷方式；安装/卸载后也必须回到不存在状态。
+    foreach ($shortcut in @(Get-KerminalShortcutPaths)) {
+        Assert-True (-not (Test-Path -LiteralPath $shortcut)) "快捷方式仍存在：$shortcut"
+    }
     Assert-True (@(Get-KerminalProcessesForPath -ExecutablePath (Join-Path $script:DefaultInstallDir $script:ExeName)).Count -eq 0) '仍有 Kerminal 进程未回收'
 
     if ($RequireFormalRootAbsent) {
@@ -641,6 +645,40 @@ function Remove-DirectoryWithRetry {
         }
     }
     Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
+function Get-KerminalShortcutPaths {
+    <#
+    安装器固定写桌面和开始菜单三处快捷方式；预检、清理和回读共用一张表，避免路径漂移。
+    @author kongweiguang
+    #>
+    $programs = [Environment]::GetFolderPath('Programs')
+    return @(
+        (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Kerminal.lnk'),
+        (Join-Path $programs 'Kerminal.lnk'),
+        (Join-Path (Join-Path $programs 'Kerminal') 'Kerminal.lnk')
+    )
+}
+
+function Get-ShortcutTargetPath {
+    <#
+    只读取 .lnk 的真实目标用于归属判断；缺失、损坏或无法解析时返回 null，绝不凭文件名删除。
+    @author kongweiguang
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $shell = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $target = [string]$shell.CreateShortcut($Path).TargetPath
+        if ([string]::IsNullOrWhiteSpace($target)) { return $null }
+        return $target
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $shell) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+    }
 }
 
 function Remove-Installation {
@@ -702,17 +740,24 @@ function Remove-Installation {
         }
     }
 
-    foreach ($shortcut in @(
-            (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Kerminal.lnk'),
-            (Join-Path ([Environment]::GetFolderPath('Programs')) 'Kerminal.lnk'),
-            (Join-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'Kerminal') 'Kerminal.lnk')
-        )) {
+    foreach ($shortcut in @(Get-KerminalShortcutPaths)) {
+        if (-not (Test-Path -LiteralPath $shortcut)) { continue }
+        $target = Get-ShortcutTargetPath -Path $shortcut
+        # 只删除指向本次安装目录的快捷方式；clean runner 预检已保证同名项不是用户已有环境。
+        if ([string]::IsNullOrWhiteSpace($target) -or -not (Test-PathUnder -Path $target -Root $installDirFull)) {
+            $script:CleanupErrors.Add("$Label 快捷方式目标不属于安装目录，未删除：$shortcut -> $target")
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $shortcut -Force -ErrorAction Stop
+        } catch {
+            $script:CleanupErrors.Add("$Label 删除快捷方式失败：$($_.Exception.Message)")
+            continue
+        }
+        # 删除后回读；只要文件仍在就说明删除未生效，不能用目标归属掩盖残留。
         if (Test-Path -LiteralPath $shortcut) {
-            try {
-                Remove-Item -LiteralPath $shortcut -Force -ErrorAction Stop
-            } catch {
-                $script:CleanupErrors.Add("$Label 删除快捷方式失败：$($_.Exception.Message)")
-            }
+            $remainingTarget = Get-ShortcutTargetPath -Path $shortcut
+            $script:CleanupErrors.Add("$Label 快捷方式删除后仍存在：$shortcut -> $remainingTarget")
         }
     }
 
@@ -1002,21 +1047,38 @@ function Start-AcceptanceApp {
             throw "等待新版启动/迁移超时：marker=$markerValid backup=$backupValid settings=$settingsValid firstFrame=$firstFrame lastError=$lastError"
         }
 
+        # 首帧后保留短暂宽限期：应用自行提前退出说明启动验证没有稳定完成，即使退出码为 0 也据实失败。
         Start-Sleep -Milliseconds 1000
+        if ($process.HasExited) {
+            throw "Kerminal 首帧后自行提前退出（exit=$($process.ExitCode)），不能判定为正常启动。stderr: $(Get-CompletedText $stderrTask)"
+        }
+
+        $exitMode = 'running'
+        $closed = $false
+        try { $closed = $process.CloseMainWindow() } catch { $closed = $false }
+        if ($closed) {
+            if ($process.WaitForExit(20000)) { $exitMode = 'close-message' }
+        }
         if (-not $process.HasExited) {
-            $closed = $false
-            try { $closed = $process.CloseMainWindow() } catch { $closed = $false }
-            if ($closed) {
-                [void]$process.WaitForExit(20000)
-            }
-            if (-not $process.HasExited) {
-                $forced = $true
-                try { $process.Kill($true) } catch { }
-                [void]$process.WaitForExit(15000)
-            }
+            # 关闭消息超时或没有主窗口时才强制回收；显式标记 forced-timeout，绝不冒充正常关闭。
+            $forced = $true
+            $exitMode = 'forced-timeout'
+            try { $process.Kill($true) } catch { }
+            [void]$process.WaitForExit(15000)
         }
         if (-not $process.HasExited) { throw "Kerminal 进程未能回收：PID $($process.Id)" }
+        if ($exitMode -eq 'running') {
+            if (-not $closed) {
+                # 没有可用的关闭通道就自行退出，仍属自发退出，不能按正常关闭记录。
+                throw "Kerminal 在关闭请求前后自行退出（exit=$($process.ExitCode)），不能判定为正常启动。stderr: $(Get-CompletedText $stderrTask)"
+            }
+            # 关闭请求已送达，进程在等待边界后完成退出；同样属于关闭消息路径。
+            $exitMode = 'close-message'
+        }
         $exitCode = $process.ExitCode
+        if ($exitMode -eq 'close-message' -and $exitCode -ne 0) {
+            throw "Kerminal 响应关闭消息后非零退出（exit=$exitCode）。stderr: $(Get-CompletedText $stderrTask)"
+        }
         $stdout = Get-CompletedText $stdoutTask
         $stderr = Get-CompletedText $stderrTask
 
@@ -1043,6 +1105,7 @@ function Start-AcceptanceApp {
             migratedSettingsSha256 = Get-Sha256Hex -Path (Join-Path $dataRoot 'settings.toml')
             processId              = $process.Id
             exitCode               = $exitCode
+            exitMode               = $exitMode
             forcedTermination      = $forced
             stdout                 = 'app/stdout.log'
             stderr                 = 'app/stderr.log'
@@ -1135,6 +1198,8 @@ function Save-Report {
     if ($null -ne $script:Report.appLaunch) {
         $app = $script:Report.appLaunch
         $lines.Add("- New app launch: firstFrame=$($app.firstFrameObserved) marker=$($app.formatMarker) backup=$($app.migrationBackup) settingsReadback=$($app.settingsReadback)")
+        # 明确区分关闭消息正常退出与超时强制回收，避免把强杀记录成正常关闭。
+        $lines.Add("- New app shutdown: mode=$($app.exitMode) exit=$($app.exitCode) forced=$($app.forcedTermination)")
         $lines.Add("- Migrated settings SHA-256: ``$($app.migratedSettingsSha256)``; original ``$($app.originalSettingsSha256)``")
     }
     if ($script:CleanupErrors.Count -eq 0) {
