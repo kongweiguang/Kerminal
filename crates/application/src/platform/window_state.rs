@@ -29,11 +29,20 @@ impl WindowRect {
 }
 
 /// 原生窗口重开时应恢复的状态；最大化与全屏独立保存正常窗口矩形。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowStateSnapshot {
     pub normal_bounds: WindowRect,
     pub maximized: bool,
     pub fullscreen: bool,
+    /// None 代表从未保存侧栏状态，首次加载时根据分组数决定默认展开状态。
+    pub host_navigation: Option<HostNavigationWindowState>,
+}
+
+/// 只保存稳定的分组身份与普通视图的位置，搜索投影属于临时状态。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostNavigationWindowState {
+    pub expanded_group_ids: Vec<String>,
+    pub scroll_offset: i32,
 }
 
 /// 普通运行态只接受当前文件；历史窗口状态在启动前已由一次迁移转换。

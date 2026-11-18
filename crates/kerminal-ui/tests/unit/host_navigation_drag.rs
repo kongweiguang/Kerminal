@@ -584,6 +584,143 @@ fn assert_no_connection(events: &[HostNavigationEvent]) {
     );
 }
 
+/// 多分组首次收起；搜索展开结果并保留普通视图的展开和滚动状态。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn search_projection_restores_normal_expansion_and_scroll(app: &mut TestAppContext) {
+    let hosts = (0..24)
+        .map(|index| remote(&format!("remote-{index:02}"), Some("a")))
+        .collect();
+    let (_runtime, _directory, navigation, _events, _subscription, visual) = fixture(
+        app,
+        hosts,
+        Vec::new(),
+        vec![group("a"), group("b")],
+        ConfigurationMode::ReadWrite,
+    );
+    visual.simulate_resize(size(px(440.), px(300.)));
+    draw(visual);
+    visual.update(|_, app| {
+        assert!(navigation.read(app).collapsed_groups.contains("a"));
+        assert!(navigation.read(app).collapsed_groups.contains("b"));
+    });
+    click(visual, "host-navigation-group-a");
+    visual.update(|_, app| {
+        navigation
+            .read(app)
+            .host_tree_scroll_handle
+            .set_offset(point(px(0.), px(-100.)))
+    });
+    draw(visual);
+    let before = visual.update(|_, app| navigation.read(app).host_tree_scroll_handle.offset());
+    assert!(before.y < px(0.));
+    visual.update(|window, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.search_input.update(cx, |input, cx| {
+                input.replace_all("remote-19", window, cx);
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
+            })
+        });
+    });
+    draw(visual);
+    visual.update(|_, app| assert_eq!(navigation.read(app).search, "remote-19"));
+    bounds(visual, "host-navigation-host-remote-19");
+    click(visual, "host-navigation-group-a");
+    visual.update(|window, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.search_input.update(cx, |input, cx| {
+                input.replace_all("remote-18", window, cx);
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
+            })
+        });
+    });
+    draw(visual);
+    bounds(visual, "host-navigation-host-remote-18");
+    visual.update(|window, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.search_input.update(cx, |input, cx| {
+                input.replace_all("", window, cx);
+                cx.emit(gpui_kit::component::input::InputEvent::Change);
+            })
+        });
+    });
+    draw(visual);
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert!(!navigation.collapsed_groups.contains("a"));
+        assert!(navigation.collapsed_groups.contains("b"));
+        assert_eq!(navigation.host_tree_scroll_handle.offset(), before);
+    });
+}
+
+/// 外部定位必须显露目标所在分组，同时保留其他分组的折叠选择。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn external_host_selection_reveals_collapsed_group(app: &mut TestAppContext) {
+    let (_runtime, _directory, navigation, _events, _subscription, visual) = fixture(
+        app,
+        vec![remote("remote-a", Some("a"))],
+        Vec::new(),
+        vec![group("a"), group("b")],
+        ConfigurationMode::ReadWrite,
+    );
+    draw(visual);
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            assert!(navigation.collapsed_groups.contains("a"));
+            assert!(navigation.select_host_from_external(
+                &HostId::parse("remote-a").expect("有效的测试主机 ID"),
+                cx,
+            ));
+            assert!(!navigation.collapsed_groups.contains("a"));
+            assert!(navigation.collapsed_groups.contains("b"));
+        });
+    });
+    draw(visual);
+    bounds(visual, "host-navigation-host-remote-a");
+}
+
+/// 恢复仅使用当前目录中的分组，并在真实列表完成布局后还原有效滚动位置。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn saved_navigation_state_restores_only_current_groups(app: &mut TestAppContext) {
+    let (_runtime, _directory, navigation, _events, _subscription, visual) = fixture(
+        app,
+        (0..24)
+            .map(|index| remote(&format!("remote-{index:02}"), Some("a")))
+            .collect(),
+        Vec::new(),
+        vec![group("a"), group("b")],
+        ConfigurationMode::ReadWrite,
+    );
+    visual.update(|_, app| {
+        navigation.update(app, |navigation, cx| {
+            navigation.restore_window_state(
+                Some(
+                    kerminal_application::platform::window_state::HostNavigationWindowState {
+                        expanded_group_ids: vec!["a".to_owned(), "removed".to_owned()],
+                        scroll_offset: -100,
+                    },
+                ),
+                cx,
+            )
+        });
+    });
+    visual.simulate_resize(size(px(440.), px(300.)));
+    draw(visual);
+    draw(visual);
+    visual.update(|_, app| {
+        let navigation = navigation.read(app);
+        assert!(!navigation.collapsed_groups.contains("a"));
+        assert!(navigation.collapsed_groups.contains("b"));
+        assert_eq!(
+            navigation.window_state().unwrap().expanded_group_ids,
+            vec!["a"]
+        );
+        assert_eq!(navigation.host_tree_scroll_handle.offset().y, px(-100.));
+    });
+}
+
 /// 远端到空组、本地到折叠组以及最后一台主机回空根层都通过真实鼠标落点提交。
 #[gpui_kit::test]
 fn remote_local_and_empty_root_drop_commit_once(app: &mut TestAppContext) {
@@ -644,6 +781,7 @@ fn invalid_gestures_never_write_and_click_behavior_is_preserved(app: &mut TestAp
         vec![group("source"), group("target")],
         ConfigurationMode::ReadWrite,
     );
+    click(visual, "host-navigation-group-source");
     drag_to(
         visual,
         "host-navigation-host-remote-a",
@@ -849,6 +987,7 @@ fn edge_scroll_reaches_offscreen_group_and_clamps_offsets(app: &mut TestAppConte
     );
     visual.simulate_resize(size(px(440.), px(330.)));
     draw(visual);
+    click(visual, "host-navigation-group-group-00");
     let start = center(visual, "host-navigation-host-remote-a");
     let (viewport, initial_offset) = visual.update(|_, app| {
         let navigation = navigation.read(app);
@@ -936,6 +1075,7 @@ fn cancellation_releases_drag_resources_without_a_late_drop(app: &mut TestAppCon
     );
     visual.simulate_resize(size(px(440.), px(300.)));
     draw(visual);
+    click(visual, "host-navigation-group-group-0");
     let start = center(visual, "host-navigation-host-remote-a");
     let viewport = visual.update(|_, app| navigation.read(app).host_tree_scroll_handle.bounds());
     let edge = point(viewport.center().x, viewport.bottom() - px(2.));
@@ -1109,6 +1249,7 @@ fn drop_during_refresh_reports_no_move(app: &mut TestAppContext) {
         vec![group("source"), group("target")],
         ConfigurationMode::ReadWrite,
     );
+    click(visual, "host-navigation-group-source");
     begin_host_drag(visual, "host-navigation-host-remote-a", true);
     directory.block_read.store(true, Ordering::SeqCst);
     visual.update(|_, app| navigation.update(app, |navigation, cx| navigation.reload(cx)));
@@ -1142,6 +1283,7 @@ fn drop_after_read_failure_reports_refresh_required(app: &mut TestAppContext) {
         vec![group("source"), group("target")],
         ConfigurationMode::ReadWrite,
     );
+    click(visual, "host-navigation-group-source");
     begin_host_drag(visual, "host-navigation-host-remote-a", true);
     directory.fail_next_read.store(true, Ordering::SeqCst);
     visual.update(|_, app| navigation.update(app, |navigation, cx| navigation.reload(cx)));

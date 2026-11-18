@@ -13,6 +13,7 @@ pub(super) async fn capture(
     directory: &Path,
     theme: &str,
 ) -> Result<(), Box<dyn Error>> {
+    set_group_collapsed(cx, window, WORKBENCH_GROUP_ID, false)?;
     ensure_ungrouped_hosts_render_at_tree_root(cx, window)?;
     let targets = [
         (
@@ -652,7 +653,18 @@ fn set_drop_group_collapsed(
     handle: AnyWindowHandle,
     collapsed: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let selector = format!("host-navigation-group-{WORKBENCH_DROP_GROUP_ID}");
+    set_group_collapsed(cx, handle, WORKBENCH_DROP_GROUP_ID, collapsed)
+}
+
+/// 验收显式打开待操作的分组，避免依赖首次启动的展开默认值。
+/// @author kongweiguang
+pub(super) fn set_group_collapsed(
+    cx: &mut AsyncApp,
+    handle: AnyWindowHandle,
+    group_id: &str,
+    collapsed: bool,
+) -> Result<(), Box<dyn Error>> {
+    let selector = format!("host-navigation-group-{group_id}");
     let should_click = handle.update(cx, |_, window, app| {
         window.refresh();
         draw_acceptance_frame(window, app);
@@ -681,6 +693,7 @@ pub(super) async fn capture_drag(
 ) -> Result<(), Box<dyn Error>> {
     let terminals_before = drag_terminal_count(cx, services).await?;
     let scale_factor = window.update(cx, |_, window, _| window.scale_factor())?;
+    set_group_collapsed(cx, window, WORKBENCH_GROUP_ID, false)?;
     set_drop_group_collapsed(cx, window, true)?;
     let grouped_selector = format!("host-navigation-host-{WORKBENCH_HOST_ID}");
     let ungrouped_selector = format!("host-navigation-host-{WORKBENCH_UNGROUPED_HOST_ID}");

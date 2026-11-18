@@ -5,8 +5,8 @@
 use std::fs;
 
 use kerminal_application::platform::window_state::{
-    WindowRect, WindowStateLoad, WindowStateRepository, WindowStateSnapshot, WindowStateSource,
-    WindowStateUnavailableReason,
+    HostNavigationWindowState, WindowRect, WindowStateLoad, WindowStateRepository,
+    WindowStateSnapshot, WindowStateSource, WindowStateUnavailableReason,
 };
 use kerminal_infrastructure::{
     platform::window_state::WindowStateStore, storage::StorageCoordinator,
@@ -24,6 +24,7 @@ fn snapshot() -> WindowStateSnapshot {
         },
         maximized: true,
         fullscreen: false,
+        host_navigation: None,
     }
 }
 
@@ -51,6 +52,59 @@ async fn current_file_round_trips_through_atomic_store() {
     assert_eq!(first_revision, 1);
     assert_eq!(
         loaded,
+        WindowStateLoad::Restored {
+            snapshot: snapshot(),
+            revision: Some(1),
+            source: WindowStateSource::Current,
+        }
+    );
+}
+
+/// 侧栏状态与窗口几何共用 revision，重启后应可完整恢复展开身份与滚动位置。
+/// @author kongweiguang
+#[tokio::test]
+async fn host_navigation_round_trips_with_window_geometry() {
+    let root = tempfile::tempdir().expect("temporary window state root");
+    let store = store(&root);
+    let mut state = snapshot();
+    state.host_navigation = Some(HostNavigationWindowState {
+        expanded_group_ids: (0..1000)
+            .map(|number| format!("00000000-0000-0000-0000-{number:012}"))
+            .collect(),
+        scroll_offset: -240,
+    });
+    store
+        .compare_and_swap(None, state.clone())
+        .await
+        .expect("save state");
+    assert_eq!(
+        store.load().await.expect("reload state"),
+        WindowStateLoad::Restored {
+            snapshot: state,
+            revision: Some(1),
+            source: WindowStateSource::Current,
+        }
+    );
+}
+
+/// 侧栏数据过大时拒绝提交，保证已经保存的窗口状态仍能被受限 reader 打开。
+/// @author kongweiguang
+#[tokio::test]
+async fn oversized_navigation_preserves_the_previous_file() {
+    let root = tempfile::tempdir().expect("temporary window state root");
+    let store = store(&root);
+    store
+        .compare_and_swap(None, snapshot())
+        .await
+        .expect("initial state");
+    let mut oversized = snapshot();
+    oversized.host_navigation = Some(HostNavigationWindowState {
+        expanded_group_ids: vec!["a".repeat(16 * 1024 * 1024)],
+        scroll_offset: 0,
+    });
+    assert!(store.compare_and_swap(Some(1), oversized).await.is_err());
+    assert_eq!(
+        store.load().await.expect("previous state remains readable"),
         WindowStateLoad::Restored {
             snapshot: snapshot(),
             revision: Some(1),

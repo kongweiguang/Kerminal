@@ -28,6 +28,7 @@ use kerminal_application::{
         host_types::PluginHost,
         management::{HostGroup, HostGroupDraft, HostManagementService, ManagedHost},
     },
+    platform::window_state::HostNavigationWindowState,
     preferences::{InterfaceDensity, ProfileService, VersionedProfile},
     workspace::{WorkspacePinnedContainer, WorkspaceTargetRef},
 };
@@ -364,6 +365,11 @@ pub struct HostNavigation {
     selected_machine_id: Option<String>,
     session_projection: HashMap<HostId, HostSessionStatus>,
     collapsed_groups: HashSet<String>,
+    search_collapsed_groups: HashSet<String>,
+    group_state_initialized: bool,
+    restored_navigation_state: Option<HostNavigationWindowState>,
+    pending_restored_scroll: Option<i32>,
+    reveal_saved_target: bool,
     pending_host_move: Option<PendingHostMove>,
     pending_group_pins: HashSet<String>,
     last_open_request: Option<(HostId, Instant)>,
@@ -377,6 +383,7 @@ pub struct HostNavigation {
     configuration_watch_cancellation: CancellationToken,
     configuration_watch_started: bool,
     host_tree_scroll_handle: ScrollHandle,
+    search_tree_scroll_handle: ScrollHandle,
     active_host_drag: Option<HostNavigationDrag>,
     host_drag_task: Option<Task<()>>,
     host_drag_generation: u64,
@@ -407,7 +414,16 @@ impl HostNavigation {
         });
         let search_subscription = cx.subscribe(&search_input, |navigation, input, event, cx| {
             if matches!(event, InputEvent::Change) {
-                navigation.search = input.read(cx).value().to_string();
+                let search = input.read(cx).value().to_string();
+                if navigation.search != search {
+                    navigation.search_collapsed_groups.clear();
+                }
+                if navigation.search.trim().is_empty() != search.trim().is_empty() {
+                    navigation
+                        .search_tree_scroll_handle
+                        .set_offset(Point::default());
+                }
+                navigation.search = search;
                 cx.notify();
             }
         });
@@ -432,6 +448,11 @@ impl HostNavigation {
             selected_machine_id: None,
             session_projection: HashMap::new(),
             collapsed_groups: HashSet::new(),
+            search_collapsed_groups: HashSet::new(),
+            group_state_initialized: false,
+            restored_navigation_state: None,
+            pending_restored_scroll: None,
+            reveal_saved_target: false,
             pending_host_move: None,
             pending_group_pins: HashSet::new(),
             last_open_request: None,
@@ -445,6 +466,7 @@ impl HostNavigation {
             configuration_watch_cancellation: CancellationToken::new(),
             configuration_watch_started: false,
             host_tree_scroll_handle: ScrollHandle::new(),
+            search_tree_scroll_handle: ScrollHandle::new(),
             active_host_drag: None,
             host_drag_task: None,
             host_drag_generation: 0,
@@ -597,7 +619,7 @@ impl HostNavigation {
                                 Ok((rows, plugin_hosts, local_hosts, groups, profiles)) => {
                                     navigation.rows = rows;
                                     navigation.plugin_rows = plugin_hosts;
-                                    navigation.groups = groups.groups;
+                                    navigation.reconcile_groups(groups.groups);
                                     navigation.group_revision = groups.revision;
                                     navigation.default_profile_name =
                                         unique_default_profile_name(&profiles);
@@ -610,6 +632,7 @@ impl HostNavigation {
                                             )
                                         })
                                         .collect();
+                                    navigation.reveal_saved_group();
                                     if navigation.selected_host.as_ref().is_some_and(|selected| {
                                         !navigation.rows.iter().any(|host| &host.id == selected)
                                             && !navigation
@@ -1200,7 +1223,7 @@ impl HostNavigation {
         cx.emit(HostNavigationEvent::PluginHostOpenRequested { host_id });
     }
 
-    /// 快速打开和上下文导航按当前目录校验目标；失效主机只显示反馈并刷新，不伪造选择。
+    /// 快速导航按稳定身份校验目标并展开所属分组，失效主机只显示反馈并刷新。
     ///
     /// @author kongweiguang
     pub(crate) fn select_host_from_external(
@@ -1221,6 +1244,15 @@ impl HostNavigation {
             cx.notify();
             return false;
         }
+        if let Some(group_id) = self
+            .rows
+            .iter()
+            .find(|host| &host.id == host_id)
+            .and_then(|host| host.group_id.as_ref())
+        {
+            self.collapsed_groups.remove(group_id);
+            self.search_collapsed_groups.remove(group_id);
+        }
         self.select_host(host_id.clone(), cx);
         true
     }
@@ -1228,6 +1260,7 @@ impl HostNavigation {
     /// 明确保存远端主机后按 HostId 选中并重读目录，避免依赖旧列表快照或普通 reload 推断选择。
     /// @author kongweiguang
     pub(crate) fn select_saved_host(&mut self, host_id: HostId, cx: &mut Context<Self>) {
+        self.reveal_saved_target = true;
         apply_saved_navigation_target(
             &mut self.selected_host,
             &mut self.selected_profile,
@@ -1246,6 +1279,7 @@ impl HostNavigation {
     /// 明确保存本地主机后按 ProfileId 选中；本地目标清除远端 Host 选择。
     /// @author kongweiguang
     pub(crate) fn select_saved_profile(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        self.reveal_saved_target = true;
         apply_saved_navigation_target(
             &mut self.selected_host,
             &mut self.selected_profile,
@@ -1655,7 +1689,11 @@ impl HostNavigation {
         self.host_drag_generation = self.host_drag_generation.wrapping_add(1).max(1);
         let generation = self.host_drag_generation;
         self.active_host_drag = Some(drag.clone());
-        let scroll_handle = self.host_tree_scroll_handle.clone();
+        let scroll_handle = if self.search.trim().is_empty() {
+            self.host_tree_scroll_handle.clone()
+        } else {
+            self.search_tree_scroll_handle.clone()
+        };
         let mut window_context = window.to_async(cx);
         let task = cx.spawn(async move |this, cx| {
             loop {
@@ -1912,25 +1950,198 @@ impl HostNavigation {
         cx.notify();
     }
 
-    /// 分组折叠只影响当前视图，不修改主机分组或工作区持久化状态。
+    /// 已知分组保留用户选择，新分组默认收起；首次只有一个分组时直接展示内容。
+    /// @author kongweiguang
+    fn reconcile_groups(&mut self, groups: Vec<HostGroup>) {
+        let previous = self
+            .groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<HashSet<_>>();
+        let current = groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<HashSet<_>>();
+        if self.group_state_initialized {
+            self.collapsed_groups
+                .retain(|id| current.contains(id.as_str()));
+            self.collapsed_groups
+                .extend(current.difference(&previous).map(|id| (*id).to_owned()));
+        } else {
+            self.collapsed_groups = if groups.len() == 1 {
+                HashSet::new()
+            } else {
+                groups.iter().map(|group| group.id.clone()).collect()
+            };
+            self.group_state_initialized = true;
+        }
+        self.groups = groups;
+        if let Some(state) = self.restored_navigation_state.take() {
+            self.apply_window_state(state);
+        }
+    }
+
+    /// 恢复只应用已存在的身份，过期分组不会凭空出现在侧栏中。
+    /// @author kongweiguang
+    fn apply_window_state(&mut self, state: HostNavigationWindowState) {
+        let expanded = state.expanded_group_ids.into_iter().collect::<HashSet<_>>();
+        self.collapsed_groups = self
+            .groups
+            .iter()
+            .filter(|group| !expanded.contains(&group.id))
+            .map(|group| group.id.clone())
+            .collect();
+        self.pending_restored_scroll = Some(state.scroll_offset.min(0));
+    }
+
+    /// 先等待真实目录快照，防止异步加载前把保存的状态误判为过期。
+    /// @author kongweiguang
+    pub(crate) fn restore_window_state(
+        &mut self,
+        state: Option<HostNavigationWindowState>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = state {
+            if self.group_state_initialized {
+                self.apply_window_state(state);
+            } else {
+                self.restored_navigation_state = Some(state);
+            }
+            cx.notify();
+        }
+    }
+
+    /// 只返回已完成目录加载的普通视图，避免临时搜索和加载中空快照覆盖磁盘记录。
+    /// @author kongweiguang
+    pub(crate) fn window_state(&self) -> Option<HostNavigationWindowState> {
+        if !self.group_state_initialized {
+            return None;
+        }
+        let expanded_group_ids = self
+            .groups
+            .iter()
+            .filter(|group| !self.collapsed_groups.contains(&group.id))
+            .map(|group| group.id.clone())
+            .collect();
+        let offset = self
+            .pending_restored_scroll
+            .unwrap_or_else(|| self.host_tree_scroll_handle.offset().y.as_f32() as i32);
+        Some(HostNavigationWindowState {
+            expanded_group_ids,
+            scroll_offset: offset.min(0),
+        })
+    }
+
+    /// 搜索投影拥有独立折叠集合，清空搜索即可无损恢复普通状态。
+    /// @author kongweiguang
+    fn active_collapsed_groups(&self) -> &HashSet<String> {
+        if self.search.trim().is_empty() {
+            &self.collapsed_groups
+        } else {
+            &self.search_collapsed_groups
+        }
+    }
+
+    /// 批量折叠只作用于实际可见的搜索分组，避免隐藏组改变按钮的状态。
+    /// @author kongweiguang
+    fn visible_group_ids(&self) -> Vec<String> {
+        if self.search.trim().is_empty() {
+            return navigation_group_ids(&self.groups);
+        }
+        let hosts = filtered_hosts(&self.rows, &self.groups, &self.search);
+        let profiles = filtered_profiles(&self.profile_rows, &self.groups, &self.search);
+        let plugins = filtered_plugin_hosts(&self.plugin_rows, &self.groups, &self.search);
+        self.groups
+            .iter()
+            .filter(|group| {
+                let matches_host = hosts
+                    .iter()
+                    .any(|host| host.group_id.as_deref() == Some(&group.id));
+                let matches_profile = profiles
+                    .iter()
+                    .any(|row| row.profile.sidebar_group_id.as_deref() == Some(&group.id));
+                let matches_plugin = plugins
+                    .iter()
+                    .any(|host| host.group_id.as_deref() == Some(&group.id));
+                let matches_container = self.pinned_containers.iter().any(|container| {
+                    pinned_container_matches_query(container, &self.search)
+                        && container.target.host_id.as_ref().is_some_and(|host_id| {
+                            self.rows.iter().any(|host| {
+                                &host.id == host_id
+                                    && host.protocol == RemoteProtocol::Ssh
+                                    && host.group_id.as_deref() == Some(&group.id)
+                            })
+                        })
+                });
+                should_render_saved_group_header(
+                    &group.name,
+                    &self.search,
+                    matches_host || matches_profile || matches_plugin || matches_container,
+                )
+            })
+            .map(|group| group.id.clone())
+            .collect()
+    }
+
+    /// 保存成功后展示目标所在组，避免新保存的连接被折叠状态遮住。
+    /// @author kongweiguang
+    fn reveal_saved_group(&mut self) {
+        if !std::mem::take(&mut self.reveal_saved_target) {
+            return;
+        }
+        let host_group = self.selected_host.as_ref().and_then(|id| {
+            self.rows
+                .iter()
+                .find(|row| &row.id == id)
+                .and_then(|row| row.group_id.as_ref())
+                .or_else(|| {
+                    self.plugin_rows
+                        .iter()
+                        .find(|row| &row.id == id)
+                        .and_then(|row| row.group_id.as_ref())
+                })
+        });
+        let profile_group = self.selected_profile.as_ref().and_then(|id| {
+            self.profile_rows
+                .iter()
+                .find(|row| &row.profile.id == id)
+                .and_then(|row| row.profile.sidebar_group_id.as_ref())
+        });
+        if let Some(group_id) = host_group.or(profile_group) {
+            self.collapsed_groups.remove(group_id);
+        }
+    }
+
+    /// 搜索时的折叠只作用于临时投影，避免覆盖普通视图的用户选择。
+    /// @author kongweiguang
     fn toggle_group(&mut self, group_id: String, cx: &mut Context<Self>) {
-        if !self.collapsed_groups.remove(&group_id) {
-            self.collapsed_groups.insert(group_id);
+        let collapsed = if self.search.trim().is_empty() {
+            &mut self.collapsed_groups
+        } else {
+            &mut self.search_collapsed_groups
+        };
+        if !collapsed.remove(&group_id) {
+            collapsed.insert(group_id);
         }
         cx.notify();
     }
 
-    /// 一次性展开或折叠已保存分组；折叠状态只在导航实体内生效，不写入连接配置。
+    /// 一次性切换当前投影的分组，搜索时不改变普通视图。
     /// @author kongweiguang
     fn toggle_all_groups(&mut self, cx: &mut Context<Self>) {
-        let group_ids = navigation_group_ids(&self.groups);
+        let group_ids = self.visible_group_ids();
         if group_ids.is_empty() {
             return;
         }
-        if all_groups_are_collapsed(&group_ids, &self.collapsed_groups) {
-            self.collapsed_groups.clear();
+        let collapsed = if self.search.trim().is_empty() {
+            &mut self.collapsed_groups
         } else {
-            self.collapsed_groups = group_ids.into_iter().collect();
+            &mut self.search_collapsed_groups
+        };
+        if all_groups_are_collapsed(&group_ids, collapsed) {
+            collapsed.clear();
+        } else {
+            *collapsed = group_ids.into_iter().collect();
         }
         cx.notify();
     }
@@ -1941,6 +2152,22 @@ impl Render for HostNavigation {
     /// 背景菜单提供无分组的新建入口，不从当前选中行推断目标。
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.group_state_initialized
+            && self.pending_restored_scroll.is_some()
+            && self.search.trim().is_empty()
+        {
+            let navigation = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = navigation.update(cx, |navigation, cx| {
+                    if let Some(offset) = navigation.pending_restored_scroll.take() {
+                        navigation
+                            .host_tree_scroll_handle
+                            .set_offset(Point::new(px(0.), px(offset as f32)));
+                        cx.notify();
+                    }
+                });
+            });
+        }
         self.start_configuration_watch(cx);
         let theme = ThemeTokens::current(window, cx).for_workbench();
         let metrics = host_navigation_layout_metrics(self.density, window.rem_size());
@@ -2018,7 +2245,11 @@ impl Render for HostNavigation {
             .px(px(metrics.list_padding_x))
             .pb(px(metrics.list_padding_bottom))
             .overflow_y_scroll()
-            .track_scroll(&self.host_tree_scroll_handle);
+            .track_scroll(if self.search.trim().is_empty() {
+                &self.host_tree_scroll_handle
+            } else {
+                &self.search_tree_scroll_handle
+            });
 
         if self.loading
             && self.rows.is_empty()
@@ -2622,8 +2853,8 @@ fn render_navigation_header(
     metrics: HostNavigationLayoutMetrics,
     cx: &mut Context<HostNavigation>,
 ) -> impl IntoElement {
-    let group_ids = navigation_group_ids(&navigation.groups);
-    let all_collapsed = all_groups_are_collapsed(&group_ids, &navigation.collapsed_groups);
+    let group_ids = navigation.visible_group_ids();
+    let all_collapsed = all_groups_are_collapsed(&group_ids, navigation.active_collapsed_groups());
     let search = div()
         .id("host-navigation-search-frame")
         .flex_1()
@@ -3017,7 +3248,7 @@ fn render_host_group(
         items,
     } = items;
     let count = items.len();
-    let collapsed = navigation.collapsed_groups.contains(&group_id);
+    let collapsed = navigation.active_collapsed_groups().contains(&group_id);
     let saved_group = navigation.groups.iter().find(|group| group.id == group_id);
     let pinned = saved_group.is_some_and(|group| is_group_pinned(group.sort_order));
     let pin_pending = navigation.pending_group_pins.contains(&group_id);

@@ -990,6 +990,9 @@ fn run_native_ui(
                 let request_sender = completion_signal.clone();
                 // 每次事件各持有独立句柄，避免把订阅回调借用的 flush future 逃逸到 runtime。
                 let flush_handle = window_state_handle.clone();
+                if should_flush_window_state {
+                    root_entity.update(app, |root, cx| flush_handle.capture_navigation(root, cx));
+                }
                 let flush_receipt = should_flush_window_state.then(|| {
                     spawn_window_state_flush(
                         runtime_handle.clone(),

@@ -103,6 +103,7 @@ fn read_legacy_file(path: &Path) -> AppResult<Option<WindowStateSnapshot>> {
         },
         maximized: file.main.maximized,
         fullscreen: file.main.fullscreen,
+        host_navigation: None,
     };
     if !snapshot.normal_bounds.is_valid() {
         return Err(AppError::configuration_corrupt("旧窗口状态"));

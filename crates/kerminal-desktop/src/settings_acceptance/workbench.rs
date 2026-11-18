@@ -732,6 +732,7 @@ async fn capture_workbench(
     verify_compact_host_drawer(cx, window).await?;
     ensure_host_navigation_visible(cx, window).await?;
     click_selector(cx, window, "host-navigation-refresh")?;
+    sidebar_menus::set_group_collapsed(cx, window, WORKBENCH_GROUP_ID, false)?;
 
     click_selector(
         cx,

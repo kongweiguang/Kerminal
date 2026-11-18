@@ -69,7 +69,8 @@ struct VisibilityState {
 }
 
 impl WindowStateBinding {
-    /// 在原生窗口创建后订阅 bounds、可见性和焦点事件，避免以固定间隔轮询平台状态。
+    /// 订阅窗口与侧栏状态并共用 CAS 写入器，保证窗口几何和导航状态不会相互覆盖。
+    /// @author kongweiguang
     pub fn install(
         root: &mut RootView,
         window: &mut Window,
@@ -96,6 +97,7 @@ impl WindowStateBinding {
                 None,
             ),
         };
+        let navigation_state = snapshot.host_navigation.clone();
         let handle = WindowStateHandle {
             controller: Arc::new(WindowStateController {
                 repository,
@@ -156,13 +158,23 @@ impl WindowStateBinding {
                 );
             });
 
+        let mut subscriptions = vec![
+            bounds_subscription,
+            visibility_subscription,
+            activation_subscription,
+        ];
+        if let Some(navigation) = root.host_navigation_entity() {
+            navigation.update(cx, |navigation, cx| {
+                navigation.restore_window_state(navigation_state, cx)
+            });
+            let navigation_handle = handle.clone();
+            subscriptions.push(cx.observe(&navigation, move |root, _, cx| {
+                navigation_handle.capture_navigation(root, cx);
+            }));
+        }
         Self {
             handle,
-            _subscriptions: vec![
-                bounds_subscription,
-                visibility_subscription,
-                activation_subscription,
-            ],
+            _subscriptions: subscriptions,
         }
     }
 
@@ -173,13 +185,28 @@ impl WindowStateBinding {
 }
 
 impl WindowStateHandle {
-    /// bounds 事件出现平台异常值时保留最后有效还原矩形，不以默认值覆盖用户布局。
+    /// 平台异常时保留最后有效状态；克隆快照使侧栏集合不跨线程共享可变引用。
+    /// @author kongweiguang
     fn snapshot(&self) -> WindowStateSnapshot {
         self.controller
             .state
             .lock()
-            .map(|state| state.latest)
+            .map(|state| state.latest.clone())
             .unwrap_or_else(|_| default_snapshot())
+    }
+
+    /// 在普通交互和退出前捕获导航视图，滚动条拖动也能在退出时可靠保存。
+    /// @author kongweiguang
+    pub fn capture_navigation(&self, root: &RootView, cx: &mut Context<RootView>) {
+        let Some(navigation) = root.host_navigation_entity() else {
+            return;
+        };
+        let Some(navigation_state) = navigation.read(cx).window_state() else {
+            return;
+        };
+        let mut snapshot = self.snapshot();
+        snapshot.host_navigation = Some(navigation_state);
+        self.capture(snapshot, cx);
     }
 
     /// 将 bounds 变更合并为单个有界 debounce；后续 CAS 由共享 ApplicationTaskExecutor 执行。
@@ -258,7 +285,8 @@ impl WindowStateHandle {
         }
     }
 
-    /// 仅经共享 runtime 完成 CAS；revision 冲突、损坏和未知提交均停止重试并保留原件。
+    /// 仅经共享 runtime 完成 CAS；克隆当前快照使并发侧栏变化能够排入下一代写入。
+    /// @author kongweiguang
     async fn persist_pending(&self) -> AppResult<()> {
         loop {
             let (snapshot, expected_revision, generation) = {
@@ -282,7 +310,7 @@ impl WindowStateHandle {
                     state.completed.cancel();
                     return Ok(());
                 }
-                (state.latest, state.revision, state.generation)
+                (state.latest.clone(), state.revision, state.generation)
             };
 
             let repository = Arc::clone(&self.controller.repository);
@@ -458,6 +486,8 @@ fn gpui_bounds(rect: WindowRect) -> Bounds<Pixels> {
 }
 
 /// 读取当前 GPUI 几何与最大化/全屏状态；后两种 bounds 是 GPUI 的还原矩形，转换失败时只保留上一份正常矩形。
+/// 窗口几何事件只更新几何部分，保留同一写入队列中的侧栏状态。
+/// @author kongweiguang
 fn snapshot_from_window(window: &Window, previous: WindowStateSnapshot) -> WindowStateSnapshot {
     let bounds = window.window_bounds();
     let (normal_bounds, maximized, fullscreen) = match bounds {
@@ -481,15 +511,18 @@ fn snapshot_from_window(window: &Window, previous: WindowStateSnapshot) -> Windo
         normal_bounds,
         maximized,
         fullscreen,
+        host_navigation: previous.host_navigation,
     }
 }
 
-/// 首次启动或当前记录不可用时才采用产品初始布局；后续 bounds 异常会使用已保存矩形。
+/// 首次启动不预设侧栏状态，让目录读取后依据真实分组数量决定默认展开。
+/// @author kongweiguang
 fn default_snapshot() -> WindowStateSnapshot {
     WindowStateSnapshot {
         normal_bounds: DEFAULT_WINDOW_RECT,
         maximized: false,
         fullscreen: false,
+        host_navigation: None,
     }
 }
 

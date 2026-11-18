@@ -34,6 +34,16 @@ use crate::features::workspace_controller::{WorkspaceControllerEffect, Workspace
 use super::workspace_runtime::RuntimePanePhase;
 use super::{CenterPanel, RootView, TerminalTargetRequest, WorkspaceTerminalOpenKind};
 
+impl RootView {
+    /// 窗口状态桥只获取现有导航实体，避免重新创建实体导致展开状态丢失。
+    /// @author kongweiguang
+    pub(crate) fn host_navigation_entity(
+        &self,
+    ) -> Option<Entity<crate::features::connections::HostNavigation>> {
+        self.host_navigation.clone()
+    }
+}
+
 /// SFTP 预检可跨越外部连接确认模态，但不能跨越用户后来的中央页面或标签导航。
 pub(super) struct SftpNavigationRequest {
     pub(super) request_id: String,

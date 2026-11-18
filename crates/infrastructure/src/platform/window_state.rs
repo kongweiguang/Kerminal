@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::storage::{AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file};
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
-const MAX_STATE_BYTES: u64 = 16 * 1024;
+// 与迁移预检的文档上限一致；大量分组的展开身份不能阻断窗口几何保存。
+const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 const CURRENT_FILE_NAME: &str = "window-state.json";
 
 /// 普通运行态只读写当前格式；旧 Tauri 数据只能由启动前的一次迁移处理。
@@ -99,7 +100,8 @@ impl WindowStateStore {
         }
     }
 
-    /// 在共享根锁内比较 revision、写同目录 staging 并原子替换，冲突与未知提交均不重试。
+    /// 在共享根锁内比较 revision 并原子替换；写入受读入大小限制，避免生成无法重读的文件。
+    /// @author kongweiguang
     fn compare_and_swap_sync(
         &self,
         expected_revision: Option<u64>,
@@ -127,6 +129,11 @@ impl WindowStateStore {
             revision,
             state: PersistedWindowState::from(snapshot),
         };
+        let serialized = serde_json::to_vec(&document)
+            .map_err(|error| AppError::infrastructure_with_source("窗口状态序列化失败", error))?;
+        if serialized.len() as u64 >= MAX_STATE_BYTES {
+            return Err(AppError::invalid("窗口状态超出允许大小，原状态已保留"));
+        }
         let mut staging = tempfile::Builder::new()
             .prefix(".window-state-")
             .suffix(".tmp")
@@ -134,8 +141,12 @@ impl WindowStateStore {
             .map_err(|error| {
                 AppError::infrastructure_with_source("窗口状态 staging 创建失败", error)
             })?;
-        serde_json::to_writer(staging.as_file_mut(), &document)
-            .map_err(|error| AppError::infrastructure_with_source("窗口状态序列化失败", error))?;
+        staging
+            .as_file_mut()
+            .write_all(&serialized)
+            .map_err(|error| {
+                AppError::infrastructure_with_source("窗口状态 staging 写入失败", error)
+            })?;
         staging.as_file_mut().write_all(b"\n").map_err(|error| {
             AppError::infrastructure_with_source("窗口状态 staging 写入失败", error)
         })?;
@@ -194,11 +205,14 @@ struct WindowStateDocument {
     state: PersistedWindowState,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct PersistedWindowState {
     normal_bounds: WindowRect,
     maximized: bool,
     fullscreen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_navigation:
+        Option<kerminal_application::platform::window_state::HostNavigationWindowState>,
 }
 
 impl From<WindowStateSnapshot> for PersistedWindowState {
@@ -208,6 +222,7 @@ impl From<WindowStateSnapshot> for PersistedWindowState {
             normal_bounds: snapshot.normal_bounds,
             maximized: snapshot.maximized,
             fullscreen: snapshot.fullscreen,
+            host_navigation: snapshot.host_navigation,
         }
     }
 }
@@ -219,6 +234,7 @@ impl From<PersistedWindowState> for WindowStateSnapshot {
             normal_bounds: state.normal_bounds,
             maximized: state.maximized,
             fullscreen: state.fullscreen,
+            host_navigation: state.host_navigation,
         }
     }
 }
