@@ -956,6 +956,11 @@ pub struct RootView {
     plugin_tab_close_deadlines: BTreeMap<TabId, std::time::Instant>,
     active_content_scope: Option<crate::plugins::content::ContentScope>,
     content_window_active: bool,
+    /// 原生验收用：窗口激活 observer 实际触发的激活/失活次数；普通生产不读取。
+    #[cfg_attr(not(any(test, feature = "right-rail-acceptance")), allow(dead_code))]
+    acceptance_activation_events: usize,
+    #[cfg_attr(not(any(test, feature = "right-rail-acceptance")), allow(dead_code))]
+    acceptance_deactivation_events: usize,
     content_failures: BTreeMap<crate::plugins::content::ContentScope, SharedString>,
     // Page 没有标签控制器的恢复回执，必须独立确认激活、显示与焦点后才能挂载。
     ready_content_pages: HashSet<String>,
@@ -3467,7 +3472,12 @@ impl RootView {
                         external_plugin_settings,
                         external_plugin_views,
                     )
-                    .with_extensions(extensions, "1.0.0".into());
+                    // 页头兼容 API 必须与 application 实际发布的一致；写死旧版本会把
+                    // 支持 1.1 的局域网目录误判为不支持，导致来源切换后整页不可用。
+                    .with_extensions(
+                        extensions,
+                        kerminal_application::plugins::HOST_API_VERSION.into(),
+                    );
                 match hosts {
                     Some(hosts) => panel.with_host_management_service(hosts),
                     None => panel,
@@ -3973,11 +3983,27 @@ impl RootView {
         let terminal_activation_subscription =
             cx.observe_window_activation(window, |root, window, cx| {
                 root.content_window_active = window.is_window_active();
+                // 原生验收用计数：第二个顶层窗口让主窗口真实失活/激活时，driver 据此证明
+                // observer 事件确实发生，而不是把 workspace 切 Tab 当作跨窗口 activity。
+                if cfg!(any(test, feature = "right-rail-acceptance")) {
+                    if window.is_window_active() {
+                        root.acceptance_activation_events =
+                            root.acceptance_activation_events.saturating_add(1);
+                    } else {
+                        root.acceptance_deactivation_events =
+                            root.acceptance_deactivation_events.saturating_add(1);
+                    }
+                }
                 root.sync_plugin_content_visibility(cx);
                 if !window.is_window_active() {
                     // 应用失活时提前停止组件拥有的拖动与边缘滚动，GPUI 不会替应用清理 active_drag。
                     root.cancel_workbench_drag(window, cx);
-                } else if root.agent_tool_panel_is_visible() {
+                }
+                // 双向激活变化都在事件阶段提交完整工具投影：失活时首帧直接使用 (false) 状态，
+                // 激活时首帧直接使用 (true) 状态，避免任一方向先画 unavailable 占位再 defer 恢复。
+                // 与 Tab/Pane 切换同门禁；同 Tab 的 reconcile 会早退，不重建面板或终端实体。
+                root.sync_tool_projection_before_first_draw(window, cx);
+                if window.is_window_active() && root.agent_tool_panel_is_visible() {
                     root.request_agent_snapshot(cx);
                 }
                 root.cancel_unfocused_pane_compositions(window, cx);
@@ -4237,6 +4263,8 @@ impl RootView {
             plugin_tab_close_deadlines: BTreeMap::new(),
             active_content_scope: None,
             content_window_active: window.is_window_active(),
+            acceptance_activation_events: 0,
+            acceptance_deactivation_events: 0,
             content_failures: BTreeMap::new(),
             ready_content_pages: HashSet::new(),
             workspace_render_subscriptions: HashMap::new(),

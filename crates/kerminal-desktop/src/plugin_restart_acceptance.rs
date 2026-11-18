@@ -1,4 +1,4 @@
-//! 显式验收环境驱动普通 main 的四代进程，重启与资源回收始终由生产宿主拥有。
+//! 显式验收环境驱动普通 main 的三代进程，重启与资源回收始终由生产宿主拥有。
 //! @author kongweiguang
 
 use std::{
@@ -10,10 +10,10 @@ use std::{
 use gpui_kit::{AnyWindowHandle, App, AsyncApp, ElementId, Entity, Role, Window};
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
-    extensions::{ExtensionChange, ExtensionsService, install_progress_channel},
+    extensions::{ExtensionsService, install_progress_channel},
     preferences::ThemeMode,
 };
-use kerminal_domain::plugins::{PendingPluginChange, PluginId, PluginStoreState};
+use kerminal_domain::plugins::{PendingPluginChange, PluginStoreState};
 use kerminal_ui::{AppServices, QuitIntent, RootView};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -157,10 +157,14 @@ async fn exercise(
         let config = tokio::fs::canonicalize(&setup.config).await.map_err(io_error)?;
         let expected = tokio::fs::canonicalize(setup.output.join("config")).await.map_err(io_error)?;
         if config != expected { return Err(AppError::invalid("重启验收配置根不属于本轮输出")); }
-        let phase = if tokio::fs::try_exists(setup.output.join("observed-2.json")).await.map_err(io_error)? { 3 }
-            else if tokio::fs::try_exists(setup.output.join("observed-1.json")).await.map_err(io_error)? { 2 }
+        // 主线单版本目录已移除人工回退，验收状态机固定为三代；发现旧四代残留时显式失败，
+        // 避免把已不存在的回退代当成下一阶段继续授权，也不能静默沿用旧成功收据。
+        if tokio::fs::try_exists(setup.output.join("observed-2.json")).await.map_err(io_error)? {
+            return Err(AppError::invalid("重启验收仍是旧四代形态"));
+        }
+        let phase = if tokio::fs::try_exists(setup.output.join("observed-1.json")).await.map_err(io_error)? { 2 }
             else if tokio::fs::try_exists(setup.output.join("observed-0.json")).await.map_err(io_error)? { 1 } else { 0 };
-        let version = expected_version(phase);
+        let version = expected_version(phase)?;
         let frozen = startup.enabled.iter().find(|plugin| plugin.id.as_str() == "acme.notes")
             .map(|plugin| plugin.package.manifest.version.as_str());
         if frozen != version { return Err(AppError::conflict("启动冻结版本与阶段不符")); }
@@ -203,7 +207,7 @@ async fn exercise(
             })
         })
         .map_err(io_error)?;
-    let version = expected_version(phase);
+    let version = expected_version(phase)?;
     let (renderer, persistence_evidence, new_capability) = if let Some(version) = version {
         persistence::exercise_generation(cx, root, window, executor, &settings, phase, version)
             .await
@@ -268,16 +272,12 @@ async fn exercise(
                 if !receipt.restart_required || receipt.cleanup_warning.is_some() {
                     return Err(AppError::conflict("本地安装未形成确定的待重启事务"));
                 }
-            } else if phase == 2 {
-                let id = PluginId::parse("acme.notes").map_err(io_error)?;
-                let receipt = service.change(ExtensionChange::Rollback(id)).await?;
-                if !receipt.restart_required || receipt.cleanup_warning.is_some() {
-                    return Err(AppError::conflict("回滚未形成确定的待重启事务"));
-                }
             }
+            // 第三代只核对升级后的运行态并退出；主线单版本目录已固定拒绝回退，
+            // 验收不能再制造人工回退事务，否则会把已移除的旧契约当成成功路径。
             let state = service.state().await?;
             if let Some(version) = version {
-                validate_state(&state, version, if phase < 3 { Some(phase) } else { None })?;
+                validate_state(&state, version, if phase < 2 { Some(phase) } else { None })?;
             } else {
                 validate_bootstrap(&state, true)?;
             }
@@ -285,16 +285,13 @@ async fn exercise(
         })
         .await
         .map_err(|error| stage_error(error, "阶段安装与状态回读"))?;
-    let operation = if phase == 0 {
-        "local-file-initial-install"
-    } else if phase == 1 {
-        "local-file-update"
-    } else if phase == 2 {
-        "rollback"
-    } else {
-        "exit"
+    // 前两代分别产生初始安装和本地更新事务，第三代只完成升级后核验并退出。
+    let operation = match phase {
+        0 => "local-file-initial-install",
+        1 => "local-file-update",
+        _ => "exit",
     };
-    let requested_intent = if phase < 3 {
+    let requested_intent = if phase < 2 {
         "RestartForExtensions"
     } else {
         "Exit"
@@ -308,7 +305,7 @@ async fn exercise(
     let observed_digest = executor
         .run(move |_| async move { write_json_with_digest(observed_path, report).await })
         .await?;
-    let intent = if phase < 3 {
+    let intent = if phase < 2 {
         QuitIntent::RestartForExtensions
     } else {
         QuitIntent::Exit
@@ -631,6 +628,7 @@ async fn wait_capability_snapshot(
 }
 
 /// 权威状态与当前运行版本分开校验，排队成功必须同时满足活动版本未热替换及确切pending目标。
+/// 主线单版本目录不再接受回退排队，pending 只允许本代产生的 Update；出现其他形状即拒绝。
 fn validate_state(
     state: &PluginStoreState,
     version: &str,
@@ -650,9 +648,6 @@ fn validate_state(
     let valid_pending = match pending_phase {
         Some(1) => {
             matches!(state.pending.as_slice(), [PendingPluginChange::Update {id,to,..}] if id.as_str()=="acme.notes" && to.to_string()=="1.1.0")
-        }
-        Some(2) => {
-            matches!(state.pending.as_slice(), [PendingPluginChange::Rollback {id,to}] if id.as_str()=="acme.notes" && to.to_string()=="1.0.0")
         }
         None => state.pending.is_empty(),
         _ => false,
@@ -676,12 +671,14 @@ fn validate_bootstrap(state: &PluginStoreState, pending: bool) -> AppResult<()> 
     Ok(())
 }
 
-/// 初始安装尚无活动版本，其余三代严格绑定更新和回滚的版本顺序。
-fn expected_version(phase: u8) -> Option<&'static str> {
+/// 初始安装尚无活动版本，随后只允许 1.0.0 和升级后的 1.1.0 两代；
+/// 第四个阶段必须报错，防止旧四代脚本把已移除的回退代继续当作成功路径。
+fn expected_version(phase: u8) -> AppResult<Option<&'static str>> {
     match phase {
-        0 => None,
-        2 => Some("1.1.0"),
-        _ => Some("1.0.0"),
+        0 => Ok(None),
+        1 => Ok(Some("1.0.0")),
+        2 => Ok(Some("1.1.0")),
+        _ => Err(AppError::invalid("重启验收阶段超出三代契约")),
     }
 }
 

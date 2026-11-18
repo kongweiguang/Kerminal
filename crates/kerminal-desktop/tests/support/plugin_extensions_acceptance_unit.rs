@@ -7,8 +7,9 @@ use kerminal_domain::plugins::PluginStoreState;
 use serde_json::json;
 
 use super::{
-    ACCEPTANCE_MODE, AcceptanceFailures, EXPECTED_PENDING, FRAME_VALIDATION,
-    combine_acceptance_results, frame_evidence, validate_pending_install,
+    ACCEPTANCE_MODE, AcceptanceFailures, EXPECTED_PENDING, FRAME_VALIDATION, builtin_collapsed,
+    combine_acceptance_results, frame_evidence, group_count, validate_pending_install,
+    validate_source_urls,
 };
 
 /// 用完整待安装条目构造权威状态，使排序、重复和额外项都由真实领域类型判定。
@@ -47,7 +48,7 @@ fn pending_install_requires_exact_identity_set() {
     .expect("完整 pending 集合必须通过");
     assert_eq!(
         ids,
-        vec!["acme.market-two".to_owned(), "acme.file-search".to_owned()]
+        vec!["acme.file-search".to_owned(), "acme.market-two".to_owned()]
     );
 
     for (case, pending) in [
@@ -132,6 +133,29 @@ fn acceptance_results_resolve_each_stage_independently() {
     );
 }
 
+/// 来源保存必须同时命中配置回读、运行源和启动器注入地址；任一为空或错配都不能通过。
+#[test]
+fn source_urls_require_config_runtime_and_fixture_to_agree() {
+    let url = "http://127.0.0.1:41873/catalog.json";
+    assert!(
+        validate_source_urls(url, url, url).is_ok(),
+        "三者一致时必须通过"
+    );
+    for (config, runtime, expected) in [
+        ("", url, url),
+        (url, "", url),
+        (url, url, ""),
+        ("http://127.0.0.1:41874/catalog.json", url, url),
+        (url, "http://127.0.0.1:41874/catalog.json", url),
+        (url, url, "http://127.0.0.1:41874/catalog.json"),
+    ] {
+        assert!(
+            validate_source_urls(config, runtime, expected).is_err(),
+            "来源不一致不能通过：config={config}, runtime={runtime}, expected={expected}"
+        );
+    }
+}
+
 /// 帧证据必须明确保留“结构已校验、特征像素和系统合成未观察”，不能随成功退出升级为视觉通过。
 #[test]
 fn frame_evidence_keeps_unobserved_scope() {
@@ -141,4 +165,36 @@ fn frame_evidence_keeps_unobserved_scope() {
     assert_eq!(evidence["featurePixelsChecked"], false);
     assert_eq!(evidence["systemComposition"], "not-observed");
     assert_eq!(ACCEPTANCE_MODE, "private-desktop-composition");
+}
+
+/// 统一列表等待条件只接受真实布尔与整数；缺失、错型或未知组必须返回 None，
+/// 避免把未渲染的分组事实当成默认收起或默认计数。
+#[test]
+fn unified_group_projection_rejects_missing_and_wrong_types() {
+    let snapshot = json!({
+        "page": {
+            "groups": [
+                {"kind": "builtin", "count": 4, "collapsed": true},
+                {"kind": "pending", "count": 2, "collapsed": false},
+                {"kind": "market", "count": 1, "collapsed": false},
+            ]
+        }
+    });
+    assert_eq!(group_count(&snapshot, "builtin"), Some(4));
+    assert_eq!(group_count(&snapshot, "pending"), Some(2));
+    assert_eq!(group_count(&snapshot, "market"), Some(1));
+    assert_eq!(group_count(&snapshot, "installed"), None);
+    assert_eq!(builtin_collapsed(&snapshot), Some(true));
+
+    let wrong_types = json!({
+        "page": {
+            "groups": [
+                {"kind": "builtin", "count": "4", "collapsed": "true"},
+            ]
+        }
+    });
+    assert_eq!(group_count(&wrong_types, "builtin"), None);
+    assert_eq!(builtin_collapsed(&wrong_types), None);
+    assert_eq!(builtin_collapsed(&json!({"page": {"groups": []}})), None);
+    assert_eq!(builtin_collapsed(&json!({})), None);
 }

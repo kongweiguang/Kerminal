@@ -273,9 +273,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 }
 
 /// 在新建的隔离配置根预留唯一回环端口，直到验收点击启动前才交还给 MCP。
+/// 同一逻辑也供 Agent 连续性验收复用，避免与正在运行的用户 Kerminal 抢占固定端口。
 ///
 /// @author kongweiguang
-fn seed_isolated_mcp_port(config_directory: &Path) -> Result<std::net::TcpListener, io::Error> {
+pub(super) fn seed_isolated_mcp_port(
+    config_directory: &Path,
+) -> Result<std::net::TcpListener, io::Error> {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
     let settings = format!("schema_version = 1\n\n[mcp]\nbindMode = \"loopback\"\nport = {port}\n");

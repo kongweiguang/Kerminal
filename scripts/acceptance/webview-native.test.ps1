@@ -36,24 +36,23 @@ function Import-TestInitializer {
         $source=$source.Replace($old,$new)
     }
     if($ForceJobSetupFailure){
-        # 仅替换内存中的 Job 信息类，检查完整启动路径在 CreateProcess 前拒绝失败配置。
-        $old='$parts.Add($jobs[0].Extent.Text); $parts.Add($launch[0].Extent.Text)'
-        $new='$parts.Add($jobs[0].Extent.Text.Replace(''SetInformationJobObject(job,9,ref limits,'',''SetInformationJobObject(job,-1,ref limits,'')); $parts.Add($launch[0].Extent.Text)'
-        if($source.Split([string[]]@($old),[StringSplitOptions]::None).Count -ne 2){throw 'Job setup failure injection is ambiguous.'}
-        $source=$source.Replace($old,$new)
+        # 现行启动器在 StartCoreImpl 内配置 Job；把失败注入放到 C# 源码生成之后，检查完整启动路径在创建进程前拒绝失败配置。
+        $anchor='    $source = Replace-WebViewLauncherPart $source ''public JobSnapshot GetJobSnapshot()'
+        if($source.Split([string[]]@($anchor),[StringSplitOptions]::None).Count -ne 2){throw 'Job setup failure injection is ambiguous.'}
+        $inject=@'
+    $source=Replace-WebViewLauncherPart $source 'SetInformationJobObject(job, JobObjectExtendedLimitInformationClass, ref limits, limitSize)' 'SetInformationJobObject(job, -1, ref limits, limitSize)'
+'@
+        $source=$source.Replace($anchor,($inject+"`n"+$anchor))
     }
     if($InjectCleanupFailures){
-        # 测试副本仍先执行真实终止和关闭，再把结果伪装为失败，既覆盖诊断又不泄漏测试资源。
-        $old='$parts.Add($jobs[0].Extent.Text); $parts.Add($launch[0].Extent.Text)'
-        $new='$parts.Add($jobs[0].Extent.Text.Replace(''if(!TerminateJobObject(job,1))'',''if(!TerminateJobObject(job,1) || true)'').Replace(''if(!CloseHandle(job)) errors.Add'',''if(!CloseHandle(job) || true) errors.Add'')); $parts.Add($launch[0].Extent.Text)'
-        if($source.Split([string[]]@($old),[StringSplitOptions]::None).Count -ne 2){throw 'Job cleanup injection is ambiguous.'}
-        $source=$source.Replace($old,$new)
+        # 现行启动器在 Dispose 内逐个关闭句柄；注入失败后仍必须真实关闭资源，只把结果伪装为错误。
         $anchor='    $source = Replace-WebViewLauncherPart $source ''public JobSnapshot GetJobSnapshot()'
         if($source.Split([string[]]@($anchor),[StringSplitOptions]::None).Count -ne 2){throw 'Launcher cleanup injection is ambiguous.'}
         $inject=@'
-    $source = Replace-WebViewLauncherPart $source 'if (desktop != IntPtr.Zero && !CloseDesktop(desktop))' 'if (desktop != IntPtr.Zero && (!CloseDesktop(desktop) || true))'
-    $source = Replace-WebViewLauncherPart $source 'if (!CloseHandle(handle)) errors.Add' 'if (!CloseHandle(handle) || description == "标准输出") errors.Add'
-    $source = Replace-WebViewLauncherPart $source 'processInformation = info; if (ProbeJob.ResumeThread(processInformation.Thread) == uint.MaxValue)' 'processInformation = info; var marker = Environment.GetEnvironmentVariable("KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER"); if (marker != null) { using (var p = System.Diagnostics.Process.GetProcessById(unchecked((int)processInformation.ProcessId))) System.IO.File.WriteAllText(marker, p.Id.ToString() + ":" + p.StartTime.ToUniversalTime().Ticks.ToString()); } if (Environment.GetEnvironmentVariable("KERMINAL_ACCEPTANCE_JOB_TEST_AFTER_CREATE") == "1") throw new InvalidOperationException("测试：首线程恢复前启动失败"); if (ProbeJob.ResumeThread(processInformation.Thread) == uint.MaxValue)'
+    $source=Replace-WebViewLauncherPart $source 'if (!NativeDesktopLauncher.CloseHandle(_jobHandle))' 'if (!NativeDesktopLauncher.CloseHandle(_jobHandle) || true)'
+    $source=Replace-WebViewLauncherPart $source 'if (!NativeDesktopLauncher.CloseHandle(_processHandle))' 'if (!NativeDesktopLauncher.CloseHandle(_processHandle) || true)'
+    $source=Replace-WebViewLauncherPart $source 'DesktopClosed = NativeDesktopLauncher.CloseDesktop(_desktopHandle);' 'DesktopClosed = NativeDesktopLauncher.CloseDesktop(_desktopHandle); if (DesktopClosed) { firstError = 6; }'
+    $source=Replace-WebViewLauncherPart $source 'uint resumeResult = ResumeThread(processInformation.Thread);' 'var marker = Environment.GetEnvironmentVariable("KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER"); if (marker != null) { using (var p = System.Diagnostics.Process.GetProcessById(unchecked((int)processInformation.ProcessId))) System.IO.File.WriteAllText(marker, p.Id.ToString() + ":" + p.StartTime.ToUniversalTime().Ticks.ToString()); } if (Environment.GetEnvironmentVariable("KERMINAL_ACCEPTANCE_JOB_TEST_AFTER_CREATE") == "1") throw new InvalidOperationException("测试：首线程恢复前启动失败"); uint resumeResult = ResumeThread(processInformation.Thread);'
 '@
         $source=$source.Replace($anchor,($inject+"`n"+$anchor))
     }
@@ -62,7 +61,7 @@ function Import-TestInitializer {
         $anchor='    $source = Replace-WebViewLauncherPart $source ''public JobSnapshot GetJobSnapshot()'
         if($source.Split([string[]]@($anchor),[StringSplitOptions]::None).Count -ne 2){throw 'Resume pause injection is ambiguous.'}
         $inject=@'
-    $source = Replace-WebViewLauncherPart $source 'processInformation = info; if (ProbeJob.ResumeThread(processInformation.Thread) == uint.MaxValue)' 'processInformation = info; var marker = Environment.GetEnvironmentVariable("KERMINAL_ACCEPTANCE_JOB_TEST_MARKER"); System.IO.File.WriteAllText(marker + ".tmp", processInformation.ProcessId.ToString()); System.IO.File.Move(marker + ".tmp", marker); System.Threading.Thread.Sleep(25000); if (ProbeJob.ResumeThread(processInformation.Thread) == uint.MaxValue)'
+    $source=Replace-WebViewLauncherPart $source 'uint resumeResult = ResumeThread(processInformation.Thread);' 'var marker = Environment.GetEnvironmentVariable("KERMINAL_ACCEPTANCE_JOB_TEST_MARKER"); System.IO.File.WriteAllText(marker + ".tmp", processInformation.ProcessId.ToString()); System.IO.File.Move(marker + ".tmp", marker); System.Threading.Thread.Sleep(25000); uint resumeResult = ResumeThread(processInformation.Thread);'
 '@
         $source=$source.Replace($anchor,($inject+"`n"+$anchor))
     }
@@ -91,6 +90,8 @@ function Import-TestWebViewLauncher {
     $quoted="'"+$PSScriptRoot.Replace("'","''")+"'"
     $source=($parts -join "`n").Replace('$PSScriptRoot',$quoted)
     . ([scriptblock]::Create($source))
+    # 返回变换后的 C# 源码，供主测试核对命令、隔离和 Job 契约没有随共享启动器漂移。
+    return Get-WebViewLauncherSource
 }
 
 function Test-JobSetupFailure {
@@ -245,9 +246,9 @@ public static class FakeCli {
 }
 
 function New-TestChildCommand {
-    # 子进程只写入专属临时标识并短时休眠，不访问用户应用或输入桌面。
+    # 子进程只写入专属临时标识并短时休眠，不访问用户应用或输入桌面；关闭失败用例需要立即退出。
     # @author kongweiguang
-    param([bool]$WithDescendant)
+    param([bool]$WithDescendant,[int]$SleepSeconds=25)
     $code=@'
 $ErrorActionPreference='Stop'
 $self=[Diagnostics.Process]::GetCurrentProcess()
@@ -265,6 +266,7 @@ $path=$env:KERMINAL_ACCEPTANCE_JOB_TEST_MARKER
 [IO.File]::Move("$path.tmp",$path)
 Start-Sleep -Seconds 25
 '@
+    $code=$code.Replace('Start-Sleep -Seconds 25',"Start-Sleep -Seconds $SleepSeconds")
     $env:KERMINAL_ACCEPTANCE_JOB_TEST_DESCENDANT=if($WithDescendant){'1'}else{'0'}
     $env:KERMINAL_ACCEPTANCE_JOB_TEST_COMMAND=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
 }
@@ -320,22 +322,52 @@ function Open-TestIdentities {
     } catch {foreach($process in $result){$process.Dispose()};throw}
 }
 
-function Assert-StartupCleanupAggregate {
-    # 主失败必须位于聚合首项，后续每个注入的失败都必须单独保留。
+function Assert-StartupFailure {
+    # 现行启动器在 finally 中静默关闭局部资源；启动失败只保留主错误，资源回收由句柄计数和子进程核对。
     # @author kongweiguang
     param($Record,[string]$Primary,[bool]$HasPrimary)
     $error=$Record.Exception
-    while($null -ne $error -and $error -isnot [AggregateException]){$error=$error.InnerException}
-    if($null -eq $error){throw 'Expected an aggregate containing startup and cleanup failures.'}
-    $items=@($error.InnerExceptions)
-    $expectedCount=if($HasPrimary){5}else{4}
-    if($items.Count -ne $expectedCount){throw "Expected $expectedCount independent errors, received $($items.Count): $error"}
-    if($HasPrimary -and -not $items[0].Message.Contains($Primary)){throw "Original startup error was not retained first: $($items[0])"}
-    $offset=if($HasPrimary){1}else{0}
-    $expected=@('关闭启动期间的标准输出句柄失败','终止启动失败的验收 Job 失败','关闭启动失败的验收 Job 失败','关闭启动失败的验收桌面失败')
-    for($i=0;$i -lt $expected.Count;$i++){
-        if(-not $items[$i+$offset].Message.Contains($expected[$i])){throw "Cleanup failure missing or out of order: $($expected[$i])"}
+    while($null -ne $error -and $error -isnot [ComponentModel.Win32Exception] -and $error -isnot [InvalidOperationException] -and $error -isnot [AggregateException]){$error=$error.InnerException}
+    if($null -eq $error){throw 'Expected a startup failure.'}
+    if($error -is [AggregateException]){throw "Unexpected aggregate: $error"}
+    if($HasPrimary -and -not $error.Message.Contains($Primary)){throw "Original startup error was not retained: $error"}
+}
+
+function Assert-InjectedCleanupFailure {
+    # 启动成功后再注入关闭失败：Dispose 必须报告错误，同时仍关闭进程、Job 和桌面句柄。
+    # @author kongweiguang
+    param([string]$Cli,[string]$WorkingDirectory,[string]$Directory)
+    $desktop='KerminalRail-settings-test-'+[Guid]::NewGuid().ToString('N')
+    $owner=[Kerminal.PluginRestartAcceptance.NativeDesktopLauncher]::StartPackage($Cli,$WorkingDirectory,(Join-Path $Directory 'cleanup'),(Join-Path $Directory 'cleanup.out'),(Join-Path $Directory 'cleanup.err'),$desktop,$Directory,$Directory)
+    try {
+        if(-not $owner.WaitForExit(10000)){throw 'Cleanup-failure child did not exit.'}
+        $failure=$null
+        try{$owner.Dispose()}catch{$failure=$_}
+        if($null -eq $failure){throw 'Injected cleanup failures were accepted.'}
+        # 注入把桌面关闭结果伪装为错误码 6；必须看到该错误码，才能证明桌面分支被实际执行。
+        $cause=$failure.Exception
+        while($null -ne $cause -and $cause -isnot [ComponentModel.Win32Exception]){$cause=$cause.InnerException}
+        if($null -eq $cause -or $cause.NativeErrorCode -ne 6){throw "Desktop close failure was not reported distinctly: $failure"}
+        if(-not $owner.DesktopClosed){throw 'Cleanup failure left the desktop handle open.'}
+    } finally {
+        if($null -ne $owner -and -not $owner.DesktopClosed){try{$owner.Dispose()}catch{}}
     }
+}
+
+function Test-LauncherInjectionAnchorGuard {
+    # 旧/缺失/重复锚点必须让注入失败，不能静默跳过而让清理用例假通过。
+    # @author kongweiguang
+    param([string]$LauncherSource)
+    $failure=$null
+    try{Replace-WebViewLauncherPart 'alpha beta' 'missing' 'x'}catch{$failure=$_}
+    if($null -eq $failure -or -not $failure.Exception.Message.Contains('作业注入点发生变化')){throw 'A missing injection anchor was silently accepted.'}
+    $failure=$null
+    try{Replace-WebViewLauncherPart 'alpha alpha' 'alpha' 'x'}catch{$failure=$_}
+    if($null -eq $failure -or -not $failure.Exception.Message.Contains('作业注入点发生变化')){throw 'A duplicate injection anchor was silently accepted.'}
+    $failure=$null
+    try{Replace-WebViewLauncherPart $LauncherSource 'if (!NativeDesktopLauncher.CloseDesktop(_desktopHandle))' 'x'}catch{$failure=$_}
+    if($null -eq $failure){throw 'The stale desktop-close anchor was silently accepted.'}
+    Write-Output 'PASS: missing, duplicate and stale launcher injection anchors are rejected'
 }
 
 function Assert-TestChildReaped {
@@ -359,7 +391,7 @@ function Assert-InjectedStartFailure {
         $desktop='KerminalRail-settings-test-'+[Guid]::NewGuid().ToString('N')
         $owner=[Kerminal.PluginRestartAcceptance.NativeDesktopLauncher]::StartPackage($Cli,$WorkingDirectory,(Join-Path $Directory 'fault'),(Join-Path $Directory 'fault.out'),(Join-Path $Directory 'fault.err'),$desktop,$Directory,$Directory)
         throw 'Injected cleanup failures were accepted as a successful launch.'
-    } catch {Assert-StartupCleanupAggregate -Record $_ -Primary $Primary -HasPrimary $HasPrimary}
+    } catch {Assert-StartupFailure -Record $_ -Primary $Primary -HasPrimary $HasPrimary}
     finally {
         if($null -ne $owner){
             try {if($owner.GetJobSnapshot().ActiveProcesses -gt 0){$owner.TerminateJob(1)};if(-not $owner.WaitForExit(10000)){throw 'Unexpected test owner did not exit.'}}
@@ -374,9 +406,9 @@ if($Case -ne 'all'){
     $cli=Join-Path $PSHOME 'pwsh.exe'
     $working=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
     $env:KERMINAL_ACCEPTANCE_JOB_TEST_MARKER=Join-Path $Scratch "$Case.json"
-    New-TestChildCommand -WithDescendant ($Case -ceq 'owner')
+    New-TestChildCommand -WithDescendant ($Case -ceq 'owner') -SleepSeconds $(if($Case -ceq 'cleanup-failure'){0}else{25})
     if($Case -ceq 'cleanup-failure'){
-        # 各注入路径均先真实关闭测试资源，再返回模拟失败；主错误和全部后续错误都必须可见。
+        # 启动失败只保留主错误；关闭失败在 Dispose 中报告，但进程、Job 和桌面句柄仍必须真实释放。
         $self=[Diagnostics.Process]::GetCurrentProcess()
         for($i=0;$i -le 5;$i++){
             # 先预热三条路径，再采样句柄，避免把首次加载 PowerShell/诊断程序集误报为泄漏。
@@ -388,15 +420,13 @@ if($Case -ne 'all'){
             Assert-InjectedStartFailure -Cli $cli -WorkingDirectory $working -Directory $Scratch -Primary '测试：首线程恢复前启动失败' -HasPrimary $true
             Assert-TestChildReaped $env:KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER
             Remove-Item -LiteralPath $env:KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER -Force
-            $env:KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER=Join-Path $Scratch 'cleanup-after-start.txt'
+            $env:KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER=$null
             $env:KERMINAL_ACCEPTANCE_JOB_TEST_AFTER_CREATE='0'
-            Assert-InjectedStartFailure -Cli $cli -WorkingDirectory $working -Directory $Scratch -Primary '' -HasPrimary $false
-            Assert-TestChildReaped $env:KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER
-            Remove-Item -LiteralPath $env:KERMINAL_ACCEPTANCE_JOB_TEST_CREATED_MARKER -Force
+            Assert-InjectedCleanupFailure -Cli $cli -WorkingDirectory $working -Directory $Scratch
         }
         $self.Refresh();$after=$self.HandleCount;$self.Dispose()
         if($after-$before -gt 3){throw "Injected cleanup failures leaked handles: before=$before after=$after"}
-        Write-Output 'PASS: startup and all cleanup failures remain visible; owned resources are reaped'
+        Write-Output 'PASS: startup failures retain their cause and injected cleanup failures still release owned handles'
         return
     }
     if($Case -ceq 'setup-failure'){
@@ -410,7 +440,7 @@ if($Case -ne 'all'){
                 throw 'A child started with an invalid Job configuration.'
             } catch {
                 $cause=$_.Exception.GetBaseException()
-                if($cause -isnot [ComponentModel.Win32Exception] -or -not $cause.Message.Contains('配置验收 Job 关闭即终止失败')){throw}
+                if($cause -isnot [ComponentModel.Win32Exception] -or -not $cause.Message.Contains('Configuring the owned acceptance job failed.')){throw}
             } finally {
                 if($null -ne $owner){try {if($owner.GetJobSnapshot().ActiveProcesses -gt 0){$owner.TerminateJob(1)};[void]$owner.WaitForExit(10000)} finally {$owner.Dispose()}}
             }
@@ -486,7 +516,7 @@ $scratchRoot=Join-Path ([IO.Path]::GetTempPath()) ('kerminal-job-test-'+[Guid]::
 [void][IO.Directory]::CreateDirectory($scratchRoot)
 $worker=$null; $handles=$null
 try {
-    Import-TestWebViewLauncher
+    $transformed=Import-TestWebViewLauncher
     foreach($item in @(
         @('plugin-webview-native.ps1','Initialize-PluginWebViewLauncher'),
         @('plugin-extensions-native.ps1','Initialize-ExtensionsLauncher'),
@@ -495,6 +525,32 @@ try {
         @('plugin-restart-native.ps1','Initialize-RestartLauncher')
     )){Import-TestInitializer -File $item[0] -Name $item[1]}
     Write-Output 'PASS: shared launcher and five AST consumers compile'
+    # 共享启动器已内建 Job；变换结果必须保留 Default 桌面、隔离目录、八参数命令锚点和 Job 查询方法，
+    # 同时不得再出现旧版 scope 查找或 settings 命令，否则派生消费者会静默失去隔离或回收边界。
+    foreach($required in @(
+        'namespace Kerminal.WebViewProbe',
+        '--webview-probe --output ',
+        '--theme ',
+        'string scope = "suggestions";',
+        'var profileRoot = outputDirectory + "-profile";',
+        'variables["SystemRoot"] = systemRoot;',
+        'return StartCoreImpl(executable, workingDirectory, outputDirectory, stdoutPath, stderrPath, desktopName, true, command, false);',
+        'return Start(executable, workingDirectory, outputDirectory, stdoutPath, stderrPath, desktopName, width, height);'
+    )){
+        if(-not $transformed.Contains($required)){throw "Transformed launcher lost required contract: $required"}
+    }
+    foreach($forbidden in @('variables.TryGetValue("KERMINAL_SETTINGS_ACCEPTANCE_SCOPE"','--settings-acceptance --output-dir','return StartCore(')){
+        if($transformed.Contains($forbidden)){throw "Transformed launcher still contains a stale anchor: $forbidden"}
+    }
+    $launcherType='Kerminal.WebViewProbe.NativeDesktopLauncher' -as [type]
+    if($null -eq $launcherType -or @($launcherType.GetMethods() | Where-Object {$_.Name -ceq 'Start' -and $_.GetParameters().Count -eq 8}).Count -ne 1){throw 'The transformed launcher lost its eight-parameter entry point.'}
+    $processType='Kerminal.WebViewProbe.NativeDesktopProcess' -as [type]
+    if($null -eq $processType -or $null -eq $processType.GetMethod('GetJobSnapshot') -or $null -eq $processType.GetMethod('TerminateJob')){throw 'The transformed launcher lost its owned-Job query methods.'}
+    Write-Output 'PASS: transformed launcher keeps Default-desktop, isolation, Job and command contracts'
+    # 注入器本身也必须失败关闭：旧锚点、缺失锚点和重复锚点都不能被静默跳过。
+    $replaceSource=Get-TestFunctionSource -Path (Join-Path $PSScriptRoot 'webview-native.ps1') -Name 'Replace-WebViewLauncherPart'
+    . ([scriptblock]::Create($replaceSource))
+    Test-LauncherInjectionAnchorGuard -LauncherSource $transformed
     Test-JobSetupFailure
     $packageTest=Join-Path $scratchRoot 'package-entry';[void][IO.Directory]::CreateDirectory($packageTest)
     Test-PackageEntrypoint -Directory $packageTest

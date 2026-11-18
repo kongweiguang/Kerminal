@@ -1287,6 +1287,19 @@ impl PreferencesPanel {
             revision: versioned.revision,
         };
         self.settings_autosave.reset();
+        // reset 会取消在途保存的票据，迟到的保存回执不再进入 finish_settings_save，
+        // 来源待确认状态也就永远等不到回读；这里显式结束并说明未切换，避免弹层
+        // 长期停在“保存中”或把旧来源误当成新来源。
+        if self.extensions.catalog_source_pending().is_some() {
+            self.extensions.fail_catalog_source_save(
+                crate::locale::text(
+                    "设置已重新载入，来源未切换，请重试。",
+                    "Settings were reloaded, so the source was not switched. Try again.",
+                )
+                .to_string(),
+                cx,
+            );
+        }
         self.sync_settings_inputs(&snapshot.value, window, cx);
         self.mcp_settings.sync(&snapshot.value.mcp, window, cx);
         self.theme_mode = snapshot.value.theme_mode;

@@ -12,7 +12,8 @@ use super::{AgentResumeCapability, AgentSessionView};
 
 /// 依次选择 main 的精确运行会话、可恢复历史，再按安全方向回退旧权限历史。
 ///
-/// 未核对的恢复事务排在新建之前，避免 Enter 重复启动 CLI。
+/// 未核对的恢复事务优先于可恢复历史，避免调用方把待核对记录当作普通历史继续。
+/// 该函数保留为 application 的会话匹配契约，不参与右栏“进入”的新建语义。
 ///
 /// @author kongweiguang
 pub fn find_reusable_agent_session<'a>(

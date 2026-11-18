@@ -384,40 +384,6 @@ fn history_actions_keep_unresolved_recovery_accessible() {
     }
 }
 
-/// 预览必须匹配原会话和完整绑定；切换代次、归档或会话消失时丢弃迟到结果。
-///
-/// @author kongweiguang
-#[test]
-fn context_preview_rejects_changed_agent_or_binding() {
-    let mut view = recovery_view(SessionLifecycle::Running);
-    view.session.target = Some(AgentTargetBinding::unbound(7));
-    let id = view.session.agent_session_id.clone();
-    let expected = view.session.target.clone();
-    let matches = |candidate: Option<&AgentSessionView>| {
-        super::super::actions::context_preview_target_matches(&id, expected.as_ref(), candidate)
-    };
-    assert!(matches(Some(&view)));
-    assert!(!matches(None));
-    let mut changed_target = view.clone();
-    changed_target.session.target = Some(AgentTargetBinding::unbound(8));
-    assert!(!matches(Some(&changed_target)));
-    let mut refreshed_target = view.clone();
-    let binding = refreshed_target
-        .session
-        .target
-        .as_mut()
-        .expect("bound fixture");
-    binding.binding_id = Some("recovered-binding-id".to_owned());
-    binding.last_seen_at = Some("2026-10-29T00:00:00Z".to_owned());
-    assert!(matches(Some(&refreshed_target)));
-    let mut changed_agent = view.clone();
-    changed_agent.session.agent_session_id = AgentSessionId::new();
-    assert!(!matches(Some(&changed_agent)));
-    let mut archived = view;
-    archived.session.status = AgentSessionStatus::Archived;
-    assert!(!matches(Some(&archived)));
-}
-
 /// 正常状态要求明确零码成功；非零/信号保留失败，缺少或矛盾回执不冒称成功。
 ///
 /// @author kongweiguang

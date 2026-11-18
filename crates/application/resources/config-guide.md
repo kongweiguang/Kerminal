@@ -41,6 +41,8 @@
 
 `[mcp].bindMode` 是监听范围：`loopback` 为本机，`lan` 为所有 IPv4 网卡；缺省为 `loopback`。`port` 是固定监听端口，缺省为 `37657`，有效范围 1–65535。局域网模式要求 `tokenRef = "service:kerminal:mcp-token:v1"`，对应令牌由应用保存在加密 vault；不要将令牌正文写入普通配置、日志或工作区上下文。配置校验不能创建令牌或启动服务。
 
+`pluginCatalogUrl` 是插件市场目录的 JSON 地址。空字符串表示使用内置官方目录；自定义值必须是合法的 HTTP(S) 绝对地址，允许局域网、回环主机和非默认端口，拒绝 userinfo、fragment 与 0 端口，最长 2048 个字符。目录只读取 JSON，不要求签名文件；在应用设置界面保存后立即切换到新来源并刷新，无需重启；直接编辑 `settings.toml` 时，目录地址在下次启动生效。失败时保留原来源。不同来源的缓存相互隔离，切换来源不会复用另一来源的目录内容；正在进行的旧来源刷新不会写入新来源缓存，也不会把旧来源结果当成新来源展示。
+
 `[workbenchLayout]` 保存稳定的工作台用户意图：`hostSidebarCollapsed` 默认 `false`，`hostSidebarWidth` 默认 `220` 且范围为 `168`–`360`；`dockPanelWidths` 默认空表，右侧 Attached 工具共用 `360` 逻辑像素内容宽度，显式宽度范围为 `130`–`1360`；`bottomPanelHeight` 默认 `240` 且范围为 `180`–`4000`。
 
 以上宽高均为逻辑像素内容尺寸，不包含 `4px` 调整槽。窗口可用宽度不足时，运行时按中心区域最小宽度等布局预算临时夹紧；窄窗抽屉夹紧到实际剩余视口，这些夹紧值不写回设置。省略整个表或任一字段都使用当前默认值，不改变现有 `schema_version = 1`。
@@ -63,6 +65,7 @@ schema_version = 1
 themeMode = "system"
 interfaceDensity = "compact"
 keybindings = [{ action = "terminal.paste", label = "粘贴到终端", description = "", binding = "", windowsBinding = "Ctrl+V", linuxBinding = "Ctrl+Shift+V", macBinding = "Cmd+V", scope = "terminal", editable = true }]
+pluginCatalogUrl = ""
 
 [appearance]
 colorScheme = "kerminal"

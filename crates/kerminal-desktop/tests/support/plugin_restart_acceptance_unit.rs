@@ -34,13 +34,15 @@ fn snapshot() -> Value {
     })
 }
 
-/// 四个普通进程必须按空根、初装、更新、回退排序，不能把 bootstrap 当成旧版视图。
+/// 三个普通进程必须按空根、初装、更新排序；第四代必须报错，
+/// 因为主线单版本目录已移除回退，旧四代脚本不能继续把回退阶段当作成功路径。
 #[test]
-fn phases_keep_bootstrap_and_rollback_distinct() {
-    assert_eq!(expected_version(0), None);
-    assert_eq!(expected_version(1), Some("1.0.0"));
-    assert_eq!(expected_version(2), Some("1.1.0"));
-    assert_eq!(expected_version(3), Some("1.0.0"));
+fn phases_keep_bootstrap_and_new_version_distinct_and_reject_rollback() {
+    assert_eq!(expected_version(0).expect("bootstrap phase"), None);
+    assert_eq!(expected_version(1).expect("initial phase"), Some("1.0.0"));
+    assert_eq!(expected_version(2).expect("update phase"), Some("1.1.0"));
+    assert!(expected_version(3).is_err());
+    assert!(expected_version(u8::MAX).is_err());
 }
 
 /// 初装与回退的旧版判据和新版判据互斥，并覆盖缺少真实基础控件的假阴性。

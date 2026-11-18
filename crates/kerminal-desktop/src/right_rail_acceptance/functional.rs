@@ -76,6 +76,35 @@ pub(super) async fn checkpoint(
     Ok(())
 }
 
+/// activity 首帧截图允许主窗口在已证明的私有桌面上可见/活动，仍使用同一稳定帧与像素摘要。
+///
+/// @author kongweiguang
+pub(super) async fn checkpoint_visible(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    records: &mut Vec<FunctionalRecord>,
+    operation: &'static str,
+    outcome: &'static str,
+) -> Result<(), Box<dyn Error>> {
+    let evidence = super::wait_for_stable_frame_visible(
+        cx,
+        window,
+        capture
+            .output_directory
+            .join(format!("functional-{operation}.png")),
+        None,
+        operation,
+    )
+    .await?;
+    records.push(FunctionalRecord {
+        operation,
+        outcome,
+        evidence,
+    });
+    Ok(())
+}
+
 /// 同一窗口事件循环内绘制刷新中状态，避免快速 SFTP 回执掩盖列表闪烁。
 ///
 /// @author kongweiguang

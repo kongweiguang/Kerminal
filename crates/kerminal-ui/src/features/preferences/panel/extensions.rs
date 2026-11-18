@@ -5,8 +5,11 @@ use std::sync::Arc;
 
 use gpui_kit::{App, AppContext as _, Context, Entity, Subscription, Window};
 #[cfg(feature = "right-rail-acceptance")]
-use kerminal_application::{AppError, AppResult};
-use kerminal_application::{ApplicationTaskExecutor, extensions::ExtensionsService};
+use kerminal_application::AppError;
+use kerminal_application::{
+    AppResult, ApplicationTaskExecutor, extensions::ExtensionsService,
+    preferences::VersionedSettings,
+};
 
 use super::{PreferencesEvent, PreferencesPanel, PreferencesSection};
 use crate::features::extensions::{ExtensionsEvent, ExtensionsPage};
@@ -27,6 +30,13 @@ pub(in crate::features::preferences) struct ExtensionsPreferencesState {
     _subscription: Option<Subscription>,
     /// 退出被写操作拒绝时保留可见原因；写入结束后由正文清除。
     notice: Option<String>,
+    /// 已提交但尚未被权威回读确认的目录地址；空串表示恢复官方来源。
+    ///
+    /// 单独保存在面板而不是页面：保存经过设置草稿的单飞队列，回执可能落在
+    /// 下一次保存之后，页面不能自行猜测哪次快照才是最终结果。
+    catalog_source_pending: Option<String>,
+    /// 来源回读代次；每次新提交或失败都推进，迟到的旧回读不能改写新请求。
+    catalog_source_readback_generation: u64,
 }
 
 impl ExtensionsPreferencesState {
@@ -45,6 +55,8 @@ impl ExtensionsPreferencesState {
             page: None,
             _subscription: None,
             notice: None,
+            catalog_source_pending: None,
+            catalog_source_readback_generation: 0,
         }
     }
 
@@ -67,12 +79,17 @@ impl ExtensionsPreferencesState {
             // 订阅挂在设置面板上而不是页面内，关闭分类后事件仍由 Root 统一处理。
             self._subscription = Some(cx.subscribe(
                 &page,
-                |_panel, _page, event: &ExtensionsEvent, cx| match event {
+                |panel, _page, event: &ExtensionsEvent, cx| match event {
                     ExtensionsEvent::RestartRequested => {
                         cx.emit(PreferencesEvent::ExtensionsRestartRequested)
                     }
                     // 写入结束可能清除退出提示，父面板需要重新计算正文包装。
                     ExtensionsEvent::WriteFinished => cx.notify(),
+                    // 来源保存必须复用设置草稿的 CAS 与权威回读；页面只发意图，
+                    // 面板负责替换 URL 字段并启动单飞保存。
+                    ExtensionsEvent::CatalogSourceSaveRequested { url } => {
+                        panel.request_catalog_source_save(url.clone(), cx);
+                    }
                 },
             ));
             self.page = Some(page);
@@ -121,6 +138,110 @@ impl ExtensionsPreferencesState {
     /// 只读访问已创建页面；未进入扩展分类时保持 None。
     fn page(&self) -> Option<Entity<ExtensionsPage>> {
         self.page.clone()
+    }
+
+    /// 记录本次来源保存提交的规范化地址，并推进回读代次。
+    ///
+    /// 空串表示官方来源；推进代次让上一次尚未返回的回读失效，避免旧磁盘快照
+    /// 覆盖用户刚提交的新地址。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn begin_catalog_source_save(&mut self, url: String) {
+        self.catalog_source_pending = Some(url);
+        self.catalog_source_readback_generation =
+            self.catalog_source_readback_generation.wrapping_add(1);
+    }
+
+    /// 读取待确认的来源地址；没有进行中的来源保存时返回 None。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn catalog_source_pending(&self) -> Option<&str> {
+        self.catalog_source_pending.as_deref()
+    }
+
+    /// 保存成功且没有后续保存时，返回本次需要真实回读核对的地址与代次。
+    ///
+    /// 保存回执只是提交值的确认，不代表磁盘内容；只有 `load_settings` 回读到的
+    /// 地址与提交一致，才允许切换运行态来源。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn catalog_source_readback_token(
+        &self,
+    ) -> Option<(String, u64)> {
+        self.catalog_source_pending
+            .clone()
+            .map(|url| (url, self.catalog_source_readback_generation))
+    }
+
+    /// 回读完成：地址一致才切换运行源；不一致或读取失败保留旧源并显式报错。
+    ///
+    /// 保存已经成功时不能把回读失败说成保存失败，否则用户会重复写入；这里用
+    /// 独立文案说明“已保存、未切换”，重试仍会重新走保存或回读。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn finish_catalog_source_readback(
+        &mut self,
+        url: &str,
+        generation: u64,
+        result: AppResult<VersionedSettings>,
+        cx: &mut Context<PreferencesPanel>,
+    ) {
+        if self.catalog_source_readback_generation != generation
+            || self.catalog_source_pending.as_deref() != Some(url)
+        {
+            return;
+        }
+        match result {
+            Ok(loaded) if loaded.settings.plugin_catalog_url == url => {
+                // 回读已确认，先结束待确认状态；否则后续无关保存成功会再次触发回读。
+                self.catalog_source_pending = None;
+                self.catalog_source_readback_generation =
+                    self.catalog_source_readback_generation.wrapping_add(1);
+                if let Some(page) = self.page.clone() {
+                    page.update(cx, |page, cx| page.apply_catalog_source(url, cx));
+                }
+            }
+            Ok(_) => {
+                self.fail_catalog_source_save(
+                    crate::locale::text(
+                        "来源已保存，但回读到的地址与提交不一致；当前仍使用旧来源，请核对后重试。",
+                        "The source was saved, but the read-back address differs from what was submitted. The previous source is still in use; review and retry.",
+                    )
+                    .to_string(),
+                    cx,
+                );
+            }
+            Err(error) => {
+                let message = format!(
+                    "{} {}",
+                    crate::locale::text(
+                        "来源已保存，但回读配置失败；当前仍使用旧来源，请重试。",
+                        "The source was saved, but reading the settings back failed. The previous source is still in use; retry.",
+                    ),
+                    super::localized_error(&error),
+                );
+                self.fail_catalog_source_save(message, cx);
+            }
+        }
+    }
+
+    /// 保存失败或无法确认时清除待确认状态，并把原因留在来源弹层。
+    ///
+    /// 页面保留输入与当前生效来源，用户修正后可直接重试，不需要重新打开弹层。
+    /// 推进回读代次，防止失败前已发出的回读在之后又把来源切走。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn fail_catalog_source_save(
+        &mut self,
+        message: String,
+        cx: &mut Context<PreferencesPanel>,
+    ) {
+        self.catalog_source_pending = None;
+        self.catalog_source_readback_generation =
+            self.catalog_source_readback_generation.wrapping_add(1);
+        if let Some(page) = self.page.clone() {
+            page.update(cx, |page, cx| page.fail_catalog_source_save(message, cx));
+        }
     }
 
     /// 只有写操作会改变插件目录和待重启集合，退出只需要等待这一阶段。

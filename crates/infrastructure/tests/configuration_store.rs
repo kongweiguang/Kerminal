@@ -780,6 +780,62 @@ async fn settings_guide_example_decodes_appearance_and_workbench_layout_fields()
     assert_eq!(loaded.settings.workbench_layout.bottom_panel_height, 240);
 }
 
+/// 自定义目录地址必须经 typed 设置往返，且保存只更新该键，不吞掉用户扩展字段。
+///
+/// 目录来源切换依赖这个顶层字段被真实仓储读回；若只验证内存 DTO，文档结构漂移会在
+/// 重启后才暴露，因此这里同时核对指南示例、磁盘 camelCase 键和未知字段保留。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn plugin_catalog_url_roundtrips_through_typed_settings_without_losing_unknown_fields() {
+    let example =
+        toml::from_str::<toml::Value>(&guide_toml_example("settings")).expect("指南设置示例可解析");
+    assert_eq!(
+        example["pluginCatalogUrl"].as_str(),
+        Some(""),
+        "指南必须把目录地址放在顶层，空值表示官方目录"
+    );
+
+    let temp = TemporaryConfigRoot::new();
+    let original = concat!(
+        "schema_version = 1\n",
+        "pluginCatalogUrl = \"http://127.0.0.1:8080/catalog.json\" # LAN mirror\n",
+        "unknown_extension = \"preserve\"\n",
+    );
+    fs::write(temp.0.join("settings.toml"), original).expect("写入自定义目录设置");
+    let store = ConfigurationStore::initialize(&temp.0).expect("初始化隔离配置仓储");
+    let service = PreferencesService::new(Arc::new(store.clone()));
+
+    let loaded = service.load_settings().await.expect("读取自定义目录设置");
+    assert_eq!(
+        loaded.settings.plugin_catalog_url,
+        "http://127.0.0.1:8080/catalog.json"
+    );
+
+    let mut changed = loaded.settings.clone();
+    changed.plugin_catalog_url = "https://plugins.example.com/catalog.json".to_owned();
+    service
+        .save_settings(changed, loaded.revision)
+        .await
+        .expect("按当前 revision 保存目录地址");
+
+    let reloaded = service
+        .load_settings()
+        .await
+        .expect("保存后重新读取目录地址");
+    assert_eq!(
+        reloaded.settings.plugin_catalog_url,
+        "https://plugins.example.com/catalog.json"
+    );
+    let source = fs::read_to_string(temp.0.join("settings.toml")).expect("读取保存后的设置");
+    assert!(source.contains("unknown_extension = \"preserve\""));
+    let parsed = toml::from_str::<toml::Value>(&source).expect("保存结果保持有效 TOML");
+    assert_eq!(
+        parsed["pluginCatalogUrl"].as_str(),
+        Some("https://plugins.example.com/catalog.json")
+    );
+}
+
 #[tokio::test]
 /// validator 将未来 schema 返回为 invalid 诊断，并保持原配置字节不变。
 ///

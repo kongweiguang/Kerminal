@@ -15,10 +15,14 @@ use super::protected::REQUIRED_IGNORE_RULES;
 
 /// 仅补充缺少的托管忽略行，保留用户规则并使用共享原子提交原语。
 ///
+/// 首次启动与 Git 提交共用此实现：离线 validator 要求初始化后的根已含密钥忽略规则，
+/// 若两处各写一份规则表，后续新增保护路径时必然漂移。调用方须持有存储锁，
+/// 使外部修改复核与原子提交处于同一写事务边界。
+///
 /// 提交前关闭写入句柄，使 Windows 原子替换不依赖打开句柄的共享删除策略。
 ///
 /// @author kongweiguang
-pub(super) fn ensure_ignore_rules(root: &Path) -> AppResult<bool> {
+pub(crate) fn ensure_ignore_rules(root: &Path) -> AppResult<bool> {
     let destination = root.join(".gitignore");
     let metadata = match fs::symlink_metadata(&destination) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {

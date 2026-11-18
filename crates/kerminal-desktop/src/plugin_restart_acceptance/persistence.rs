@@ -1,4 +1,4 @@
-//! 四代重启验收的真实标签草稿、跨代恢复和本地保存证据。
+//! 三代重启验收的真实标签草稿、跨代恢复和本地保存证据。
 //!
 //! 这里只通过正式工作区、NativeRenderer、GPUI 指针事件和插件设置端口观察结果；
 //! 新进程是否恢复由上一代收据与下一代 Tab ID/草稿的精确衔接证明。
@@ -86,6 +86,7 @@ pub(super) fn bootstrap_evidence() -> Value {
 }
 
 /// 每代都在正式视图上完成创建、恢复、激活和版本动作，最后返回活动快照与能力证据。
+/// 主线已移除人工回退，第三代只验证升级后的新能力与数据恢复，不再构造回退代。
 pub(super) async fn exercise_generation(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -98,7 +99,6 @@ pub(super) async fn exercise_generation(
     match phase {
         1 => seed_two_tabs(cx, root, window, executor, settings, version).await,
         2 => restore_and_count(cx, root, window, executor, settings, version).await,
-        3 => restore_and_save(cx, root, window, executor, settings, version).await,
         _ => Err(AppError::invalid("标签恢复验收阶段无效")),
     }
 }
@@ -247,67 +247,6 @@ async fn restore_and_count(
         activations,
         Vec::new(),
         checks(&before, &after, Some(&first_id)),
-    )?;
-    Ok((final_snapshot, receipt, capability))
-}
-
-/// 回退代先确认两个旧标签未新建，再通过真实 Save 按钮写入不依赖网络的插件状态。
-async fn restore_and_save(
-    cx: &mut AsyncApp,
-    root: &Entity<RootView>,
-    window: AnyWindowHandle,
-    executor: &ApplicationTaskExecutor,
-    settings: &PluginSettingsService,
-    version: &str,
-) -> AppResult<(Value, Value, Value)> {
-    let restored = wait_restored_tabs(cx, root, window).await?;
-    let ids = note_tab_ids(&restored)?;
-    let first_id = ids[0].clone();
-    let second_id = ids[1].clone();
-
-    let mut activations = Vec::new();
-    let (first_initial, activation) = activate_tab(cx, root, window, &first_id, None).await?;
-    activations.push(activation);
-    let first_draft = active_note_draft(&first_initial)?.to_owned();
-    let (second_initial, activation) = activate_tab(cx, root, window, &second_id, None).await?;
-    activations.push(activation);
-    let second_draft = active_note_draft(&second_initial)?.to_owned();
-    if first_draft == second_draft {
-        return Err(AppError::conflict("回退后的两个笔记标签草稿相同"));
-    }
-    let (active, activation) =
-        activate_tab(cx, root, window, &first_id, Some(&first_draft)).await?;
-    activations.push(activation);
-    let before = capture_tabs(&active)?;
-
-    let capability = inspect_capability(cx, root, window, &active, version).await?;
-    let save = save_active(
-        cx,
-        root,
-        window,
-        executor,
-        settings,
-        version,
-        &first_id,
-        &first_draft,
-    )
-    .await?;
-    let (_, activation) = activate_tab(cx, root, window, &second_id, Some(&second_draft)).await?;
-    activations.push(activation);
-    let (final_snapshot, activation) =
-        activate_tab(cx, root, window, &first_id, Some(&first_draft)).await?;
-    activations.push(activation);
-    let after = capture_tabs(&final_snapshot)?;
-    let receipt = persistence_receipt(
-        3,
-        "restored",
-        "workspace-restore",
-        false,
-        &before,
-        &after,
-        activations,
-        vec![save],
-        checks(&before, &after, None),
     )?;
     Ok((final_snapshot, receipt, capability))
 }
@@ -1034,24 +973,6 @@ pub(super) fn validate_persistence_receipt(receipt: &Value, phase: u8) -> AppRes
                     })
             }) {
                 return Err(AppError::conflict("1.1 隔离失败或 Count 目标草稿未变化"));
-            }
-        }
-        3 => {
-            if save_actions.len() != 1 {
-                return Err(AppError::conflict("回退代必须执行一次本地 Save"));
-            }
-            let action = &save_actions[0];
-            let tab_id = action["tabId"].as_str().unwrap_or_default();
-            if action["input"].as_str() != Some(before_by_id[tab_id].draft.as_str()) {
-                return Err(AppError::conflict("回退 Save 未保存当前标签草稿"));
-            }
-            if before.iter().any(|before| {
-                after
-                    .iter()
-                    .find(|after| after.tab_id == before.tab_id)
-                    .is_none_or(|after| after.draft != before.draft)
-            }) {
-                return Err(AppError::conflict("回退代确认后草稿被意外改变"));
             }
         }
         _ => return Err(AppError::conflict("标签恢复收据阶段无效")),

@@ -1,15 +1,20 @@
-//! 通过隔离的真实签名和 HTTP 服务覆盖安装到重启的状态流转。
+//! 通过隔离的 HTTP 目录和真实服务覆盖安装到重启的状态流转。
 //! @author kongweiguang
 
 use super::*;
 use crate::plugins::boot::BootPackageError;
 use crate::plugins::layout::LayoutError;
-use base64::{Engine, engine::general_purpose::STANDARD};
-use blake2::{Blake2b512, Digest as _};
-use ed25519_dalek::{Signer, SigningKey};
-use kerminal_application::{PublicErrorCode, extensions::CatalogSource};
+use kerminal_application::{
+    PublicErrorCode, extensions::CatalogIdentity, extensions::CatalogSource,
+};
 use kerminal_domain::plugins::PluginBootPhase;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -18,35 +23,6 @@ use tokio::{
 
 #[path = "plugin_install_recovery.rs"]
 mod recovery;
-
-/// 每次运行只在内存生成测试私钥，模拟真实目录签名而不接触正式信任根。
-fn signed_catalog(raw: &[u8]) -> (String, String) {
-    let mut seed = [0u8; 32];
-    seed[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    seed[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    let key = SigningKey::from_bytes(&seed);
-    let id = *b"test-key";
-    let mut public = b"Ed".to_vec();
-    public.extend_from_slice(&id);
-    public.extend_from_slice(key.verifying_key().as_bytes());
-    let signature = key.sign(&Blake2b512::digest(raw)).to_bytes();
-    let mut payload = b"ED".to_vec();
-    payload.extend_from_slice(&id);
-    payload.extend_from_slice(&signature);
-    let comment = "isolated";
-    let mut global = signature.to_vec();
-    global.extend_from_slice(comment.as_bytes());
-    let global_signature = key.sign(&global).to_bytes();
-    (
-        STANDARD.encode(public),
-        format!(
-            "untrusted comment: isolated\n{}\ntrusted comment: {}\n{}\n",
-            STANDARD.encode(payload),
-            comment,
-            STANDARD.encode(global_signature)
-        ),
-    )
-}
 
 /// 用协议最小清单构建真实压缩包，确保安装器执行解包和内容校验。
 fn package(version: &str) -> Vec<u8> {
@@ -70,7 +46,7 @@ fn package_with_id(id: &str, version: &str) -> Vec<u8> {
 }
 
 /// 同一生命周期覆盖安装、重启状态切换与卸载；回退入口已移除，只验证显式拒绝。
-async fn signed_catalog_lifecycle() {
+async fn catalog_lifecycle() {
     let root = tempfile::tempdir().unwrap();
     let config = crate::configuration::ConfigurationStore::initialize(root.path()).unwrap();
     let store = PluginStore::new(config.storage_coordinator()).unwrap();
@@ -90,10 +66,8 @@ async fn signed_catalog_lifecycle() {
         routes.insert(path, bytes);
         serde_json::json!({"version":version,"api":"^1.0","published_at":"2026-01-01T00:00:00Z","assets":[asset]})
     }).collect();
-    let raw = serde_json::json!({"schema":1,"source_id":"official","sequence":1,"plugins":[{"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},"publisher":"acme","categories":[],"repository":"https://github.com/acme/notes","permissions":[],"versions":versions}]}).to_string();
-    let (public, signature) = signed_catalog(raw.as_bytes());
+    let raw = serde_json::json!({"schema":1,"source_id":"fixture","sequence":1,"plugins":[{"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},"publisher":"acme","categories":[],"repository":"https://github.com/acme/notes","permissions":[],"versions":versions}]}).to_string();
     routes.insert("/catalog.json".into(), raw.into_bytes());
-    routes.insert("/catalog.json.minisig".into(), signature.into_bytes());
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -125,9 +99,17 @@ async fn signed_catalog_lifecycle() {
     let catalog = Arc::new(CatalogClient::testing(
         config.storage_coordinator(),
         format!("http://{address}/catalog.json"),
-        public,
+        String::new(),
     ));
     catalog.refresh(CancellationToken::new()).await.unwrap();
+    // 安装选择必须冻结用户看到的目录身份；测试从同一缓存读取，避免手写摘要。
+    let identity = catalog
+        .cached_verified()
+        .await
+        .unwrap()
+        .expect("目录缓存存在")
+        .snapshot
+        .identity;
     let platform = Platform::current().unwrap();
     let installer =
         PackageInstaller::new(store.clone(), catalog, settings, "1.0.0".into(), platform);
@@ -147,6 +129,7 @@ async fn signed_catalog_lifecycle() {
                     id: id.clone(),
                     version: PluginVersion::parse(version).unwrap(),
                     platform: Platform::Any,
+                    identity: identity.clone(),
                 },
                 progress.clone(),
                 CancellationToken::new(),
@@ -190,8 +173,8 @@ async fn signed_catalog_lifecycle() {
 
 /// 状态只在下次启动切换，卸载不会清除用户数据目录。
 #[tokio::test]
-async fn signed_catalog_install_update_uninstall_survives_restart() {
-    signed_catalog_lifecycle().await;
+async fn catalog_install_update_uninstall_survives_restart() {
+    catalog_lifecycle().await;
 }
 
 /// drop-in 最小清单与真实启动扫描共用协议字段，便于覆盖目录名、名称与权限展示。
@@ -1102,7 +1085,7 @@ fn assert_no_state_or_staging_left(fixture: &FlowFixture) {
 }
 
 /// 市场安装：下载完成、解压前被替换的暂存包必须被解压端摘要比对拒绝——
-/// 期望值来自签名目录的选定资产，与实际解压流在同一次打开内核对，替换包
+/// 期望值来自目录的选定资产，与实际解压流在同一次打开内核对，替换包
 /// 不入队、不发布、不留暂存残留。
 #[tokio::test]
 async fn catalog_install_rejects_package_swapped_before_unpack() {
@@ -1119,11 +1102,9 @@ async fn catalog_install_rejects_package_swapped_before_unpack() {
     let original = package("1.0.0");
     let sha = format!("{:x}", Sha256::digest(&original));
     let asset = serde_json::json!({"platform":"any","url":format!("http://{address}/a.kplugin"),"size":original.len(),"sha256":sha});
-    let raw = serde_json::json!({"schema":1,"source_id":"official","sequence":1,"plugins":[{"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},"publisher":"acme","categories":[],"repository":"https://github.com/acme/notes","permissions":[],"versions":[{"version":"1.0.0","api":"^1.0","published_at":"2026-01-01T00:00:00Z","assets":[asset]}]}]}).to_string();
-    let (public, signature) = signed_catalog(raw.as_bytes());
+    let raw = serde_json::json!({"schema":1,"source_id":"fixture","sequence":1,"plugins":[{"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},"publisher":"acme","categories":[],"repository":"https://github.com/acme/notes","permissions":[],"versions":[{"version":"1.0.0","api":"^1.0","published_at":"2026-01-01T00:00:00Z","assets":[asset]}]}]}).to_string();
     let mut routes = BTreeMap::new();
     routes.insert("/catalog.json".to_string(), raw.into_bytes());
-    routes.insert("/catalog.json.minisig".to_string(), signature.into_bytes());
     routes.insert("/a.kplugin".to_string(), original.clone());
     let server = tokio::spawn(async move {
         loop {
@@ -1156,9 +1137,16 @@ async fn catalog_install_rejects_package_swapped_before_unpack() {
     let catalog = Arc::new(CatalogClient::testing(
         config.storage_coordinator(),
         format!("http://{address}/catalog.json"),
-        public,
+        String::new(),
     ));
     catalog.refresh(CancellationToken::new()).await.unwrap();
+    let identity = catalog
+        .cached_verified()
+        .await
+        .unwrap()
+        .expect("目录缓存存在")
+        .snapshot
+        .identity;
     let installer = PackageInstaller::new(
         store.clone(),
         catalog,
@@ -1171,7 +1159,7 @@ async fn catalog_install_rejects_package_swapped_before_unpack() {
         store,
         installer,
     };
-    // 替换包是合法归档但不在签名目录内：解压端摘要比对必须失败。
+    // 替换包是合法归档但不在目录内：解压端摘要比对必须失败。
     let _hook = swap_stage_archive_before_unpack(&fixture, package_other_version("9.9.9"));
     let (progress, _) = watch::channel(InstallProgress::Preparing);
     let error = fixture
@@ -1181,6 +1169,7 @@ async fn catalog_install_rejects_package_swapped_before_unpack() {
                 id: PluginId::parse("acme.notes").unwrap(),
                 version: PluginVersion::parse("1.0.0").unwrap(),
                 platform: Platform::Any,
+                identity: identity.clone(),
             },
             progress,
             CancellationToken::new(),
@@ -1190,6 +1179,134 @@ async fn catalog_install_rejects_package_swapped_before_unpack() {
     drop(_hook);
     server.abort();
     assert_eq!(error.public_code(), PublicErrorCode::Invalid);
+    assert_no_state_or_staging_left(&fixture);
+}
+
+/// 确认后目录刷新到新序列时，安装器必须在下载前拒绝冻结的旧身份；
+/// 失败不发起资产请求，也不留下暂存或 incoming 材料。
+#[tokio::test]
+async fn catalog_install_rejects_refreshed_identity_before_download() {
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::configuration::ConfigurationStore::initialize(root.path()).unwrap();
+    let store = PluginStore::new(config.storage_coordinator()).unwrap();
+    let settings = Arc::new(PluginSettingsService::new(
+        Arc::new(config.clone()),
+        Arc::new(config.clone()),
+        Arc::new(crate::vault::VaultStore::open(config.storage_coordinator())),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let bytes = package("1.0.0");
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+    let asset = serde_json::json!({"platform":"any","url":format!("http://{address}/a.kplugin"),"size":bytes.len(),"sha256":sha});
+    let raw1 = serde_json::json!({"schema":1,"source_id":"fixture","sequence":1,"plugins":[{"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes"},"publisher":"acme","categories":[],"repository":"https://github.com/acme/notes","permissions":[],"versions":[{"version":"1.0.0","api":"^1.0","published_at":"2026-01-01T00:00:00Z","assets":[asset]}]}]}).to_string();
+    let raw2 = serde_json::json!({"schema":1,"source_id":"fixture","sequence":2,"plugins":[{"id":"acme.notes","name":{"en":"Notes"},"description":{"en":"Notes v2"},"publisher":"acme","categories":[],"repository":"https://github.com/acme/notes","permissions":[],"versions":[{"version":"1.0.0","api":"^1.0","published_at":"2026-01-01T00:00:00Z","assets":[asset]}]}]}).to_string();
+    let routes = Arc::new(Mutex::new(BTreeMap::new()));
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert("/catalog.json".to_string(), raw1.into_bytes());
+        routes.insert("/a.kplugin".to_string(), bytes.clone());
+    }
+    let asset_requests = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let routes = routes.clone();
+        let asset_requests = asset_requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut part = [0u8; 1024];
+                    let n = stream.read(&mut part).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&part[..n]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or("");
+                if path == "/a.kplugin" {
+                    asset_requests.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = {
+                    let routes = routes.lock().unwrap();
+                    routes.get(path).cloned().expect("known route")
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        })
+    };
+    let catalog = Arc::new(CatalogClient::testing(
+        config.storage_coordinator(),
+        format!("http://{address}/catalog.json"),
+        String::new(),
+    ));
+    catalog.refresh(CancellationToken::new()).await.unwrap();
+    let identity = catalog
+        .cached_verified()
+        .await
+        .unwrap()
+        .expect("目录缓存存在")
+        .snapshot
+        .identity;
+    // 同一来源刷新到序列 2；安装选择仍冻结序列 1 的身份。
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert("/catalog.json".to_string(), raw2.into_bytes());
+    }
+    catalog.refresh(CancellationToken::new()).await.unwrap();
+    let refreshed = catalog
+        .cached_verified()
+        .await
+        .unwrap()
+        .expect("刷新后缓存存在")
+        .snapshot
+        .identity;
+    assert_ne!(identity, refreshed);
+    let installer = PackageInstaller::new(
+        store.clone(),
+        catalog,
+        settings,
+        "1.0.0".into(),
+        Platform::current().unwrap(),
+    );
+    let fixture = FlowFixture {
+        root,
+        store,
+        installer,
+    };
+    let (progress, _) = watch::channel(InstallProgress::Preparing);
+    let error = fixture
+        .installer
+        .install_catalog(
+            CatalogSelection {
+                id: PluginId::parse("acme.notes").unwrap(),
+                version: PluginVersion::parse("1.0.0").unwrap(),
+                platform: Platform::Any,
+                identity: identity.clone(),
+            },
+            progress,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    server.abort();
+    assert_eq!(error.public_code(), PublicErrorCode::Conflict);
+    assert_eq!(
+        asset_requests.load(Ordering::SeqCst),
+        0,
+        "身份冲突必须在下载前拒绝"
+    );
     assert_no_state_or_staging_left(&fixture);
 }
 
@@ -1507,11 +1624,21 @@ fn prepare_rejects_reserved_identity_before_staging_move() {
         size,
         sha256: digest_hex,
     };
+    // 目录安装按选中身份里的实际来源决定是否走官方命名空间校验；自定义目录也用
+    // `Official` 记录来源，只看枚举会让自定义源自报 `kerminal` 通过清单校验。
+    // 这里显式提供官方来源身份，让包通过命名空间校验并真正走到保留 ID 门禁。
+    let selection = CatalogSelection {
+        id: PluginId::parse("kerminal.core").unwrap(),
+        version: PluginVersion::parse("1.0.0").unwrap(),
+        platform: Platform::Any,
+        identity: CatalogIdentity::new("official", 1, "0".repeat(64))
+            .with_source_url(DEFAULT_PLUGIN_CATALOG_URL),
+    };
     let error = installer
         .prepare_and_commit(
             &stage,
             PluginSource::Official,
-            None,
+            Some((&selection, "^1.0")),
             &verified,
             &progress,
             &CancellationToken::new(),
@@ -1523,6 +1650,59 @@ fn prepare_rejects_reserved_identity_before_staging_move() {
     assert!(!root.path().join("plugins/kerminal.core").exists());
     assert!(!root.path().join("plugins/.staging/kerminal.core").exists());
     assert!(directory.join("package").exists());
+    stage.cleanup().unwrap();
+}
+
+/// 自定义目录即使沿用市场来源，也不能借官方命名空间通过清单校验并安装。
+///
+/// 目录地址是发布者信任边界的唯一依据：只把 `PluginSource::Official` 当作官方
+/// 会让任意自定义目录自报 `publisher=kerminal` 后获得官方校验；这里直接驱动提交
+/// 阶段，确认自定义来源仍按第三方策略拒绝，且不产生 pending 或发布槽。
+#[test]
+fn custom_source_cannot_install_official_namespace_package() {
+    let (root, store, installer) = bare_installer();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let directory = root
+        .path()
+        .join("plugins/.staging/_incoming")
+        .join(&operation_id);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("pkg.kplugin"),
+        package_with_id("kerminal.core", "1.0.0"),
+    )
+    .unwrap();
+    let stage = Stage {
+        directory: directory.clone(),
+        operation_id,
+    };
+    let (progress, _) = watch::channel(InstallProgress::Preparing);
+    let (size, digest_hex) = file_digest(&stage.archive(), &CancellationToken::new()).unwrap();
+    let verified = archive::ArchiveExpectation {
+        size,
+        sha256: digest_hex,
+    };
+    let selection = CatalogSelection {
+        id: PluginId::parse("kerminal.core").unwrap(),
+        version: PluginVersion::parse("1.0.0").unwrap(),
+        platform: Platform::Any,
+        identity: CatalogIdentity::new("fixture", 1, "0".repeat(64))
+            .with_source_url("http://127.0.0.1:8080/catalog.json"),
+    };
+    let error = installer
+        .prepare_and_commit(
+            &stage,
+            PluginSource::Official,
+            Some((&selection, "^1.0")),
+            &verified,
+            &progress,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+    assert_eq!(error.to_string(), "插件包校验失败");
+    assert!(store.load().unwrap().state.pending.is_empty());
+    assert!(!root.path().join("plugins/kerminal.core").exists());
+    assert!(!root.path().join("plugins/.staging/kerminal.core").exists());
     stage.cleanup().unwrap();
 }
 

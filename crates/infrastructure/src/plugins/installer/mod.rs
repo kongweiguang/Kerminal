@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
     extensions::{
-        CatalogSelection, CatalogSource, DropInInspection, ExtensionChange, ExtensionReceipt,
-        InstallProgress, LocalPackageInspection, PluginPackageStore,
+        CatalogSelection, DEFAULT_PLUGIN_CATALOG_URL, DropInInspection, ExtensionChange,
+        ExtensionReceipt, InstallProgress, LocalPackageInspection, PluginPackageStore,
     },
     plugin_settings::PluginSettingsService,
     plugins::{CORE_PLUGIN_ID, is_builtin_unit, is_reserved_plugin_id},
@@ -67,6 +67,10 @@ impl PackageInstaller {
     }
 
     /// 在同一可信快照中选择精确版本与平台；不能接受调用方拼接的 URL。
+    ///
+    /// 先按确认时冻结的目录身份重读同一来源缓存，再解析条目与资产：目录在确认期间
+    /// 刷新到另一份原文或来源已切换时返回冲突，避免按 id/version/platform 在最新
+    /// 目录里静默换包。身份比较发生在下载与暂存之前，失败不会留下任何安装材料。
     async fn selected_asset(
         &self,
         selection: &CatalogSelection,
@@ -74,12 +78,9 @@ impl PackageInstaller {
         if selection.platform != Platform::Any && selection.platform != self.platform {
             return Err(AppError::invalid("插件资产平台不匹配"));
         }
-        let snapshot = self
-            .catalog
-            .cached()
-            .await?
-            .ok_or_else(|| AppError::not_found("插件目录尚未加载"))?;
-        let plugin = snapshot
+        let verified = self.catalog.cached_matching(&selection.identity).await?;
+        let plugin = verified
+            .snapshot
             .catalog
             .plugins
             .iter()
@@ -164,7 +165,18 @@ impl PackageInstaller {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("插件安装已取消"));
         }
-        let policy = if source == PluginSource::Official {
+        // 官方发布者命名空间只对官方目录开放。自定义目录仍按市场来源记录，
+        // 但清单校验降为第三方，避免自定义源自报 publisher=kerminal 冒充官方；
+        // 保留 ID 策略在下面独立执行，不因来源切换而放宽。
+        //
+        // 目录安装一定带 selection，用身份里的实际来源判定；只有本地/测试等没有
+        // 目录选择的路径才退回 PluginSource。这样自定义目录无法借 source=Official
+        // 通过官方命名空间校验，同时保留“官方包也必须在移动前拒绝内置 ID”的门禁。
+        let official = match expected {
+            Some((selection, _)) => selection.identity.source_url == DEFAULT_PLUGIN_CATALOG_URL,
+            None => source == PluginSource::Official,
+        };
+        let policy = if official {
             ManifestPolicy::Official
         } else {
             ManifestPolicy::ThirdParty
@@ -959,7 +971,7 @@ impl PluginPackageStore for PackageInstaller {
         .map_err(|e| AppError::outcome_unknown_with_source("插件确认任务异常，请读回状态", e))?
     }
 
-    /// 安装始终重新解析验签目录，大小检查先于下载。
+    /// 安装始终重新解析当前目录并核对选中身份，避免确认后目录内容漂移。
     async fn install_catalog(
         &self,
         selection: CatalogSelection,
@@ -975,7 +987,9 @@ impl PluginPackageStore for PackageInstaller {
         if let Err(error) = download::download(
             &asset,
             &stage.archive(),
-            self.catalog.allows_loopback(),
+            // 目录不再维护主机白名单；下载器保留该参数只为兼容旧调用形状，
+            // 实际地址边界由共享 URL 契约与传输层逐跳复核。
+            false,
             &progress,
             &cancellation,
         )

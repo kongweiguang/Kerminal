@@ -4,11 +4,34 @@
 
 use super::{
     LOCAL_AGENT_CAPTURE_MODE, absolute_agent_continuity_output_base, parse_options,
-    read_fixture_manifest_from, resolve_fixture_local_files_root, toml_basic_string,
-    write_local_agent_profile,
+    read_fixture_manifest_from, resolve_fixture_local_files_root, resolve_local_agent_shell,
+    toml_basic_string, write_local_agent_profile_with_shell,
 };
 use std::ffi::OsString;
 use std::{fs, path::Path};
+
+/// 原生 activity 激活只允许私有桌面内 SetActiveWindow/SetFocus；禁止 foreground/input 注入路径。
+///
+/// @author kongweiguang
+#[test]
+fn acceptance_activation_avoids_foreground_and_input_injection() {
+    let source = include_str!("../../src/right_rail_acceptance.rs");
+    for forbidden in [
+        "window.activate_window(",
+        "SendInput",
+        "SetForegroundWindow",
+        "SwitchDesktop",
+        "AttachThreadInput",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "acceptance activation must not use {forbidden}"
+        );
+    }
+    assert!(source.contains("SetActiveWindow"));
+    assert!(source.contains("SetFocus"));
+    assert!(source.contains("focus: false"));
+}
 
 /// 每个单独子模式仍可组合窗口参数，防止新增专项入口影响已有命令行。
 ///
@@ -157,7 +180,8 @@ fn local_agent_profile_selects_pwsh7_without_profile_and_isolated_cwd() {
     let path = directory.path().join("agent-continuity-local.toml");
     let cwd = directory.path().join("isolated cwd");
     fs::create_dir(&cwd).expect("temporary working directory");
-    write_local_agent_profile(&path, &cwd).expect("write local agent profile");
+    write_local_agent_profile_with_shell(&path, &cwd, "pwsh.exe")
+        .expect("write local agent profile");
     let document = fs::read_to_string(path).expect("read local agent profile");
     assert!(document.contains("shell = \"pwsh.exe\""));
     assert!(document.contains("\"-NoLogo\", \"-NoProfile\""));
@@ -169,6 +193,65 @@ fn local_agent_profile_selects_pwsh7_without_profile_and_isolated_cwd() {
             toml_basic_string(cwd.to_str().expect("temporary cwd is valid UTF-8"))
         )),
         "profile cwd must escape the isolated working directory as a TOML basic string"
+    );
+}
+
+/// 显式绝对 pwsh 路径必须按 TOML basic string 转义写入，避免子进程按 PATH 搜索到
+/// Store alias 或其它同名 shim；默认未提供时仍保持 pwsh.exe，不改变普通本地启动。
+///
+/// @author kongweiguang
+#[test]
+fn local_agent_profile_uses_explicit_pwsh_path() {
+    let directory = tempfile::tempdir().expect("temporary profile directory");
+    let path = directory.path().join("agent-continuity-local.toml");
+    let cwd = directory.path().join("isolated cwd");
+    fs::create_dir(&cwd).expect("temporary working directory");
+    let shell = r"C:\Program Files\PowerShell\7\pwsh.exe";
+    write_local_agent_profile_with_shell(&path, &cwd, shell).expect("write local agent profile");
+    let document = fs::read_to_string(path).expect("read local agent profile");
+    assert!(
+        document.contains(&format!("shell = {}", toml_basic_string(shell))),
+        "explicit shell must be escaped as a TOML basic string"
+    );
+    assert!(document.contains("\"-NoLogo\", \"-NoProfile\""));
+    assert!(document.contains("is_default = true"));
+}
+
+/// 显式 shell 必须是绝对路径；未提供/空白保持 pwsh.exe，相对路径 fail-closed。
+///
+/// @author kongweiguang
+#[test]
+fn local_agent_profile_shell_resolution_is_fail_closed() {
+    assert_eq!(
+        resolve_local_agent_shell(None).expect("default shell"),
+        "pwsh.exe"
+    );
+    assert_eq!(
+        resolve_local_agent_shell(Some("  ")).expect("blank shell"),
+        "pwsh.exe"
+    );
+    let absolute_path = std::env::current_dir()
+        .expect("current directory")
+        .join("PowerShell 7")
+        .join("pwsh.exe");
+    let absolute = absolute_path
+        .to_str()
+        .expect("absolute path is valid UTF-8");
+    assert_eq!(
+        resolve_local_agent_shell(Some(absolute)).expect("absolute shell"),
+        absolute
+    );
+    assert_eq!(
+        resolve_local_agent_shell(Some("pwsh.exe"))
+            .expect_err("relative shell")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        resolve_local_agent_shell(Some(r"relative\pwsh.exe"))
+            .expect_err("relative shell")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
     );
 }
 

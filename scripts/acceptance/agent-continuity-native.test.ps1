@@ -20,6 +20,35 @@ function Assert-Throws {
     Assert-True ($failure.Exception.Message.Contains($ExpectedMessage)) "Unexpected failure: $failure"
 }
 
+class FakePwshProbeProcess {
+    # 仅测试用进程替身：记录 Kill/Wait 次数，验证超时回收不会直接 Dispose 或吞掉 kill 失败。
+    [int]$ExitCode = 0
+    [int]$WaitCalls = 0
+    [int]$KillCalls = 0
+    [bool]$KillThrows = $false
+    [bool]$ExitImmediately = $false
+    [bool]$ExitAfterKill = $true
+    [object]$StandardOutput
+    [object]$StandardError
+    FakePwshProbeProcess([string]$stdout) {
+        $this.StandardOutput = [pscustomobject]@{ Text = $stdout }
+        $this.StandardOutput | Add-Member -MemberType ScriptMethod -Name ReadToEnd -Value { $this.Text }
+        $this.StandardError = [pscustomobject]@{ Text = '' }
+        $this.StandardError | Add-Member -MemberType ScriptMethod -Name ReadToEnd -Value { $this.Text }
+    }
+    [bool] WaitForExit([int]$milliseconds) {
+        $this.WaitCalls++
+        if ($this.ExitImmediately) { return $true }
+        if ($this.WaitCalls -eq 1) { return $false }
+        return $this.ExitAfterKill
+    }
+    [void] Kill() {
+        if ($this.KillThrows) { throw 'kill failed' }
+        $this.KillCalls++
+    }
+    [void] Dispose() {}
+}
+
 $sourcePath = Join-Path $PSScriptRoot 'agent-continuity-native.ps1'
 $tokens = $null
 $errors = $null
@@ -47,6 +76,11 @@ Assert-True ($sourceText.Contains('Get-InheritedKerminalEnvironmentNames')) 'Wra
 # 外层宿主参数是隔离前提：静态检查入口必须先核对本脚本路径与 -NoProfile/-NonInteractive，
 # 否则交互式或加载 profile 的 pwsh 会在隔离目录创建前就写入用户历史。
 Assert-True ($sourceText.Contains('Assert-OuterShellArguments -SourceRoot $PSScriptRoot')) 'Wrapper must validate its own pwsh host arguments.'
+Assert-True ($sourceText.Contains('Invoke-Pwsh7VersionProbe')) 'Wrapper must probe pwsh 7 in a real subprocess.'
+Assert-True ($sourceText.Contains('$PSVersionTable.PSVersion.Major')) 'Wrapper must read the actual pwsh major version.'
+Assert-True ($sourceText.Contains('-NoLogo -NoProfile -NonInteractive')) 'Wrapper must use the restricted probe command line.'
+Assert-True ($sourceText.Contains('Select-Pwsh7Candidate')) 'Wrapper must keep candidate selection testable.'
+Assert-True ($sourceText.Contains('$pwsh.EntryDirectory')) 'Wrapper must prepend the selected entry directory to PATH.'
 $hostCheckIndex = $sourceText.IndexOf('Assert-OuterShellArguments -SourceRoot $PSScriptRoot')
 $firstCreateIndex = $sourceText.IndexOf('[void][IO.Directory]::CreateDirectory($runRoot)')
 Assert-True ($hostCheckIndex -ge 0 -and $firstCreateIndex -gt $hostCheckIndex) 'Host-argument validation must run before creating the run directory.'
@@ -74,6 +108,11 @@ foreach ($functionName in @(
     'Assert-OuterShellArguments',
     'Get-InheritedKerminalEnvironmentNames',
     'Get-AcceptanceExecutableHash',
+    'Get-AgentContinuityPtyProbeLine',
+    'Get-AgentContinuityPtyMatrix',
+    'Test-Pwsh7VersionText',
+    'Invoke-Pwsh7VersionProbe',
+    'Select-Pwsh7Candidate',
     'Get-StartOverloadSignatures',
     'Get-CSharpMethodBody',
     'Assert-AgentContinuityStartContract',
@@ -90,6 +129,43 @@ foreach ($functionName in @(
     . ([scriptblock]::Create($definitions[0].Extent.Text))
 }
 
+# pwsh 7 解析/选择回归：版本文本必须严格为 7；探针执行可注入，选择顺序 alias→real→path。
+Assert-True (Test-Pwsh7VersionText -Text '7') 'Version parser must accept 7.'
+Assert-True (Test-Pwsh7VersionText -Text "7`r`n") 'Version parser must accept CRLF 7.'
+Assert-True (-not (Test-Pwsh7VersionText -Text '6')) 'Version parser must reject 6.'
+Assert-True (-not (Test-Pwsh7VersionText -Text '7.0')) 'Version parser must reject non-integer output.'
+Assert-True (-not (Test-Pwsh7VersionText -Text '')) 'Version parser must reject empty output.'
+$injected = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -Runner { param($p) [pscustomobject]@{ Ok = $true; Text = '7'; Reason = 'completed' } }
+Assert-True ([bool]$injected.Ok) 'Injected probe result was not preserved.'
+$injectedFailure = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -Runner { param($p) [pscustomobject]@{ Ok = $false; Text = ''; Reason = 'timeout' } }
+Assert-True (-not [bool]$injectedFailure.Ok -and [string]$injectedFailure.Reason -ceq 'timeout') 'Injected probe failure was not preserved.'
+$injectedThrow = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -Runner { param($p) throw 'boom' }
+Assert-True (-not [bool]$injectedThrow.Ok -and [string]$injectedThrow.Reason -ceq 'runner-error') 'Injected probe exception was not converted to a fixed reason.'
+
+# 超时回收：Kill 后必须有界确认退出；kill 失败或未退出都不能吞成普通 timeout。
+$fakeTimeout = [FakePwshProbeProcess]::new('7')
+$timeoutResult = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -ProcessFactory { param($p) $fakeTimeout }
+Assert-True (-not [bool]$timeoutResult.Ok -and [string]$timeoutResult.Reason -ceq 'timeout') 'Timed-out probe must report timeout after confirmed kill.'
+Assert-True ($fakeTimeout.KillCalls -eq 1) 'Timed-out probe must kill exactly the process it created.'
+$fakeKillTimeout = [FakePwshProbeProcess]::new('7')
+$fakeKillTimeout.ExitAfterKill = $false
+$killTimeoutResult = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -ProcessFactory { param($p) $fakeKillTimeout }
+Assert-True (-not [bool]$killTimeoutResult.Ok -and [string]$killTimeoutResult.Reason -ceq 'kill-timeout') 'Unconfirmed kill must not be reported as a normal timeout.'
+$fakeKillError = [FakePwshProbeProcess]::new('7')
+$fakeKillError.KillThrows = $true
+$killErrorResult = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -ProcessFactory { param($p) $fakeKillError }
+Assert-True (-not [bool]$killErrorResult.Ok -and [string]$killErrorResult.Reason -ceq 'kill-error') 'Kill failure must be surfaced as a fixed reason.'
+$fakeSuccess = [FakePwshProbeProcess]::new('7')
+$fakeSuccess.ExitImmediately = $true
+$successResult = Invoke-Pwsh7VersionProbe -Path 'C:\fake\pwsh.exe' -ProcessFactory { param($p) $fakeSuccess }
+Assert-True ([bool]$successResult.Ok -and [string]$successResult.Reason -ceq 'completed') 'Injected successful probe must still parse major 7.'
+$selectedAlias = Select-Pwsh7Candidate -Candidates @('alias','real','path') -Probe { param($c) [pscustomobject]@{ Ok = ($c -ceq 'alias'); Reason = 'completed' } }
+Assert-True ($null -ne $selectedAlias -and [string]$selectedAlias.Path -ceq 'alias') 'Alias candidate must win when it passes.'
+$selectedReal = Select-Pwsh7Candidate -Candidates @('alias','real','path') -Probe { param($c) [pscustomobject]@{ Ok = ($c -ceq 'real'); Reason = 'completed' } }
+Assert-True ($null -ne $selectedReal -and [string]$selectedReal.Path -ceq 'real') 'Real candidate must be selected when alias fails.'
+$selectedNone = Select-Pwsh7Candidate -Candidates @('alias','real','path') -Probe { param($c) [pscustomobject]@{ Ok = $false; Reason = 'timeout' } }
+Assert-True ($null -eq $selectedNone) 'No candidate must select null.'
+
 $environmentAssignments = @($syntax.EndBlock.Statements | Where-Object {
     $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -ceq '$environmentNames'
 })
@@ -100,7 +176,10 @@ foreach ($required in @(
     'TEMP', 'TMP', 'TMPDIR', 'PATH', 'PSModulePath',
     'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
     'KERMINAL_CONFIG_ROOT', 'KERMINAL_RIGHT_RAIL_FIXTURE_MANIFEST',
-    'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_SETTINGS_ACCEPTANCE_SCOPE'
+    'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_SETTINGS_ACCEPTANCE_SCOPE',
+    'KERMINAL_ACCEPTANCE_PWSH', 'KERMINAL_ACCEPTANCE_PTY_PROBE',
+    'KERMINAL_ACCEPTANCE_PWSH_REAL', 'KERMINAL_ACCEPTANCE_PWSH_ALIAS',
+    'KERMINAL_ACCEPTANCE_UI_SCALE'
 )) {
     Assert-True (@($environmentNames | Where-Object { $_ -ceq $required }).Count -eq 1) "Environment variable is not tracked exactly once: $required"
 }
@@ -196,7 +275,7 @@ try {
     [IO.File]::Delete($fakeExecutable)
     Assert-Throws { Get-AcceptanceExecutableHash -Path $fakeExecutable } 'executable is missing'
 
-    $environmentProbe = @('KERMINAL_AGENT_CONTINUITY_TEST_A', 'KERMINAL_AGENT_CONTINUITY_TEST_B')
+    $environmentProbe = @('KERMINAL_AGENT_CONTINUITY_TEST_A', 'KERMINAL_AGENT_CONTINUITY_TEST_B', 'KERMINAL_ACCEPTANCE_PTY_PROBE', 'KERMINAL_ACCEPTANCE_PWSH_REAL', 'KERMINAL_ACCEPTANCE_PWSH_ALIAS', 'KERMINAL_ACCEPTANCE_UI_SCALE')
     $originalProbe = Get-ProcessEnvironmentSnapshot -Names $environmentProbe
     try {
         foreach ($name in $environmentProbe) {
@@ -215,7 +294,7 @@ try {
         }
     }
 
-    $environmentProbe = @('KERMINAL_AGENT_CONTINUITY_TEST_A', 'KERMINAL_AGENT_CONTINUITY_TEST_B')
+    $environmentProbe = @('KERMINAL_AGENT_CONTINUITY_TEST_A', 'KERMINAL_AGENT_CONTINUITY_TEST_B', 'KERMINAL_ACCEPTANCE_PTY_PROBE', 'KERMINAL_ACCEPTANCE_PWSH_REAL', 'KERMINAL_ACCEPTANCE_PWSH_ALIAS', 'KERMINAL_ACCEPTANCE_UI_SCALE')
     $originalProbe = Get-ProcessEnvironmentSnapshot -Names $environmentProbe
     try {
         foreach ($mode in @('absent', 'empty', 'value')) {
@@ -246,16 +325,67 @@ try {
         }
     }
 
+    $probeStderr = Join-Path $testRoot 'probe-stderr.log'
+    Write-Utf8 -Path $probeStderr -Content (@(
+        'unrelated sensitive line C:\secret\cmd.exe --token abc',
+        'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5 secret=C:\secret\cmd.exe',
+        'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5',
+        'another line'
+    ) -join "`n")
+    $probeLine = Get-AgentContinuityPtyProbeLine -StderrPath $probeStderr
+    Assert-True ($probeLine -ceq 'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5') 'PTY probe line was not extracted or an extra-field line was accepted.'
+    Assert-True (-not $probeLine.Contains('secret') -and -not $probeLine.Contains('token')) 'PTY probe line leaked unrelated stderr.'
+    $badProbeStderr = Join-Path $testRoot 'probe-bad.log'
+    Write-Utf8 -Path $badProbeStderr -Content 'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5 secret=C:\secret\cmd.exe'
+    Assert-True ($null -eq (Get-AgentContinuityPtyProbeLine -StderrPath $badProbeStderr)) 'PTY probe must reject a same-prefix line with extra fields.'
+    [IO.File]::Delete($probeStderr)
+    [IO.File]::Delete($badProbeStderr)
+
+    # 矩阵日志只接受固定 shell/结果/UUID/close 枚举；探针行按出现顺序关联到最近的 start 标签。
+    # 同前缀带额外字段、未知 shell 或非 UUID session 都必须被丢弃，避免敏感尾巴进入报告。
+    $matrixStderr = Join-Path $testRoot 'matrix-stderr.log'
+    Write-Utf8 -Path $matrixStderr -Content (@(
+        'unrelated sensitive line C:\secret\cmd.exe --token abc',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=cmd result=start',
+        'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=cmd result=failed',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=powershell result=start',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=powershell result=ok session=00000000-0000-0000-0000-000000000000',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=powershell close=ok',
+        'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=-1073283067',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=pwsh_real result=start',
+        'KERMINAL_ACCEPTANCE_PTY_PROBE stage=job raw_os_error=unknown',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=pwsh_real result=timeout',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=pwsh_alias result=skipped',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=pwsh_alias result=cancelled',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=powershell close=failed',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=cmd result=ok session=00000000-0000-0000-0000-000000000000 secret=C:\secret\cmd.exe',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=cmd result=ok session=not-a-uuid',
+        'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=unknown result=ok',
+        'KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5 secret=C:\secret\cmd.exe'
+    ) -join "`n")
+    $matrix = Get-AgentContinuityPtyMatrix -StderrPath $matrixStderr
+    Assert-True (@($matrix.lines).Count -eq 10) 'PTY matrix lines were not strictly filtered.'
+    Assert-True (@($matrix.probes).Count -eq 3) 'PTY matrix probe association count is unexpected.'
+    Assert-True ([string]$matrix.probes[0].shell -ceq 'cmd') 'First probe must associate with cmd.'
+    Assert-True ($null -eq $matrix.probes[1].shell) 'A probe after close must not inherit the previous shell label.'
+    Assert-True ([string]$matrix.probes[2].shell -ceq 'pwsh_real') 'Third probe must associate with pwsh_real.'
+    Assert-True (-not ((@($matrix.lines) -join "`n").Contains('secret'))) 'PTY matrix leaked unrelated stderr.'
+    Assert-True (@($matrix.lines | Where-Object { $_ -ceq 'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=pwsh_alias result=skipped' }).Count -eq 1) 'PTY matrix skipped line is missing.'
+    Assert-True (@($matrix.lines | Where-Object { $_ -ceq 'KERMINAL_ACCEPTANCE_PTY_MATRIX shell=powershell close=failed' }).Count -eq 1) 'PTY matrix close failure line is missing.'
+    [IO.File]::Delete($matrixStderr)
+
     $runRoot = Join-Path $testRoot 'run'
     $outputDirectory = Join-Path $runRoot 'output'
     $configDirectory = Join-Path $outputDirectory 'config'
     $profilesDirectory = Join-Path $configDirectory 'profiles'
     [void][IO.Directory]::CreateDirectory($profilesDirectory)
+    $testShell = 'C:\Program Files\PowerShell\7\pwsh.exe'
     Write-Utf8 -Path (Join-Path $profilesDirectory 'agent-continuity-local.toml') -Content (@(
         'schema_version = 1',
         'id = "agent-continuity-local"',
         'name = "Agent Continuity Local"',
-        'shell = "pwsh.exe"',
+        ('shell = "' + $testShell.Replace('\', '\\') + '"'),
         'args = ["-NoLogo", "-NoProfile"]',
         'env = {}',
         ('cwd = "' + $outputDirectory.Replace('\', '\\') + '"'),
@@ -267,16 +397,27 @@ try {
     $operations = @(
         'agent-continuity-launcher-ready',
         'agent-continuity-started',
+        'agent-continuity-inactive-output',
+        'agent-continuity-native-window-activity-output',
+        'agent-continuity-landing-light',
+        'agent-continuity-landing-system',
+        'agent-continuity-landing-dark',
+        'agent-continuity-native-window-activity-landing',
+        'agent-continuity-history-continued',
         'agent-continuity-draft-before-switch',
+        'agent-continuity-native-window-activity-draft',
         'agent-continuity-other-tab-active',
         'agent-continuity-hidden-output-observed',
         'agent-continuity-returned',
         'agent-continuity-resumed-input',
+        'agent-continuity-entry-new-chat',
         'agent-continuity-exited',
+        'agent-continuity-entry-after-exit-direct-create',
         'agent-continuity-same-tab-second-pane-ready',
         'agent-continuity-same-tab-focus-switched',
         'agent-continuity-same-tab-continuity-preserved',
-        'agent-continuity-same-tab-second-pane-reclaimed'
+        'agent-continuity-same-tab-second-pane-reclaimed',
+        'agent-continuity-history-fixed-viewport'
     )
     $writePng = {
         param([string]$Path)
@@ -337,7 +478,7 @@ try {
     $report = & $newReport
     Assert-AgentContinuityReport -Report $report -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory `
         -DesktopName 'KerminalRail-settings-agent-test' -ProcessId 1234 -Width 1440 -Height 900
-    Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory
+    Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory -ShellPath $testShell
 
     $bad = & $newReport
     $bad.captureMode = 'hidden-native-window'
@@ -354,10 +495,10 @@ try {
     & $writePng $removedEvidence
 
     [void][IO.Directory]::CreateDirectory((Join-Path $configDirectory 'hosts'))
-    Assert-Throws { Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory } 'contains hosts'
+    Assert-Throws { Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory -ShellPath $testShell } 'contains hosts'
     [IO.Directory]::Delete((Join-Path $configDirectory 'hosts'))
     [void][IO.Directory]::CreateDirectory((Join-Path $outputDirectory 'agent-continuity-leftover'))
-    Assert-Throws { Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory } 'was not cleaned'
+    Assert-Throws { Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory -ShellPath $testShell } 'was not cleaned'
     [IO.Directory]::Delete((Join-Path $outputDirectory 'agent-continuity-leftover'))
 }
 finally {

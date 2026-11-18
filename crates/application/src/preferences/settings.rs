@@ -49,6 +49,13 @@ pub struct SettingsSnapshot {
     pub external_launch: ExternalLaunchSettings,
     #[serde(default)]
     pub mcp: McpSettings,
+    /// 插件目录地址；空串表示官方默认，非空时必须是合法 HTTP(S) 地址。
+    ///
+    /// 保存前统一在这里校验，避免界面、组合根和基础设施各自解释空值与 URL 规则。
+    /// 自定义来源允许局域网、回环和非默认端口，因此复用插件资产 URL 契约而不是
+    /// 另建白名单。
+    #[serde(default)]
+    pub plugin_catalog_url: String,
     pub agent_launcher: AgentLauncherSettings,
     pub sftp: SftpPerformanceSettings,
     pub tool_rail: ToolRailSettings,
@@ -75,6 +82,7 @@ impl Default for SettingsSnapshot {
             desktop_notifications: DesktopNotificationSettings::default(),
             external_launch: ExternalLaunchSettings::default(),
             mcp: McpSettings::default(),
+            plugin_catalog_url: String::new(),
             agent_launcher: AgentLauncherSettings::default(),
             sftp: SftpPerformanceSettings::default(),
             tool_rail: ToolRailSettings::default(),
@@ -111,6 +119,17 @@ impl SettingsSnapshot {
         self.desktop_notifications = self.desktop_notifications.normalized();
         self.external_launch = self.external_launch.normalized();
         self.mcp = self.mcp.validated()?;
+        // 空串是官方默认来源的显式表示；非空地址必须符合共享 HTTP(S) 契约，
+        // 否则保存成功后再切运行态才失败，会把设置页与真实来源分开。
+        self.plugin_catalog_url = self.plugin_catalog_url.trim().to_owned();
+        if self.plugin_catalog_url.len() > 2048 {
+            return Err(AppError::invalid("插件目录地址不能超过 2048 个字符"));
+        }
+        if !self.plugin_catalog_url.is_empty()
+            && kerminal_plugin_protocol::validate_asset_url(&self.plugin_catalog_url).is_err()
+        {
+            return Err(AppError::invalid("插件目录地址无效"));
+        }
         self.agent_launcher = self.agent_launcher.validated()?;
         self.sftp = self.sftp.normalized();
         self.tool_rail = self.tool_rail.normalized();

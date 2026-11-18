@@ -1,4 +1,4 @@
-//! Agent 会话生命周期、显式目标绑定与受限上下文预览用例协调。
+//! Agent 会话生命周期、显式目标绑定与历史会话管理用例协调。
 //!
 //! @author kongweiguang
 
@@ -8,11 +8,11 @@ use kerminal_application::{
     AppError, ApplicationTaskExecutor,
     agents::{
         AgentHistoryMode, AgentHistoryRequest, AgentResumeRecoveryStatus, AgentSessionView,
-        CreateAgentSessionRequest, RenameAgentSessionTitleRequest, find_reusable_agent_session,
+        CreateAgentSessionRequest, RenameAgentSessionTitleRequest,
     },
 };
 use kerminal_domain::{
-    agents::{AgentLaunchPermissionMode, AgentLauncherKey, AgentSessionScope, AgentTargetBinding},
+    agents::{AgentLauncherKey, AgentSessionScope, AgentTargetBinding},
     identity::{AgentSessionId, SessionId},
 };
 use tokio_util::sync::CancellationToken;
@@ -64,27 +64,12 @@ impl AgentsPanel {
                     Ok(projection) => {
                         panel.sessions_verified = true;
                         panel.history_load_error = None;
-                        let preview_is_stale =
-                            panel.context_preview_owner.as_ref().is_some_and(|id| {
-                                !context_preview_target_matches(
-                                    id,
-                                    panel.context_preview_target.as_ref(),
-                                    projection
-                                        .sessions
-                                        .iter()
-                                        .find(|view| &view.session.agent_session_id == id),
-                                )
-                            });
-                        if preview_is_stale {
-                            panel.invalidate_context_preview();
-                        }
                         if panel.selected_agent.as_ref().is_some_and(|id| {
                             !projection
                                 .sessions
                                 .iter()
                                 .any(|view| &view.session.agent_session_id == id)
                         }) {
-                            panel.invalidate_context_preview();
                             panel.selected_agent = None;
                         }
                         panel.sessions = projection.sessions;
@@ -272,8 +257,8 @@ impl AgentsPanel {
             || !candidate_is_current
         {
             Some((
-                "历史筛选或目标已变化，请重新打开该行菜单。",
-                "The history filter or target changed. Reopen this row menu.",
+                "历史筛选或目标已变化，请重新选择该会话后重试。",
+                "The history filter or target changed. Select the session again.",
             ))
         } else if !self.sessions.iter().any(|view| {
             &view.session.agent_session_id == expected_id && view.session.title == expected_title
@@ -286,7 +271,7 @@ impl AgentsPanel {
             None
         };
         if let Some((zh, en)) = failure {
-            self.show_menu_notice(zh, en, cx);
+            self.show_action_notice(zh, en, cx);
             false
         } else {
             true
@@ -445,7 +430,6 @@ impl AgentsPanel {
         if self.busy || self.launcher_selection_busy || self.selected_agent.is_none() {
             return;
         }
-        self.invalidate_context_preview();
         self.selected_agent = None;
         self.rename_target = None;
         self.status = None;
@@ -474,7 +458,6 @@ impl AgentsPanel {
             cx.notify();
             return;
         }
-        self.invalidate_context_preview();
         self.launcher_setup_prompt = false;
         self.selected_agent = Some(id);
         self.publish_selection(cx);
@@ -494,13 +477,24 @@ impl AgentsPanel {
         });
     }
 
-    /// 新建请求携带当前显式 launcher key；只有用例确认取消后才提示已取消，迟到成功仍展示真实会话。
+    /// 入口“进入”只负责创建新会话；旧会话必须从下方历史列表显式继续，避免入口在
+    /// 运行中会话与新建之间隐式二选一。创建门禁仍校验启动项与历史核验，防止绕过基线。
     ///
     /// @author kongweiguang
     pub(super) fn create_agent(&mut self, cx: &mut Context<Self>) {
         if self.busy || self.launcher_selection_busy || self.launcher_catalog_loading {
             return;
         }
+        let Some(launcher_key) = self.selected_launcher_for_launch(cx) else {
+            return;
+        };
+        self.launch_new_session(launcher_key, cx);
+    }
+
+    /// 入口新建使用当前启动项校验；失败时保留可解释状态，不静默回退到另一 Agent。
+    ///
+    /// @author kongweiguang
+    fn selected_launcher_for_launch(&mut self, cx: &mut Context<Self>) -> Option<AgentLauncherKey> {
         let Some(launcher_key) = self.launcher_key.clone() else {
             self.status = Some(self.launcher_load_error.clone().unwrap_or_else(|| {
                 crate::locale::text(
@@ -510,7 +504,7 @@ impl AgentsPanel {
                 .to_string()
             }));
             cx.notify();
-            return;
+            return None;
         };
         let Some(catalog) = self.launcher_catalog.as_ref() else {
             self.status = Some(
@@ -521,13 +515,13 @@ impl AgentsPanel {
                 .to_string(),
             );
             cx.notify();
-            return;
+            return None;
         };
-        let Some(launcher) = catalog
+        if !catalog
             .options
             .iter()
-            .find(|option| option.key == launcher_key)
-        else {
+            .any(|option| option.key == launcher_key)
+        {
             self.status = Some(
                 crate::locale::text(
                     "所选 Agent 已不在当前配置中；请选择有效选项或刷新。",
@@ -536,8 +530,8 @@ impl AgentsPanel {
                 .to_string(),
             );
             cx.notify();
-            return;
-        };
+            return None;
+        }
         if self.loading || !self.sessions_verified {
             self.status = Some(
                 crate::locale::text(
@@ -547,38 +541,12 @@ impl AgentsPanel {
                 .to_string(),
             );
             cx.notify();
-            return;
+            return None;
         }
-        let permission_mode = AgentLaunchPermissionMode::default_for(launcher.provider);
-        let reusable = find_reusable_agent_session(
-            &self.sessions,
-            &self.scope,
-            &launcher_key,
-            permission_mode,
-            |launch| catalog.matches_legacy_custom_launch(&launcher_key, launch),
-        )
-        .map(|view| {
-            (
-                view.session.agent_session_id.clone(),
-                super::render::has_running_agent_terminal(view),
-                super::render::agent_can_reconcile(view),
-                super::render::agent_can_resume(view),
-            )
-        });
-        if let Some((id, running, reconcile, resumable)) = reusable {
-            if running || reconcile {
-                self.select_agent(id, cx);
-            } else if resumable {
-                self.resume_agent(id, cx);
-            } else {
-                self.launch_new_session(launcher_key, cx);
-            }
-            return;
-        }
-        self.launch_new_session(launcher_key, cx);
+        Some(launcher_key)
     }
 
-    /// 仅在历史核验后未找到可复用会话时创建新 PTY，并保留选择基线门禁。
+    /// 入口“进入”创建新 PTY；保留历史核验与选择基线门禁，不复用或恢复历史会话。
     ///
     /// @author kongweiguang
     fn launch_new_session(&mut self, launcher_key: AgentLauncherKey, cx: &mut Context<Self>) {
@@ -640,7 +608,7 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 继续指定历史身份；菜单回调不会重新读取后来变更的 selected Agent。
+    /// 继续指定历史身份；历史行回调不会重新读取后来变更的 selected Agent。
     ///
     /// @author kongweiguang
     pub(super) fn resume_agent(&mut self, id: AgentSessionId, cx: &mut Context<Self>) {
@@ -709,7 +677,7 @@ impl AgentsPanel {
             view.session.agent_session_id == id && super::render::agent_can_reconcile(view)
         });
         if !has_recovery {
-            self.show_menu_notice(
+            self.show_action_notice(
                 "该 Agent 没有待核对的恢复事务，请刷新状态后重试。",
                 "This Agent has no pending recovery to reconcile. Refresh and try again.",
                 cx,
@@ -824,7 +792,7 @@ impl AgentsPanel {
         true
     }
 
-    /// 同时服务无确认的菜单归档与确认框归档，两类入口只在成功收据处理上有差异。
+    /// 删除确认框提交后启动归档用例；成功收据只在同一确认 owner 仍有效时关闭弹框。
     ///
     /// @author kongweiguang
     fn start_archive_operation(
@@ -842,7 +810,7 @@ impl AgentsPanel {
             .iter()
             .find(|view| view.session.agent_session_id == id)
         else {
-            self.show_menu_notice(
+            self.show_action_notice(
                 "该 Agent 会话已不存在，请刷新后重试。",
                 "This Agent session no longer exists. Refresh and try again.",
                 cx,
@@ -850,7 +818,7 @@ impl AgentsPanel {
             return false;
         };
         if view.session.status == kerminal_domain::agents::AgentSessionStatus::Archived {
-            self.show_menu_notice("该会话已经归档。", "This chat is already archived.", cx);
+            self.show_action_notice("该会话已经归档。", "This chat is already archived.", cx);
             return false;
         }
         let selected_before = self.selected_agent.clone();
@@ -877,65 +845,7 @@ impl AgentsPanel {
         true
     }
 
-    /// 显式绑定固定菜单捕获的会话与候选；动作前重新核验恢复状态和候选，禁止切换到后来目标。
-    ///
-    /// @author kongweiguang
-    pub(super) fn bind_agent_candidate(
-        &mut self,
-        id: AgentSessionId,
-        candidate: AgentTargetBinding,
-        expected_target: Option<AgentTargetBinding>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.busy {
-            return;
-        }
-        let Some(view) = self
-            .sessions
-            .iter()
-            .find(|view| view.session.agent_session_id == id)
-        else {
-            self.show_menu_notice(
-                "该会话已不存在，请刷新后重试。",
-                "This chat no longer exists. Refresh and try again.",
-                cx,
-            );
-            return;
-        };
-        if view.session.status == kerminal_domain::agents::AgentSessionStatus::Archived
-            || view.resume_recovery.is_some()
-            || view.session.target != expected_target
-            || self.candidate.as_ref().map(|target| &target.binding) != Some(&candidate)
-        {
-            self.show_menu_notice(
-                "会话或终端目标已变化，请重新打开操作菜单。",
-                "The chat or terminal target changed. Reopen the actions menu.",
-                cx,
-            );
-            return;
-        }
-        let generation = view
-            .session
-            .target
-            .as_ref()
-            .map_or(0, |binding| binding.generation)
-            .saturating_add(1);
-        let mut binding = candidate;
-        binding.generation = generation;
-        self.persist_preferred_target(
-            id,
-            binding,
-            false,
-            ("正在显式绑定首选终端…", "Binding the preferred terminal…"),
-            (
-                "Agent 首选终端已显式更新。",
-                "Agent preferred terminal updated.",
-            ),
-            cx,
-        );
-    }
-
-    /// 共用持久化绑定事务；绑定变化时失效旧预览并刷新历史，仅在原选择未变时应用继续选择。
+    /// 共用持久化绑定事务；绑定变化时刷新历史，仅在原选择未变时应用继续选择。
     ///
     /// @author kongweiguang
     fn persist_preferred_target(
@@ -966,15 +876,6 @@ impl AgentsPanel {
                 match result {
                     Ok(view) => {
                         let persisted_id = view.session.agent_session_id.clone();
-                        if panel.context_preview_owner.as_ref() == Some(&persisted_id)
-                            && !context_preview_target_matches(
-                                &persisted_id,
-                                panel.context_preview_target.as_ref(),
-                                Some(&view),
-                            )
-                        {
-                            panel.invalidate_context_preview();
-                        }
                         panel.replace_session_view(view);
                         cx.emit(AgentPanelEvent::TargetBindingChanged);
                         if select_after && panel.selected_agent == selected_before {
@@ -995,109 +896,6 @@ impl AgentsPanel {
                     Err(error) => {
                         panel.show_operation_error("目标绑定失败", "Could not bind target", error)
                     }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 预览固定历史行的 Agent 与原绑定，回执与当前投影、服务结果均一致时才显示，避免切换目标后误读。
-    ///
-    /// @author kongweiguang
-    pub(super) fn preview_agent_context(
-        &mut self,
-        id: AgentSessionId,
-        expected_target: Option<AgentTargetBinding>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.busy {
-            return;
-        }
-        let current = self
-            .sessions
-            .iter()
-            .find(|view| view.session.agent_session_id == id);
-        if !context_preview_target_matches(&id, expected_target.as_ref(), current) {
-            self.show_menu_notice(
-                "会话或绑定目标已变化，请重新打开操作菜单。",
-                "The chat or bound target changed. Reopen the actions menu.",
-                cx,
-            );
-            return;
-        }
-        let requested_agent = id.clone();
-        self.context_preview_generation = self.context_preview_generation.wrapping_add(1).max(1);
-        let generation = self.context_preview_generation;
-        self.context_preview = None;
-        self.context_preview_owner = Some(requested_agent.clone());
-        self.context_preview_target = expected_target.clone();
-        self.context_preview_loading = true;
-        let agents = self.agents.clone();
-        let executor = self.executor.clone();
-        self.busy = true;
-        self.status =
-            Some(crate::locale::text("正在读取目标上下文…", "Loading target context…").to_string());
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(
-                    move |cancel| async move { agents.target_context(id, 16 * 1024, cancel).await },
-                )
-                .await;
-            let _ = this.update(cx, |panel, cx| {
-                if panel.context_preview_generation != generation
-                    || panel.context_preview_owner.as_ref() != Some(&requested_agent)
-                {
-                    return;
-                }
-                panel.context_preview_loading = false;
-                panel.busy = false;
-                let current = panel
-                    .sessions
-                    .iter()
-                    .find(|view| view.session.agent_session_id == requested_agent);
-                match result {
-                    Ok(context)
-                        if context_preview_target_matches(
-                            &requested_agent,
-                            expected_target.as_ref(),
-                            current,
-                        ) && context_preview_target_matches(
-                            &requested_agent,
-                            expected_target.as_ref(),
-                            Some(&context.session),
-                        ) =>
-                    {
-                        let snapshot_available = context.snapshot.is_some();
-                        panel.context_preview = context.snapshot.map(|snapshot| snapshot.text);
-                        panel.status = Some(
-                            if !snapshot_available {
-                                crate::locale::text(
-                                    "绑定目标暂无可用快照。",
-                                    "No snapshot is available for the bound target.",
-                                )
-                            } else if context.redacted {
-                                crate::locale::text(
-                                    "上下文已加载；敏感内容已脱敏。",
-                                    "Context loaded; sensitive content was redacted.",
-                                )
-                            } else {
-                                crate::locale::text("上下文已加载。", "Context loaded.")
-                            }
-                            .to_string(),
-                        );
-                    }
-                    Ok(_) => panel.show_menu_notice(
-                        "绑定目标已变化，预览已丢弃，请重新打开菜单。",
-                        "The bound target changed. The preview was discarded; reopen the menu.",
-                        cx,
-                    ),
-                    Err(error) => panel.show_operation_error(
-                        "目标上下文不可用",
-                        "Target context unavailable",
-                        error,
-                    ),
                 }
                 cx.notify();
             });
@@ -1157,7 +955,6 @@ impl AgentsPanel {
                             },
                         );
                         if may_select {
-                            panel.invalidate_context_preview();
                             panel.selected_agent = Some(new_id);
                             if !cancel_requested
                                 && let Some((agent_session_id, terminal_session_id)) = focus_target
@@ -1382,22 +1179,13 @@ impl AgentsPanel {
                         let archived = view.session.status
                             == kerminal_domain::agents::AgentSessionStatus::Archived;
                         let recovery = view.resume_recovery.clone();
-                        let id = view.session.agent_session_id.clone();
+                        panel.apply_lifecycle_success_selection(
+                            &target_id,
+                            &selected_before,
+                            &view,
+                            select_after_success,
+                        );
                         panel.replace_session_view(view);
-                        if panel.selected_agent == selected_before {
-                            if archived
-                                && id == target_id
-                                && panel.selected_agent.as_ref() == Some(&id)
-                            {
-                                panel.invalidate_context_preview();
-                                panel.selected_agent = None;
-                            } else if !archived && select_after_success {
-                                if panel.selected_agent.as_ref() != Some(&id) {
-                                    panel.invalidate_context_preview();
-                                }
-                                panel.selected_agent = Some(id);
-                            }
-                        }
                         panel.status = Some(if archived {
                             crate::locale::text(
                                 "Agent 已归档，历史与上下文已保留。",
@@ -1476,6 +1264,29 @@ impl AgentsPanel {
         cx.notify();
     }
 
+    /// 生命周期成功回执在基线选择未变时应用选择；归档当前会话时清除选择，
+    /// 避免继续指向已不可用的历史项。
+    ///
+    /// @author kongweiguang
+    pub(super) fn apply_lifecycle_success_selection(
+        &mut self,
+        target_id: &AgentSessionId,
+        selected_before: &Option<AgentSessionId>,
+        view: &AgentSessionView,
+        select_after_success: bool,
+    ) {
+        if &self.selected_agent != selected_before {
+            return;
+        }
+        let id = view.session.agent_session_id.clone();
+        let archived = view.session.status == kerminal_domain::agents::AgentSessionStatus::Archived;
+        if archived && &id == target_id && self.selected_agent.as_ref() == Some(&id) {
+            self.selected_agent = None;
+        } else if !archived && select_after_success {
+            self.selected_agent = Some(id);
+        }
+    }
+
     /// 根据聚合身份替换唯一列表投影，防止并发刷新留下同一个 Agent 的重复行。
     fn replace_session_view(&mut self, view: AgentSessionView) {
         let id = view.session.agent_session_id.clone();
@@ -1505,30 +1316,6 @@ impl AgentsPanel {
             };
         self.status = Some(message);
     }
-}
-
-/// 只接收同一绑定身份及代次；状态更新时间和旧绑定补充 ID 不改变目标身份。
-///
-/// @author kongweiguang
-pub(super) fn context_preview_target_matches(
-    expected_id: &AgentSessionId,
-    expected_target: Option<&AgentTargetBinding>,
-    view: Option<&AgentSessionView>,
-) -> bool {
-    view.is_some_and(|view| {
-        &view.session.agent_session_id == expected_id
-            && view.session.status != kerminal_domain::agents::AgentSessionStatus::Archived
-            && match (expected_target, view.session.target.as_ref()) {
-                (None, None) => true,
-                (Some(expected), Some(current)) => {
-                    expected.generation == current.generation
-                        && expected.points_to_same_session(current)
-                        && (expected.binding_id.is_none()
-                            || expected.binding_id == current.binding_id)
-                }
-                _ => false,
-            }
-    })
 }
 
 /// 仅在显式继续、会话归属允许且候选仍属于当前 Tab 时生成新的首选终端代次。

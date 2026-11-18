@@ -56,7 +56,7 @@ fn save_button() -> Value {
     })
 }
 
-/// 三种阶段使用各自真实会出现的动作集合；phase 2 只改变一个标签，phase 3 保存但不改草稿。
+/// 三代阶段使用各自真实会出现的动作集合；phase 1 保存两个标签，phase 2 只改变一个标签。
 fn receipt(phase: u8) -> Value {
     let (before, after, activations, saves, target) = match phase {
         1 => (
@@ -96,23 +96,6 @@ fn receipt(phase: u8) -> Value {
             Vec::new(),
             Some("tab-a"),
         ),
-        3 => (
-            vec![
-                tab("tab-a", "count alpha", "view-a", "instance-a"),
-                tab("tab-b", "seed beta", "view-b", "instance-b"),
-            ],
-            vec![
-                tab("tab-a", "count alpha", "view-a", "instance-a"),
-                tab("tab-b", "seed beta", "view-b", "instance-b"),
-            ],
-            vec![
-                activation("tab-a", "count alpha", "view-a"),
-                activation("tab-b", "seed beta", "view-b"),
-                activation("tab-a", "count alpha", "view-a"),
-            ],
-            vec![save("tab-a", "count alpha", json!("seed beta"))],
-            None,
-        ),
         _ => unreachable!("synthetic persistence phase"),
     };
     let mode = if phase == 1 { "seeded" } else { "restored" };
@@ -138,12 +121,20 @@ fn receipt(phase: u8) -> Value {
 #[test]
 fn persistence_phases_accept_consistent_receipts() {
     assert!(validate_persistence_receipt(&bootstrap_evidence(), 0).is_ok());
-    for phase in 1..=3 {
+    for phase in 1..=2 {
         assert!(
             validate_persistence_receipt(&receipt(phase), phase).is_ok(),
             "phase {phase}"
         );
     }
+}
+
+/// 旧四代形状的第三阶段必须在状态机处拒绝，不能静默接受已移除的回退代。
+#[test]
+fn persistence_rejects_removed_rollback_phase() {
+    let mut rollback = receipt(2);
+    rollback["phase"] = json!(3);
+    assert!(validate_persistence_receipt(&rollback, 3).is_err());
 }
 
 /// 新 Tab ID、丢失标签、重复身份或重复 viewId 都不能被内容数量掩盖。
@@ -195,22 +186,24 @@ fn persistence_requires_single_target_change_and_preserves_other_draft() {
     assert!(validate_persistence_receipt(&save_in_restore, 2).is_err());
 }
 
-/// Save 必须使用具体标签草稿、动作前不同状态和独立回读，空输入或旧值不算动作。
+/// Save 必须使用具体标签草稿、动作前不同状态和独立回读，空输入或旧值不算动作；
+/// 三代契约里只有 1.0 种子代会保存，1.1 恢复代不得写回。
 #[test]
 fn persistence_requires_confirmed_local_save_actions() {
-    let mut wrong_input = receipt(3);
-    wrong_input["saveActions"][0]["input"] = json!("other");
-    assert!(validate_persistence_receipt(&wrong_input, 3).is_err());
-
-    let mut wrong_observed = receipt(3);
+    let mut wrong_observed = receipt(1);
     wrong_observed["saveActions"][0]["observedText"] = json!("other");
-    assert!(validate_persistence_receipt(&wrong_observed, 3).is_err());
+    assert!(validate_persistence_receipt(&wrong_observed, 1).is_err());
 
-    let mut stale = receipt(3);
+    let mut stale = receipt(1);
     stale["saveActions"][0]["input"] = json!("seed beta");
     stale["saveActions"][0]["observedText"] = json!("seed beta");
     stale["saveActions"][0]["beforeText"] = json!("seed beta");
-    assert!(validate_persistence_receipt(&stale, 3).is_err());
+    assert!(validate_persistence_receipt(&stale, 1).is_err());
+
+    let mut duplicate_input = receipt(1);
+    duplicate_input["saveActions"][1]["input"] = json!("seed alpha");
+    duplicate_input["saveActions"][1]["observedText"] = json!("seed alpha");
+    assert!(validate_persistence_receipt(&duplicate_input, 1).is_err());
 
     let mut missing = receipt(1);
     let first_save = missing["saveActions"][0].clone();
@@ -226,9 +219,9 @@ fn persistence_requires_confirmed_local_save_actions() {
     global_fallback["tabsAfterActions"][1]["draft"] = json!("seed beta");
     assert!(validate_persistence_receipt(&global_fallback, 1).is_err());
 
-    let mut no_click = receipt(3);
+    let mut no_click = receipt(1);
     no_click["saveActions"][0]["controlAfterClick"]["supportsClick"] = json!(false);
-    assert!(validate_persistence_receipt(&no_click, 3).is_err());
+    assert!(validate_persistence_receipt(&no_click, 1).is_err());
 }
 
 /// 标签必须经具体 selector 的真实点击记录覆盖，Role 或 viewId 不符不能由汇总布尔补偿。

@@ -3,7 +3,7 @@
 //! @author kongweiguang
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -12,21 +12,28 @@ use kerminal_application::{
     AppError, AppResult, PreferencesService,
     agents::{
         AgentHistoryProjection, AgentHistoryRequest, AgentLaunchResolver, AgentLauncherCatalog,
-        AgentService, AgentSessionView, AgentTargetContext, AgentTargetResolution,
-        AgentTerminalSnapshotRequest, AgentTextPreview, AgentTextSubmissionReceipt,
-        CreateAgentSessionFromHistoryRequest, CreateAgentSessionRequest,
-        RenameAgentSessionTitleRequest, SendAgentCommandRequest,
+        AgentResumeCapability, AgentService, AgentSessionView, AgentTargetContext,
+        AgentTargetResolution, AgentTerminalSnapshotRequest, AgentTextPreview,
+        AgentTextSubmissionReceipt, CreateAgentSessionFromHistoryRequest,
+        CreateAgentSessionRequest, RenameAgentSessionTitleRequest, SendAgentCommandRequest,
     },
     preferences::{
         ConfigurationRepository, SettingsRepository, SettingsSnapshot, VersionedSettings,
     },
 };
 use kerminal_domain::{
-    agents::{AgentLauncherKey, AgentTargetBinding},
-    identity::AgentSessionId,
+    agents::{
+        AgentLauncherKey, AgentProvider, AgentSession, AgentSessionLaunch, AgentSessionScope,
+        AgentTargetBinding,
+    },
+    identity::{AgentSessionId, SessionId},
     preferences::{
         ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
         ConfigurationRecoveryState,
+    },
+    sessions::{
+        LocalSessionTarget, SessionInfo, SessionLifecycle, SessionOwner, SessionTarget,
+        TerminalSize,
     },
 };
 use tokio::sync::Semaphore;
@@ -88,18 +95,20 @@ impl ConfigurationRepository for ReadOnlySettings {
 }
 
 /// 历史请求可暂时阻塞，使测试观察真实刷新中状态，而不依赖计时竞争。
-pub(super) struct FixtureAgentService {
+pub(crate) struct FixtureAgentService {
     view: AgentSessionView,
     catalog: AgentLauncherCatalog,
     hold_history: AtomicBool,
     fail_history: AtomicBool,
     history_gate: Semaphore,
     history_loads: AtomicUsize,
+    /// 记录测试期间被触发的未实现操作，用真实调用路径区分“没有启动”和“尝试启动后失败”。
+    unsupported_operations: Mutex<Vec<&'static str>>,
 }
 
 impl FixtureAgentService {
     /// 使用默认设置解析真实 Launcher 目录；测试会话独立于任何本地路径。
-    pub(super) async fn new(view: AgentSessionView) -> Self {
+    pub(crate) async fn new(view: AgentSessionView) -> Self {
         let preferences = Arc::new(PreferencesService::new(Arc::new(ReadOnlySettings)));
         let resolver = AgentLaunchResolver::new(preferences);
         let catalog = resolver
@@ -113,28 +122,85 @@ impl FixtureAgentService {
             fail_history: AtomicBool::new(false),
             history_gate: Semaphore::new(0),
             history_loads: AtomicUsize::new(0),
+            unsupported_operations: Mutex::new(Vec::new()),
         }
     }
 
+    /// 统计某条未实现操作被真实调用路径触发的次数；0 表示界面没有发起该动作。
+    pub(crate) fn unsupported_operation_count(&self, name: &str) -> usize {
+        self.unsupported_operations
+            .lock()
+            .expect("fixture unsupported operation lock")
+            .iter()
+            .filter(|operation| **operation == name)
+            .count()
+    }
+
     /// 暴露真实历史查询次数，供回归测试区分“只更新候选”和“重新读取历史”。
-    pub(super) fn history_loads(&self) -> usize {
+    pub(crate) fn history_loads(&self) -> usize {
         self.history_loads.load(Ordering::SeqCst)
     }
 
     /// 阻塞下一次历史查询，使测试可以检查已确认记录在刷新期间的真实布局。
-    pub(super) fn hold_history(&self) {
+    pub(crate) fn hold_history(&self) {
         self.hold_history.store(true, Ordering::SeqCst);
     }
 
     /// 释放阻塞中的查询后允许普通查询继续完成。
-    pub(super) fn release_history(&self) {
+    pub(crate) fn release_history(&self) {
         self.hold_history.store(false, Ordering::SeqCst);
         self.history_gate.add_permits(1);
     }
 
     /// 通过真实查询回执模拟故障和恢复，不直接篡改面板的已核验状态。
-    pub(super) fn set_history_failure(&self, fail: bool) {
+    pub(crate) fn set_history_failure(&self, fail: bool) {
         self.fail_history.store(fail, Ordering::SeqCst);
+    }
+}
+
+/// 构造一个带 Running Agent-owned PTY 的隔离会话，供入口与内置 AgentLauncher 首帧测试复用。
+///
+/// @author kongweiguang
+pub(crate) fn fixture_agent_view() -> AgentSessionView {
+    let id = AgentSessionId::new();
+    let session = AgentSession::new(
+        id.clone(),
+        AgentProvider::Codex,
+        None,
+        "Codex".to_owned(),
+        // 持久化格式是 Unix epoch 秒字符串；fixture 与生产读取路径一致，避免掩盖解析错误。
+        "1792368000".to_owned(),
+        "workspace".to_owned(),
+        "workspace/agents/session".to_owned(),
+        AgentSessionLaunch {
+            command_label: "Codex".to_owned(),
+            shell: "codex".to_owned(),
+            args: Vec::new(),
+            cwd: "workspace/agents/session".to_owned(),
+        },
+        Some(AgentSessionScope::Global),
+        None,
+    )
+    .expect("valid isolated Agent session");
+    AgentSessionView {
+        session,
+        terminal: Some(SessionInfo {
+            session_id: SessionId::new(),
+            target: SessionTarget::Local(LocalSessionTarget {
+                program: "codex".into(),
+                args: Vec::new(),
+                working_directory: None,
+                environment: Default::default(),
+            }),
+            owner: SessionOwner::Agent {
+                agent_session_id: id,
+            },
+            size: TerminalSize::default(),
+            lifecycle: SessionLifecycle::Running,
+            exit_status: None,
+        }),
+        resume_capability: AgentResumeCapability::MetadataUnavailable,
+        resume_recovery: None,
     }
 }
 
@@ -143,9 +209,14 @@ macro_rules! impl_fixture_service {
         #[async_trait]
         impl AgentService for FixtureAgentService {
     $(
-        /// 仅实现本测试需观察的查询，未覆盖的操作不能制造虚假成功。
+        /// 仅实现本测试需观察的查询，未覆盖的操作不能制造虚假成功；记录调用名供断言区分
+        /// “界面没有发起动作”和“动作已发起但服务失败”。
         async fn $name(&self, $($arg: $ty),*) -> AppResult<$result> {
             $(let _ = $arg;)*
+            self.unsupported_operations
+                .lock()
+                .expect("fixture unsupported operation lock")
+                .push(stringify!($name));
             Err(AppError::unsupported("unused Agent visual fixture operation"))
         }
     )*

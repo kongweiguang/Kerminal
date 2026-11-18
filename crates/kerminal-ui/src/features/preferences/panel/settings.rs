@@ -356,6 +356,164 @@ impl PreferencesPanel {
         }
     }
 
+    /// 来源保存复用设置草稿的 CAS 与权威回读，不另建配置写入通道。
+    ///
+    /// URL 先用默认快照单独校验；URL 已在基线时只做权威回读，不因其它字段的临时
+    /// 输入错误或脏值重写整份设置。URL 未落盘时才替换草稿 URL 并走整份 CAS 保存，
+    /// 因此其它字段的校验仍会约束这次写入；写入未启动时撤回未提交的 URL 字段，
+    /// 避免之后被无关保存带走。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn request_catalog_source_save(
+        &mut self,
+        url: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_controls_locked() {
+            self.extensions.fail_catalog_source_save(
+                crate::locale::text(
+                    "当前设置处于只读或保存冲突状态，暂时不能修改商店来源。",
+                    "The store source cannot be changed while settings are read-only or conflicted.",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        if self.settings.is_none() {
+            self.extensions.fail_catalog_source_save(
+                crate::locale::text(
+                    "设置尚未载入，请稍后重试。",
+                    "Settings are not loaded yet. Try again shortly.",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        // 默认快照只承载 URL：校验与规范化规则仍由 application 统一提供，
+        // 不在这里复制一份 URL 语法，也不让其它字段的编辑中错误参与判断。
+        let probe = SettingsSnapshot {
+            plugin_catalog_url: url,
+            ..SettingsSnapshot::default()
+        };
+        let normalized = match probe.validated() {
+            Ok(value) => value.plugin_catalog_url,
+            Err(error) => {
+                self.extensions
+                    .fail_catalog_source_save(super::localized_error(&error), cx);
+                return;
+            }
+        };
+        // URL 已在基线（上次成功保存或加载确认）时，来源意图与其它草稿字段解耦：
+        // 不重写无关设置，直接真实回读确认；同时撤回草稿里可能残留的未提交 URL。
+        let url_confirmed = self.settings.as_ref().is_some_and(|draft| {
+            draft.baseline_value().plugin_catalog_url == normalized
+                && matches!(
+                    draft.status(),
+                    DraftStatus::Ready | DraftStatus::Failed | DraftStatus::Saving
+                )
+        });
+        if url_confirmed {
+            let _ = self.withdraw_unsubmitted_catalog_source_field();
+            self.extensions.begin_catalog_source_save(normalized);
+            self.spawn_catalog_source_readback(cx);
+            return;
+        }
+        let candidate = {
+            let draft = self.settings.as_ref().expect("draft checked above");
+            let mut candidate = draft.value().clone();
+            candidate.plugin_catalog_url = normalized.clone();
+            candidate
+        };
+        if !self.replace_settings_draft_value(candidate) {
+            self.extensions.fail_catalog_source_save(
+                crate::locale::text(
+                    "设置草稿状态已变化，请重新读取后再保存。",
+                    "The settings draft changed. Reload it before saving.",
+                )
+                .to_string(),
+                cx,
+            );
+            return;
+        }
+        self.extensions.begin_catalog_source_save(normalized);
+        self.settings_success_status = None;
+        // 必须推进编辑代次：若已有设置在途，单飞协调器只会为“更新的代次”排队；
+        // 复用旧代次会让本次 URL 永远等不到后续保存，最终被误判成来源被覆盖。
+        self.settings_autosave.edited();
+        if !self.save_settings(cx) {
+            // 保存没有启动时提交值只存在于草稿里；撤回未提交的 URL 字段，防止失败
+            // 地址被之后无关的 autosave 静默写入。若 URL 已由基线或在途快照确认，
+            // 保留来源意图，由权威回读或该在途回执继续确认。
+            if !self.withdraw_unsubmitted_catalog_source_field() {
+                let message = self
+                    .status
+                    .clone()
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| {
+                        crate::locale::text(
+                            "商店来源未能启动保存。",
+                            "The store source save could not be started.",
+                        )
+                        .to_string()
+                    });
+                self.extensions.fail_catalog_source_save(message, cx);
+            } else if self.settings.as_ref().is_some_and(|draft| {
+                matches!(draft.status(), DraftStatus::Ready | DraftStatus::Failed)
+            }) {
+                self.spawn_catalog_source_readback(cx);
+            }
+        }
+    }
+
+    /// 撤回未提交的来源 URL 字段；返回 true 表示待确认 URL 已由基线或在途快照确认。
+    ///
+    /// 判断对象是来源待确认地址而不是可编辑副本：其它字段或 URL 输入框的后续编辑
+    /// 不能改变“本次来源是否已落盘”。Saving 时以不可变提交快照判断，快照已含该
+    /// URL 说明在途保存可能落盘；否则把可编辑副本恢复到快照 URL，保留其它编辑与
+    /// 在途快照。Ready/Failed 以基线判断；Conflict/OutcomeUnknown 不触碰，交给
+    /// 权威恢复流程。这样已知未提交的失败地址不会被之后无关的 autosave 静默写入，
+    /// 也不会误伤可能已落盘的来源意图。
+    ///
+    /// @author kongweiguang
+    fn withdraw_unsubmitted_catalog_source_field(&mut self) -> bool {
+        let pending_url = self.extensions.catalog_source_pending().map(str::to_owned);
+        let Some(draft) = self.settings.as_mut() else {
+            return false;
+        };
+        match draft.status() {
+            DraftStatus::Saving => {
+                let Some(snapshot) = draft.pending_save_value().cloned() else {
+                    return false;
+                };
+                let confirmed = pending_url
+                    .as_deref()
+                    .is_some_and(|url| snapshot.plugin_catalog_url == url);
+                if draft.value().plugin_catalog_url != snapshot.plugin_catalog_url {
+                    let mut value = draft.value().clone();
+                    value.plugin_catalog_url = snapshot.plugin_catalog_url;
+                    let _ = draft.replace_value_during_save(value);
+                }
+                confirmed
+            }
+            DraftStatus::Failed | DraftStatus::Ready => {
+                let baseline_url = draft.baseline_value().plugin_catalog_url.clone();
+                let confirmed = pending_url
+                    .as_deref()
+                    .is_some_and(|url| baseline_url == url);
+                if draft.value().plugin_catalog_url != baseline_url {
+                    let mut value = draft.value().clone();
+                    value.plugin_catalog_url = baseline_url;
+                    // 走既有 replace_value 迁移：Failed→Ready 由状态机负责，不另造草稿语义。
+                    let _ = draft.replace_value(value);
+                }
+                confirmed
+            }
+            DraftStatus::ExternalConflict | DraftStatus::OutcomeUnknown => true,
+        }
+    }
+
     /// 校验当前值后以单飞 CAS 保存；保存中到期的较新编辑排队使用回执 revision。
     ///
     /// @author kongweiguang
@@ -542,6 +700,18 @@ impl PreferencesPanel {
                 self.fail_workbench_layout_save(error.public_code(), message.clone(), cx);
                 self.status = Some(message.clone());
                 self.settings_success_status = None;
+                // 已知失败时来源提交值没有落盘：撤回未提交的 URL 字段，避免之后
+                // 无关 autosave 静默写入失败地址。URL 已由成功回执进入基线时保留
+                // 来源意图，由后续权威回读确认；未知/冲突不回退，交由既有读回
+                // 恢复流程确认磁盘状态；保存成功但回读失败也不进入这里。
+                if error.public_code() != PublicErrorCode::Conflict
+                    && error.public_code() != PublicErrorCode::OutcomeUnknown
+                    && self.extensions.catalog_source_pending().is_some()
+                    && !self.withdraw_unsubmitted_catalog_source_field()
+                {
+                    self.extensions
+                        .fail_catalog_source_save(message.clone(), cx);
+                }
                 if tool_rail_save {
                     cx.emit(PreferencesEvent::ToolRailSaveFailed { message });
                 }
@@ -550,9 +720,17 @@ impl PreferencesPanel {
             }
         };
         let has_dirty_settings = self.settings.as_ref().is_some_and(ConfigDraft::is_dirty);
+        let source_pending = self.extensions.catalog_source_pending().is_some();
+        // 来源提交失败时不能借自动排队保存重试：那会在用户看不到失败的情况下
+        // 再次写入并把来源切走，等同于盲目重写。失败原因交给来源弹层，由用户
+        // 显式重试；父草稿的其它脏值仍保留，下一次编辑或保存会继续提交。
+        let source_save_failed = source_pending && !saved_successfully;
         let queued_generation = self.settings_autosave.finish_save(
             ticket,
-            allow_follow_up && has_dirty_settings && !reconcile_watcher_change,
+            allow_follow_up
+                && has_dirty_settings
+                && !reconcile_watcher_change
+                && !source_save_failed,
         );
         if reconcile_watcher_change || verify_after_write {
             self.spawn_settings_revision_check(cx);
@@ -560,11 +738,119 @@ impl PreferencesPanel {
         if saved_successfully && !reconcile_watcher_change {
             self.flush_pending_workbench_layout(cx);
         }
-        if queued_generation.is_some() && self.settings.as_ref().is_some_and(ConfigDraft::is_dirty)
-        {
-            self.save_settings(cx);
+        let follow_up_expected = queued_generation.is_some() && has_dirty_settings;
+        if follow_up_expected && !self.save_settings(cx) {
+            // 排队保存若因校验或草稿门禁无法启动，来源请求不能永远停在“保存中”；
+            // 此时没有后续权威回执。与冲突合并续写共用同一收口，避免两处判断漂移。
+            self.finish_unstarted_catalog_source_save(cx);
+        }
+        // 来源必须经过真实 load_settings 回读才能切换：保存回执只证明提交值，
+        // 不证明磁盘内容。单飞保存的中间回执由 follow_up_expected 继续等待；
+        // 最终回执到达后无论其 URL 是否与提交一致，都以回读结果为准。
+        if self.extensions.catalog_source_pending().is_some() && !follow_up_expected {
+            if saved_successfully && !reconcile_watcher_change {
+                self.spawn_catalog_source_readback(cx);
+            } else if verify_after_write && !reconcile_watcher_change {
+                // 冲突/未知：保留来源意图，由权威恢复读回确认或显式失败；
+                // 在这里清 pending 会取消恢复代次，导致写入已确认却无法切源。
+            } else if !reconcile_watcher_change && self.catalog_source_url_is_baseline_confirmed() {
+                // 来源 URL 已由成功回执写入基线，本次失败只涉及其它字段；
+                // 仍必须真实回读确认后才切换，不能把整份设置保存失败当成来源失败。
+                self.spawn_catalog_source_readback(cx);
+            } else {
+                let message = if reconcile_watcher_change {
+                    crate::locale::text(
+                        "设置已被外部修改，来源未切换，请重试。",
+                        "Settings changed externally, so the source was not switched. Try again.",
+                    )
+                    .to_string()
+                } else {
+                    self.source_save_failure_message()
+                };
+                self.extensions.fail_catalog_source_save(message, cx);
+            }
         }
         cx.notify();
+    }
+
+    /// 保存未启动时收口来源意图：未确认则撤回并显式失败，基线/在途快照已确认则真实回读。
+    ///
+    /// 冲突合并续写与 follow-up 排队共用同一判断；只处理来源，不改其它草稿字段，
+    /// 未知/冲突交给既有恢复流程，避免在这里盲目重写。调用方必须已经确认保存
+    /// 没有启动（`save_settings` 返回 false），否则会把在途保存误判成未启动。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn finish_unstarted_catalog_source_save(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if self.extensions.catalog_source_pending().is_none() {
+            return;
+        }
+        if !self.withdraw_unsubmitted_catalog_source_field() {
+            let message = self.source_save_failure_message();
+            self.extensions.fail_catalog_source_save(message, cx);
+        } else if self
+            .settings
+            .as_ref()
+            .is_some_and(|draft| matches!(draft.status(), DraftStatus::Ready | DraftStatus::Failed))
+        {
+            self.spawn_catalog_source_readback(cx);
+        }
+    }
+
+    /// 判断待确认来源是否已进入草稿基线：成功回执或加载确认只证明 URL 已落盘，
+    /// 切换运行源仍以真实回读为准。
+    ///
+    /// @author kongweiguang
+    fn catalog_source_url_is_baseline_confirmed(&self) -> bool {
+        let Some(pending) = self.extensions.catalog_source_pending() else {
+            return false;
+        };
+        self.settings
+            .as_ref()
+            .is_some_and(|draft| draft.baseline_value().plugin_catalog_url == pending)
+    }
+
+    /// 保存成功后异步读取权威设置，核对来源地址后才允许切换运行态。
+    ///
+    /// 回读与保存使用同一共享执行器，不另建运行时；代次与待确认地址在回读
+    /// 完成时复核，迟到的旧结果不会覆盖新提交。
+    ///
+    /// @author kongweiguang
+    fn spawn_catalog_source_readback(&mut self, cx: &mut Context<Self>) {
+        let Some((url, generation)) = self.extensions.catalog_source_readback_token() else {
+            return;
+        };
+        let service = self.preferences.clone();
+        let executor = self.executor.clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |_| async move { service.load_settings().await })
+                .await;
+            let _ = this.update_in(cx, |panel, _, cx| {
+                panel
+                    .extensions
+                    .finish_catalog_source_readback(&url, generation, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 来源保存失败时优先复用设置保存的已本地化原因；没有原因时给出可重试提示。
+    ///
+    /// @author kongweiguang
+    fn source_save_failure_message(&self) -> String {
+        self.status
+            .clone()
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| {
+                crate::locale::text(
+                    "商店来源未能确认保存，请重试。",
+                    "The store source save could not be confirmed. Try again.",
+                )
+                .to_string()
+            })
     }
 }
 

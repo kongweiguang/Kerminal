@@ -772,12 +772,18 @@ impl DesktopComposition {
             .system_locale
             .clone()
             .unwrap_or_else(|| "en".into());
-        let theme = match self.preferences.load_settings().await?.settings.theme_mode {
+        // 一次读取同时供主题和插件目录来源使用，避免两次加载之间设置被改写后
+        // 组合根拿到不一致的配置。
+        let settings = self.preferences.load_settings().await?.settings;
+        let theme = match settings.theme_mode {
             kerminal_application::preferences::settings::ThemeMode::Dark => "dark",
             kerminal_application::preferences::settings::ThemeMode::Light => "light",
             kerminal_application::preferences::settings::ThemeMode::System => "system",
         };
-        let catalog = Arc::new(CatalogClient::for_runtime(self.storage.clone())?);
+        let catalog = Arc::new(CatalogClient::for_runtime(
+            self.storage.clone(),
+            &settings.plugin_catalog_url,
+        )?);
         let platform = crate::plugins::startup::current_platform()?;
         let plugins = crate::plugins::assembly::DesktopPlugins::new(
             startup.clone(),

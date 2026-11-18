@@ -108,7 +108,7 @@ function Assert-NoRestartFailure {
 }
 
 function Assert-FinalRestartEvidence {
-    # 最终必须复核四个独立退出句柄与导演Job的零存活后代；仅见成功报告不足以证明资源回收。
+    # 最终必须复核三个独立退出句柄与导演Job的零存活后代；仅见成功报告不足以证明资源回收。
     # @author kongweiguang
     param($Owner,$Handles,$ExpectedCount,[string]$RunRoot)
     $settle=[DateTime]::UtcNow.AddSeconds(15)
@@ -341,7 +341,7 @@ function Assert-RestartPersistence {
     # 标签恢复必须由具体 ID/草稿/实例/点击/保存数组解释；上一代期望独立传入，不能由布尔汇总代替。
     # processGeneration 只要求非零存在，不假设跨进程数值递增。
     # @author kongweiguang
-    param($Observed,[ValidateRange(0,3)][int]$Phase,$ExpectedTabs)
+    param($Observed,[ValidateRange(0,2)][int]$Phase,$ExpectedTabs)
     $p=Get-RestartRequiredField $Observed 'persistence'
     if((Get-RestartUInt (Get-RestartRequiredField $p 'schemaVersion') 'persistence schemaVersion') -ne 1){throw 'Invalid restart persistence schemaVersion.'}
     if((Get-RestartUInt (Get-RestartRequiredField $p 'phase') 'persistence phase') -ne $Phase){throw 'Invalid restart persistence phase.'}
@@ -422,11 +422,7 @@ function Assert-RestartPersistence {
     if($Phase -eq 1){
         if($saves.Count -ne 2 -or @($saves | ForEach-Object tabId | Sort-Object -Unique).Count -ne 2 -or @($saves | ForEach-Object input | Sort-Object -Unique).Count -ne 2){throw '1.0 seed generation must save two distinct tabs and inputs.'}
         foreach($tab in $beforeOrder){if($tab.draft -ceq $saves[-1].input){throw '1.0 tab draft equals the final global plugin state.'}}
-    }elseif($Phase -eq 2){
-        if($saves.Count -ne 0){throw '1.1 restore generation must not save.'}
-    }else{
-        if($saves.Count -ne 1 -or $saves[0].input -cne $before[$saves[0].tabId].draft){throw 'Rollback must save the active tab draft once.'}
-    }
+    }elseif($saves.Count -ne 0){throw '1.1 restore generation must not save.'}
     $checks=Get-RestartRequiredField $p 'checks'
     foreach($field in @('distinctTabIds','distinctInstances','distinctViewIds','distinctDrafts','stableViewIdPerTab','nonTargetDraftsPreserved')){
         Assert-RestartBoolean (Get-RestartRequiredField $checks $field) $true "persistence checks $field"
@@ -498,10 +494,11 @@ function Get-RestartActiveRenderer {
 function Assert-RestartEvidence {
     # 各代分别核对控件语义、动作数据和帧证据，不能把离屏绘制或 fixture 声明当成物理画面。
     # @author kongweiguang
-    param($Observed,[ValidateRange(0,3)][int]$Phase)
-    $version=@($null,'1.0.0','1.1.0','1.0.0')[$Phase]
-    $operation=@('local-file-initial-install','local-file-update','rollback','exit')[$Phase]
-    $intent=if($Phase -lt 3){'RestartForExtensions'}else{'Exit'}
+    param($Observed,[ValidateRange(0,2)][int]$Phase)
+    # 主线单版本目录固定拒绝回退，验收只保留空根、1.0 和升级后的 1.1 三代。
+    $version=@($null,'1.0.0','1.1.0')[$Phase]
+    $operation=@('local-file-initial-install','local-file-update','exit')[$Phase]
+    $intent=if($Phase -lt 2){'RestartForExtensions'}else{'Exit'}
     Assert-RestartString (Get-RestartRequiredField $Observed 'status') 'observed' 'status'
     if((Get-RestartUInt (Get-RestartRequiredField $Observed 'schemaVersion') 'schemaVersion') -ne 1){throw 'Invalid restart evidence: schemaVersion'}
     if((Get-RestartUInt (Get-RestartRequiredField $Observed 'phase') 'phase') -ne $Phase){throw 'Invalid restart evidence: phase'}
@@ -624,7 +621,8 @@ try {
         $deadline=[DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         $generationReceipts=@()
         $expectedTabs=$null
-        foreach($phase in 0..3){
+        # 主线单版本目录已移除人工回退，验收只有空根、1.0 和升级后的 1.1 三代。
+        foreach($phase in 0..2){
             Assert-NoRestartFailure -RunRoot $output
             $startup=Wait-RestartReceipt -Path (Join-Path $output "startup-$phase.json") -RunRoot $output -Deadline $deadline -Owner $owner
             $expected=$(if($phase -eq 0){$null}elseif($phase -eq 2){'1.1.0'}else{'1.0.0'})
@@ -659,8 +657,8 @@ try {
             $expectedTabs=if($null -eq $persistenceGate){$null}else{$persistenceGate.Tabs}
             $observedPath=Join-Path $output "observed-$phase.json"
             $completion=Wait-RestartReceipt -Path (Join-Path $output "completion-$phase.json") -RunRoot $output -Deadline $deadline -Owner $owner
-            $operation=@('local-file-initial-install','local-file-update','rollback','exit')[$phase]
-            $intent=if($phase -lt 3){'RestartForExtensions'}else{'Exit'}
+            $operation=@('local-file-initial-install','local-file-update','exit')[$phase]
+            $intent=if($phase -lt 2){'RestartForExtensions'}else{'Exit'}
             Assert-RestartCompletion -Completion $completion -ObservedPath $observedPath -Phase $phase -ProcessId ([UInt64]$handle.ProcessId) -Operation $operation -Intent $intent
             $frameVersion=$(if($phase -eq 0){'bootstrap'}else{$expected})
             $bytes=[IO.File]::ReadAllBytes((Join-Path $output "native-$phase-$frameVersion.png"))
@@ -670,20 +668,20 @@ try {
             Assert-NoRestartFailure -RunRoot $output
             $generationReceipts+=[pscustomobject]@{Phase=$phase;ProcessId=$handle.ProcessId;ExitCode=0;Executable=$handle.Executable;Startup="startup-$phase.json";Observed="observed-$phase.json";Completion="completion-$phase.json";NativeFrame="native-$phase-$frameVersion.png"}
         }
-        if($handles.Count -ne 4){throw 'Four distinct normal process exits were not proven.'}
-        $job=Assert-FinalRestartEvidence -Owner $owner -Handles $handles -ExpectedCount 4 -RunRoot $output
+        if($handles.Count -ne 3){throw 'Three distinct normal process exits were not proven.'}
+        $job=Assert-FinalRestartEvidence -Owner $owner -Handles $handles -ExpectedCount 3 -RunRoot $output
         $logs=(@(Get-ChildItem -LiteralPath (Join-Path $config 'logs') -Filter '*.log' | ForEach-Object {[IO.File]::ReadAllText($_.FullName)}) -join "`n")
         $lifecycle=@{}
         foreach($event in @('HOST_COMPOSITION_STOP_COMPLETE','HOST_LISTENER_STOP_COMPLETE','DESKTOP_RUNTIME_STOP_COMPLETE')){
             $count=[regex]::Matches($logs,('event='+$event+'(?=\s|$)')).Count
-            if($count -lt 4){throw "Production lifecycle log is incomplete: $event"}
+            if($count -lt 3){throw "Production lifecycle log is incomplete: $event"}
             $lifecycle[$event]=$count
         }
         $restartSubmitted=[regex]::Matches($logs,'event=HOST_RESTART_SUBMITTED(?=\s|$)').Count
-        if($restartSubmitted -ne 3){throw 'Three production restart commands were not submitted.'}
+        if($restartSubmitted -ne 2){throw 'Two production restart commands were not submitted.'}
         $lifecycle['HOST_RESTART_SUBMITTED']=$restartSubmitted
         $restartCount=[regex]::Matches($logs,'event=HOST_RESTART_COMPLETE(?=\s|$)').Count
-        if($restartCount -ne 3){throw 'Three production HostCoordinator restarts were not proven.'}
+        if($restartCount -ne 2){throw 'Two production HostCoordinator restarts were not proven.'}
         $lifecycle['HOST_RESTART_COMPLETE']=$restartCount
         $quitSubmitted=[regex]::Matches($logs,'event=HOST_QUIT_SUBMITTED(?=\s|$)').Count
         $quitComplete=[regex]::Matches($logs,'event=HOST_QUIT_COMPLETE(?=\s|$)').Count

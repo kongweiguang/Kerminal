@@ -148,3 +148,85 @@ fn windows_launcher_search_environment_is_explicit_and_overridable() {
     assert_eq!(absent.get_env("PATH"), None);
     assert_eq!(absent.get_env("PATHEXT"), None);
 }
+
+/// 测试专用的 source 桥接错误：外层 io 的 source() 返回本错误，本错误的 source() 再返回
+/// 内层 os error；用于验证标准 Error::source 链确实包含内层 io。不是 std::io::Error 嵌套
+/// 容器本体的覆盖——后者 source() 会跳过内层本体。
+///
+/// @author kongweiguang
+#[derive(Debug)]
+struct OuterIo(std::io::Error);
+
+impl std::fmt::Display for OuterIo {
+    /// 固定安全占位文本，避免测试错误信息携带路径或命令；只用于构造 source 链。
+    ///
+    /// @author kongweiguang
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("outer io")
+    }
+}
+
+impl std::error::Error for OuterIo {
+    /// 把内层 os error 作为标准 source 暴露，使 anyhow 链可继续 downcast 到内层 io。
+    ///
+    /// @author kongweiguang
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// 探针在 anyhow 链中逐层 downcast io::Error 并取 raw_os_error；外层 raw=None 时不能
+/// 提前停止，必须继续找到内层 OS 错误。输出行只含固定枚举和数字。
+///
+/// @author kongweiguang
+#[test]
+fn spawn_probe_extracts_nested_io_and_classifies_fixed_stage() {
+    let outer = std::io::Error::other(OuterIo(std::io::Error::from_raw_os_error(5)));
+    let error = anyhow::Error::new(outer).context("CreateProcessW failed");
+    assert!(
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.raw_os_error() == Some(5))
+        }),
+        "standard Error::source chain must include the inner io"
+    );
+    let (stage, raw_os_error) = classify_spawn_error(&error);
+    assert_eq!(stage, SpawnProbeStage::CreateProcess);
+    assert_eq!(raw_os_error, Some(5));
+    let line = format_spawn_probe_line(stage, raw_os_error);
+    assert_eq!(
+        line,
+        "KERMINAL_ACCEPTANCE_PTY_PROBE stage=create_process raw_os_error=5"
+    );
+}
+
+/// 真实 vendor 固定 context 必须精确分类；同前缀后的动态 payload 与敏感文本不进入输出。
+///
+/// @author kongweiguang
+#[test]
+fn spawn_probe_matches_real_vendor_contexts_and_never_leaks_text() {
+    for (text, expected) in [
+        (
+            r"UpdateProcThreadAttribute for Job List failed: Access is denied. (os error 5) C:\secret\cmd.exe --token abc",
+            SpawnProbeStage::Attribute,
+        ),
+        ("AssignProcessToJobObject failed", SpawnProbeStage::Job),
+        ("CreateProcessW failed", SpawnProbeStage::CreateProcess),
+        (
+            r"unclassified vendor failure C:\secret\cmd.exe --token abc",
+            SpawnProbeStage::Unknown,
+        ),
+    ] {
+        let error = anyhow::anyhow!(text);
+        let (stage, raw_os_error) = classify_spawn_error(&error);
+        assert_eq!(stage, expected);
+        assert_eq!(raw_os_error, None);
+        let line = format_spawn_probe_line(stage, raw_os_error);
+        assert!(line.contains("raw_os_error=unknown"));
+        assert!(
+            !line.contains("secret") && !line.contains("token") && !line.contains("cmd.exe"),
+            "probe line must not leak source text: {line}"
+        );
+    }
+}

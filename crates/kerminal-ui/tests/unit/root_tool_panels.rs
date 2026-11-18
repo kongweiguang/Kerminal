@@ -72,6 +72,7 @@ use crate::{
 };
 
 // 共享命令服务 fixture 在 crate 根只声明一次，这里用 use 引入，避免重复载入。
+use crate::features::agents::test_support::{FixtureAgentService, fixture_agent_view};
 use crate::root_commands_service;
 
 /// 生产切换分支仅在明确打开居中宿主时迁移焦点；普通 render、关闭和更高层 owner 都保留原输入控件。
@@ -1831,6 +1832,111 @@ fn split_focus_switch_keeps_retained_plugin_tool_mounted(app: &mut TestAppContex
         "after the split switch the retained view must never render with pane A"
     );
 
+    // 窗口失活再激活：两个方向的首个绘制帧都必须直接使用当前 window_active 的已确认
+    // 工具投影，不能先画 unavailable 占位再 defer 恢复；同一保活实体和目标身份保持不变。
+    let entity_before_reactivation = fixture_view.entity_id();
+    let target_before_reactivation = visual.update(|_, app| {
+        root.read_with(app, |root, _| root.projected_logs_target_for_test.clone())
+    });
+    visual.update(|_, app| {
+        root.update(app, |root, _| {
+            root.plugin_tools.reset_unavailable_fallback_renders()
+        });
+    });
+    visual.deactivate_window();
+    visual.update(|window, app| {
+        state
+            .rendered_contexts
+            .lock()
+            .expect("render context lock")
+            .clear();
+        fixture_view.update(app, |_, cx| cx.notify());
+        window.draw(app).clear(app);
+        assert!(
+            !window.is_window_active(),
+            "the deactivation first frame must project the inactive window"
+        );
+        let live_id: gpui_kit::ElementId = "fixture-split-tool-live".into();
+        let retry_id: gpui_kit::ElementId = "retry-plugin-tool-fixture.split-tool".into();
+        let snapshots = gpui_kit::base::test_support::snapshots(window);
+        let live_visible = snapshots
+            .iter()
+            .any(|node| node.visible() && node.path().contains(&live_id));
+        let retry_visible = snapshots
+            .iter()
+            .any(|node| node.visible() && node.path().contains(&retry_id));
+        assert!(
+            live_visible,
+            "the first deactivation frame must mount the retained tool content"
+        );
+        assert!(
+            !retry_visible,
+            "deactivation must not flash the unavailable recovery surface"
+        );
+    });
+    settle_split_fixture(&runtime, visual);
+    visual.update(|window, _| window.activate_window());
+    // 只绘制激活后的第一帧，不先跑 deferred effect；修复必须在事件阶段已提交 (true, true)。
+    visual.run_until_parked();
+    visual.update(|window, app| {
+        state
+            .rendered_contexts
+            .lock()
+            .expect("render context lock")
+            .clear();
+        fixture_view.update(app, |_, cx| cx.notify());
+        window.draw(app).clear(app);
+        assert!(
+            window.is_window_active(),
+            "the activation first frame must project the active window"
+        );
+        let live_id: gpui_kit::ElementId = "fixture-split-tool-live".into();
+        let retry_id: gpui_kit::ElementId = "retry-plugin-tool-fixture.split-tool".into();
+        let snapshots = gpui_kit::base::test_support::snapshots(window);
+        assert!(
+            snapshots
+                .iter()
+                .any(|node| node.visible() && node.path().contains(&live_id)),
+            "the first draw after reactivation must mount the retained tool content"
+        );
+        assert!(
+            !snapshots
+                .iter()
+                .any(|node| node.visible() && node.path().contains(&retry_id)),
+            "reactivation must not flash the unavailable recovery surface"
+        );
+        let created_views = state
+            .created_views
+            .lock()
+            .expect("created views lock")
+            .clone();
+        assert_eq!(
+            created_views.len(),
+            1,
+            "reactivation must not recreate the retained tool"
+        );
+        assert_eq!(
+            created_views[0].entity_id(),
+            entity_before_reactivation,
+            "reactivation must keep the original retained tool entity"
+        );
+        assert_eq!(
+            root.read_with(app, |root, _| root.projected_logs_target_for_test.clone()),
+            target_before_reactivation,
+            "reactivation must not rebind the tool target"
+        );
+    });
+    visual.update(|_, app| {
+        let fallback_renders = root
+            .read(app)
+            .plugin_tools
+            .unavailable_fallback_render_count();
+        assert_eq!(
+            fallback_renders, 0,
+            "the deactivation/activation transition must never render the unavailable fallback"
+        );
+    });
+
     // 失败路径：切回 A 并让 A 的 context_changed 失败。此时若宿主放宽门禁，
     // 用户会继续操作旧 B 目标的工具；回归要求旧目标立即不可挂载，并展示真实的局部恢复面。
     state
@@ -2356,6 +2462,101 @@ fn split_focus_switch_keeps_retained_plugin_tool_mounted(app: &mut TestAppContex
                 .iter()
                 .any(|node| node.visible() && node.path().contains(&live_id)),
             "a closed tool must not render its retained content"
+        );
+    });
+}
+
+/// 内置 AgentLauncher 在窗口失活/激活过渡中不得渲染恢复占位；首帧仍挂载同一 AgentsPanel 实体。
+/// 使用生产 render 的可见 fallback 计数取证，覆盖 run_until_parked 后最终快照看不到的首帧。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn agent_launcher_builtin_survives_window_activation_round_trip(app: &mut TestAppContext) {
+    let (runtime, root, visual) =
+        crate::root::external_auth::tests::host_file_workspace_fixture(app, |services| {
+            let (commands, _) =
+                root_commands_service::empty_commands_service_with_calls(services.sessions.clone());
+            let agent_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let agents =
+                Arc::new(agent_runtime.block_on(FixtureAgentService::new(fixture_agent_view())));
+            services
+                .with_commands(Arc::new(commands))
+                .with_agents(agents)
+        });
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    settle_split_fixture(&runtime, visual);
+    visual.update(|window, app| {
+        window.activate_window();
+        root.update(app, |root, cx| {
+            let mut tool_rail = ToolRailSettings::default();
+            tool_rail.panel_placements.insert(
+                ToolRailToolId::AgentLauncher,
+                ToolRailPanelPlacement::Attached,
+            );
+            root.settings_snapshot = Some(SettingsSnapshot {
+                tool_rail,
+                ..Default::default()
+            });
+            root.toggle_tool_rail_panel(ToolRailToolId::AgentLauncher, window, cx);
+            cx.notify();
+        });
+        window.draw(app).clear(app);
+    });
+    settle_split_fixture(&runtime, visual);
+    let entity_before =
+        visual.update(|_, app| root.read(app).agents_panel.as_ref().map(Entity::entity_id));
+    assert!(
+        entity_before.is_some(),
+        "AgentLauncher must mount the production AgentsPanel entity"
+    );
+    visual.update(|_, app| {
+        root.update(app, |root, _| {
+            root.plugin_tools.reset_unavailable_fallback_renders()
+        });
+    });
+
+    visual.deactivate_window();
+    visual.update(|window, app| {
+        window.draw(app).clear(app);
+        assert!(!window.is_window_active());
+        let unavailable: gpui_kit::ElementId = "tool-agent-launcher-unavailable".into();
+        let snapshots = gpui_kit::base::test_support::snapshots(window);
+        assert!(
+            !snapshots
+                .iter()
+                .any(|node| node.visible() && node.path().contains(&unavailable)),
+            "deactivation must not render the AgentLauncher unavailable surface"
+        );
+    });
+    settle_split_fixture(&runtime, visual);
+    visual.update(|window, _| window.activate_window());
+    visual.run_until_parked();
+    visual.update(|window, app| {
+        window.draw(app).clear(app);
+        assert!(window.is_window_active());
+        let unavailable: gpui_kit::ElementId = "tool-agent-launcher-unavailable".into();
+        let snapshots = gpui_kit::base::test_support::snapshots(window);
+        assert!(
+            !snapshots
+                .iter()
+                .any(|node| node.visible() && node.path().contains(&unavailable)),
+            "activation must not render the AgentLauncher unavailable surface"
+        );
+        let entity_after = root.read(app).agents_panel.as_ref().map(Entity::entity_id);
+        assert_eq!(
+            entity_after, entity_before,
+            "AgentLauncher must keep the same AgentsPanel entity across activation changes"
+        );
+        let fallback_renders = root
+            .read(app)
+            .plugin_tools
+            .unavailable_fallback_render_count();
+        assert_eq!(
+            fallback_renders, 0,
+            "the AgentLauncher activation transition must never render the unavailable fallback"
         );
     });
 }

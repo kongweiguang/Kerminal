@@ -252,6 +252,10 @@ pub struct PluginTools {
     /// `#[cfg(test)]` 项，常驻一个空集合的代价远小于为测试另建可变观察通道。
     #[cfg_attr(not(test), allow(dead_code))]
     attempted_projection_generations: Vec<u64>,
+    /// 可见工具在 render 时落到恢复占位的次数，仅测试或原生验收构建记录并读取。
+    /// 普通生产构建不 clone 可见集合、不逐工具 contains，也不写入该计数。
+    #[cfg_attr(not(any(test, feature = "right-rail-acceptance")), allow(dead_code))]
+    unavailable_fallback_renders: usize,
     builtin_views: BTreeMap<ToolRailToolId, Option<EntityId>>,
 }
 
@@ -305,6 +309,33 @@ impl PluginTools {
             self.attempted_projection_generations
                 .push(ticket.generation);
         }
+    }
+
+    /// 可见工具在本帧落到恢复占位时计数；只用于证明窗口激活过渡没有产生恢复面。
+    /// 用 `cfg!` 运行期分支代替条件编译语句，普通生产构建不保留计数写入；
+    /// `right-rail-acceptance` 构建保留，供原生首帧取证。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn note_unavailable_fallback_render(&mut self) {
+        if cfg!(any(test, feature = "right-rail-acceptance")) {
+            self.unavailable_fallback_renders = self.unavailable_fallback_renders.saturating_add(1);
+        }
+    }
+
+    /// 首帧回归取证：重置可见工具落到恢复占位的计数。
+    ///
+    /// @author kongweiguang
+    #[cfg_attr(not(any(test, feature = "right-rail-acceptance")), allow(dead_code))]
+    pub(crate) fn reset_unavailable_fallback_renders(&mut self) {
+        self.unavailable_fallback_renders = 0;
+    }
+
+    /// 首帧回归取证：读取可见工具落到恢复占位的次数。
+    ///
+    /// @author kongweiguang
+    #[cfg_attr(not(any(test, feature = "right-rail-acceptance")), allow(dead_code))]
+    pub(crate) fn unavailable_fallback_render_count(&self) -> usize {
+        self.unavailable_fallback_renders
     }
 
     /// 附属工具的后台采集需要已挂载且窗口激活，终端画布则单独按可见性更新。

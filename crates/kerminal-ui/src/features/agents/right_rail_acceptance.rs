@@ -13,6 +13,8 @@ pub(crate) struct AgentAcceptancePanelSnapshot {
     pub status: Option<String>,
     pub selected: Option<AgentSessionView>,
     pub sessions: Vec<AgentSessionView>,
+    /// 当前历史过滤；原生 activity 前后必须保持不变。
+    pub history_mode: AgentHistoryMode,
 }
 
 impl AgentsPanel {
@@ -73,6 +75,7 @@ impl AgentsPanel {
     }
 
     /// 仅以已配置的本轮 custom key 调用正式新建动作，拒绝重复开始或回退 builtin。
+    /// 顶部“进入”现在只创建新会话，因此直接复用生产入口动作，不再走临时选择桥。
     ///
     /// @author kongweiguang
     pub(crate) fn right_rail_acceptance_create_agent(
@@ -240,6 +243,7 @@ impl AgentsPanel {
             status: self.status.clone(),
             selected: self.selected_view().cloned(),
             sessions: self.sessions.clone(),
+            history_mode: self.history_mode,
         }
     }
 }

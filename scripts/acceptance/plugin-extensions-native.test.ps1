@@ -30,10 +30,32 @@ function Assert-ExtensionsRejects {
     if($Field){Assert-True ($failure.Exception.Message.Contains($Field)) "Strict rejection did not identify ${Field}: $failure"}
 }
 
+function New-SyntheticUnifiedPage {
+    # 与真实 acceptance_snapshot 同形的统一列表页；组顺序、折叠与批量字段由各阶段覆盖。
+    # @author kongweiguang
+    param([bool]$BuiltinCollapsed,[bool]$BackToList=$true,[double]$ContentWidth=903.0,$Selected=$null)
+    return [pscustomobject]@{page=[pscustomobject]@{
+        catalog_entries=2;installed=4;pending=2;offline=$false;busy=$false;selected=$Selected;error=$null
+        catalog_error=$null;state_error=$null;readme_error=$null;confirmation_visible=$false
+        confirmation_kind=$null;confirmation_id=$null;confirmation_permissions=$null;pending_restart=$true
+        content_width=$ContentWidth;back_to_list=$BackToList
+        groups=@(
+            [pscustomobject]@{kind='builtin';count=4;collapsed=$BuiltinCollapsed}
+            [pscustomobject]@{kind='pending';count=2;collapsed=$false}
+            [pscustomobject]@{kind='market';count=1;collapsed=$false}
+        )
+        update_candidates=0;batch_items=@();batch_progress=$null
+    }}
+}
+
 function New-SyntheticExtensionsReport {
     # 构造与候选报告同形的内存回执，便于逐一破坏每个独立证据门禁。
     # @author kongweiguang
-    param([string]$Desktop,[string]$Candidate,[string]$PackageHash)
+    param([string]$Desktop,[string]$Candidate,[string]$PackageHash,[string]$SourceUrl)
+    $narrowList=New-SyntheticUnifiedPage -BuiltinCollapsed $true -ContentWidth 640.0
+    $narrowDetail=New-SyntheticUnifiedPage -BuiltinCollapsed $true -BackToList $false -ContentWidth 640.0 -Selected 'acme.market-one'
+    $narrowReturned=New-SyntheticUnifiedPage -BuiltinCollapsed $true -ContentWidth 640.0
+    $sourceEntry='real header button opens the window dialog; unchanged backfilled fixture URL is saved through the settings CAS and load_settings read-back'
     return ([ordered]@{
         schemaVersion=1
         mode='private-desktop-composition'
@@ -45,6 +67,7 @@ function New-SyntheticExtensionsReport {
         quitReceipt=$true
         resourcesShutdownComplete=$true
         runtimeShutdownObserved=$false
+        inputMode='synthetic GPUI pointer dispatch to focus the extension list plus real Home/End/arrow keystrokes; production file-picker result entry'
         candidateSha256=$Candidate
         localPackageSha256=$PackageHash
         nativeIsolation=[pscustomobject]@{platformSupported=$true;isolationProven=$true;processId=1234;uiThreadId=99;uiThreadDesktopName=$Desktop;inputDesktopName='Default';foregroundWindowPid=4321}
@@ -52,11 +75,41 @@ function New-SyntheticExtensionsReport {
         scaleFactor=1.25
         frameEvidence=[pscustomobject]@{source='gpui-render-to-image';validation='png-structure-crc-and-dimensions';featurePixelsChecked=$false;systemComposition='not-observed'}
         market=[pscustomobject]@{page=[pscustomobject]@{catalog_entries=2;busy=$false;offline=$false;error=$null}}
+        source=[pscustomobject]@{
+            entry=$sourceEntry
+            before=[pscustomobject]@{page=[pscustomobject]@{source_url=$SourceUrl;source_dialog_open=$false;source_saving=$false;source_error=$null}}
+            dialog=[pscustomobject]@{page=[pscustomobject]@{source_url=$SourceUrl;source_dialog_open=$true;source_saving=$false;source_error=$null}}
+            saved=[pscustomobject]@{page=[pscustomobject]@{source_url=$SourceUrl;source_dialog_open=$false;source_saving=$false;source_error=$null;catalog_entries=2;offline=$false;busy=$false}}
+            screenshot='source-dialog.png'
+            configUrl=$SourceUrl
+            runtimeUrl=$SourceUrl
+            expectedUrl=$SourceUrl
+            configMatchesRuntime=$true
+        }
         selection=[pscustomobject]@{page=[pscustomobject]@{selected='acme.market-two'}}
         catalogConfirmation=[pscustomobject]@{page=[pscustomobject]@{confirmation_kind='install';confirmation_id='acme.market-two'}}
         catalogInstalled=[pscustomobject]@{page=[pscustomobject]@{pending=1;busy=$false;confirmation_visible=$false;pending_restart=$true}}
         confirmation=[pscustomobject]@{page=[pscustomobject]@{confirmation_visible=$true;busy=$false;confirmation_kind='file';confirmation_id='acme.file-search';confirmation_permissions=@('full-access')}}
         installed=[pscustomobject]@{page=[pscustomobject]@{pending=2;busy=$false;confirmation_visible=$false;pending_restart=$true;error=$null}}
+        unifiedList=[pscustomobject]@{
+            collapsed=(New-SyntheticUnifiedPage -BuiltinCollapsed $true)
+            expanded=(New-SyntheticUnifiedPage -BuiltinCollapsed $false)
+            collapsedAgain=(New-SyntheticUnifiedPage -BuiltinCollapsed $true)
+            screenshots=@('unified-list.png','builtin-expanded.png','builtin-collapsed.png')
+            entry='real unified list; builtin group header click toggles expansion'
+            installedGroupObserved=$false
+            updateCandidates=0
+            batchUpdateNativeCovered=$false
+            batchUpdateNotCoveredReason='fixture has no installed updatable records; update-all was not exercised'
+        }
+        narrow=[pscustomobject]@{
+            viewport=@(700.0,800.0)
+            list=$narrowList
+            detail=$narrowDetail
+            returned=$narrowReturned
+            screenshots=@('narrow-list.png','narrow-detail.png','narrow-list-returned.png')
+            dpi200PercentTested=$false
+        }
         pendingCountReadBack=2
         pendingPluginIds=@('acme.market-two','acme.file-search')
     } | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
@@ -66,7 +119,7 @@ $path=Join-Path $PSScriptRoot 'plugin-extensions-native.ps1'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
 Assert-True ($errors.Count -eq 0) "Invalid P5 PowerShell: $($errors -join '; ')"
-foreach($name in @('Get-ExtensionsStrictBoolean','Assert-ExtensionsBoolean','Get-ExtensionsStrictInteger','Get-ExtensionsStrictNumber','Get-ExtensionsStrictString','Assert-ExtensionsString','Assert-ExtensionsDigest','Get-ExtensionsStringSet','Get-ExtensionsSnapshotPage','Get-ExtensionsJobActiveProcesses','Get-ExtensionsFrameDimensions','Assert-ExtensionsFrameDimensions','Initialize-ExtensionsNativeEvidence','Read-ExtensionsPngEvidence','Assert-ExtensionsAcceptanceReport','Stop-ExtensionsOwnedProcess','Stop-ExtensionsFixture','Initialize-ExtensionsLauncher')){
+foreach($name in @('Get-ExtensionsStrictBoolean','Assert-ExtensionsBoolean','Get-ExtensionsStrictInteger','Get-ExtensionsStrictNumber','Get-ExtensionsStrictString','Assert-ExtensionsString','Assert-ExtensionsDigest','Get-ExtensionsStringSet','Get-ExtensionsSnapshotPage','Get-ExtensionsProperty','Get-ExtensionsGroups','Get-ExtensionsGroup','Assert-ExtensionsUnifiedPage','Assert-ExtensionsSourcePage','Get-ExtensionsJobActiveProcesses','Get-ExtensionsFrameDimensions','Assert-ExtensionsFrameDimensions','Initialize-ExtensionsNativeEvidence','Read-ExtensionsPngEvidence','Assert-ExtensionsAcceptanceReport','Stop-ExtensionsOwnedProcess','Stop-ExtensionsFixture','Assert-ExtensionsFixtureLogs','Initialize-ExtensionsLauncher')){
     $matches=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
     Assert-True ($matches.Count -eq 1) "Missing or ambiguous function: $name"
     $definition=$matches[0].Extent.Text
@@ -113,15 +166,51 @@ foreach($value in @(('A'*64),('a'*63),'not-a-digest',1,$null)){Assert-Extensions
 $set=Get-ExtensionsStringSet -Value @('one','two') -Field $field
 Assert-True ($set.Count -eq 2) 'A unique string array was rejected.'
 foreach($value in @('one',@('one','one'),@('one',1),@('', 'two'),$null)){Assert-ExtensionsRejects {Get-ExtensionsStringSet -Value $value -Field $field} $field}
+# 嵌套空数组经 ConvertFrom-Json 仍是零元素 IList；统一列表的批量项检查
+# 复用同一严格集合检查，非空数组和字符串由报告反例覆盖。
+Assert-True (@(Get-ExtensionsStringSet -Value @() -Field $field).Count -eq 0) 'An empty batch item array must be accepted as empty.'
 $page=Get-ExtensionsSnapshotPage -Snapshot ([pscustomobject]@{page=[pscustomobject]@{value=1}}) -Field 'snapshot'
 Assert-True ($page.value -eq 1) 'A valid page snapshot was rejected.'
 Assert-ExtensionsRejects {Get-ExtensionsSnapshotPage -Snapshot ([pscustomobject]@{}) -Field 'snapshot'} 'Missing page snapshot'
 Assert-ExtensionsRejects {Get-ExtensionsSnapshotPage -Snapshot ([pscustomobject]@{page='invalid'}) -Field 'snapshot'} 'Missing page snapshot'
 
+# 属性访问器必须原样保留空数组、单项数组、多项数组、标量和 null；
+# PowerShell 函数输出会枚举数组，空数组若丢失会伪装成缺失值，破坏严格字段校验。
+$propertyObject=[pscustomobject]@{empty=@();single=@('one');multi=@('one','two');scalar='value';null=$null}
+$empty=Get-ExtensionsProperty -Object $propertyObject -Name 'empty' -Field $field
+Assert-True ($empty -is [System.Collections.IList] -and $empty.Count -eq 0) 'An empty property array was not preserved.'
+$single=Get-ExtensionsProperty -Object $propertyObject -Name 'single' -Field $field
+Assert-True ($single -is [System.Collections.IList] -and $single.Count -eq 1 -and $single[0] -ceq 'one') 'A single-item property array was not preserved.'
+$multi=Get-ExtensionsProperty -Object $propertyObject -Name 'multi' -Field $field
+Assert-True ($multi -is [System.Collections.IList] -and $multi.Count -eq 2 -and $multi[1] -ceq 'two') 'A multi-item property array was not preserved.'
+$scalar=Get-ExtensionsProperty -Object $propertyObject -Name 'scalar' -Field $field
+Assert-True ($scalar -ceq 'value') 'A scalar property was not preserved.'
+$nullValue=Get-ExtensionsProperty -Object $propertyObject -Name 'null' -Field $field
+Assert-True ($null -eq $nullValue) 'A null property was not preserved.'
+Assert-ExtensionsRejects {Get-ExtensionsProperty -Object $propertyObject -Name 'missing' -Field $field} 'Missing field'
+Assert-ExtensionsRejects {Get-ExtensionsProperty -Object $null -Name 'empty' -Field $field} $field
+Assert-ExtensionsRejects {Get-ExtensionsProperty -Object 'text' -Name 'empty' -Field $field} $field
+# 真实 JSON 往返：ConvertFrom-Json 的嵌套空数组是零元素 IList，访问器不能把它变成 null。
+$roundTrip='{"empty":[],"single":["one"],"multi":["one","two"],"scalar":"value","null":null}'|ConvertFrom-Json
+$jsonEmpty=Get-ExtensionsProperty -Object $roundTrip -Name 'empty' -Field $field
+Assert-True ($jsonEmpty -is [System.Collections.IList] -and $jsonEmpty.Count -eq 0) 'A JSON round-trip empty array was not preserved.'
+$jsonSingle=Get-ExtensionsProperty -Object $roundTrip -Name 'single' -Field $field
+Assert-True ($jsonSingle -is [System.Collections.IList] -and $jsonSingle.Count -eq 1 -and $jsonSingle[0] -ceq 'one') 'A JSON round-trip single-item array was not preserved.'
+$jsonMulti=Get-ExtensionsProperty -Object $roundTrip -Name 'multi' -Field $field
+Assert-True ($jsonMulti -is [System.Collections.IList] -and $jsonMulti.Count -eq 2 -and $jsonMulti[1] -ceq 'two') 'A JSON round-trip multi-item array was not preserved.'
+$jsonScalar=Get-ExtensionsProperty -Object $roundTrip -Name 'scalar' -Field $field
+Assert-True ($jsonScalar -ceq 'value') 'A JSON round-trip scalar was not preserved.'
+$jsonNull=Get-ExtensionsProperty -Object $roundTrip -Name 'null' -Field $field
+Assert-True ($null -eq $jsonNull) 'A JSON round-trip null was not preserved.'
+# 严格类型不放松：保留后的空数组仍必须通过字符串集合检查，非数组标量仍被拒绝。
+Assert-True (@(Get-ExtensionsStringSet -Value $jsonEmpty -Field $field).Count -eq 0) 'A preserved empty array must remain a valid empty string set.'
+Assert-ExtensionsRejects {Get-ExtensionsStringSet -Value $jsonScalar -Field $field} $field
+
 $desktop='KerminalRail-settings-'+('a'*32)
 $candidate='c'*64
 $packageHash='d'*64
-$report=New-SyntheticExtensionsReport -Desktop $desktop -Candidate $candidate -PackageHash $packageHash
+$sourceUrl='http://127.0.0.1:43210/catalog.json'
+$report=New-SyntheticExtensionsReport -Desktop $desktop -Candidate $candidate -PackageHash $packageHash -SourceUrl $sourceUrl
 $dimensions=Assert-ExtensionsAcceptanceReport -Report $report -ProcessId 1234 -Candidate $candidate -PackageHash $packageHash -Theme 'light' -Desktop $desktop -InputDesktop 'Default'
 Assert-True ($dimensions.Width -eq 1500 -and $dimensions.Height -eq 1000 -and $dimensions.Scale -eq 1.25) 'The synthetic viewport did not derive the expected pixel dimensions.'
 $jsonReport=$report | ConvertTo-Json -Depth 10 | ConvertFrom-Json
@@ -141,6 +230,7 @@ foreach($case in @(
     @{Name='resources-string';Field='resourcesShutdownComplete';Mutate={param($r) $r.resourcesShutdownComplete='true'}},
     @{Name='runtime-true';Field='runtimeShutdownObserved';Mutate={param($r) $r.runtimeShutdownObserved=$true}},
     @{Name='runtime-string';Field='runtimeShutdownObserved';Mutate={param($r) $r.runtimeShutdownObserved='false'}},
+    @{Name='input-mode';Field='inputMode';Mutate={param($r) $r.inputMode='synthetic pointer only'}},
     @{Name='candidate';Field='candidateSha256';Mutate={param($r) $r.candidateSha256='e'*64}},
     @{Name='candidate-uppercase';Field='candidateSha256';Mutate={param($r) $r.candidateSha256='C'*64}},
     @{Name='package';Field='localPackageSha256';Mutate={param($r) $r.localPackageSha256='e'*64}},
@@ -170,6 +260,28 @@ foreach($case in @(
     @{Name='market-count-string';Field='catalog_entries';Mutate={param($r) $r.market.page.catalog_entries='2'}},
     @{Name='market-offline';Field='offline';Mutate={param($r) $r.market.page.offline=$true}},
     @{Name='market-error';Field='error';Mutate={param($r) $r.market.page.error='failed'}},
+    @{Name='source-missing';Field='Source save evidence';Mutate={param($r) $r.PSObject.Properties.Remove('source')}},
+    @{Name='source-entry';Field='source.entry';Mutate={param($r) $r.source.entry='header click only'}},
+    @{Name='source-screenshot';Field='source.screenshot';Mutate={param($r) $r.source.screenshot='catalog.png'}},
+    @{Name='source-config-type';Field='source.configUrl';Mutate={param($r) $r.source.configUrl=1}},
+    @{Name='source-config-mismatch';Field='Source config';Mutate={param($r) $r.source.configUrl='http://127.0.0.1:43211/catalog.json'}},
+    @{Name='source-config-not-loopback';Field='Source URL';Mutate={param($r) $r.source.configUrl='https://example.com/catalog.json'}},
+    @{Name='source-matches-false';Field='source.configMatchesRuntime';Mutate={param($r) $r.source.configMatchesRuntime=$false}},
+    @{Name='source-matches-string';Field='source.configMatchesRuntime';Mutate={param($r) $r.source.configMatchesRuntime='true'}},
+    @{Name='source-before-url';Field='source.before.source_url';Mutate={param($r) $r.source.before.page.source_url='http://127.0.0.1:43211/catalog.json'}},
+    @{Name='source-before-url-type';Field='source.before.source_url';Mutate={param($r) $r.source.before.page.source_url=1}},
+    @{Name='source-before-dialog';Field='source.before.source_dialog_open';Mutate={param($r) $r.source.before.page.source_dialog_open=$true}},
+    @{Name='source-dialog-closed';Field='source.dialog.source_dialog_open';Mutate={param($r) $r.source.dialog.page.source_dialog_open=$false}},
+    @{Name='source-dialog-saving';Field='source.dialog.source_saving';Mutate={param($r) $r.source.dialog.page.source_saving=$true}},
+    @{Name='source-dialog-error';Field='source.dialog.source_error';Mutate={param($r) $r.source.dialog.page.source_error='failed'}},
+    @{Name='source-dialog-error-missing';Field='source.dialog.source_error';Mutate={param($r) $r.source.dialog.page.PSObject.Properties.Remove('source_error')}},
+    @{Name='source-saved-open';Field='source.saved.source_dialog_open';Mutate={param($r) $r.source.saved.page.source_dialog_open=$true}},
+    @{Name='source-saved-saving';Field='source.saved.source_saving';Mutate={param($r) $r.source.saved.page.source_saving=$true}},
+    @{Name='source-saved-error';Field='source.saved.source_error';Mutate={param($r) $r.source.saved.page.source_error='failed'}},
+    @{Name='source-saved-url';Field='source.saved.source_url';Mutate={param($r) $r.source.saved.page.source_url='http://127.0.0.1:43211/catalog.json'}},
+    @{Name='source-saved-count';Field='source.saved.catalog_entries';Mutate={param($r) $r.source.saved.page.catalog_entries=1}},
+    @{Name='source-saved-offline';Field='source.saved.offline';Mutate={param($r) $r.source.saved.page.offline=$true}},
+    @{Name='source-saved-busy';Field='source.saved.busy';Mutate={param($r) $r.source.saved.page.busy=$true}},
     @{Name='selection';Field='selected';Mutate={param($r) $r.selection.page.selected='acme.market-one'}},
     @{Name='catalog-kind';Field='confirmation_kind';Mutate={param($r) $r.catalogConfirmation.page.confirmation_kind='file'}},
     @{Name='catalog-id';Field='confirmation_id';Mutate={param($r) $r.catalogConfirmation.page.confirmation_id='other'}},
@@ -190,13 +302,60 @@ foreach($case in @(
     @{Name='pending-missing';Field='pendingPluginIds';Mutate={param($r) $r.pendingPluginIds=@('acme.market-two')}},
     @{Name='pending-extra';Field='pendingPluginIds';Mutate={param($r) $r.pendingPluginIds=@('acme.market-two','acme.file-search','acme.extra')}},
     @{Name='pending-duplicate';Field='pendingPluginIds';Mutate={param($r) $r.pendingPluginIds=@('acme.market-two','acme.market-two')}},
-    @{Name='pending-string';Field='pendingPluginIds';Mutate={param($r) $r.pendingPluginIds='acme.market-two'}}
+    @{Name='pending-string';Field='pendingPluginIds';Mutate={param($r) $r.pendingPluginIds='acme.market-two'}},
+    @{Name='unified-missing';Field='unifiedList';Mutate={param($r) $r.PSObject.Properties.Remove('unifiedList')}},
+    @{Name='unified-entry';Field='unifiedList.entry';Mutate={param($r) $r.unifiedList.entry='installed tab'}},
+    @{Name='unified-screenshots';Field='unifiedList.screenshots';Mutate={param($r) $r.unifiedList.screenshots=@('unified-list.png')}},
+    @{Name='unified-installed-observed';Field='unifiedList.installedGroupObserved';Mutate={param($r) $r.unifiedList.installedGroupObserved=$true}},
+    @{Name='unified-installed-observed-string';Field='unifiedList.installedGroupObserved';Mutate={param($r) $r.unifiedList.installedGroupObserved='false'}},
+    @{Name='unified-candidates';Field='unifiedList.updateCandidates';Mutate={param($r) $r.unifiedList.updateCandidates=1}},
+    @{Name='unified-candidates-string';Field='unifiedList.updateCandidates';Mutate={param($r) $r.unifiedList.updateCandidates='0'}},
+    @{Name='unified-batch-covered';Field='unifiedList.batchUpdateNativeCovered';Mutate={param($r) $r.unifiedList.batchUpdateNativeCovered=$true}},
+    @{Name='unified-batch-reason';Field='unifiedList.batchUpdateNotCoveredReason';Mutate={param($r) $r.unifiedList.batchUpdateNotCoveredReason=''}},
+    @{Name='unified-groups-missing';Field='groups';Mutate={param($r) $r.unifiedList.collapsed.page.PSObject.Properties.Remove('groups')}},
+    @{Name='unified-groups-type';Field='groups';Mutate={param($r) $r.unifiedList.collapsed.page.groups='builtin'}},
+    @{Name='unified-group-kind';Field='groups.kind';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].kind='unknown'}},
+    @{Name='unified-group-count';Field='groups.count';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].count=0}},
+    @{Name='unified-group-count-string';Field='groups.count';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].count='4'}},
+    @{Name='unified-group-collapsed-missing';Field='groups.collapsed';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].PSObject.Properties.Remove('collapsed')}},
+    @{Name='unified-group-collapsed-string';Field='groups.collapsed';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].collapsed='true'}},
+    @{Name='unified-group-collapsed-opposite';Field='Builtin group collapsed';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].collapsed=$false}},
+    @{Name='unified-expanded-opposite';Field='Builtin group collapsed';Mutate={param($r) $r.unifiedList.expanded.page.groups[0].collapsed=$true}},
+    @{Name='unified-group-order';Field='Group order';Mutate={param($r) $r.unifiedList.collapsed.page.groups=@($r.unifiedList.collapsed.page.groups[2],$r.unifiedList.collapsed.page.groups[1],$r.unifiedList.collapsed.page.groups[0])}},
+    @{Name='unified-group-duplicate';Field='Duplicate group kind';Mutate={param($r) $r.unifiedList.collapsed.page.groups=@($r.unifiedList.collapsed.page.groups[0],$r.unifiedList.collapsed.page.groups[0],$r.unifiedList.collapsed.page.groups[2])}},
+    @{Name='unified-installed-group';Field='installed group must be absent';Mutate={param($r) $r.unifiedList.collapsed.page.groups=@([pscustomobject]@{kind='installed';count=1;collapsed=$false},$r.unifiedList.collapsed.page.groups[0],$r.unifiedList.collapsed.page.groups[1],$r.unifiedList.collapsed.page.groups[2])}},
+    @{Name='unified-market-count';Field='Market group';Mutate={param($r) $r.unifiedList.collapsed.page.groups[2].count=2}},
+    @{Name='unified-pending-count';Field='Pending group';Mutate={param($r) $r.unifiedList.collapsed.page.groups[1].count=1}},
+    @{Name='unified-batch-items';Field='batch_items';Mutate={param($r) $r.unifiedList.collapsed.page.batch_items=@('acme.market-one 0.9.0→1.0.0')}},
+    @{Name='unified-batch-items-string';Field='batch_items';Mutate={param($r) $r.unifiedList.collapsed.page.batch_items='acme.market-one 0.9.0→1.0.0'}},
+    @{Name='unified-batch-progress';Field='batch_progress';Mutate={param($r) $r.unifiedList.collapsed.page.batch_progress='1/2 acme.market-one'}},
+    @{Name='narrow-viewport';Field='Unexpected logical viewport';Mutate={param($r) $r.narrow.viewport=@(1200.0,800.0)}},
+    @{Name='narrow-screenshots';Field='narrow.screenshots';Mutate={param($r) $r.narrow.screenshots=@('narrow-list.png')}},
+    @{Name='narrow-detail-selected';Field='narrow.detail.selected';Mutate={param($r) $r.narrow.detail.page.selected='acme.market-two'}},
+    @{Name='narrow-detail-back';Field='narrow.detail.back_to_list';Mutate={param($r) $r.narrow.detail.page.back_to_list=$true}},
+    @{Name='narrow-content-width';Field='narrow.content_width';Mutate={param($r) $r.narrow.list.page.content_width=700.0}},
+    @{Name='narrow-dpi';Field='narrow.dpi200PercentTested';Mutate={param($r) $r.narrow.dpi200PercentTested=$true}},
+    @{Name='installed-tab';Field='installedTab';Mutate={param($r) $r | Add-Member -NotePropertyName installedTab -NotePropertyValue ([pscustomobject]@{})}}
 )){
     $bad=$jsonReport | ConvertTo-Json -Depth 10 | ConvertFrom-Json
     $case.Mutate.Invoke($bad)
     $failure=$null
     try{Assert-ExtensionsAcceptanceReport -Report $bad -ProcessId 1234 -Candidate $candidate -PackageHash $packageHash -Theme 'light' -Desktop $desktop -InputDesktop 'Default'}catch{$failure=$_}
     Assert-True ($null -ne $failure) "Acceptance report accepted invalid synthetic case: $($case.Name)"
+}
+
+# 分组与折叠反例必须定位到具体字段，避免任何其他报告错误冒充分组校验。
+$groupCases=@(
+    @{Name='missing';Field='groups';Mutate={param($r) $r.unifiedList.collapsed.page.PSObject.Properties.Remove('groups')}},
+    @{Name='type';Field='groups';Mutate={param($r) $r.unifiedList.collapsed.page.groups='builtin'}},
+    @{Name='collapsed-missing';Field='groups.collapsed';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].PSObject.Properties.Remove('collapsed')}},
+    @{Name='collapsed-type';Field='groups.collapsed';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].collapsed='true'}},
+    @{Name='collapsed-opposite';Field='Builtin group collapsed';Mutate={param($r) $r.unifiedList.collapsed.page.groups[0].collapsed=$false}}
+)
+foreach($case in $groupCases){
+    $bad=$jsonReport | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $case.Mutate.Invoke($bad)
+    Assert-ExtensionsRejects {Assert-ExtensionsAcceptanceReport -Report $bad -ProcessId 1234 -Candidate $candidate -PackageHash $packageHash -Theme 'light' -Desktop $desktop -InputDesktop 'Default'} $case.Field
 }
 
 Initialize-ExtensionsNativeEvidence
@@ -226,6 +385,9 @@ foreach($case in @(
 }
 $dimensions=Get-ExtensionsFrameDimensions -Viewport @(1200,800) -Scale 1.0 -Stage 'synthetic'
 Assert-True ($dimensions.Width -eq 1200 -and $dimensions.Height -eq 800) 'A 1.0 scale viewport was miscomputed.'
+$narrowDimensions=Get-ExtensionsFrameDimensions -Viewport @(700,800) -Scale 1.25 -Stage 'synthetic-narrow' -ExpectedWidth 700.0 -ExpectedHeight 800.0
+Assert-True ($narrowDimensions.Width -eq 875 -and $narrowDimensions.Height -eq 1000 -and $narrowDimensions.ViewportWidth -eq 700.0) 'A narrow viewport was miscomputed.'
+Assert-Throws {Get-ExtensionsFrameDimensions -Viewport @(700,800) -Scale 1.0 -Stage 'synthetic' -ExpectedWidth 1200.0 -ExpectedHeight 800.0} 'Unexpected logical viewport'
 foreach($case in @(
     @{Viewport=@(1190,800);Scale=1.0;Message='Unexpected logical viewport'},
     @{Viewport=@(1200,800);Scale='1.0';Message='scaleFactor'},
@@ -297,6 +459,23 @@ try {
     if(Test-Path -LiteralPath $fixtureRoot){Remove-Item -LiteralPath $fixtureRoot -Recurse -Force}
 }
 
+# 真实网络日志检查：只允许目录 JSON 请求；minisig、缺失目录请求和缺失日志都必须失败。
+$logRoot=Join-Path ([IO.Path]::GetTempPath()) ('kerminal-p5-logs-'+[guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($logRoot)
+try {
+    [IO.File]::WriteAllText((Join-Path $logRoot 'fixture.stdout.log'),"fixture GET /catalog.json`nfixture GET /acme.market-one.kplugin`n")
+    [IO.File]::WriteAllText((Join-Path $logRoot 'fixture.stderr.log'),'')
+    Assert-ExtensionsFixtureLogs -Base $logRoot
+    [IO.File]::WriteAllText((Join-Path $logRoot 'fixture.stdout.log'),"fixture GET /catalog.json.minisig`n")
+    Assert-Throws {Assert-ExtensionsFixtureLogs -Base $logRoot} 'signature request'
+    [IO.File]::WriteAllText((Join-Path $logRoot 'fixture.stdout.log'),"fixture GET /acme.market-one.kplugin`n")
+    Assert-Throws {Assert-ExtensionsFixtureLogs -Base $logRoot} 'no catalog JSON request'
+    Remove-Item -LiteralPath (Join-Path $logRoot 'fixture.stderr.log') -Force
+    Assert-Throws {Assert-ExtensionsFixtureLogs -Base $logRoot} 'Missing fixture log'
+} finally {
+    if(Test-Path -LiteralPath $logRoot){Remove-Item -LiteralPath $logRoot -Recurse -Force}
+}
+
 $tries=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst] -and $null -ne $_.Finally})
 Assert-True ($tries.Count -eq 1) 'The acceptance cleanup block is missing or ambiguous.'
 $finallyText=$tries[0].Finally.Extent.Text
@@ -325,31 +504,47 @@ if($null -eq ('Kerminal.PluginExtensionsAcceptance.NativeDesktopLauncher' -as [t
     Initialize-ExtensionsLauncher
 }
 $launcher='Kerminal.PluginExtensionsAcceptance.NativeDesktopLauncher' -as [type]
-Assert-True ($null -ne $launcher -and $null -ne $launcher.GetMethod('Start')) 'The P5 private-desktop launcher did not compile.'
+Assert-True ($null -ne $launcher -and @($launcher.GetMethods() | Where-Object {$_.Name -ceq 'Start' -and $_.GetParameters().Count -eq 8}).Count -eq 1) 'The P5 private-desktop launcher did not compile with the eight-parameter entry point.'
 Assert-True ([IO.File]::ReadAllText($path).Contains("'KerminalRail-settings-'")) 'The launcher no longer enforces the private desktop prefix.'
 
 $scriptText=[IO.File]::ReadAllText($path)
 foreach($required in @(
-    'resourcesShutdownComplete','runtimeShutdownObserved','shutdownScope','isolationScope',
+    'resourcesShutdownComplete','runtimeShutdownObserved','inputMode','shutdownScope','isolationScope',
     'Assert-ExtensionsAcceptanceReport','Get-ExtensionsStrictInteger','Get-ExtensionsStrictBoolean',
     'Read-ExtensionsPngEvidence','png-structure-crc-and-dimensions','NativeEvidence','InputDesktop',
     'Stop-ExtensionsOwnedProcess','Stop-ExtensionsFixture','KERMINAL_PLUGIN_EXTENSIONS_DESKTOP',
     'NormalExitJobMembers','NonJobProcessesProven=$false','IndependentDesktopResample=$false',
     'FrameFeaturePixelsChecked=$false','SystemComposition=''not-observed''',
     "'KerminalRail-settings-'+[Guid]::NewGuid().ToString('N')",',$stderrPath,$desktop,1200,800)',
-    "if(Test-Path -LiteralPath `$output){throw"
+    "if(Test-Path -LiteralPath `$output){throw",
+    'Get-ExtensionsGroups','Assert-ExtensionsUnifiedPage','unifiedList',
+    'unified-list','builtin-expanded','builtin-collapsed','narrow-list-returned',
+    'installedGroupObserved','batchUpdateNativeCovered','update_candidates','batch_items','batch_progress',
+    'ExpectedWidth','NarrowFrameDimensions',
+    'Assert-ExtensionsSourcePage','Assert-ExtensionsFixtureLogs','source-dialog',
+    'source_url','source_dialog_open','source_saving','source_error','configMatchesRuntime',
+    'minisig','Source config, runtime and expected URLs disagree'
 )){
     Assert-True ($scriptText.Contains($required)) "Required P5 evidence or cleanup gate is missing: $required"
 }
 Assert-True (-not $scriptText.Contains('report.shutdownComplete')) 'The runner still accepts the ambiguous shutdownComplete flag.'
-foreach($forbidden in @('SwitchDesktop','SendInput','SetForegroundWindow')){Assert-True (-not $scriptText.Contains($forbidden)) "Unsafe desktop operation remains: $forbidden"}
+Assert-True ($scriptText.Contains("PSObject.Properties['installedTab']")) 'The runner no longer rejects the removed installedTab evidence.'
+foreach($forbidden in @('SwitchDesktop','SendInput','SetForegroundWindow','extensions-installed-mode','extensions-builtin-group')){Assert-True (-not $scriptText.Contains($forbidden)) "Unsafe or obsolete evidence remains: $forbidden"}
 $assertFunction=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-ExtensionsAcceptanceReport'},$true))[0].Extent.Text
-Assert-True ($assertFunction.Contains('Get-ExtensionsStrictInteger') -and $assertFunction.Contains('Assert-ExtensionsBoolean') -and $assertFunction.Contains('Get-ExtensionsStringSet')) 'The final report gate lost strict type checks.'
+Assert-True ($assertFunction.Contains('Get-ExtensionsStrictInteger') -and $assertFunction.Contains('Assert-ExtensionsBoolean') -and $assertFunction.Contains('Get-ExtensionsStringSet') -and $assertFunction.Contains('Assert-ExtensionsUnifiedPage')) 'The final report gate lost strict type checks.'
+Assert-True ($assertFunction.Contains('Assert-ExtensionsSourcePage') -and $assertFunction.Contains('configMatchesRuntime')) 'The final report gate lost source save checks.'
+# 来源页检查必须逐字段读取并拒绝缺失；单独提取该函数，避免报告门禁的字符串检查落空。
+$sourceFunction=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-ExtensionsSourcePage'},$true))[0].Extent.Text
+Assert-True ($sourceFunction.Contains('source_error') -and $sourceFunction.Contains('source_dialog_open') -and $sourceFunction.Contains('source_saving')) 'The source page gate no longer rejects missing state.'
+# 批量项检查位于统一列表函数内部；单独提取该函数，避免报告门禁的字符串检查落空。
+$unifiedFunction=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-ExtensionsUnifiedPage'},$true))[0].Extent.Text
+Assert-True ($unifiedFunction.Contains('Get-ExtensionsStringSet') -and $unifiedFunction.Contains('batch_items')) 'The unified page gate no longer rejects non-empty batch items.'
 
 $rust=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../../crates/kerminal-desktop/src/plugin_extensions_acceptance.rs'))
-foreach($required in @('"resourcesShutdownComplete"','"runtimeShutdownObserved"','"shutdownScope"','"isolationScope"','"quitReceipt"','"pendingPluginIds"','"frameEvidence"','"featurePixelsChecked": false','"systemComposition": "not-observed"','KERMINAL_PLUGIN_EXTENSIONS_DESKTOP','combine_acceptance_results','validate_pending_install','validate_private_desktop')){
+foreach($required in @('"resourcesShutdownComplete"','"runtimeShutdownObserved"','"shutdownScope"','"isolationScope"','"quitReceipt"','"pendingPluginIds"','"frameEvidence"','"featurePixelsChecked": false','"systemComposition": "not-observed"','KERMINAL_PLUGIN_EXTENSIONS_DESKTOP','combine_acceptance_results','validate_pending_install','validate_private_desktop','"unifiedList"','"groups"','"update_candidates"','extensions-group-builtin','unified-list','builtin-expanded','builtin-collapsed','narrow-list-returned','"installedGroupObserved"','"batchUpdateNativeCovered"','"batchUpdateNotCoveredReason"','"source_url"','"source_dialog_open"','"source_saving"','"source_error"','extensions-source-save','source-dialog.png','"configUrl"','"runtimeUrl"','"configMatchesRuntime"','load_settings','KERMINAL_PLUGIN_CATALOG_URL')){
     Assert-True ($rust.Contains($required)) "The candidate no longer preserves honest P5 evidence: $required"
 }
 Assert-True (-not $rust.Contains('"shutdownComplete"')) 'The candidate still claims unobserved runtime shutdown as complete.'
 Assert-True (-not $rust.Contains('"pendingCountReadBack" = json!(state.pending.len())')) 'The candidate still reports a count without authoritative pending identities.'
+foreach($forbidden in @('"installedTab"','extensions-installed-mode','extensions-builtin-group')){Assert-True (-not $rust.Contains($forbidden)) "The candidate still contains removed evidence: $forbidden"}
 'P5 extensions strict-report, PNG and cleanup synthetic tests passed; no desktop or process was started.'

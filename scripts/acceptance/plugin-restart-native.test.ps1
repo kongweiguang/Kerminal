@@ -55,9 +55,9 @@ function New-SyntheticSaveAction {
 }
 
 function New-SyntheticPersistence {
-    # 三个版本阶段使用不同动作集合；phase 2 只改变首标签草稿。
+    # 三代阶段使用不同动作集合；phase 1 保存两个标签，phase 2 只改变首标签草稿。
     # @author kongweiguang
-    param([ValidateRange(1,3)][int]$Phase)
+    param([ValidateRange(1,2)][int]$Phase)
     $afterA=$(if($Phase -eq 1){'seed alpha'}else{'count alpha'})
     $finalB='seed gamma'
     $activations=@(
@@ -67,10 +67,9 @@ function New-SyntheticPersistence {
     )
     $saves=@()
     if($Phase -eq 1){$saves=@((New-SyntheticSaveAction 'tab-a' 'seed alpha' $null),(New-SyntheticSaveAction 'tab-b' 'seed beta' 'seed alpha'))}
-    elseif($Phase -eq 3){$saves=@((New-SyntheticSaveAction 'tab-a' 'count alpha' 'seed beta'))}
     return [pscustomobject]@{
         schemaVersion=1;phase=$Phase;mode=$(if($Phase -eq 1){'seeded'}else{'restored'});source=$(if($Phase -eq 1){'new-content-tabs'}else{'workspace-restore'});createdNewTabs=($Phase -eq 1);notesTabCount=2
-        tabsBeforeActions=@((New-SyntheticPersistedTab 'tab-a' $(if($Phase -eq 3){'count alpha'}else{'seed alpha'}) 'view-a' 'instance-a'),(New-SyntheticPersistedTab 'tab-b' $finalB 'view-b' 'instance-b'))
+        tabsBeforeActions=@((New-SyntheticPersistedTab 'tab-a' 'seed alpha' 'view-a' 'instance-a'),(New-SyntheticPersistedTab 'tab-b' $finalB 'view-b' 'instance-b'))
         tabsAfterActions=@((New-SyntheticPersistedTab 'tab-a' $afterA 'view-a' 'instance-a'),(New-SyntheticPersistedTab 'tab-b' $finalB 'view-b' 'instance-b'))
         activationPasses=$activations;saveActions=$saves
         checks=[pscustomobject]@{distinctTabIds=$true;distinctInstances=$true;distinctViewIds=$true;distinctDrafts=$true;stableViewIdPerTab=$true;nonTargetDraftsPreserved=$true}
@@ -91,10 +90,10 @@ function New-SyntheticPersistenceObserved {
 function New-SyntheticReceipt {
     # 只构造内存契约样本；它们不能作为实际 GPUI 或插件运行证据。
     # @author kongweiguang
-    param([ValidateRange(0,3)][int]$Phase)
-    $versions=@($null,'1.0.0','1.1.0','1.0.0')
-    $operations=@('local-file-initial-install','local-file-update','rollback','exit')
-    $intent=if($Phase -lt 3){'RestartForExtensions'}else{'Exit'}
+    param([ValidateRange(0,2)][int]$Phase)
+    $versions=@($null,'1.0.0','1.1.0')
+    $operations=@('local-file-initial-install','local-file-update','exit')
+    $intent=if($Phase -lt 2){'RestartForExtensions'}else{'Exit'}
     $controls=[pscustomobject]@{
         save=(New-SyntheticButton 'external-button-root.2.0' 'Save')
         check=(New-SyntheticButton 'external-button-root.2.1' 'Check example.com')
@@ -144,8 +143,9 @@ foreach($name in @('Get-RestartRequiredField','Assert-RestartString','Assert-Res
     . ([scriptblock]::Create($definitions[0].Extent.Text))
 }
 $phaseLoops=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.ForEachStatementAst] -and $node.Variable.VariablePath.UserPath -ceq 'phase'},$true))
-Assert-True ($phaseLoops.Count -eq 1) 'Missing or ambiguous four-generation loop.'
+Assert-True ($phaseLoops.Count -eq 1) 'Missing or ambiguous three-generation loop.'
 $loopText=$phaseLoops[0].Extent.Text
+Assert-True ($loopText.Contains('0..2') -and -not $loopText.Contains('0..3')) 'Restart acceptance must not keep the removed fourth generation.'
 $receiptIndex=$loopText.IndexOf('$observed=Wait-RestartReceipt',[StringComparison]::Ordinal)
 $assertIndex=$loopText.IndexOf('Assert-RestartEvidence -Observed $observed -Phase $phase',[StringComparison]::Ordinal)
 $persistenceIndex=$loopText.IndexOf('Assert-RestartPersistence -Observed $observed -Phase $phase',[StringComparison]::Ordinal)
@@ -167,7 +167,7 @@ $desktopClosedIndex=$scriptText.LastIndexOf('if(-not $closingOwner.DesktopClosed
 $ownerClearIndex=$scriptText.LastIndexOf('$owner=$null',[StringComparison]::Ordinal)
 Assert-True ($closeResourcesIndex -ge 0 -and $desktopClosedIndex -gt $closeResourcesIndex -and $ownerClearIndex -gt $desktopClosedIndex) 'Successful cleanup must retain owner for fallback until close and desktop checks pass.'
 
-foreach($phase in 0..3){Assert-RestartEvidence -Observed (New-SyntheticReceipt $phase) -Phase $phase}
+foreach($phase in 0..2){Assert-RestartEvidence -Observed (New-SyntheticReceipt $phase) -Phase $phase}
 $zh=New-SyntheticReceipt 2
 $zh.newCapability.viewSemantics.controls.save.accessibleName='保存'
 $zh.newCapability.viewSemantics.controls.check.accessibleName='检查 example.com'
@@ -234,7 +234,7 @@ foreach($scenario in @(
     Assert-Failure {Assert-RestartEvidence $bad 0} $scenario[1] $scenario[0]
 }
 
-foreach($phase in @(1,3)){
+foreach($phase in @(1)){
     foreach($scenario in @(
         @('missing-save','Missing restart evidence field: selector'),
         @('bad-save-role','Invalid restart evidence: control isButton'),
@@ -369,8 +369,6 @@ $gate1=Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved (Ne
 Assert-True ($gate1.Tabs.Count -eq 2 -and $gate1.Tabs[0].draft -ceq 'seed alpha' -and $gate1.Tabs[1].draft -ceq 'seed gamma') 'Synthetic seeded tabs were not returned for cross-generation linkage.'
 $gate2=Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved (New-SyntheticPersistence 2)) -Phase 2 -ExpectedTabs $gate1.Tabs
 Assert-True ($gate2.Tabs.Count -eq 2 -and $gate2.Tabs[0].draft -ceq 'count alpha' -and $gate2.Tabs[1].draft -ceq 'seed gamma') 'Synthetic restored tabs did not expose the single target change.'
-$gate3=Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved (New-SyntheticPersistence 3)) -Phase 3 -ExpectedTabs $gate2.Tabs
-Assert-True ($gate3.Tabs.Count -eq 2 -and $gate3.Tabs[0].draft -ceq 'count alpha') 'Synthetic rollback tabs did not preserve drafts before local save.'
 
 $bad=New-SyntheticPersistence 2
 $bad.tabsAfterActions[1].tabId='tab-c'
@@ -423,10 +421,9 @@ $bad=New-SyntheticPersistence 1
 $bad.tabsBeforeActions[1].draft='seed beta'
 $bad.tabsAfterActions[1].draft='seed beta'
 Assert-Failure {Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved $bad) -Phase 1 -ExpectedTabs $null} 'final global plugin state' 'persistence global fallback'
-$bad=New-SyntheticPersistence 3
-$bad.saveActions[0].input='other'
-$bad.saveActions[0].observedText='other'
-Assert-Failure {Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved $bad) -Phase 3 -ExpectedTabs $gate2.Tabs} 'save the active tab draft once' 'persistence rollback wrong save'
+$bad=New-SyntheticPersistence 2
+$bad.saveActions=@(New-SyntheticSaveAction 'tab-a' 'count alpha' 'seed beta')
+Assert-Failure {Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved $bad) -Phase 2 -ExpectedTabs $gate1.Tabs} 'must not save' 'persistence restore save'
 $bad=New-SyntheticPersistence 2
 $bad.activationPasses[0].selector='workspace-tab-hitbox-tab-a'
 Assert-Failure {Assert-RestartPersistence -Observed (New-SyntheticPersistenceObserved $bad) -Phase 2 -ExpectedTabs $gate1.Tabs} 'activation selector' 'persistence fake activation path'
@@ -581,4 +578,4 @@ Assert-True ($tryCount -ge 1 -and $scriptText.Contains('Assert-NoRestartFailure 
 $finallyBlocks=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.TryStatementAst] -and $null -ne $node.Finally},$true))
 $outerFinally=$finallyBlocks | Sort-Object {$_.Extent.EndOffset} | Select-Object -Last 1
 Assert-True ($null -ne $outerFinally -and -not $outerFinally.Finally.Extent.Text.Contains('throw ')) 'Outer cleanup throws inside finally and can mask the original failure.'
-'P7 synthetic four-generation receipt gates passed; no native process was started.'
+'P7 synthetic three-generation receipt gates passed; no native process was started.'

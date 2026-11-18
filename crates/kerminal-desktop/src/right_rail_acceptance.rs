@@ -36,10 +36,10 @@ use std::{
 };
 
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, AsyncApp, Context, Entity, TitlebarOptions,
+    AnyWindowHandle, AppContext as _, AsyncApp, Context, Entity, Styled as _, TitlebarOptions,
     WindowBackgroundAppearance, WindowOptions, component::TitleBar,
 };
-use gpui_pre::{App, Bounds, WindowBounds, px, size};
+use gpui_pre::{App, Bounds, WindowBounds, point, px, size};
 use kerminal_application::{
     AppResult,
     preferences::{ThemeMode, settings::ToolRailToolId},
@@ -201,6 +201,8 @@ struct RightRailCaptureContext {
     container_target_port: u16,
     requested_window_width: Option<u32>,
     requested_window_height: Option<u32>,
+    /// 窗口内 UI rem/字体放大倍数；仅 Agent 验收可选，不等同于系统 DPI 模拟。
+    requested_ui_scale: Option<f32>,
     requested_bounds_size: Option<(f32, f32)>,
     functional_only: bool,
     capture_only: bool,
@@ -355,6 +357,7 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                     container_target_port,
                     requested_window_width,
                     requested_window_height,
+                    requested_ui_scale: None,
                     requested_bounds_size: None,
                     functional_only,
                     capture_only,
@@ -396,6 +399,10 @@ fn run_agent_continuity_only(options: AcceptanceOptions) -> Result<(), Box<dyn E
     fs::create_dir(&config_directory)?;
     let profiles = config_directory.join("profiles");
     fs::create_dir(&profiles)?;
+    // 用户可能正在运行主程序并占用默认 MCP 端口；Agent 验收必须在启动前写入唯一回环端口，
+    // 否则 Agent 创建会在 MCP 启动阶段失败。预留 listener 持有到组合根启动前，缩小竞态窗口。
+    let mcp_port_reservation =
+        super::settings_acceptance::seed_isolated_mcp_port(&config_directory)?;
     write_local_agent_profile(
         &profiles.join("agent-continuity-local.toml"),
         &output_directory,
@@ -405,11 +412,40 @@ fn run_agent_continuity_only(options: AcceptanceOptions) -> Result<(), Box<dyn E
     // 并行验收或用户 shell 改写；再移除 fixture manifest，本地分支不会意外回到远程夹具。
     //
     // SAFETY: 此处仍位于单线程启动路径，尚未创建 ApplicationRuntime 或 GPUI 线程。
+    // 探针开关只接受显式 1；boot 在 clear 前捕获，仅 Agent-only 本轮重新设置，
+    // 不让其它验收或普通启动继承，也不为全局 clear 加宽泛例外。矩阵需要区分真实安装与
+    // App Execution Alias，因此把脚本解析出的两个绝对路径与开关一起捕获，避免运行时
+    // 再按 PATH 搜索或读取已被清理的 KERMINAL_*。
+    let acceptance_pty_probe = std::env::var("KERMINAL_ACCEPTANCE_PTY_PROBE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let acceptance_pwsh_real = std::env::var_os("KERMINAL_ACCEPTANCE_PWSH_REAL");
+    let acceptance_pwsh_alias = std::env::var_os("KERMINAL_ACCEPTANCE_PWSH_ALIAS");
+    // 窗口内 UI rem/字体放大只用于验收取证，不等同于系统 DPI；限制在 1.0–3.0，
+    // 非法值忽略而不是把错误比例传给窗口。
+    let acceptance_ui_scale = std::env::var("KERMINAL_ACCEPTANCE_UI_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| (1.0..=3.0).contains(value));
     clear_inherited_kerminal_environment();
     unsafe {
         std::env::set_var("KERMINAL_CONFIG_ROOT", &config_directory);
         std::env::remove_var("KERMINAL_RIGHT_RAIL_FIXTURE_MANIFEST");
+        if let Some(scale) = acceptance_ui_scale {
+            std::env::set_var("KERMINAL_ACCEPTANCE_UI_SCALE", scale.to_string());
+        }
+        if acceptance_pty_probe {
+            std::env::set_var("KERMINAL_ACCEPTANCE_PTY_PROBE", "1");
+            if let Some(path) = acceptance_pwsh_real {
+                std::env::set_var("KERMINAL_ACCEPTANCE_PWSH_REAL", path);
+            }
+            if let Some(path) = acceptance_pwsh_alias {
+                std::env::set_var("KERMINAL_ACCEPTANCE_PWSH_ALIAS", path);
+            }
+        }
     }
+    drop(mcp_port_reservation);
     let fixture_host_id = HostId::parse(LOCAL_AGENT_HOST_ID)?;
     let runtime = ApplicationRuntime::new()?;
     let mut composition = runtime.block_on(DesktopComposition::build(
@@ -432,6 +468,7 @@ fn run_agent_continuity_only(options: AcceptanceOptions) -> Result<(), Box<dyn E
                 container_target_port: 0,
                 requested_window_width: options.window_width,
                 requested_window_height: options.window_height,
+                requested_ui_scale: acceptance_ui_scale,
                 requested_bounds_size,
                 functional_only: true,
                 capture_only: false,
@@ -497,6 +534,41 @@ fn toml_basic_string(value: &str) -> String {
 ///
 /// @author kongweiguang
 fn write_local_agent_profile(path: &Path, working_directory: &Path) -> io::Result<()> {
+    // 脚本已验证 pwsh 7 的真实绝对路径时优先使用，避免子进程按 PATH 搜索到 Store alias
+    // 或其它同名 shim；未提供时保持原有 pwsh.exe 默认，不改变普通本地启动行为。
+    let configured_shell = std::env::var("KERMINAL_ACCEPTANCE_PWSH").ok();
+    let shell = resolve_local_agent_shell(configured_shell.as_deref())?;
+    write_local_agent_profile_with_shell(path, working_directory, &shell)
+}
+
+/// 解析验收 profile 的 shell：显式值必须是绝对路径，避免 PATH 搜索差异；未提供或空白时
+/// 保持 pwsh.exe 默认。纯函数便于测试，不读取环境变量。
+///
+/// @author kongweiguang
+fn resolve_local_agent_shell(value: Option<&str>) -> io::Result<String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            if !Path::new(value).is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "KERMINAL_ACCEPTANCE_PWSH must be an absolute pwsh path",
+                ));
+            }
+            Ok(value.to_owned())
+        }
+        None => Ok("pwsh.exe".to_owned()),
+    }
+}
+
+/// 以显式 shell 值写本地 Agent 验收 profile；拆出纯函数便于测试绝对路径转义，
+/// 不读取环境变量，也不改变生产启动器的 shell 解析。
+///
+/// @author kongweiguang
+fn write_local_agent_profile_with_shell(
+    path: &Path,
+    working_directory: &Path,
+    shell: &str,
+) -> io::Result<()> {
     let working_directory = working_directory.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -508,7 +580,7 @@ fn write_local_agent_profile(path: &Path, working_directory: &Path) -> io::Resul
             "schema_version = 1\n",
             "id = \"agent-continuity-local\"\n",
             "name = \"Agent Continuity Local\"\n",
-            "shell = \"pwsh.exe\"\n",
+            "shell = {}\n",
             "args = [\"-NoLogo\", \"-NoProfile\"]\n",
             "env = {{}}\n",
             "cwd = {}\n",
@@ -517,6 +589,7 @@ fn write_local_agent_profile(path: &Path, working_directory: &Path) -> io::Resul
             "created_at = \"0\"\n",
             "updated_at = \"0\"\n",
         ),
+        toml_basic_string(shell),
         toml_basic_string(working_directory),
     );
     fs::write(path, document)
@@ -1205,6 +1278,7 @@ fn run_hidden_window(
         container_target_port,
         requested_window_width,
         requested_window_height,
+        requested_ui_scale,
         functional_only,
         capture_only,
         sftp_functional_only,
@@ -1245,6 +1319,11 @@ fn run_hidden_window(
             };
             let result = gpui_kit::open_window(window_options, cx, |window, cx| {
                 window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+                // 只放大窗口内 rem/字体，不修改系统 DPI 或显示设置；截图报告会标明这是
+                // window_rem_not_system_dpi，避免把逻辑像素尺寸当成 200% 系统缩放。
+                if let Some(scale) = requested_ui_scale {
+                    window.set_rem_size(px(16. * scale));
+                }
                 if let Some(bounds_size) = requested_bounds_size {
                     // Win32 creates the hidden HWND with CW_USEDEFAULT; resize explicitly so its first client frame uses the requested logical size.
                     window.resize(bounds_size);
@@ -1286,6 +1365,7 @@ fn run_hidden_window(
                             container_target_port,
                             requested_window_width,
                             requested_window_height,
+                            requested_ui_scale,
                             functional_only,
                             capture_only,
                             sftp_functional_only,
@@ -1331,6 +1411,152 @@ fn run_hidden_window(
         return Err(io::Error::other(message).into());
     }
     Ok(())
+}
+
+/// 原生 activity 验收的第二个顶层窗口：只用于让主窗口真实失活/激活，不承载产品视图。
+/// 与主窗口同线程、同 private desktop；不切换用户 input desktop，也不读取用户窗口。
+struct AcceptanceActivityWindow;
+
+impl gpui_kit::Render for AcceptanceActivityWindow {
+    fn render(
+        &mut self,
+        _window: &mut gpui_kit::Window,
+        _cx: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        gpui_kit::div().size_full()
+    }
+}
+
+/// 在主窗口同一 private desktop 上打开并聚焦辅助窗口；调用方必须在所有路径显式关闭。
+///
+/// @author kongweiguang
+pub(super) fn open_acceptance_activity_window(
+    cx: &mut AsyncApp,
+) -> Result<AnyWindowHandle, Box<dyn Error>> {
+    let opened = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(320.), px(240.)),
+                ))),
+                show: true,
+                focus: false,
+                ..Default::default()
+            },
+            cx,
+            |_window, cx| cx.new(|_| AcceptanceActivityWindow),
+        )
+    });
+    let (handle, _view) =
+        opened.map_err(|error| io::Error::other(format!("辅助原生窗口创建失败：{error}")))?;
+    Ok(handle)
+}
+
+/// 关闭辅助窗口；只操作本轮自己创建的句柄，不枚举或关闭其它窗口。
+///
+/// @author kongweiguang
+pub(super) fn close_acceptance_activity_window(
+    cx: &mut AsyncApp,
+    handle: AnyWindowHandle,
+) -> Result<(), Box<dyn Error>> {
+    handle.update(cx, |_, window, _| window.remove_window())?;
+    Ok(())
+}
+
+/// 显示/隐藏验收主窗口；隐藏窗口只用于隔离截图，activity 步骤需要真实可见才能失活/激活。
+///
+/// @author kongweiguang
+pub(super) fn set_acceptance_window_visibility(
+    cx: &mut AsyncApp,
+    handle: AnyWindowHandle,
+    visible: bool,
+) -> Result<(), Box<dyn Error>> {
+    let result = handle.update(cx, |_, window, _| {
+        if window.supports_visibility_control() {
+            window
+                .set_window_visibility(visible)
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        }
+    })?;
+    result.map_err(|detail| io::Error::other(format!("设置验收窗口可见性失败：{detail}")).into())
+}
+
+/// 激活验收窗口：只在已证明的私有非输入桌面、同进程/同 UI 线程、确切本轮 HWND 上调用
+/// SetActiveWindow/SetFocus；不调用前台窗口、输入注入、桌面切换或线程附加 API，
+/// 避免影响用户 input desktop。其它平台明确 unsupported。
+///
+/// @author kongweiguang
+pub(super) fn activate_acceptance_window(
+    cx: &mut AsyncApp,
+    handle: AnyWindowHandle,
+) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        use std::ffi::c_void;
+
+        unsafe extern "system" {
+            fn GetCurrentThreadId() -> u32;
+            fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
+            fn SetActiveWindow(hwnd: *mut c_void) -> *mut c_void;
+            fn SetFocus(hwnd: *mut c_void) -> *mut c_void;
+        }
+
+        handle.update(cx, |_, window, _| {
+            let evidence = isolation::capture()?;
+            let current_thread = unsafe { GetCurrentThreadId() };
+            let thread_desktop = evidence
+                .ui_thread_desktop_name
+                .as_deref()
+                .unwrap_or_default();
+            let input_desktop = evidence.input_desktop_name.as_deref().unwrap_or_default();
+            if !evidence.platform_supported
+                || !evidence.isolation_proven
+                || evidence.process_id != Some(std::process::id())
+                || evidence.ui_thread_id != Some(current_thread)
+                || thread_desktop.is_empty()
+                || input_desktop.is_empty()
+                || thread_desktop.eq_ignore_ascii_case(input_desktop)
+            {
+                return Err(io::Error::other(format!(
+                    "验收窗口激活前未证明私有非输入桌面/同进程同 UI 线程：{evidence:?}"
+                )));
+            }
+            let raw = window
+                .window_handle()
+                .map_err(|error| io::Error::other(format!("读取验收窗口原生句柄失败：{error}")))?;
+            let RawWindowHandle::Win32(win32) = raw.as_raw() else {
+                return Err(io::Error::other("验收窗口不是 Win32 原生窗口"));
+            };
+            let hwnd = win32.hwnd.get() as *mut c_void;
+            let mut owner_process = 0u32;
+            let owner_thread = unsafe { GetWindowThreadProcessId(hwnd, &mut owner_process) };
+            if owner_process != std::process::id() || owner_thread != current_thread {
+                return Err(io::Error::other(
+                    "验收窗口句柄不属于当前进程/UI 线程，拒绝激活",
+                ));
+            }
+            // 只切本线程私有桌面内的活动窗口/焦点，不触碰 input desktop 的 foreground 路径。
+            unsafe {
+                SetActiveWindow(hwnd);
+                SetFocus(hwnd);
+            }
+            Ok::<_, io::Error>(())
+        })??;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cx, handle);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "验收窗口激活仅支持 Windows 私有桌面",
+        )
+        .into())
+    }
 }
 
 /// Preserves first-run bounds when size flags are absent and centers explicit logical dimensions on the primary display.
@@ -2833,6 +3059,28 @@ async fn wait_for_stable_frame(
     Ok(capture)
 }
 
+/// activity 首帧截图允许主窗口在已证明的私有桌面上可见/活动，仍要求同一稳定帧与像素摘要。
+///
+/// @author kongweiguang
+async fn wait_for_stable_frame_visible(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    path: PathBuf,
+    initial_frame: Option<String>,
+    surface: &str,
+) -> Result<CaptureRecord, Box<dyn Error>> {
+    let (capture, _) = wait_for_stable_frame_with_candidates_and_validation(
+        cx,
+        window,
+        path,
+        initial_frame,
+        surface,
+        true,
+    )
+    .await?;
+    Ok(capture)
+}
+
 /// Returns the exact phases that stabilized the saved frame so state restoration can match only that baseline.
 ///
 /// @author kongweiguang
@@ -2843,13 +3091,39 @@ async fn wait_for_stable_frame_with_candidates(
     initial_frame: Option<String>,
     surface: &str,
 ) -> Result<(CaptureRecord, Vec<String>), Box<dyn Error>> {
+    wait_for_stable_frame_with_candidates_and_validation(
+        cx,
+        window,
+        path,
+        initial_frame,
+        surface,
+        false,
+    )
+    .await
+}
+
+/// 隐藏采样与 activity 采样共用同一稳定帧循环，只在隔离校验上区分是否允许可见窗口。
+///
+/// @author kongweiguang
+async fn wait_for_stable_frame_with_candidates_and_validation(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    path: PathBuf,
+    initial_frame: Option<String>,
+    surface: &str,
+    allow_visible: bool,
+) -> Result<(CaptureRecord, Vec<String>), Box<dyn Error>> {
     let deadline = Instant::now() + PANEL_FRAME_TIMEOUT;
     let mut first_panel_frame = None;
     let mut content_ready = initial_frame.is_none();
     let mut frame_candidates = StableFrameCandidates::default();
 
     loop {
-        let frame = frame_signature(cx, window)?;
+        let frame = if allow_visible {
+            frame_signature_visible(cx, window)?
+        } else {
+            frame_signature(cx, window)?
+        };
         if let Some(initial_frame) = initial_frame.as_ref() {
             match first_panel_frame.as_ref() {
                 Some(first_panel_frame) if frame != *first_panel_frame => content_ready = true,
@@ -2859,7 +3133,11 @@ async fn wait_for_stable_frame_with_candidates(
         }
 
         if content_ready && frame_candidates.observe(&frame) {
-            let capture = save_frame(cx, window, path.clone())?;
+            let capture = if allow_visible {
+                save_frame_visible(cx, window, path.clone())?
+            } else {
+                save_frame(cx, window, path.clone())?
+            };
             if frame_candidates.accepts_saved_capture(&capture.pixel_sha256) {
                 let (logical_width, logical_height, scale_factor) =
                     window.update(cx, |_, window, _| {
@@ -2898,9 +3176,17 @@ async fn wait_for_stable_frame_with_candidates(
             } else {
                 "面板帧未能稳定"
             };
-            save_frame(cx, window, path.with_extension("unstable-before.png"))?;
+            if allow_visible {
+                save_frame_visible(cx, window, path.with_extension("unstable-before.png"))?;
+            } else {
+                save_frame(cx, window, path.with_extension("unstable-before.png"))?;
+            }
             cx.background_executor().timer(PANEL_FRAME_POLL).await;
-            save_frame(cx, window, path.with_extension("unstable-after.png"))?;
+            if allow_visible {
+                save_frame_visible(cx, window, path.with_extension("unstable-after.png"))?;
+            } else {
+                save_frame(cx, window, path.with_extension("unstable-after.png"))?;
+            }
             return Err(io::Error::other(format!("等待 {surface} 稳定超时（{reason}）")).into());
         }
         cx.background_executor().timer(PANEL_FRAME_POLL).await;
@@ -2944,10 +3230,36 @@ fn frame_signature(
     cx: &mut AsyncApp,
     window_handle: AnyWindowHandle,
 ) -> Result<String, Box<dyn Error>> {
+    frame_signature_with_validation(cx, window_handle, false)
+}
+
+/// activity 验收允许主窗口在已证明的私有桌面上可见/活动，仍复用同一首帧绘制与像素摘要。
+///
+/// @author kongweiguang
+fn frame_signature_visible(
+    cx: &mut AsyncApp,
+    window_handle: AnyWindowHandle,
+) -> Result<String, Box<dyn Error>> {
+    frame_signature_with_validation(cx, window_handle, true)
+}
+
+/// 隐藏采样与 activity 采样共用同一绘制/截图路径，只在隔离校验上区分是否允许可见窗口。
+///
+/// @author kongweiguang
+fn frame_signature_with_validation(
+    cx: &mut AsyncApp,
+    window_handle: AnyWindowHandle,
+    allow_visible: bool,
+) -> Result<String, Box<dyn Error>> {
     let signature = window_handle.update(cx, |_, window, app| {
         let visible = window.is_visible();
         let active = window.is_window_active();
-        isolation::capture()?.validate_window_state(visible, active)?;
+        let isolation = isolation::capture()?;
+        if allow_visible {
+            isolation.validate_activity_window_state(visible, active)?;
+        } else {
+            isolation.validate_window_state(visible, active)?;
+        }
         let clear = window.draw(app);
         clear.clear(app);
         if window.simulate_next_frame(app) > 0 {
@@ -2978,14 +3290,43 @@ fn save_frame(
     window_handle: AnyWindowHandle,
     path: PathBuf,
 ) -> Result<CaptureRecord, Box<dyn Error>> {
+    save_frame_with_validation(cx, window_handle, path, false)
+}
+
+/// activity 首帧截图允许主窗口在已证明的私有桌面上可见/活动，仍保存同一像素摘要。
+///
+/// @author kongweiguang
+fn save_frame_visible(
+    cx: &mut AsyncApp,
+    window_handle: AnyWindowHandle,
+    path: PathBuf,
+) -> Result<CaptureRecord, Box<dyn Error>> {
+    save_frame_with_validation(cx, window_handle, path, true)
+}
+
+/// 隐藏采样与 activity 采样共用同一渲染/保存路径，只在隔离校验上区分是否允许可见窗口。
+///
+/// @author kongweiguang
+fn save_frame_with_validation(
+    cx: &mut AsyncApp,
+    window_handle: AnyWindowHandle,
+    path: PathBuf,
+    allow_visible: bool,
+) -> Result<CaptureRecord, Box<dyn Error>> {
     let file = path
         .file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "截图文件名无效"))?
         .to_owned();
     let capture = window_handle.update(cx, |_, window, app| {
-        isolation::capture()?
-            .validate_window_state(window.is_visible(), window.is_window_active())?;
+        let visible = window.is_visible();
+        let active = window.is_window_active();
+        let isolation = isolation::capture()?;
+        if allow_visible {
+            isolation.validate_activity_window_state(visible, active)?;
+        } else {
+            isolation.validate_window_state(visible, active)?;
+        }
         let clear = window.draw(app);
         clear.clear(app);
         let image = window.render_to_image().map_err(io::Error::other)?;

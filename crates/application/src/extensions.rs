@@ -1,4 +1,4 @@
-//! 扩展页用例与受信目录、安装存储之间的边界。
+//! 扩展页用例与目录、安装存储之间的边界。
 //! @author kongweiguang
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
@@ -17,7 +17,17 @@ use crate::{
     plugins::{CORE_PLUGIN_ID, PluginRegistry, is_builtin_unit},
 };
 
-/// 目录是验签后的只读投影；来源由宿主固定，不由条目声明。
+/// 官方目录地址是产品缺省值；设置留空时组合根也归一化为该地址。
+///
+/// 放在应用层是为了让设置校验、组合根和界面共用同一个稳定常量，避免各层各自
+/// 复制字符串后出现“空值到底代表哪个源”的分歧。自定义源只需要替换运行期地址，
+/// 不改变目录 JSON 结构或安装记录格式。
+///
+/// @author kongweiguang
+pub const DEFAULT_PLUGIN_CATALOG_URL: &str =
+    "https://github.com/kongweiguang/Kerminal-Plugins/releases/download/catalog-v1/catalog.json";
+
+/// 目录是宿主加载并校验后的只读投影；来源由当前配置的目录地址决定，不由条目声明。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginCatalog {
@@ -43,7 +53,7 @@ pub struct CatalogPlugin {
     pub versions: Vec<CatalogVersion>,
 }
 
-/// 版本与资产绑定在经过验签的同一目录中，不能从界面拼接 URL。
+/// 版本与资产绑定在同一份目录中，不能从界面拼接 URL。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogVersion {
@@ -88,7 +98,7 @@ pub fn install_progress_channel() -> (
     watch::channel(InstallProgress::Preparing)
 }
 
-/// 摘要和大小由目录签名保护，下载完成后仍需按原始字节核对。
+/// 摘要和大小来自目录声明；目录不再验签，因此下载后仍必须按原始字节核对完整性。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogAsset {
@@ -98,20 +108,76 @@ pub struct CatalogAsset {
     pub size: u64,
 }
 
-/// 刷新失败时可显示已验签缓存，并明确提示目录未更新。
+/// 目录身份锚点：来源地址、目录来源标识、序列与原始字节摘要共同证明用户看到的是哪一份目录。
+///
+/// 摘要必须基于加载时的原始字节，而不是重新序列化后的结构体：字段顺序、空白等
+/// 排版差异都属于用户实际看到的同一份原文，重新序列化会把这些差异抹平，使
+/// “确认后目录已变化”无法被识别。`source_url` 额外绑定当前配置的目录地址，
+/// 防止两个来源恰好提供相同原文时，旧确认被拿到另一来源继续安装。
+/// 应用层只承载身份，摘要计算留在基础设施。
+///
+/// @author kongweiguang
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogIdentity {
+    pub source_id: String,
+    pub sequence: u64,
+    pub raw_sha256: String,
+    /// 当前生效的目录地址；由基础设施在构造身份时写入，界面只做透传。
+    pub source_url: String,
+}
+
+impl CatalogIdentity {
+    /// 由加载结果构造身份；调用方必须传入同一次加载的原文摘要，不能事后重新计算。
+    ///
+    /// 保留三参数构造是为了让不关心来源地址的测试替身继续可用；生产路径必须再调用
+    /// `with_source_url` 绑定实际地址，否则安装器会拒绝跨来源确认。
+    ///
+    /// @author kongweiguang
+    pub fn new(source_id: impl Into<String>, sequence: u64, raw_sha256: impl Into<String>) -> Self {
+        Self {
+            source_id: source_id.into(),
+            sequence,
+            raw_sha256: raw_sha256.into(),
+            source_url: String::new(),
+        }
+    }
+
+    /// 绑定当前目录地址；地址是确认与安装之间的来源边界，不能由界面单独替换。
+    ///
+    /// @author kongweiguang
+    pub fn with_source_url(mut self, source_url: impl Into<String>) -> Self {
+        self.source_url = source_url.into();
+        self
+    }
+}
+
+/// 刷新失败时可显示已加载缓存，并明确提示目录未更新。
+///
+/// 快照与身份一起传递，界面选择安装目标时才能把“用户看到的目录”冻结到确认动作；
+/// 只带结构体会让刷新竞态在确认期间静默换包。
+///
+/// @author kongweiguang
 #[derive(Clone, Debug)]
 pub struct CatalogSnapshot {
     pub catalog: PluginCatalog,
+    pub identity: CatalogIdentity,
     pub stale: bool,
     pub fetched_at: u64,
 }
 
 /// 安装目标只包含可验证身份，目录来源和下载地址由基础设施决定。
+///
+/// `identity` 冻结确认时看到的目录；安装器在解析资产前必须按它重新读取当前来源
+/// 缓存，来源地址、目录已刷新到另一序列或另一份原文时返回冲突，要求用户重新确认
+/// 而不是静默换包。
+///
+/// @author kongweiguang
 #[derive(Clone, Debug)]
 pub struct CatalogSelection {
     pub id: PluginId,
     pub version: PluginVersion,
     pub platform: Platform,
+    pub identity: CatalogIdentity,
 }
 
 /// 扩展页展示的内置单元静态身份，不包含运行时启停结果。
@@ -190,9 +256,25 @@ pub struct ExtensionReceipt {
 
 #[async_trait]
 pub trait CatalogSource: Send + Sync + 'static {
-    /// 读取上次验签成功的目录，缺失时返回 None。
+    /// 当前生效的目录地址；始终返回规范化后的实际 URL。
+    ///
+    /// 空配置在构造时已经折叠为官方默认地址，因此这里不会返回空串：界面与安装身份
+    /// 都拿同一个实际地址比较，避免“空串=默认”的隐式规则在跨层传递中丢失。
+    ///
+    /// @author kongweiguang
+    fn source_url(&self) -> String;
+
+    /// 切换目录地址；先按统一 URL 规则验证，成功才原子替换，失败保留旧来源。
+    ///
+    /// 不提供静默 no-op 默认实现：不支持切源的实现必须显式报错，否则界面会把
+    /// “未切换”当成“已保存并应用”。空串表示回到官方默认地址。
+    ///
+    /// @author kongweiguang
+    fn set_source_url(&self, source_url: &str) -> AppResult<()>;
+
+    /// 读取当前来源上次加载成功的目录，缺失时返回 None。
     async fn cached(&self) -> AppResult<Option<CatalogSnapshot>>;
-    /// 只读取已验签目录中指定的 README 地址，正文由调用方按不可信文本处理。
+    /// 只读取当前目录中指定的 README 地址，正文由调用方按不可信文本处理。
     async fn readme(
         &self,
         id: &PluginId,
@@ -257,6 +339,24 @@ impl ExtensionsService {
         Self { catalog, packages }
     }
 
+    /// 回显当前实际目录地址；官方默认来源也返回完整 URL，界面据此展示当前来源。
+    ///
+    /// @author kongweiguang
+    pub fn source_url(&self) -> String {
+        self.catalog.source_url()
+    }
+
+    /// 设置保存成功并回读后切换到新目录来源。
+    ///
+    /// 只切换运行态端口，不在这里写设置：写入失败时来源必须保持原值，
+    /// 否则界面会显示一份并未落盘的配置。切换失败原样上抛，由界面提示并保留旧来源；
+    /// 切换后旧来源的刷新结果由端口按来源快照丢弃，不会写进新来源缓存。
+    ///
+    /// @author kongweiguang
+    pub fn set_source_url(&self, source_url: &str) -> AppResult<()> {
+        self.catalog.set_source_url(source_url)
+    }
+
     /// 枚举内置单元供扩展页展示；只读冻结目录，不触碰目录端口或安装存储。
     ///
     /// 页面在 activate 时同步调用即可，顺序与 `providers()` 的注册顺序一致，
@@ -311,7 +411,7 @@ impl ExtensionsService {
         }
         self.catalog.refresh(cancellation).await
     }
-    /// README 的链接只能来自当前验签目录，界面不能传入任意 URL。
+    /// README 的链接只能来自当前已加载目录，界面不能传入任意 URL。
     pub async fn readme(
         &self,
         id: &PluginId,
@@ -319,7 +419,7 @@ impl ExtensionsService {
     ) -> AppResult<Option<String>> {
         self.catalog.readme(id, cancellation).await
     }
-    /// 查询在已验签快照上执行，分类与文本筛选不会改变目录或触发网络。
+    /// 查询在当前已加载快照上执行，分类与文本筛选不会改变目录或触发网络。
     pub fn search<'a>(
         &self,
         catalog: &'a PluginCatalog,
@@ -350,7 +450,12 @@ impl ExtensionsService {
         self.packages.state().await
     }
 
-    /// 目录资产只通过稳定身份选择，防止页面伪造签名目录内容。
+    /// 目录资产只通过稳定身份选择，防止页面把界面显示的内容替换成另一份目录。
+    ///
+    /// 目录不再验签，因此身份里绑定来源地址和原始字节摘要；安装器据此拒绝
+    /// 已切换来源或已刷新目录的过期确认。
+    ///
+    /// @author kongweiguang
     pub async fn install(
         &self,
         selection: CatalogSelection,

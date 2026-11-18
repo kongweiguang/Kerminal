@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use gpui_kit::{Context, Window};
 use kerminal_application::{
     AppError, AppResult, PreferencesService,
-    agents::AgentSessionView,
+    agents::{AgentHistoryMode, AgentSessionView},
     preferences::{
         ConfigurationValidationScope, ConfigurationValidationService, CustomAgentDefinition,
         settings::ToolRailToolId,
@@ -87,6 +87,8 @@ pub struct AgentContinuityPanelState {
     target_generation: Option<u64>,
     target_terminal_session_id: Option<SessionId>,
     session_count: usize,
+    /// 当前历史过滤；原生 activity 前后必须保持不变。
+    history_mode: AgentHistoryMode,
 }
 
 impl AgentContinuityPanelState {
@@ -144,6 +146,13 @@ impl AgentContinuityPanelState {
     /// @author kongweiguang
     pub fn session_count(&self) -> usize {
         self.session_count
+    }
+
+    /// 当前历史过滤；原生 activity 前后比较，防止窗口切换隐式重置筛选。
+    ///
+    /// @author kongweiguang
+    pub fn history_mode(&self) -> AgentHistoryMode {
+        self.history_mode
     }
 }
 
@@ -229,6 +238,20 @@ fn continuity_pane_presence(
 }
 
 impl RootView {
+    /// 原生双窗口验收临时关闭隐藏窗口活动态覆盖，确保失焦路径使用真实 OS 状态；恢复后沿用隔离验收的隐藏投影。
+    ///
+    /// @author kongweiguang
+    pub fn set_right_rail_acceptance_activity_override(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_rail_acceptance_active_override = enabled;
+        self.sync_tool_projection_before_first_draw(window, cx);
+        cx.notify();
+    }
+
     /// Captures only when the validated fixture pane is also owned by Root's currently visible Terminal tab.
     ///
     /// @author kongweiguang
@@ -426,7 +449,7 @@ impl RootView {
     ) -> Result<AgentAcceptanceSetup, String> {
         self.configure_right_rail_acceptance_agent_with_fixture(
             AgentAcceptanceBindingScope::Ssh(host_id),
-            AgentAcceptanceFixture::Exiting,
+            AgentAcceptanceFixture::exiting(),
             cx,
         )
     }
@@ -597,6 +620,29 @@ impl RootView {
             && !self.is_creating_session
     }
 
+    /// 本地 Tab 创建失败诊断：返回 (安全状态串, 当前 status)。状态串含 controller/settings/
+    /// workspace/creating、三个退出标志、pending creation owner 与 workspace_session_error；
+    /// status 单独返回，避免从格式化串反解析。只读，不改变门禁或写入状态。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_local_tab_creation_state(&self) -> (String, Option<String>) {
+        let state = format!(
+            "controller_present={} settings_ready={} workspace_load_pending={} creating={} host_shutdown_requested={} pending_quit={} quit_ready={} pending_creation_owner={} workspace_session_error={:?}",
+            self.workspace_controller.is_some(),
+            self.settings_snapshot.is_some(),
+            self.workspace_load_pending,
+            self.is_creating_session,
+            self.host_shutdown_requested,
+            self.pending_quit_intent.is_some(),
+            self.quit_ready_intent.is_some(),
+            self.pending_terminal_creation_owner.is_some(),
+            self.workspace_session_error
+                .as_ref()
+                .map(ToString::to_string),
+        );
+        (state, self.status.as_ref().map(ToString::to_string))
+    }
+
     /// 返回同一生产 panel 的等待与错误状态，driver 不根据超时猜测 CLI 启动失败。
     ///
     /// @author kongweiguang
@@ -751,6 +797,21 @@ impl RootView {
         let (panel, _) = self.right_rail_acceptance_agent_context_scoped(
             AgentAcceptanceBindingScope::Ssh(host_id),
         )?;
+        Ok(panel.update(cx, |panel, cx| {
+            panel.right_rail_acceptance_continue_agent(agent_session_id, cx)
+        }))
+    }
+
+    /// 本地历史行继续复用同一生产动作；入口不再提供内联继续，验收必须走列表语义。
+    ///
+    /// @author kongweiguang
+    pub fn continue_right_rail_acceptance_agent_local(
+        &mut self,
+        agent_session_id: &AgentSessionId,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let (panel, _) =
+            self.right_rail_acceptance_agent_context_scoped(AgentAcceptanceBindingScope::Local)?;
         Ok(panel.update(cx, |panel, cx| {
             panel.right_rail_acceptance_continue_agent(agent_session_id, cx)
         }))
@@ -965,6 +1026,11 @@ impl RootView {
                 .as_ref()
                 .and_then(|view| view.session.target.as_ref())
                 .and_then(|target| target.terminal_session_id.clone()),
+            history_mode: snapshot
+                .as_ref()
+                .map_or(AgentHistoryMode::CurrentTarget, |snapshot| {
+                    snapshot.history_mode
+                }),
             session_count: snapshot.map_or(0, |snapshot| snapshot.sessions.len()),
         }
     }
@@ -1137,6 +1203,38 @@ impl RootView {
         self.services.clone()
     }
 
+    /// 原生 activity 验收读取主窗口 observer 的激活/失活次数；只读，不触发窗口动作。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_window_activation_events(&self) -> (usize, usize) {
+        (
+            self.acceptance_activation_events,
+            self.acceptance_deactivation_events,
+        )
+    }
+
+    /// 在辅助窗口切换前清零，避免把此前显示/激活主窗口的事件算进本轮 activity。
+    ///
+    /// @author kongweiguang
+    pub fn reset_right_rail_acceptance_window_activation_events(&mut self) {
+        self.acceptance_activation_events = 0;
+        self.acceptance_deactivation_events = 0;
+    }
+
+    /// 原生首帧取证：读取可见工具落到恢复占位的次数；普通生产不读取。
+    ///
+    /// @author kongweiguang
+    pub fn right_rail_acceptance_unavailable_fallback_render_count(&self) -> usize {
+        self.plugin_tools.unavailable_fallback_render_count()
+    }
+
+    /// 在 activity 前清零，确保计数只覆盖本轮失活/激活过渡。
+    ///
+    /// @author kongweiguang
+    pub fn reset_right_rail_acceptance_unavailable_fallback_render_count(&mut self) {
+        self.plugin_tools.reset_unavailable_fallback_renders();
+    }
+
     /// 每次 Agent acceptance bridge 调用都重核活动工具、目标 pane、panel 与 candidate，不复用过期目标。
     ///
     /// @author kongweiguang
@@ -1266,9 +1364,27 @@ fn acceptance_agent_command(shell: &LocalSessionTarget, marker: &str) -> AppResu
 /// Windows PowerShell 5.1 的语义也未验证，因此连续性夹具明确拒绝这两类 profile。
 ///
 /// 触发文件只作为无内容存在性信号，脚本不读取正文；路径每轮唯一，避免 Test-Path 与写入竞态。
+/// 模板末尾不能带换行：设置 TOML 的多行字面量会在闭合分隔符前裁掉尾换行，验收读回按原字符串
+/// 精确比较，保留尾换行会把持久化成功误报成 launcher 不匹配。
 ///
 /// @author kongweiguang
 const AGENT_CONTINUITY_COMMAND_TEMPLATE: &str = r#"$ErrorActionPreference = 'Stop'
+# ConPTY 下 -Command 脚本的 stdin 可能保留行输入模式，KeyAvailable 在 Enter 前看不到草稿；
+# 显式关闭行输入/回显，保留其它控制位，才能读取未提交的草稿字符。
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class KerminalConsoleMode {
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GetStdHandle(int handle);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleMode(IntPtr handle, out uint mode);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleMode(IntPtr handle, uint mode);
+}
+"@
+$stdinHandle = [KerminalConsoleMode]::GetStdHandle(-10)
+$consoleMode = 0
+if ([KerminalConsoleMode]::GetConsoleMode($stdinHandle, [ref]$consoleMode)) {
+    [void][KerminalConsoleMode]::SetConsoleMode($stdinHandle, $consoleMode -band (-bnot 0x6))
+}
 [Console]::Out.Write("__MARKER__-psversion:$($PSVersionTable.PSVersion.Major)`n")
 [Console]::Out.Write("__MARKER__-ready`n__MARKER__-prompt> ")
 [Console]::Out.Flush()
@@ -1307,8 +1423,7 @@ while ($true) {
   Start-Sleep -Milliseconds 50
 }
 [Console]::Out.Write("__MARKER__-exiting`n")
-[Console]::Out.Flush()
-"#;
+[Console]::Out.Flush()"#;
 
 /// 只允许本轮生成的十六进制 marker 进入脚本文本，避免历史或外部字符串拼出额外命令片段。
 ///

@@ -1,4 +1,4 @@
-//! Agent 右栏的会话管理、目标绑定和上下文预览。
+//! Agent 右栏的会话管理、目标绑定和恢复核对。
 //!
 //! @author kongweiguang
 
@@ -108,6 +108,10 @@ pub enum AgentSendOutcome {
     Expired,
     Failed,
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/agent_landing_visual_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "../../../tests/unit/agent_selection.rs"]
@@ -308,11 +312,6 @@ pub struct AgentsPanel {
     launcher_load_error: Option<String>,
     launcher_selection_error: Option<String>,
     launcher_generation: u64,
-    context_preview: Option<String>,
-    context_preview_owner: Option<AgentSessionId>,
-    context_preview_target: Option<AgentTargetBinding>,
-    context_preview_generation: u64,
-    context_preview_loading: bool,
     theme_mode: kerminal_application::preferences::ThemeMode,
     terminal_palette: Option<TerminalPalette>,
     busy: bool,
@@ -391,11 +390,6 @@ impl AgentsPanel {
             launcher_load_error: None,
             launcher_selection_error: None,
             launcher_generation: 0,
-            context_preview: None,
-            context_preview_owner: None,
-            context_preview_target: None,
-            context_preview_generation: 0,
-            context_preview_loading: false,
             theme_mode: kerminal_application::preferences::ThemeMode::System,
             terminal_palette: None,
             busy: false,
@@ -456,12 +450,11 @@ impl AgentsPanel {
         cx.notify();
     }
 
-    /// 根窗口同步新建会话的归属范围；范围改变时作废旧预览请求，不改写既有会话归属。
+    /// 根窗口同步新建会话的归属范围；范围改变时刷新历史，不改写既有会话归属。
     pub fn set_scope(&mut self, scope: AgentSessionScope, cx: &mut Context<Self>) {
         if self.scope == scope {
             return;
         }
-        self.invalidate_context_preview();
         self.scope = scope;
         self.history_mode = AgentHistoryMode::CurrentTarget;
         self.rename_target = None;
@@ -674,21 +667,6 @@ impl AgentsPanel {
             .terminal
             .as_ref()
             .map(|terminal| terminal.session_id.clone())
-    }
-
-    /// 作废旧预览 owner 的响应，并结束预览专属忙碌状态，避免迟到结果覆盖新会话。
-    ///
-    /// @author kongweiguang
-    fn invalidate_context_preview(&mut self) {
-        self.context_preview_generation = self.context_preview_generation.wrapping_add(1).max(1);
-        self.context_preview = None;
-        self.context_preview_owner = None;
-        self.context_preview_target = None;
-        if self.context_preview_loading {
-            self.context_preview_loading = false;
-            self.busy = false;
-            self.status = None;
-        }
     }
 
     /// 只从本次 service 投影中解析选择，不以索引或当前 Tab 猜测 Agent 会话。

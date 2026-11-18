@@ -11,7 +11,7 @@ use std::{
 use gpui_kit::base::ElementExt as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    InteractiveElement as _, IntoElement, MouseButton, Pixels, Render, SharedString,
+    Hsla, InteractiveElement as _, IntoElement, MouseButton, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Window,
     assets::IconName,
     component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
@@ -211,6 +211,35 @@ pub struct WorkspacePanes {
 
 impl EventEmitter<WorkspacePaneEvent> for WorkspacePanes {}
 impl EventEmitter<WorkspacePaneSessionActionEvent> for WorkspacePanes {}
+
+/// 分屏叶子表面样式集中解析，避免激活态在透明或壁纸窗口下重新铺出整块面板蒙版。
+///
+/// 所有分屏共用工作区材质，焦点只通过一圈低透明度强调色外框表达；
+/// 外框在 render_pane 中固定为 1px，切换激活 pane 时终端网格与分屏比例不重排；
+/// 拖拽落点反馈仍沿用既有的 2px 强调边框，不并入常态表面。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy)]
+struct PaneSurfaceStyle {
+    background: Hsla,
+    border: Hsla,
+}
+
+impl PaneSurfaceStyle {
+    /// 激活态只改变描边颜色而不是底色，避免 selected 实色在浅色板上过重、深色板上发灰。
+    ///
+    /// @author kongweiguang
+    fn resolve(theme: ThemeTokens, active: bool) -> Self {
+        Self {
+            background: theme.materials.workspace,
+            border: if active {
+                theme.accent.opacity(0.55)
+            } else {
+                theme.border
+            },
+        }
+    }
+}
 
 impl WorkspacePanes {
     /// 注入已校验布局、真实标题和画布 renderer；持久结构仍由 WorkspaceService 管理。
@@ -503,12 +532,7 @@ impl WorkspacePanes {
         let title = header_projection.title;
         let tooltip_title = title.clone();
         let active = *pane_id == self.active_pane;
-        let background = if active {
-            theme.materials.panel
-        } else {
-            theme.materials.workspace
-        };
-        let border = if active { theme.selected } else { theme.border };
+        let surface = PaneSurfaceStyle::resolve(theme, active);
 
         // 候选创建期间分屏入口只禁用、不消失：保持槽位不变可避免窄分屏横向跳动，
         // 同时关闭按钮继续可用，用户在测量或连接迟迟不收敛时始终能取消这次分屏。
@@ -687,8 +711,8 @@ impl WorkspacePanes {
             .overflow_hidden()
             .rounded(theme.radius_panel)
             .border_1()
-            .border_color(border)
-            .bg(background)
+            .border_color(surface.border)
+            .bg(surface.background)
             .child(header)
             .child(
                 div()
@@ -1253,3 +1277,7 @@ mod candidate_path_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/workspace_panes_candidate_header.rs"]
 mod candidate_header_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/workspace_panes_surface.rs"]
+mod surface_tests;

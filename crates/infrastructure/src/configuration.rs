@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::task;
 
+use crate::configuration_sync::gitignore::ensure_ignore_rules;
 use crate::storage::{
     AtomicCommitError, CommitMode, StorageCoordinator, StorageLock, commit_staged_file,
 };
@@ -100,6 +101,13 @@ impl ConfigurationStore {
     }
 
     /// 在恢复 journal 和扫描文件之前冻结全部 codec，避免首次读取与后续校验使用不同规则。
+    ///
+    /// 同一阶段尽力补齐托管 `.gitignore`：离线 validator 在 hosts 范围要求密钥忽略规则已存在，
+    /// 规则缺失时启动继续并通过 validator 诊断与 Git 提交门禁暴露保护缺口；
+    /// 不安全路径或写入失败保留原路径，不阻断恢复或普通启动。
+    /// 写入发生在恢复扫描之前，因此恢复态根也可能得到保护性规则，但不改变其只读恢复判定。
+    ///
+    /// @author kongweiguang
     pub fn initialize_with_host_types(
         root: impl AsRef<Path>,
         host_types: Arc<HostConfigurationCatalog>,
@@ -113,6 +121,11 @@ impl ConfigurationStore {
         fs::create_dir_all(&root).map_err(|source| ConfigurationStoreInitError { source })?;
         let storage = StorageCoordinator::new(root.clone());
         let guide_status = ensure_config_guide(&root, &storage);
+        // 首次启动尽力补齐托管忽略规则：离线 validator 在 hosts 范围要求密钥规则已存在，
+        // 而 Git 提交路径只在用户显式提交时才补写。这里不能因规则写入失败阻断启动：
+        // `.gitignore` 可能本就是用户目录/链接或位于不可写介质，此时保留原路径，
+        // 由 validator 诊断和 Git 提交门禁继续以严格错误暴露缺失保护，不能静默降级。
+        ensure_managed_ignore_rules(&root, &storage);
         let profile_transaction_recovery =
             profile_default_transaction::recover_profile_default_transaction(&root, &storage);
         let host_group_transaction_recovery =
@@ -941,6 +954,31 @@ impl Error for ConfigurationStoreInitError {
     /// 保留底层目录创建原因供桌面内部诊断。
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.source)
+    }
+}
+
+/// 首次初始化尽力补齐托管忽略规则，使离线 validator 与 Git 同步看到同一保护集。
+///
+/// 规则写入失败不阻断启动：不安全路径、不可写介质或原子替换失败时保留原路径，
+/// 缺失保护继续由离线 validator 的 hosts 诊断和 Git 提交路径的同一严格实现暴露，
+/// 不会静默伪造成功或放宽检查。恢复态根同样只允许这项保护性补齐，不写业务配置；
+/// 只读恢复判定仍由后续扫描决定。
+///
+/// @author kongweiguang
+fn ensure_managed_ignore_rules(root: &Path, storage: &StorageCoordinator) {
+    let result = (|| -> AppResult<()> {
+        let _lock = storage
+            .lock()
+            .map_err(|source| AppError::infrastructure_with_source("无法锁定配置存储", source))?;
+        ensure_ignore_rules(root)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // 只记录稳定错误码，日志不包含配置根路径或底层 I/O 文本。
+        tracing::warn!(
+            event = "CONFIG_GITIGNORE_BOOTSTRAP_UNAVAILABLE",
+            code = error.public_code().as_str(),
+        );
     }
 }
 

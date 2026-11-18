@@ -1125,6 +1125,9 @@ impl RootView {
         let theme = ThemeTokens::current(window, cx);
         let projection = self.projection_for_layout(&layout, &plugin_context, window, cx);
         let window_active = projection.window_active;
+        // 首帧回归取证只在测试或原生验收构建捕获可见集合；普通生产不 clone、不逐工具 contains。
+        let test_visible_tools =
+            cfg!(any(test, feature = "right-rail-acceptance")).then(|| projection.visible.clone());
         let ticket = self.plugin_tools.stage_projection(projection.clone());
         // 值相同也必须提交：render 可能刚暂存同一投影而生命周期还没执行，或内置活动需要更新。
         cx.defer_in(window, move |root, window, cx| {
@@ -1133,19 +1136,28 @@ impl RootView {
 
         let mut renderers = WorkbenchToolPanelRenderers::default();
         for tool in self.plugin_tools.registered_tools() {
-            let renderer = self
+            let mounted = self
                 .plugin_tools
-                .view_for_mount(tool, &plugin_context, window_active)
-                .map_or_else(
-                    || {
-                        if matches!(tool, ToolRailToolId::Plugin(_)) {
-                            self.render_plugin_tool_recovery(tool, theme, cx)
-                        } else {
-                            tool_unavailable_renderer(tool, theme)
-                        }
-                    },
-                    |view| view.into_any_element(),
-                );
+                .view_for_mount(tool, &plugin_context, window_active);
+            if cfg!(any(test, feature = "right-rail-acceptance"))
+                && mounted.is_none()
+                && test_visible_tools
+                    .as_ref()
+                    .is_some_and(|visible| visible.contains(&tool))
+            {
+                // 可见工具在 render 时落到恢复占位，说明首帧没有拿到当前 window_active 投影。
+                self.plugin_tools.note_unavailable_fallback_render();
+            }
+            let renderer = mounted.map_or_else(
+                || {
+                    if matches!(tool, ToolRailToolId::Plugin(_)) {
+                        self.render_plugin_tool_recovery(tool, theme, cx)
+                    } else {
+                        tool_unavailable_renderer(tool, theme)
+                    }
+                },
+                |view| view.into_any_element(),
+            );
             renderers.insert(tool, renderer);
         }
 

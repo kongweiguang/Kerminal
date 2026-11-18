@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult, PublicErrorCode,
     extensions::{
-        CatalogSelection, CatalogSnapshot, CatalogSource, DropInInspection, ExtensionChange,
-        ExtensionReceipt, ExtensionsService, InstallProgress, LocalPackageInspection,
-        PluginPackageStore,
+        CatalogSelection, CatalogSnapshot, CatalogSource, DEFAULT_PLUGIN_CATALOG_URL,
+        DropInInspection, ExtensionChange, ExtensionReceipt, ExtensionsService, InstallProgress,
+        LocalPackageInspection, PluginPackageStore,
     },
     plugins::CORE_PLUGIN_ID,
 };
@@ -27,6 +27,16 @@ struct UnavailableCatalog;
 
 #[async_trait]
 impl CatalogSource for UnavailableCatalog {
+    /// 测试替身没有可切换的运行态来源，回显官方默认地址保持类型语义完整。
+    fn source_url(&self) -> String {
+        DEFAULT_PLUGIN_CATALOG_URL.to_owned()
+    }
+
+    /// 显式失败而不是静默接受，避免服务层把未实现的切源当成已应用。
+    fn set_source_url(&self, _source_url: &str) -> AppResult<()> {
+        Err(AppError::unsupported("测试未配置插件目录"))
+    }
+
     async fn cached(&self) -> AppResult<Option<CatalogSnapshot>> {
         Ok(None)
     }

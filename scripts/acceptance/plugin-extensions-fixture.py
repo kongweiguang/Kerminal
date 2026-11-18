@@ -1,8 +1,7 @@
-"""只向隔离验收进程提供一次性签名目录与真实压缩包。"""
+"""只向隔离验收进程提供一次性 HTTP 目录与真实压缩包。"""
 # @author kongweiguang
 
 import argparse
-import base64
 import hashlib
 import io
 import json
@@ -10,15 +9,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tarfile
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
 
 def package(plugin_id: str) -> bytes:
     """使用完整格式的最小包，让后续下载仍经过生产解包、清单和摘要检查。"""
     manifest = json.dumps({
         "schema": 1, "id": plugin_id, "name": {"en": plugin_id},
-        "description": {"en": "Isolated signed marketplace fixture"},
+        "description": {"en": "Isolated marketplace fixture"},
         "version": "1.0.0", "api": "^1.0", "publisher": "acme",
         "runtime": {"kind": "none"},
     }, separators=(",", ":")).encode()
@@ -29,21 +25,6 @@ def package(plugin_id: str) -> bytes:
         header.mode = 0o644
         archive.addfile(header, io.BytesIO(manifest))
     return output.getvalue()
-
-
-def sign(raw: bytes) -> tuple[str, bytes]:
-    """私钥仅存于当前进程内存，公钥随验收参数注入，绝不替换正式市场信任根。"""
-    key = Ed25519PrivateKey.generate()
-    key_id = b"p5uikey1"
-    public = b"Ed" + key_id + key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    signature = key.sign(hashlib.blake2b(raw).digest())
-    comment = b"isolated-native-acceptance"
-    payload = b"ED" + key_id + signature
-    global_signature = key.sign(signature + comment)
-    encoded = (b"untrusted comment: isolated\n" + base64.b64encode(payload)
-               + b"\ntrusted comment: " + comment + b"\n"
-               + base64.b64encode(global_signature) + b"\n")
-    return base64.b64encode(public).decode(), encoded
 
 
 def main() -> None:
@@ -79,7 +60,7 @@ def main() -> None:
         routes[path] = body
         plugins.append({
             "id": plugin_id, "name": {"en": plugin_id},
-            "description": {"en": "Isolated signed marketplace fixture"},
+            "description": {"en": "Isolated marketplace fixture"},
             "publisher": "acme", "categories": ["productivity"],
             "repository": "https://github.com/acme/fixture", "permissions": [],
             "versions": [{"version": "1.0.0", "api": "^1.0",
@@ -88,13 +69,12 @@ def main() -> None:
                               "size": len(body), "sha256": hashlib.sha256(body).hexdigest(),
                           }]}],
         })
-    raw = json.dumps({"schema": 1, "source_id": "official", "sequence": 1,
+    # 自定义来源标识证明目录不再绑定固定轨道；只发布 JSON，不提供签名文件。
+    raw = json.dumps({"schema": 1, "source_id": "fixture", "sequence": 1,
                       "plugins": plugins}, separators=(",", ":")).encode()
-    public, signature = sign(raw)
     routes["/catalog.json"] = raw
-    routes["/catalog.json.minisig"] = signature
     ready_temporary = args.ready.with_suffix(".tmp")
-    ready_temporary.write_text(json.dumps({"url": address + "/catalog.json", "key": public,
+    ready_temporary.write_text(json.dumps({"url": address + "/catalog.json",
                                           "catalogSha256": hashlib.sha256(raw).hexdigest()}), encoding="utf-8")
     ready_temporary.replace(args.ready)
     try:

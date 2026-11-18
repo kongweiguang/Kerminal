@@ -15,6 +15,8 @@ param(
     [uint32]$Width = 1440,
     [ValidateRange(600, 2160)]
     [uint32]$Height = 900,
+    [ValidateRange(1.0, 3.0)]
+    [double]$UiScale = 1.0,
     [ValidateRange(30, 1800)]
     [int]$TimeoutSeconds = 300
 )
@@ -134,25 +136,217 @@ function Assert-PathOutsideUserConfiguration {
     }
 }
 
-function Resolve-Pwsh7 {
-    # profile 使用裸 pwsh.exe，应用按 PATH 查找；启动前把首个命中固定下来并验证版本，
-    # 避免用户 PATH 中的旧版或 shim 被当成验收 shell。
+function Test-Pwsh7VersionText {
+    # 只接受首个非空行且整行等于 7；FileVersionInfo 对 AppExecLink 不可靠，
+    # 版本判定必须来自真实进程输出，且不把版本串或 stderr 带入报告。
     # @author kongweiguang
-    $commands = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction Stop)
-    if ($commands.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$commands[0].Source)) {
-        throw 'pwsh.exe 7 was not found on PATH.'
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $lines = @($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+    if ($lines.Count -ne 1) { return $false }
+    return ([string]$lines[0]).Trim() -ceq '7'
+}
+
+function Invoke-Pwsh7VersionProbe {
+    # 在独立受限子进程中实际执行固定版本查询；必须同时满足启动成功、未超时、exit 0 和
+    # 输出 7。Runner/ProcessFactory 仅用于静态测试注入，生产路径始终启动真实进程；
+    # 超时只结束该探针自己创建的进程，并在有界期限内确认退出，不枚举或停止其它进程。
+    # @author kongweiguang
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$TimeoutMilliseconds = 15000,
+        [scriptblock]$Runner,
+        [scriptblock]$ProcessFactory
+    )
+    if ($null -ne $Runner) {
+        try {
+            $result = & $Runner $Path
+            return [pscustomobject]@{
+                Ok = [bool]$result.Ok
+                Text = [string]$result.Text
+                Reason = [string]$result.Reason
+            }
+        } catch {
+            return [pscustomobject]@{ Ok = $false; Text = ''; Reason = 'runner-error' }
+        }
     }
-    $path = [IO.Path]::GetFullPath([string]$commands[0].Source)
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "pwsh.exe is missing: $path" }
-    $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
-    $major = if ($version.ProductMajorPart -gt 0) { $version.ProductMajorPart } else { $version.FileMajorPart }
-    if ($major -ne 7) { throw "Agent continuity requires pwsh 7, found version $major at $path." }
-    $pwshHome = Split-Path -Parent $path
-    $modules = Join-Path $pwshHome 'Modules'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Path
+    $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -Command "$PSVersionTable.PSVersion.Major"'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    # 探针在隔离目录建立前运行，显式关闭遥测/更新检查，减少对真实用户环境的一次性写入。
+    $startInfo.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+    $startInfo.Environment['POWERSHELL_UPDATECHECK'] = 'Off'
+    $startInfo.Environment['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
+    $startInfo.Environment['DOTNET_NOLOGO'] = '1'
+    try {
+        $process = if ($null -ne $ProcessFactory) {
+            & $ProcessFactory $Path
+        } else {
+            [Diagnostics.Process]::Start($startInfo)
+        }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Text = ''; Reason = 'start-error' }
+    }
+    try {
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill()
+            } catch {
+                return [pscustomobject]@{ Ok = $false; Text = ''; Reason = 'kill-error' }
+            }
+            # Kill 后必须有界确认退出；未确认不能把回收失败吞成普通 timeout。
+            if (-not $process.WaitForExit(5000)) {
+                return [pscustomobject]@{ Ok = $false; Text = ''; Reason = 'kill-timeout' }
+            }
+            return [pscustomobject]@{ Ok = $false; Text = ''; Reason = 'timeout' }
+        }
+        $text = $process.StandardOutput.ReadToEnd()
+        [void]$process.StandardError.ReadToEnd()
+        if ($process.ExitCode -ne 0) {
+            return [pscustomobject]@{ Ok = $false; Text = $text; Reason = 'exit-code' }
+        }
+        return [pscustomobject]@{
+            Ok = (Test-Pwsh7VersionText -Text $text)
+            Text = $text
+            Reason = 'completed'
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Select-Pwsh7Candidate {
+    # 纯选择：按传入顺序返回第一个 probe 通过的候选；不执行进程，便于静态测试覆盖
+    # alias 优先、alias 失败回退 real/普通 exe 以及全部失败返回 null。
+    # @author kongweiguang
+    param(
+        [AllowEmptyCollection()][string[]]$Candidates = @(),
+        [Parameter(Mandatory = $true)][scriptblock]$Probe
+    )
+    foreach ($candidate in $Candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $result = & $Probe $candidate
+        if ([bool]$result.Ok) {
+            return [pscustomobject]@{ Path = $candidate; Reason = [string]$result.Reason }
+        }
+    }
+    return $null
+}
+
+function Resolve-Pwsh7 {
+    # 启动前固定并验证一个可运行的 pwsh 7。Store 的 AppExecLink 用 FileVersionInfo 读不到版本，
+    # 因此每个候选都在独立受限子进程中实际查询 $PSVersionTable；验证成功的 alias 优先作为
+    # 入口，真实 PSHOME 只提供 Modules，PATH 首位放选中入口目录，避免裸 pwsh 又解析到
+    # 无法启动的真实包路径。没有 alias 时仍可使用普通非 Store exe。
+    # @author kongweiguang
+    $commands = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue)
+    $pathCandidates = [Collections.Generic.List[string]]::new()
+    foreach ($command in $commands) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+            $pathCandidates.Add([IO.Path]::GetFullPath([string]$command.Source))
+        }
+    }
+    $realPath = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $realPath -PathType Leaf)) { $realPath = $null }
+    # alias 只认标准 WindowsApps 入口；Get-Command 返回的其它路径仍作为普通 PATH 候选，
+    # 不能把任意非 PSHOME 路径都当成 App Execution Alias。
+    $aliasPath = $null
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+        $aliasCandidate = Join-Path $localAppData 'Microsoft\WindowsApps\pwsh.exe'
+        if (Test-Path -LiteralPath $aliasCandidate -PathType Leaf) {
+            $aliasPath = [IO.Path]::GetFullPath($aliasCandidate)
+        }
+    }
+    $ordered = [Collections.Generic.List[string]]::new()
+    foreach ($candidate in @($aliasPath, $realPath) + $pathCandidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $ordered.Contains($candidate)) {
+            $ordered.Add($candidate)
+        }
+    }
+    $selected = Select-Pwsh7Candidate -Candidates @($ordered) -Probe {
+        param($candidate)
+        Invoke-Pwsh7VersionProbe -Path $candidate
+    }
+    if ($null -eq $selected) {
+        throw 'Agent continuity requires a runnable pwsh 7; no candidate passed the restricted version probe.'
+    }
+    # 真实安装目录只作为 modules 来源；选中 alias 时 Home 仍指向真实 PSHOME。
+    $realHome = if ($null -ne $realPath) { Split-Path -Parent $realPath } else { $null }
+    $modulesHome = if (-not [string]::IsNullOrWhiteSpace($realHome) -and (Test-Path -LiteralPath (Join-Path $realHome 'Modules') -PathType Container)) {
+        $realHome
+    } else {
+        Split-Path -Parent $selected.Path
+    }
+    $modules = Join-Path $modulesHome 'Modules'
     if (-not (Test-Path -LiteralPath $modules -PathType Container)) {
         throw "pwsh 7 built-in module directory is missing: $modules"
     }
-    return [pscustomobject]@{ Path = $path; Home = $pwshHome; Modules = $modules }
+    $pathKind = if ($selected.Path -eq $aliasPath) { 'alias' } elseif ($selected.Path -eq $realPath) { 'real' } else { 'path' }
+    return [pscustomobject]@{
+        Path = $selected.Path
+        Home = $modulesHome
+        Modules = $modules
+        RealPath = $realPath
+        AliasPath = $aliasPath
+        EntryDirectory = Split-Path -Parent $selected.Path
+        PathKind = $pathKind
+        VersionMajor = 7
+    }
+}
+
+function Get-AgentContinuityPtyProbeLine {
+    # 只接受整行严格白名单（固定 stage 四值 + 有符号数字/unknown）；同前缀携带额外字段或
+    # 敏感尾巴的行必须跳过，避免把命令/路径/环境带入报告。
+    # @author kongweiguang
+    param([Parameter(Mandatory = $true)][string]$StderrPath)
+    if (-not (Test-Path -LiteralPath $StderrPath -PathType Leaf)) { return $null }
+    $pattern = '^KERMINAL_ACCEPTANCE_PTY_PROBE stage=(attribute|job|create_process|unknown) raw_os_error=(-?\d+|unknown)$'
+    $line = Get-Content -LiteralPath $StderrPath -ErrorAction SilentlyContinue |
+        Where-Object { $_ -cmatch $pattern } |
+        Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace([string]$line)) { return $null }
+    return [string]$line
+}
+
+function Get-AgentContinuityPtyMatrix {
+    # 只接受整行严格白名单：固定 shell 标签、固定结果枚举、可选 UUID session 和固定 close 结果。
+    # 探针行按出现顺序关联到最近的 start shell 标签；同前缀携带额外字段的行一律跳过，
+    # 避免命令、路径或环境进入报告。
+    # @author kongweiguang
+    param([Parameter(Mandatory = $true)][string]$StderrPath)
+    if (-not (Test-Path -LiteralPath $StderrPath -PathType Leaf)) {
+        return [pscustomobject]@{ lines = @(); probes = @() }
+    }
+    $matrixPattern = '^KERMINAL_ACCEPTANCE_PTY_MATRIX shell=(cmd|powershell|pwsh_real|pwsh_alias) (result=(start|ok|failed|timeout|cancelled|skipped)( session=[0-9a-fA-F-]{36})?|close=(ok|failed))$'
+    $probePattern = '^KERMINAL_ACCEPTANCE_PTY_PROBE stage=(attribute|job|create_process|unknown) raw_os_error=(-?\d+|unknown)$'
+    $lines = [Collections.Generic.List[string]]::new()
+    $probes = [Collections.Generic.List[object]]::new()
+    $currentShell = $null
+    foreach ($line in Get-Content -LiteralPath $StderrPath -ErrorAction SilentlyContinue) {
+        $text = [string]$line
+        if ($text -cmatch $matrixPattern) {
+            $lines.Add($text)
+            if ($text -cmatch '^KERMINAL_ACCEPTANCE_PTY_MATRIX shell=(cmd|powershell|pwsh_real|pwsh_alias) result=start$') {
+                $currentShell = $Matches[1]
+            } elseif ($text -cmatch '^KERMINAL_ACCEPTANCE_PTY_MATRIX shell=(cmd|powershell|pwsh_real|pwsh_alias) (result=(failed|timeout|cancelled|skipped)|close=(ok|failed))$') {
+                # 子项结束后清空标签；后续探针来自矩阵之外的生产流程，不能继续冒充上一个 shell。
+                $currentShell = $null
+            }
+            continue
+        }
+        if ($text -cmatch $probePattern) {
+            $probes.Add([pscustomobject]@{
+                shell = $currentShell
+                line = $text
+            })
+        }
+    }
+    return [pscustomobject]@{ lines = @($lines); probes = @($probes) }
 }
 
 function Get-AcceptanceExecutableHash {
@@ -503,16 +697,27 @@ function Assert-AgentContinuityReport {
     $expectedOperations = @(
         'agent-continuity-launcher-ready',
         'agent-continuity-started',
+        'agent-continuity-inactive-output',
+        'agent-continuity-native-window-activity-output',
+        'agent-continuity-landing-light',
+        'agent-continuity-landing-system',
+        'agent-continuity-landing-dark',
+        'agent-continuity-native-window-activity-landing',
+        'agent-continuity-history-continued',
         'agent-continuity-draft-before-switch',
+        'agent-continuity-native-window-activity-draft',
         'agent-continuity-other-tab-active',
         'agent-continuity-hidden-output-observed',
         'agent-continuity-returned',
         'agent-continuity-resumed-input',
+        'agent-continuity-entry-new-chat',
         'agent-continuity-exited',
+        'agent-continuity-entry-after-exit-direct-create',
         'agent-continuity-same-tab-second-pane-ready',
         'agent-continuity-same-tab-focus-switched',
         'agent-continuity-same-tab-continuity-preserved',
-        'agent-continuity-same-tab-second-pane-reclaimed'
+        'agent-continuity-same-tab-second-pane-reclaimed',
+        'agent-continuity-history-fixed-viewport'
     )
     $records = @($Report.functional)
     Assert-True ($records.Count -eq $expectedOperations.Count) 'Agent continuity report checkpoint count is unexpected.'
@@ -532,7 +737,8 @@ function Assert-AgentContinuityDirectories {
     param(
         [Parameter(Mandatory = $true)][string]$RunDirectory,
         [Parameter(Mandatory = $true)][string]$OutputDirectory,
-        [Parameter(Mandatory = $true)][string]$ConfigDirectory
+        [Parameter(Mandatory = $true)][string]$ConfigDirectory,
+        [Parameter(Mandatory = $true)][string]$ShellPath
     )
     Assert-True (Test-PathWithinRoot -Path $OutputDirectory -Root $RunDirectory) 'Agent continuity output is outside the run directory.'
     $profilePath = Join-Path $ConfigDirectory 'profiles\agent-continuity-local.toml'
@@ -542,10 +748,11 @@ function Assert-AgentContinuityDirectories {
     $profile = [IO.File]::ReadAllText($profilePath)
     $workingDirectory = Join-Path $OutputDirectory ''
     $workingDirectory = $workingDirectory.TrimEnd('\')
+    $escapedShellPath = $ShellPath.Replace('\', '\\')
     foreach ($requiredLine in @(
         'schema_version = 1',
         'id = "agent-continuity-local"',
-        'shell = "pwsh.exe"',
+        ('shell = "' + $escapedShellPath + '"'),
         'args = ["-NoLogo", "-NoProfile"]',
         ('cwd = "' + $workingDirectory.Replace('\', '\\') + '"'),
         'is_default = true'
@@ -557,8 +764,12 @@ function Assert-AgentContinuityDirectories {
     if (Test-Path -LiteralPath (Join-Path $ConfigDirectory 'hosts')) {
         throw 'Agent continuity config unexpectedly contains hosts.'
     }
+    # 隔离配置会生成自己的 vault-key.toml；只允许这一条预期路径，仍拒绝其它
+    # vault/known_hosts/key 文件，避免把用户凭据或主机密钥复制进验收目录。
+    $expectedVaultKey = Join-Path $ConfigDirectory 'secrets\vault-key.toml'
     $forbidden = @(Get-ChildItem -LiteralPath $ConfigDirectory -Recurse -Force -File -ErrorAction Stop | Where-Object {
-        $_.Name -match '^(known_hosts|vault.*|id_.*)$' -or $_.Extension -in @('.key', '.pem')
+        $_.FullName -ine $expectedVaultKey -and
+        ($_.Name -match '^(known_hosts|vault.*|id_.*)$' -or $_.Extension -in @('.key', '.pem'))
     })
     if ($forbidden.Count -ne 0) {
         throw "Agent continuity config contains credential or host-key material: $($forbidden.Name -join ', ')"
@@ -660,6 +871,8 @@ Assert-OuterShellArguments -SourceRoot $PSScriptRoot -Arguments @(
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $pwsh = Resolve-Pwsh7
+# 只报告有效路径种类与实际验证的 major，不输出候选路径或用户环境。
+Write-Host "pwsh 7 probe: pathKind=$($pwsh.PathKind) major=$($pwsh.VersionMajor)"
 $executable = if ([string]::IsNullOrWhiteSpace($ExecutablePath)) {
     Join-Path $repositoryRoot "target\$BuildProfile\kerminal.exe"
 } else {
@@ -703,7 +916,10 @@ $environmentNames = @(
     'POWERSHELL_TELEMETRY_OPTOUT', 'POWERSHELL_UPDATECHECK',
     'DOTNET_CLI_TELEMETRY_OPTOUT', 'DOTNET_NOLOGO', 'DOTNET_CLI_HOME', 'NUGET_PACKAGES',
     'KERMINAL_CONFIG_ROOT', 'KERMINAL_RIGHT_RAIL_FIXTURE_MANIFEST',
-    'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_SETTINGS_ACCEPTANCE_SCOPE'
+    'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_SETTINGS_ACCEPTANCE_SCOPE',
+    'KERMINAL_ACCEPTANCE_PWSH', 'KERMINAL_ACCEPTANCE_PTY_PROBE',
+    'KERMINAL_ACCEPTANCE_PWSH_REAL', 'KERMINAL_ACCEPTANCE_PWSH_ALIAS',
+    'KERMINAL_ACCEPTANCE_UI_SCALE'
 )
 $previousEnvironment = Get-ProcessEnvironmentSnapshot -Names $environmentNames
 $previousKerminalEnvironment = if ($inheritedKerminalNames.Count -gt 0) {
@@ -759,7 +975,7 @@ try {
     $homePath = $profileRoot.Substring($drive.Length)
     if (-not $homePath.StartsWith('\')) { $homePath = '\' + $homePath }
     $basePath = if ($previousEnvironment['PATH'].Present) { [string]$previousEnvironment['PATH'].Value } else { '' }
-    $childPath = if ([string]::IsNullOrWhiteSpace($basePath)) { $pwsh.Home } else { $pwsh.Home + ';' + $basePath }
+    $childPath = if ([string]::IsNullOrWhiteSpace($basePath)) { $pwsh.EntryDirectory } else { $pwsh.EntryDirectory + ';' + $basePath }
 
     Set-ProcessEnvironmentValue -Name 'USERPROFILE' -Value $profileRoot
     Set-ProcessEnvironmentValue -Name 'HOME' -Value $profileRoot
@@ -788,6 +1004,16 @@ try {
     }
     $otherKerminalEnvironmentCleared = $true
     Set-ProcessEnvironmentValue -Name 'KERMINAL_CONFIG_ROOT' -Value $environmentConfig
+    # 已验证的绝对 pwsh 路径交给验收 profile 构造，避免子进程按 PATH 搜索到 alias 或 shim；
+    # 该值在应用创建 profile 前读取，随后由应用自身的 KERMINAL_* 清理移除。
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_ACCEPTANCE_PWSH' -Value $pwsh.Path
+    # 本地 PTY spawn 探针只接受显式 1；应用 boot 在 clear 前捕获并仅 Agent-only 本轮重设。
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_ACCEPTANCE_PTY_PROBE' -Value '1'
+    # 矩阵需要真实安装与 alias 两个绝对路径；缺失时传 null，由应用输出 skipped 而不是成功。
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_ACCEPTANCE_PWSH_REAL' -Value $pwsh.RealPath
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_ACCEPTANCE_PWSH_ALIAS' -Value $pwsh.AliasPath
+    # 窗口内 UI rem/字体放大；报告会标明这不是系统 DPI 模拟。
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_ACCEPTANCE_UI_SCALE' -Value $UiScale.ToString([Globalization.CultureInfo]::InvariantCulture)
     Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_FIXTURE_MANIFEST' -Value $null
     Set-ProcessEnvironmentValue -Name 'KERMINAL_SFTP_FOLLOW_MANIFEST' -Value $null
     Set-ProcessEnvironmentValue -Name 'KERMINAL_SETTINGS_ACCEPTANCE_SCOPE' -Value $null
@@ -830,7 +1056,7 @@ try {
     catch { throw 'Agent continuity report.json is not valid JSON.' }
     Assert-AgentContinuityReport -Report $report -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory `
         -DesktopName $desktopName -ProcessId $processId -Width $Width -Height $Height
-    Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory
+    Assert-AgentContinuityDirectories -RunDirectory $runRoot -OutputDirectory $outputDirectory -ConfigDirectory $configDirectory -ShellPath $pwsh.Path
     Assert-NoResidualProcess -RunDirectory $runRoot -ProcessId $processId -CreationTimeUtcTicks $processCreationTimeUtcTicks
 }
 catch {
@@ -913,6 +1139,9 @@ if ($null -ne $nativeProcess) {
 $failureMessages = [Collections.Generic.List[string]]::new()
 if ($null -ne $runFailure) { $failureMessages.Add([string]$runFailure.Exception.Message) }
 foreach ($message in $cleanupFailures) { $failureMessages.Add($message) }
+# 成功与失败回执都保留同一份严格过滤的矩阵证据；探针行按顺序关联到 shell 标签。
+$ptyProbeLine = Get-AgentContinuityPtyProbeLine -StderrPath $stderrPath
+$ptyMatrix = Get-AgentContinuityPtyMatrix -StderrPath $stderrPath
 if ($failureMessages.Count -ne 0) {
     $failureText = $failureMessages -join '; '
     $descendantTreeProven = $jobAssigned -and $jobCleanupVerified -and -not $jobCleanupForced
@@ -931,6 +1160,10 @@ if ($failureMessages.Count -ne 0) {
                 jobActiveProcessesAtExit = $jobActiveProcessesAtExit
                 descendantTreeProven = $descendantTreeProven
                 executableSha256 = $executableHash
+                pwshPathKind = [string]$pwsh.PathKind
+                pwshVersionMajor = [int]$pwsh.VersionMajor
+                uiScale = [double]$UiScale
+                uiScaleKind = 'window_rem_not_system_dpi'
                 runDirectory = $runRoot
                 outputDirectory = $outputDirectory
                 knownFolderApiCovered = $false
@@ -938,6 +1171,9 @@ if ($failureMessages.Count -ne 0) {
                 otherKerminalEnvironmentCleared = $otherKerminalEnvironmentCleared
                 isolationScope = 'Process environment, output paths, private desktop and owned job object only; Windows KnownFolder API and same-user token are not redirected.'
                 failure = $failureText
+                ptyProbe = $ptyProbeLine
+                ptyMatrix = @($ptyMatrix.lines)
+                ptyProbes = @($ptyMatrix.probes)
                 cleanupFailures = @($cleanupFailures)
             }
             Write-Utf8 -Path (Join-Path $runRoot 'process-result.json') -Content ((ConvertTo-Json -InputObject $failureResult) + [Environment]::NewLine)
@@ -964,6 +1200,10 @@ $result = [ordered]@{
     jobActiveProcessesAtExit = $jobActiveProcessesAtExit
     descendantTreeProven = $descendantTreeProven
     executableSha256 = $executableHash
+    pwshPathKind = [string]$pwsh.PathKind
+    pwshVersionMajor = [int]$pwsh.VersionMajor
+    uiScale = [double]$UiScale
+    uiScaleKind = 'window_rem_not_system_dpi'
     runDirectory = $runRoot
     outputDirectory = $outputDirectory
     reportCaptureMode = [string]$report.captureMode
@@ -971,6 +1211,9 @@ $result = [ordered]@{
     userTokenIsolated = $false
     otherKerminalEnvironmentCleared = $otherKerminalEnvironmentCleared
     launcherCleanupProven = $desktopClosed -and $descendantTreeProven
+    ptyProbe = $ptyProbeLine
+    ptyMatrix = @($ptyMatrix.lines)
+    ptyProbes = @($ptyMatrix.probes)
     cleanupScope = 'Exact launcher process, private desktop handle, and owned job object; the job active process count was verified zero at exit without forced termination. Windows KnownFolder API and same-user token are not redirected.'
 }
 Write-Utf8 -Path (Join-Path $runRoot 'process-result.json') -Content ((ConvertTo-Json -InputObject $result) + [Environment]::NewLine)

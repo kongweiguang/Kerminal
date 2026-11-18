@@ -2,18 +2,19 @@
 //!
 //! @author kongweiguang
 
-use chrono::DateTime;
+use chrono::{DateTime, Local};
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement, Render,
-    StatefulInteractiveElement as _, Subscription, Window,
+    AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement, Pixels,
+    Render, StatefulInteractiveElement as _, Subscription, Window,
     assets::IconName,
     component::WindowExt as _,
     component::{
         Disableable, Theme as KitTheme,
-        button::{Button, ButtonRounded, ButtonVariants},
+        button::{Button, ButtonCustomVariant, ButtonRounded, ButtonVariants},
         dialog::{DialogDescription, DialogEntrance, DialogFooter, DialogTitle},
         input::Input,
         menu::{DropdownMenu as _, PopupMenuItem},
+        scroll::ScrollableElement as _,
         tooltip::Tooltip,
     },
     div,
@@ -32,6 +33,7 @@ use kerminal_domain::{
     sessions::SessionLifecycle,
 };
 
+use crate::locale::UiLanguage;
 use crate::theme::ThemeTokens;
 
 use super::{
@@ -51,6 +53,87 @@ struct HistoryFilterOption {
     description_en: &'static str,
     count: usize,
     mode: AgentHistoryMode,
+}
+
+/// 历史区默认展示三条完整行；视口高度固定，记录数量变化不能移动上方入口。
+const HISTORY_VISIBLE_ROWS: usize = 3;
+
+/// 行式列表右侧始终为滚动条预留的 gutter；用固定物理像素与 Kit 滚动条宽度对齐，
+/// 不随 rem 放大，避免 3→4 条时正文横向回流。
+const HISTORY_SCROLLBAR_GUTTER: Pixels = px(16.);
+
+/// 两行紧凑行高：第一行标题与常驻操作共用真实 Button 高度，第二行身份与状态单行。
+/// 普通态和 rename 态都按同一预算取整，输入框高度也计入，避免逐条内容撑高或裁掉按钮。
+///
+/// @author kongweiguang
+fn history_row_height(theme: ThemeTokens, rem: Pixels) -> Pixels {
+    // 上下 p_2 合计 1rem；两行之间保留 gap_1，让标题行和身份行不互相挤压。
+    let padding = rem * 1.0;
+    let row_gap = rem * 0.25;
+    // 管理按钮为 Kit 默认 2rem 图标按钮；rename 输入使用产品控件高度，两者取较大者。
+    let first_row = (rem * 2.)
+        .max(theme.text_xs * 1.618_034)
+        .max(theme.metrics.control_height);
+    // 第二行文字固定 1.25 行高；14px 下限保证小字号下仍有可读的点击行。
+    let second_row = (theme.text_xs * 1.25).max(px(14.));
+    (padding + first_row + row_gap + second_row).ceil()
+}
+
+/// 视口高度恒为三条行高；行式列表没有外框，不再补偿不存在的上下边框。
+///
+/// @author kongweiguang
+fn history_viewport_height(theme: ThemeTokens, rem: Pixels) -> Pixels {
+    history_row_height(theme, rem) * HISTORY_VISIBLE_ROWS as f32
+}
+
+/// 历史行表面只在真实选中和中性悬停之间切换；选中优先于悬停，
+/// 让“已附着”和“指针经过”保持不同语义。
+///
+/// @author kongweiguang
+fn history_row_surface(theme: ThemeTokens, active: bool, hovered: bool) -> gpui_kit::Hsla {
+    if active {
+        theme.surface_selected()
+    } else if hovered {
+        theme.surface_hover()
+    } else {
+        theme.panel.alpha(0.)
+    }
+}
+
+/// 行分隔线绝对定位，不参与行高预算；左右内缩并避开滚动条 gutter，
+/// 避免像外框一样包住整行，也避免滚动条出现时压住分隔线。
+///
+/// @author kongweiguang
+fn history_row_separator(theme: ThemeTokens, rem: Pixels) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(rem * 0.5)
+        .right(HISTORY_SCROLLBAR_GUTTER)
+        .bottom(px(0.))
+        .h(px(1.))
+        .bg(theme.border.opacity(0.5))
+}
+
+/// 第二行身份文案：当前目标筛选下省略重复的“当前目标”，全部筛选才补归属；
+/// 完整身份始终保留 scope，供 tooltip 和可访问名称使用。
+///
+/// @author kongweiguang
+fn history_metadata_text(
+    provider: &str,
+    scope: &str,
+    time: &str,
+    mode: AgentHistoryMode,
+    is_current_target: bool,
+) -> (String, String) {
+    let full = format!("{provider} · {scope} · {time}");
+    // 当前目标筛选里所有可见行都属于当前目标，重复文案没有信息量；
+    // 但异常情况下若行不属于当前目标，仍保留 scope，避免身份丢失。
+    let display = if mode == AgentHistoryMode::CurrentTarget && is_current_target {
+        format!("{provider} · {time}")
+    } else {
+        full.clone()
+    };
+    (display, full)
 }
 
 impl AgentsPanel {
@@ -479,12 +562,9 @@ impl Render for AgentsPanel {
             panel = panel
                 .h_full()
                 .min_h(px(0.))
-                .child(self.render_landing_content(theme, cx));
+                .child(self.render_landing_content(theme, window.rem_size(), cx));
         }
 
-        if self.context_preview.is_some() {
-            panel = panel.child(self.render_context_preview(theme, cx));
-        }
         if self.pending_send.is_some() || !self.send_history.is_empty() {
             panel = panel.child(self.render_pending_send(theme, cx));
         }
@@ -581,8 +661,8 @@ impl AgentsPanel {
                     .text_size(theme.text_xs)
                     .text_color(theme.muted)
                     .child(crate::locale::text(
-                        "核对仅处理原恢复事务，不启动新的 CLI。待核对期间不能改名、重绑或归档；可保留记录并先执行“核对恢复”。",
-                        "Check only the original recovery without starting another CLI. Rename, rebinding, and archiving stay locked until verified; keep the record and reconcile first.",
+                        "核对仅处理原恢复事务，不启动新的 CLI。待核对期间不能改名或归档；可保留记录并先执行“核对恢复”。",
+                        "Check only the original recovery without starting another CLI. Rename and archiving stay locked until verified; keep the record and reconcile first.",
                     )),
             )
             .child(
@@ -592,7 +672,7 @@ impl AgentsPanel {
                     .label(crate::locale::text("核对恢复", "Reconcile recovery"))
                     .disabled(self.busy || self.loading || !self.sessions_verified)
                     .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                        if panel.ensure_menu_selection(&id, cx) && panel.can_reconcile_selected() {
+                        if panel.ensure_recovery_selection(&id, cx) && panel.can_reconcile_selected() {
                             panel.reconcile_agent(id.clone(), cx);
                         }
                     })),
@@ -646,14 +726,21 @@ impl AgentsPanel {
     }
 
     /// 入口和历史共用面板内容留白；列只限制最大宽度，避免停靠方向和密度变化时重复缩进。
+    /// 入口与历史作为一组在可用高度内垂直居中；历史视口恒为三条行高，记录数量、筛选、
+    /// 刷新和读取错误只改变视口内部，不移动上方入口。内容高于视口时由外层滚动兜底，
+    /// 居中容器只保证最小高度，不会裁掉超出部分。
+    /// 内容层必须禁止 flex 收缩：panel_content 是 flex_col，默认 shrink 会把高内容压回
+    /// 视口高，justify_center 随即在负空间里把列顶裁出滚动范围，外层也拿不到真实内容高度。
     /// @author kongweiguang
     fn render_landing_content(
         &self,
         theme: ThemeTokens,
+        rem: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         crate::ui_surface::panel_content(theme)
             .id("agents-landing-scroll")
+            .debug_selector(|| "rr-agent-landing-scroll".into())
             .w_full()
             .flex_1()
             .min_h(px(0.))
@@ -661,27 +748,28 @@ impl AgentsPanel {
             .child(
                 div()
                     .id("agents-landing-scroll-content")
+                    .debug_selector(|| "rr-agent-landing-scroll-content".into())
                     .w_full()
-                    .h_full()
+                    .min_h(relative(1.0))
+                    .flex_shrink_0()
                     .flex()
                     .flex_col()
                     .items_center()
-                    .child(div().w_full().flex_1().min_h(px(0.)))
+                    .justify_center()
                     .child(
                         div()
                             .id("agents-landing-column")
+                            .debug_selector(|| "rr-agent-landing-column".into())
                             .w_full()
                             .max_w(px(320.))
                             .flex_shrink_0()
-                            .mt(theme.metrics.gap)
                             .py(theme.metrics.gap)
                             .flex()
                             .flex_col()
                             .gap(theme.metrics.panel_padding)
                             .child(self.render_launcher(theme, cx))
-                            .child(self.render_session_history(theme, cx)),
-                    )
-                    .child(div().w_full().flex_1().min_h(px(0.))),
+                            .child(self.render_session_history(theme, rem, cx)),
+                    ),
             )
     }
 
@@ -801,134 +889,17 @@ impl AgentsPanel {
         header
     }
 
-    /// 历史行菜单冻结会话、筛选及目标；鼠标遮挡由整条触发器外层承担，保留 Kit 弹层命中路径。
-    ///
+    /// 恢复提示可能在异步刷新期间保持可见；执行前复核原会话身份和当前列表/操作状态。
     /// @author kongweiguang
-    fn render_history_actions_menu(
-        &self,
-        view: &AgentSessionView,
-        selectable: bool,
-        owner: &AgentArchiveConfirmationOwner,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + 'static {
-        let can_bind = view.session.status != AgentSessionStatus::Archived
-            && view.resume_recovery.is_none()
-            && owner.candidate.is_some();
-        let can_preview = view.session.status != AgentSessionStatus::Archived;
-        let can_reconcile = agent_can_reconcile(view);
-        let disabled = self.busy || !selectable || self.launcher_selection_busy;
-        let owner = owner.clone();
-        let expected_target = view.session.target.clone();
-        let entity = cx.entity().clone();
-
-        Button::new(format!("agent-history-actions-{}", owner.id.as_str()))
-            .compact()
-            .ghost()
-            .icon(IconName::Ellipsis)
-            .accessibility_label(crate::locale::text(
-                format!("{} 的更多操作", owner.expected_title),
-                format!("More actions for {}", owner.expected_title),
-            ))
-            .tooltip(crate::locale::text("更多操作", "More actions"))
-            .disabled(disabled)
-            .dropdown_menu(move |mut menu, _, _| {
-                let bind_owner = owner.clone();
-                let bind_entity = entity.clone();
-                let bind_previous_target = expected_target.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text(
-                        "绑定当前终端",
-                        "Bind current terminal",
-                    ))
-                    .icon(IconName::Link2)
-                    .disabled(disabled || !can_bind)
-                    .on_click(move |_, _, app| {
-                        let owner = bind_owner.clone();
-                        let previous_target = bind_previous_target.clone();
-                        bind_entity.update(app, |panel, cx| {
-                            if panel.ensure_history_action(
-                                &owner.id,
-                                &owner.expected_title,
-                                owner.mode,
-                                &owner.scope,
-                                owner.candidate.as_ref(),
-                                cx,
-                            ) && let Some(target) = owner.candidate.clone()
-                                && panel.ensure_menu_target(&target, cx)
-                            {
-                                panel.bind_agent_candidate(
-                                    owner.id.clone(),
-                                    target,
-                                    previous_target,
-                                    cx,
-                                );
-                            }
-                        });
-                    }),
-                );
-                let preview_owner = owner.clone();
-                let preview_entity = entity.clone();
-                let preview_target = expected_target.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text(
-                        "预览绑定目标上下文",
-                        "Preview bound context",
-                    ))
-                    .icon(IconName::Eye)
-                    .disabled(disabled || !can_preview)
-                    .on_click(move |_, _, app| {
-                        let owner = preview_owner.clone();
-                        let expected_target = preview_target.clone();
-                        preview_entity.update(app, |panel, cx| {
-                            if panel.ensure_history_action(
-                                &owner.id,
-                                &owner.expected_title,
-                                owner.mode,
-                                &owner.scope,
-                                owner.candidate.as_ref(),
-                                cx,
-                            ) {
-                                panel.preview_agent_context(owner.id.clone(), expected_target, cx);
-                            }
-                        });
-                    }),
-                );
-                let reconcile_owner = owner.clone();
-                let reconcile_entity = entity.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(crate::locale::text("核对恢复", "Reconcile recovery"))
-                        .disabled(disabled || !can_reconcile)
-                        .on_click(move |_, _, app| {
-                            let owner = reconcile_owner.clone();
-                            reconcile_entity.update(app, |panel, cx| {
-                                if panel.ensure_history_action(
-                                    &owner.id,
-                                    &owner.expected_title,
-                                    owner.mode,
-                                    &owner.scope,
-                                    owner.candidate.as_ref(),
-                                    cx,
-                                ) {
-                                    panel.reconcile_agent(owner.id.clone(), cx);
-                                }
-                            });
-                        }),
-                );
-                menu
-            })
-    }
-
-    /// 菜单可能在异步刷新期间保持打开；执行前复核原会话身份和当前列表/操作状态。
-    /// @author kongweiguang
-    fn ensure_menu_selection(
+    fn ensure_recovery_selection(
         &mut self,
         expected_id: &kerminal_domain::identity::AgentSessionId,
         cx: &mut Context<Self>,
     ) -> bool {
         let failure = if self.selected_agent.as_ref() != Some(expected_id) {
             Some((
-                "所选 Agent 已变化，请重新打开操作菜单。",
-                "The selected Agent changed. Reopen the actions menu.",
+                "所选 Agent 已变化，请重新选择该会话后核对恢复。",
+                "The selected Agent changed. Select the session again to reconcile.",
             ))
         } else if self.busy {
             Some((
@@ -959,33 +930,11 @@ impl AgentsPanel {
             }
         };
         if let Some((zh, en)) = failure {
-            self.show_menu_notice(zh, en, cx);
+            self.show_action_notice(zh, en, cx);
             false
         } else {
             true
         }
-    }
-
-    /// 目标候选只用于新建或显式绑定；菜单过期后绝不把绑定套到后来切入的终端。
-    /// @author kongweiguang
-    fn ensure_menu_target(
-        &mut self,
-        expected: &kerminal_domain::agents::AgentTargetBinding,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self
-            .candidate
-            .as_ref()
-            .is_some_and(|candidate| &candidate.binding == expected)
-        {
-            return true;
-        }
-        self.show_menu_notice(
-            "当前终端候选已变化，请重新打开操作菜单。",
-            "The terminal candidate changed. Reopen the actions menu.",
-            cx,
-        );
-        false
     }
 
     /// 待核对状态只开放原事务核对动作，避免把“继续”按钮变成第二次 CLI 启动。
@@ -995,9 +944,9 @@ impl AgentsPanel {
         self.selected_view().is_some_and(agent_can_reconcile)
     }
 
-    /// 过期菜单操作不静默失效也不自动选新目标，把具体原因留在面板状态区。
+    /// 过期操作不静默失效也不自动选新目标，把具体原因留在面板状态区。
     /// @author kongweiguang
-    pub(super) fn show_menu_notice(&mut self, zh: &str, en: &str, cx: &mut Context<Self>) {
+    pub(super) fn show_action_notice(&mut self, zh: &str, en: &str, cx: &mut Context<Self>) {
         self.status = Some(crate::locale::text(zh, en).to_string());
         cx.notify();
     }
@@ -1026,13 +975,15 @@ impl AgentsPanel {
                             .min_w(px(0.))
                             .child(self.render_launcher_selector(theme, cx)),
                     )
-                    .child(
+                    .child({
+                        // 顶部“进入”始终创建新会话；运行中会话只能从下方历史行显式继续，
+                        // 因此这里保持唯一主按钮，不再为临时选择切换主次样式。
                         Button::new("agents-launcher-start")
                             .compact()
+                            .primary()
                             .flex_none()
                             .min_w(theme.metrics.control_height * 1.75)
                             .h(theme.metrics.control_height + theme.metrics.gap * 1.5)
-                            .primary()
                             .accessibility_label(crate::locale::text("启动 Agent", "Start Agent"))
                             .child(
                                 div()
@@ -1044,8 +995,8 @@ impl AgentsPanel {
                             .disabled(!self.can_create_with_selected_launcher())
                             .on_click(
                                 cx.listener(|panel, _: &ClickEvent, _, cx| panel.create_agent(cx)),
-                            ),
-                    ),
+                            )
+                    }),
             )
             .when_some(self.launcher_load_error.as_ref(), |element, error| {
                 let retry_enabled =
@@ -1590,6 +1541,7 @@ impl AgentsPanel {
     fn render_session_history(
         &self,
         theme: ThemeTokens,
+        rem: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut history = div()
@@ -1607,6 +1559,7 @@ impl AgentsPanel {
         history = history.child(
             div()
                 .id("agents-history-heading")
+                .debug_selector(|| "rr-agent-history-heading".into())
                 .w_full()
                 .mb_1()
                 .flex()
@@ -1680,15 +1633,24 @@ impl AgentsPanel {
                         )),
                 ),
         );
+        let mut body = div()
+            .id("agents-history-body")
+            .debug_selector(|| "rr-agent-history-body".into())
+            .w_full()
+            .h(history_viewport_height(theme, rem))
+            .min_h(px(0.))
+            .flex()
+            .flex_col();
         if !self.loading && !self.sessions_verified {
             let error = self.history_load_error.clone().unwrap_or_else(|| {
                 crate::locale::text("暂时无法读取会话。", "Chats are temporarily unavailable.")
                     .to_string()
             });
-            history = history.child(
+            body = body.child(
                 div()
                     .id("agent-history-error")
                     .debug_selector(|| "rr-agent-history-error".into())
+                    .flex_shrink_0()
                     .max_h(px(96.))
                     .overflow_y_scroll()
                     .p_2()
@@ -1726,49 +1688,69 @@ impl AgentsPanel {
         }
         if self.visible_session_ids.is_empty() {
             if !self.loading && !self.sessions_verified {
-                return history;
+                return history.child(body);
             }
-            return history.child(self.render_empty_state(theme));
+            return history.child(body.child(self.render_empty_state(theme)));
         }
+        // 行式列表去掉卡片外框和底色，只保留行内分隔线；外层视口持有稳定 debug 身份，
+        // 内层滚动容器使用 Kit 滚动条。行内容右侧始终留出 gutter，滚动条出现时不再挤压正文。
+        // 先一次性收集可见行，避免重复遍历和两套过滤条件产生不一致的末行分隔线判断。
+        let visible: Vec<&AgentSessionView> = self
+            .sessions
+            .iter()
+            .filter(|view| {
+                self.visible_session_ids
+                    .contains(&view.session.agent_session_id)
+            })
+            .collect();
+        let visible_count = visible.len();
         let mut rows = div()
             .id("agents-session-list")
             .w_full()
-            .max_h(px(320.))
-            .overflow_y_scroll()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.content_surface());
-        for view in &self.sessions {
-            if self
-                .visible_session_ids
-                .contains(&view.session.agent_session_id)
-            {
-                rows = rows.child(self.render_session_row(
-                    view,
-                    self.selected_agent.as_ref() == Some(&view.session.agent_session_id),
-                    self.sessions_verified && !self.loading,
-                    theme,
-                    cx,
-                ));
-            }
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_y_scrollbar();
+        for (visible_index, view) in visible.into_iter().enumerate() {
+            rows = rows.child(self.render_session_row(
+                view,
+                visible_index + 1 < visible_count,
+                theme,
+                rem,
+                cx,
+            ));
         }
-        history.child(rows)
+        let list = div()
+            .id("agents-session-list-viewport")
+            .debug_selector(|| "rr-agent-history-list".into())
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(rows);
+        history.child(body.child(list))
     }
 
-    /// 主按钮继续原会话；改名、删除和更多操作均捕获稳定身份，避免动作落到后来选中的记录。
-    /// 主按钮覆盖整行但与管理按钮互为兄弟；管理按钮阻挡底层命中，标题与操作同列、状态固定在右侧。
-    /// 单行改名通过 Styled 指定高度；Input 自带的 h 仅控制多行编辑器。
+    /// 主按钮继续原会话；改名和删除均捕获稳定身份，避免动作落到后来选中的记录。
+    /// 两行行式布局：第一行标题与固定操作槽，第二行身份与状态；主按钮覆盖整行但使用
+    /// 透明自定义变体，悬停只由外行中性表面表达，避免底层 ghost 把整行刷成强调色。
+    /// 管理按钮阻挡底层命中；单行改名通过 Styled 指定高度，Input 自带的 h 仅控制多行编辑器。
+    /// 选中态和可选择性由 self 与 view 在同一渲染帧内唯一决定，行内计算即可，避免调用方
+    /// 重复传入可推导的布尔值；分隔线仍由可见列表位置决定，保留为参数。
     ///
     /// @author kongweiguang
     fn render_session_row(
         &self,
         view: &AgentSessionView,
-        active: bool,
-        selectable: bool,
+        show_separator: bool,
         theme: ThemeTokens,
+        rem: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let active = self.selected_agent.as_ref() == Some(&view.session.agent_session_id);
+        let selectable = self.sessions_verified && !self.loading;
         let id = view.session.agent_session_id.clone();
         let title = view.session.title.clone();
         let can_rename = view.resume_recovery.is_none();
@@ -1778,12 +1760,12 @@ impl AgentsPanel {
         let scope = self.scope.clone();
         let candidate = self.candidate.as_ref().map(|value| value.binding.clone());
         let is_current_target = session_matches_current_target(view, &scope);
-        let metadata = format!(
-            "{} · {} · {}",
-            session_provider_label(view.session.agent_id),
-            session_scope_label(view, is_current_target),
-            format_session_time(view),
-        );
+        let provider = session_provider_label(view.session.agent_id);
+        let scope_label = session_scope_label(view, is_current_target);
+        let time = format_session_time(view);
+        let (display_metadata, full_identity) =
+            history_metadata_text(&provider, &scope_label, &time, mode, is_current_target);
+        let status_label = lifecycle_label(view);
         let status_color = if view.resume_recovery.is_some() {
             theme.warning
         } else if running {
@@ -1797,6 +1779,9 @@ impl AgentsPanel {
         } else {
             theme.muted
         };
+        // 两行布局的右侧固定槽：普通态放改名/删除，rename 态在同一位置换成保存/取消。
+        // 槽宽按两个 2rem 图标按钮加 gap_1 预算，标题和输入只占剩余宽度，行高不随状态变化。
+        let action_slot = rem * 4.25;
 
         if self
             .rename_target
@@ -1805,36 +1790,52 @@ impl AgentsPanel {
         {
             let rename_title_valid =
                 super::can_save_agent_session_title(self.rename_title.read(cx).value().as_ref());
+            let rename_row_debug = format!("rr-agent-history-row-{}", id.as_str());
             return div()
                 .id(format!("agent-session-rename-{}", id.as_str()))
+                .debug_selector(move || rename_row_debug.clone())
+                .relative()
                 .w_full()
-                .p_3()
-                .border_b_1()
-                .border_color(theme.border)
+                .h(history_row_height(theme, rem))
+                .flex_shrink_0()
+                .p_2()
+                .pr(HISTORY_SCROLLBAR_GUTTER)
                 .flex()
-                .items_start()
-                .gap_2()
-                .child(session_icon(theme))
+                .flex_col()
+                .gap_1()
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.))
+                        .w_full()
                         .flex()
-                        .flex_col()
+                        .items_center()
                         .gap_1()
                         .child(
+                            // 输入框与保存/取消共用第一行；右侧槽位与普通态同宽，
+                            // 切换改名不会让标题列或行高跳动。
                             div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap_1()
+                                .debug_selector(|| "rr-agent-rename-input".into())
+                                .flex_1()
+                                .min_w(px(0.))
                                 .child(
                                     gpui_kit::Styled::h(
-                                        Input::new(&self.rename_title).flex_1().min_w(px(0.)),
-                                        px(28.),
+                                        Input::new(&self.rename_title).w_full(),
+                                        theme.metrics.control_height,
                                     )
                                     .disabled(self.busy || !selectable || !can_rename),
-                                )
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "rr-agent-history-rename-actions".into())
+                                // 与普通态操作槽保持一致：保存/取消按钮之间的间隙也不能
+                                // 穿透到行级命中区，滚轮仍可滚动列表。
+                                .block_mouse_except_scroll()
+                                .w(action_slot)
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_1()
                                 .child(
                                     Button::new(format!("agent-session-save-{}", id.as_str()))
                                         .compact()
@@ -1870,25 +1871,49 @@ impl AgentsPanel {
                                             panel.cancel_agent_rename(cx)
                                         })),
                                 ),
-                        )
-                        .child(session_metadata(&metadata, theme)),
+                        ),
                 )
-                .child(session_status_badge(view, running, status_color, theme));
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(session_metadata(
+                            &display_metadata,
+                            &full_identity,
+                            theme,
+                            &id,
+                        ))
+                        .child(session_status_text(&status_label, status_color, theme, &id)),
+                )
+                .when(show_separator, |element| {
+                    element.child(history_row_separator(theme, rem))
+                });
         }
 
         let continue_id = id.clone();
         let continue_title = title.clone();
         let continue_scope = scope.clone();
         let continue_candidate = candidate.clone();
+        // 完整身份与状态写入可访问名称和 tooltip；当前目标筛选下第二行可省略重复 scope，
+        // 但辅助技术仍能读到 provider、归属、时间和真实生命周期。
         let continue_label = crate::locale::text(
-            format!("继续对话 {title}"),
-            format!("Continue chat {title}"),
+            format!("继续对话 {title} · {full_identity} · {status_label}"),
+            format!("Continue chat {title} · {full_identity} · {status_label}"),
         );
+        // 整行主按钮用透明自定义变体：ghost() 的 hover 会画强调色，覆盖外行中性表面；
+        // 这里把 normal/hover/active 都设为透明，焦点线仍用正文色保持键盘可见。
+        let transparent = theme.panel.alpha(0.);
+        let primary_variant = ButtonCustomVariant::new(cx)
+            .color(transparent)
+            .foreground(theme.foreground)
+            .hover_foreground(theme.foreground)
+            .hover(transparent)
+            .active(transparent);
         let primary = Button::new(format!("agent-session-continue-{}", id.as_str()))
             .compact()
-            .ghost()
-            .flex_1()
-            .min_w(px(0.))
+            .custom(primary_variant)
             .accessibility_label(continue_label.clone())
             .tooltip(continue_label)
             .disabled(!selectable || self.busy)
@@ -1940,7 +1965,6 @@ impl AgentsPanel {
             candidate: candidate.clone(),
             generation: 0,
         };
-        let actions = self.render_history_actions_menu(view, selectable, &confirmation_owner, cx);
         let delete = Button::new(format!("agent-session-delete-{}", id.as_str()))
             .block_mouse_except_scroll()
             .compact()
@@ -1956,62 +1980,82 @@ impl AgentsPanel {
                 panel.open_archive_confirmation(confirmation_owner.clone(), window, cx);
             }));
 
+        let row_debug = format!("rr-agent-history-row-{}", id.as_str());
         div()
             .id(format!("agent-history-row-{}", id.as_str()))
+            .debug_selector(move || row_debug.clone())
             .relative()
             .w_full()
-            .p_3()
-            .border_b_1()
-            .border_color(theme.border)
+            .h(history_row_height(theme, rem))
+            .flex_shrink_0()
+            .p_2()
+            // 右侧 gutter 固定为 Kit 滚动条宽度；4 条以上出现 thumb 时不再横向回流。
+            .pr(HISTORY_SCROLLBAR_GUTTER)
             .flex()
-            .items_start()
-            .gap_2()
-            .when(active, |element| element.bg(theme.surface_selected()))
+            .flex_col()
+            .gap_1()
+            .when(active, |element| {
+                element.bg(history_row_surface(theme, true, false))
+            })
             .when(!active, |element| {
-                element.hover(|style| style.bg(theme.surface_hover()))
+                element.hover(move |style| style.bg(history_row_surface(theme, false, true)))
             })
             .child(primary.absolute().inset_0().size_full())
             .child(
                 div()
-                    .relative()
-                    .flex_1()
-                    .min_w(px(0.))
+                    .w_full()
                     .flex()
-                    .items_start()
-                    .gap_2()
-                    .child(session_icon(theme))
+                    .items_center()
+                    .gap_1()
                     .child(
+                        // 标题与操作同处第一行：操作槽固定宽度，标题只占剩余空间并截断；
+                        // 完整标题仍在主按钮的可访问名称与 tooltip 中，不靠缩小字体硬塞。
                         div()
+                            .debug_selector(|| "rr-agent-history-title".into())
                             .flex_1()
                             .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .text_size(theme.text_xs)
-                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .child(title),
-                                    )
-                                    .child(rename)
-                                    .child(delete)
-                                    .child(div().block_mouse_except_scroll().child(actions)),
-                            )
-                            .child(session_metadata(&metadata, theme)),
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(theme.text_xs)
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(title),
                     )
-                    .child(session_status_badge(view, running, status_color, theme)),
+                    .child(
+                        div()
+                            .debug_selector(|| "rr-agent-history-actions".into())
+                            // 两个图标按钮之间的 gap 仍属于整行主按钮的命中区；容器必须
+                            // 挡住非滚轮鼠标事件，否则点间隙会误触继续会话。滚轮保持透传，
+                            // 列表仍可在操作槽上滚动。
+                            .block_mouse_except_scroll()
+                            .w(action_slot)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_1()
+                            .child(rename)
+                            .child(delete),
+                    ),
             )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(session_metadata(
+                        &display_metadata,
+                        &full_identity,
+                        theme,
+                        &id,
+                    ))
+                    .child(session_status_text(&status_label, status_color, theme, &id)),
+            )
+            .when(show_separator, |element| {
+                element.child(history_row_separator(theme, rem))
+            })
     }
 
     /// 空列表保留 main 的描边卡片；正常加载使用中性文字，读取故障由列表的唯一重试提示表达。
@@ -2040,7 +2084,10 @@ impl AgentsPanel {
                 crate::locale::text("新建后的会话会显示在这里。", "New chats will appear here."),
             )
         };
-        let mut empty_state = div().id("agents-empty-state").w_full();
+        let mut empty_state = div()
+            .id("agents-empty-state")
+            .debug_selector(|| "rr-agent-empty-state".into())
+            .w_full();
         if show_loading_detail {
             empty_state = empty_state
                 .min_h(px(96.))
@@ -2085,84 +2132,6 @@ impl AgentsPanel {
             );
         }
         empty_state
-    }
-
-    /// 预览标明所属历史会话并限制可视高度；固定区不随 Launcher 视口收缩。
-    /// @author kongweiguang
-    fn render_context_preview(
-        &mut self,
-        theme: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let content = self.context_preview.clone().unwrap_or_default();
-        let owner_title = self.context_preview_owner.as_ref().and_then(|id| {
-            self.sessions
-                .iter()
-                .find(|view| &view.session.agent_session_id == id)
-                .map(|view| view.session.title.as_str())
-        });
-        let title = owner_title.map_or_else(
-            || crate::locale::text("目标上下文预览", "Bound target context").to_string(),
-            |title| {
-                crate::locale::text(
-                    format!("{title} 的目标上下文"),
-                    format!("Bound target context for {title}"),
-                )
-                .to_string()
-            },
-        );
-        div()
-            .id("agents-context-preview")
-            .w_full()
-            .max_h(px(96.))
-            .flex_shrink_0()
-            .mx_2()
-            .mb_1()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .rounded_md()
-            .overflow_hidden()
-            .bg(theme.content_surface())
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.muted)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(title),
-                    )
-                    .child(
-                        Button::new("agents-context-preview-close")
-                            .compact()
-                            .ghost()
-                            .icon(IconName::X)
-                            .accessibility_label(crate::locale::text("关闭预览", "Close preview"))
-                            .tooltip(crate::locale::text("关闭预览", "Close preview"))
-                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                panel.invalidate_context_preview();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("agents-context-preview-text")
-                    .max_h(px(64.))
-                    .overflow_y_scroll()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.foreground)
-                    .child(content),
-            )
     }
 
     /// 显示 Root 提供的短期发送预览与无正文历史；确认事件只携带 opaque IDs。
@@ -2473,55 +2442,61 @@ fn send_preview_expiry_label(value: &str) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
-/// Session 图标使用固定尺寸，保证标题长短和窄栏宽度不会推动卡片结构变化。
+/// 身份行固定单行省略；显示文案可省略重复 scope，但 tooltip 始终保留完整身份，
+/// 避免窄栏或 rem2 时换行把状态文字挤出固定行高。
 ///
 /// @author kongweiguang
-fn session_icon(theme: ThemeTokens) -> impl IntoElement {
+fn session_metadata(
+    display: &str,
+    full_identity: &str,
+    theme: ThemeTokens,
+    row_id: &AgentSessionId,
+) -> impl IntoElement {
+    let tooltip = full_identity.to_owned();
     div()
-        .size(px(28.))
-        .flex_none()
-        .rounded_md()
-        .bg(theme.secondary)
-        .text_color(theme.muted)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(IconName::MessageSquare)
-}
-
-/// 元数据按 main 的 10px/14px 辅助层级换行，窄栏仍保留时间与目录信息。
-///
-/// @author kongweiguang
-fn session_metadata(metadata: &str, theme: ThemeTokens) -> impl IntoElement {
-    div()
+        .id(format!("agent-history-metadata-{}", row_id.as_str()))
         .debug_selector(|| "rr-agent-history-metadata".into())
-        .w_full()
-        .text_size(px(10.))
-        .line_height(px(14.))
+        .flex_1()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_size(theme.text_xs)
+        .line_height(relative(1.25))
         .text_color(theme.subtle)
-        .child(metadata.to_owned())
+        .child(display.to_owned())
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
 }
 
-/// 状态用文字和边界共同表达，运行态用强调色，恢复待核对状态用警示色。
+/// 状态只用文字和语义色表达，不再画描边 badge；文字本身承载运行/失败/待核对语义，
+/// 颜色只做辅助，避免仅靠颜色区分状态。
+/// 窄行下状态保留最小可读宽度并可收缩省略，完整状态仍由 tooltip 和行主按钮的
+/// 无障碍标签承载；否则长英文状态会横向溢出整行并压住滚动条留白。
 ///
 /// @author kongweiguang
-fn session_status_badge(
-    view: &AgentSessionView,
-    running: bool,
+fn session_status_text(
+    label: &str,
     status_color: gpui_kit::Hsla,
     theme: ThemeTokens,
+    row_id: &AgentSessionId,
 ) -> impl IntoElement {
+    let tooltip = label.to_owned();
     div()
+        .id(format!("agent-session-status-{}", row_id.as_str()))
         .debug_selector(|| "rr-agent-history-status".into())
-        .flex_none()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(if running { theme.accent } else { theme.border })
+        .flex_shrink_1()
+        .min_w(theme.text_xs * 3.)
+        // 状态最多占第二行六成，给 provider · 相对时间留出非零预算；超出时
+        // 单行省略，完整状态仍由 tooltip 和行主按钮的无障碍标签承载。
+        .max_w(relative(0.6))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
         .text_size(theme.text_xs)
+        .line_height(relative(1.25))
         .text_color(status_color)
-        .child(lifecycle_label(view))
+        .child(label.to_owned())
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
 }
 
 /// 卡片归属标签与 application 的历史筛选保持一致；终端重连不改变会话所属 Tab。
@@ -2574,18 +2549,36 @@ fn session_provider_label(provider: AgentProvider) -> String {
     crate::locale::text(zh, en).to_string()
 }
 
-/// 使用最近业务更新时间并回退创建时间；无效记录显示未知，避免格式化失败影响整张历史卡片。
+/// 历史行固定展示会话创建时间：created_at 是 Unix epoch 秒字符串，转成本地时区后
+/// 只保留 M/D HH:MM。updated_at 记录业务状态变化，不能替代创建时间；空、非数字和
+/// 超出 chrono 范围的记录显示未知，不把缺失伪造成当前时间。
 ///
 /// @author kongweiguang
 fn format_session_time(view: &AgentSessionView) -> String {
-    let value = if view.session.updated_at.trim().is_empty() {
-        view.session.created_at.as_str()
-    } else {
-        view.session.updated_at.as_str()
-    };
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.format("%-m/%-d %H:%M").to_string())
-        .unwrap_or_else(|_| crate::locale::text("时间未知", "Time unknown").to_string())
+    format_session_time_for_language(view, crate::locale::current_language())
+}
+
+/// 显式语言版本让测试验证中英文兜底而不改进程级 locale；生产 wrapper 仍只读取
+/// current_language，避免测试并发污染其它模块的全局语言。
+///
+/// @author kongweiguang
+fn format_session_time_for_language(view: &AgentSessionView, language: UiLanguage) -> String {
+    view.session
+        .created_at
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%-m/%-d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| match language {
+            UiLanguage::ZhCn => "时间未知".to_owned(),
+            UiLanguage::EnUs => "Time unknown".to_owned(),
+        })
 }
 
 /// 将图标身份与安全的短命令提示统一映射，菜单和当前选择不会出现相互矛盾的说明。

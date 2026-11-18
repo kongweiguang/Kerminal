@@ -31,6 +31,11 @@ use gpui_kit::{
 };
 use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
+    extensions::{
+        CatalogSelection, CatalogSnapshot, CatalogSource, DEFAULT_PLUGIN_CATALOG_URL,
+        DropInInspection, ExtensionChange, ExtensionReceipt, ExtensionsService, InstallProgress,
+        LocalPackageInspection, PluginPackageStore,
+    },
     preferences::{
         ConfigurationGuideStatus, ConfigurationRepository, DefaultLocalShellProvider,
         KeybindingScope, PreferencesService, ProfileDraft, ProfileRepository, ProfileRevision,
@@ -38,6 +43,7 @@ use kerminal_application::{
     },
 };
 use kerminal_domain::{
+    plugins::{PluginId, PluginStoreState},
     preferences::{
         ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
         ConfigurationRecoveryState,
@@ -45,6 +51,8 @@ use kerminal_domain::{
     sessions::LocalSessionTarget,
 };
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::{oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use super::render_desktop_about::{
     MAIN_SHORTCUT_PRESENTATIONS, display_repository_url, display_shortcut,
@@ -74,9 +82,17 @@ struct MemorySettingsState {
     save_count: usize,
     save_attempt_count: usize,
     fail_next_settings_save: bool,
+    /// 指定第几次真实保存尝试失败，用于验证来源成功后的无关 follow-up 失败。
+    fail_settings_save_attempt: Option<usize>,
+    /// 挂起下一次保存直到测试放行，用于确定性复现保存中的来源请求。
+    hold_next_settings_save: Option<oneshot::Receiver<()>>,
     unknown_after_settings_save: bool,
+    /// 写入后返回未知但允许回读成功，用于验证未知结果的确认分支。
+    unknown_after_settings_save_confirmable: bool,
     fail_next_settings_read: bool,
     settings_read_count: usize,
+    /// 下一次回读返回与磁盘不同的来源地址，用于验证回读不一致时不切换运行源。
+    override_next_read_url: Option<String>,
     profiles: Vec<VersionedProfile>,
     profile_saves: usize,
     unknown_after_profile_save: bool,
@@ -94,9 +110,13 @@ impl MemorySettingsRepository {
                 save_count: 0,
                 save_attempt_count: 0,
                 fail_next_settings_save: false,
+                fail_settings_save_attempt: None,
+                hold_next_settings_save: None,
                 unknown_after_settings_save: false,
+                unknown_after_settings_save_confirmable: false,
                 fail_next_settings_read: false,
                 settings_read_count: 0,
+                override_next_read_url: None,
                 profiles: Vec::new(),
                 profile_saves: 0,
                 unknown_after_profile_save: false,
@@ -124,6 +144,56 @@ impl MemorySettingsRepository {
     fn save_attempt_count(&self) -> usize {
         self.state.lock().unwrap().save_attempt_count
     }
+
+    /// 只让下一次设置回读失败，用于区分“已保存但回读失败”和保存失败。
+    ///
+    /// @author kongweiguang
+    fn fail_next_settings_read(&self) {
+        self.state.lock().unwrap().fail_next_settings_read = true;
+    }
+
+    /// 回读次数用于证明切换运行源前确实重新读取了权威设置。
+    ///
+    /// @author kongweiguang
+    fn settings_read_count(&self) -> usize {
+        self.state.lock().unwrap().settings_read_count
+    }
+
+    /// 下一次回读返回指定来源，模拟磁盘内容与提交值不一致。
+    ///
+    /// @author kongweiguang
+    fn override_next_settings_read_url(&self, url: &str) {
+        self.state.lock().unwrap().override_next_read_url = Some(url.to_owned());
+    }
+
+    /// 挂起下一次保存并返回放行句柄，让测试在保存真正在途时注入来源请求或编辑。
+    ///
+    /// 使用 oneshot 而不是 sleep：保存任务在锁外等待，测试可以确定地观察
+    /// Saving 状态后再放行，避免定时器抖动造成偶发通过。
+    ///
+    /// @author kongweiguang
+    fn hold_next_settings_save(&self) -> oneshot::Sender<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.state.lock().unwrap().hold_next_settings_save = Some(receiver);
+        sender
+    }
+
+    /// 让指定序号的保存尝试失败，用于只失败 follow-up 而保留来源提交成功。
+    ///
+    /// @author kongweiguang
+    fn fail_settings_save_attempt(&self, attempt: usize) {
+        self.state.lock().unwrap().fail_settings_save_attempt = Some(attempt);
+    }
+
+    /// 下一次保存写入磁盘后返回未知结果，但回读保持成功，用于验证未知确认分支。
+    ///
+    /// @author kongweiguang
+    fn return_unknown_after_next_save(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .unknown_after_settings_save_confirmable = true;
+    }
 }
 
 #[async_trait]
@@ -135,13 +205,20 @@ impl SettingsRepository for MemorySettingsRepository {
         if std::mem::take(&mut state.fail_next_settings_read) {
             return Err(AppError::infrastructure("模拟设置读回失败"));
         }
+        let mut settings = state.settings.clone();
+        if let Some(url) = state.override_next_read_url.take() {
+            settings.plugin_catalog_url = url;
+        }
         Ok(VersionedSettings {
-            settings: state.settings.clone(),
+            settings,
             revision: state.revision.clone(),
         })
     }
 
     /// 每次请求先记录真实尝试，再按可控故障和 revision 决定提交；未知结果可伴随首次读回失败。
+    ///
+    /// 可选的 hold 在锁外等待，让测试确定性地制造“保存真正在途”的窗口；放行后
+    /// 重新校验 revision，避免测试期间的并发修改被旧快照覆盖。
     ///
     /// @author kongweiguang
     async fn save_settings(
@@ -149,11 +226,26 @@ impl SettingsRepository for MemorySettingsRepository {
         settings: SettingsSnapshot,
         expected_revision: Option<ConfigRevision>,
     ) -> AppResult<VersionedSettings> {
-        let mut state = self.state.lock().expect("settings state is not poisoned");
-        state.save_attempt_count += 1;
-        if std::mem::take(&mut state.fail_next_settings_save) {
-            return Err(AppError::infrastructure("模拟设置写入失败"));
+        let hold = {
+            let mut state = self.state.lock().expect("settings state is not poisoned");
+            state.save_attempt_count += 1;
+            let attempt = state.save_attempt_count;
+            if std::mem::take(&mut state.fail_next_settings_save) {
+                return Err(AppError::infrastructure("模拟设置写入失败"));
+            }
+            if state.fail_settings_save_attempt == Some(attempt) {
+                state.fail_settings_save_attempt = None;
+                return Err(AppError::infrastructure("模拟后续设置写入失败"));
+            }
+            if state.revision != expected_revision {
+                return Err(AppError::conflict("测试设置 revision 已变化"));
+            }
+            state.hold_next_settings_save.take()
+        };
+        if let Some(hold) = hold {
+            let _ = hold.await;
         }
+        let mut state = self.state.lock().expect("settings state is not poisoned");
         if state.revision != expected_revision {
             return Err(AppError::conflict("测试设置 revision 已变化"));
         }
@@ -164,6 +256,9 @@ impl SettingsRepository for MemorySettingsRepository {
         state.revision = Some(revision.clone());
         if std::mem::take(&mut state.unknown_after_settings_save) {
             state.fail_next_settings_read = true;
+            return Err(AppError::outcome_unknown("模拟设置提交结果未知"));
+        }
+        if std::mem::take(&mut state.unknown_after_settings_save_confirmable) {
             return Err(AppError::outcome_unknown("模拟设置提交结果未知"));
         }
         Ok(VersionedSettings {
@@ -347,6 +442,115 @@ impl DefaultLocalShellProvider for TestDefaultShell {
     }
 }
 
+/// 只实现来源切换的目录端口；目录内容返回空，避免设置测试依赖网络或缓存格式。
+#[derive(Default)]
+struct SourceOnlyCatalog {
+    source_url: Mutex<String>,
+}
+
+#[async_trait]
+impl CatalogSource for SourceOnlyCatalog {
+    /// 空串按官方默认回显，与设置快照“留空 = 官方”的语义保持一致。
+    fn source_url(&self) -> String {
+        let url = self.source_url.lock().unwrap().clone();
+        if url.is_empty() {
+            DEFAULT_PLUGIN_CATALOG_URL.to_owned()
+        } else {
+            url
+        }
+    }
+
+    /// 真实保存切换结果并复用 application 的 URL 校验，非法地址显式失败。
+    fn set_source_url(&self, source_url: &str) -> AppResult<()> {
+        let trimmed = source_url.trim();
+        if !trimmed.is_empty() {
+            // 公开错误文案只能来自源码常量，测试也不把动态输入拼进错误。
+            kerminal_plugin_protocol::validate_asset_url(trimmed)
+                .map_err(|_| AppError::invalid("测试目录地址无效"))?;
+        }
+        *self.source_url.lock().unwrap() = trimmed.to_owned();
+        Ok(())
+    }
+
+    async fn cached(&self) -> AppResult<Option<CatalogSnapshot>> {
+        Ok(None)
+    }
+
+    async fn readme(
+        &self,
+        _id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// 设置来源测试不访问网络；失败结果足以让页面进入可操作的离线状态。
+    async fn refresh(&self, _cancellation: CancellationToken) -> AppResult<CatalogSnapshot> {
+        Err(AppError::invalid("测试不请求目录"))
+    }
+}
+
+/// 来源保存测试不触碰安装与文件预检；只有权威状态和 drop-in 观察参与页面激活。
+struct SourceOnlyStore;
+
+#[async_trait]
+impl PluginPackageStore for SourceOnlyStore {
+    async fn state(&self) -> AppResult<PluginStoreState> {
+        Ok(PluginStoreState::default())
+    }
+
+    async fn install_catalog(
+        &self,
+        _selection: CatalogSelection,
+        _progress: watch::Sender<InstallProgress>,
+        _cancellation: CancellationToken,
+    ) -> AppResult<ExtensionReceipt> {
+        Err(AppError::unsupported("来源测试不安装目录包"))
+    }
+
+    async fn inspect_file(
+        &self,
+        _path: std::path::PathBuf,
+        _cancellation: CancellationToken,
+    ) -> AppResult<LocalPackageInspection> {
+        Err(AppError::unsupported("来源测试不预检文件"))
+    }
+
+    async fn install_file(
+        &self,
+        _path: std::path::PathBuf,
+        _inspected: LocalPackageInspection,
+        _progress: watch::Sender<InstallProgress>,
+        _cancellation: CancellationToken,
+    ) -> AppResult<ExtensionReceipt> {
+        Err(AppError::unsupported("来源测试不安装文件"))
+    }
+
+    async fn change(&self, _change: ExtensionChange) -> AppResult<ExtensionReceipt> {
+        Err(AppError::unsupported("来源测试不修改插件"))
+    }
+
+    async fn inspect_drop_ins(
+        &self,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Vec<DropInInspection>> {
+        Ok(Vec::new())
+    }
+
+    async fn confirm_drop_in(
+        &self,
+        _id: PluginId,
+        _expected_fingerprint: String,
+        _expected_revision: u64,
+    ) -> AppResult<ExtensionReceipt> {
+        Err(AppError::unsupported("来源测试不确认 drop-in"))
+    }
+
+    async fn delete_data(&self, _id: PluginId) -> AppResult<()> {
+        Err(AppError::unsupported("来源测试不删除数据"))
+    }
+}
+
 /// 使用生产 PreferencesPanel 与隔离 application 仓储构造窗口，覆盖事件订阅和保存回执。
 fn fixture(
     app: &mut TestAppContext,
@@ -363,6 +567,40 @@ fn fixture(
 fn fixture_with_mcp(
     app: &mut TestAppContext,
     mcp_runtime: Option<Arc<dyn kerminal_application::mcp_runtime::McpRuntimeControl>>,
+) -> (
+    Runtime,
+    Entity<PreferencesPanel>,
+    MemorySettingsRepository,
+    &mut VisualTestContext,
+) {
+    fixture_with_extensions_and_mcp(app, mcp_runtime, None)
+}
+
+/// 附加隔离扩展服务，验证来源保存确实经过设置草稿、仓储 CAS 与权威回读。
+fn fixture_with_extensions(
+    app: &mut TestAppContext,
+) -> (
+    Runtime,
+    Entity<PreferencesPanel>,
+    MemorySettingsRepository,
+    Arc<SourceOnlyCatalog>,
+    &mut VisualTestContext,
+) {
+    let catalog = Arc::new(SourceOnlyCatalog::default());
+    let service = Arc::new(ExtensionsService::new(
+        catalog.clone(),
+        Arc::new(SourceOnlyStore),
+    ));
+    let (runtime, panel, repository, visual) =
+        fixture_with_extensions_and_mcp(app, None, Some(service));
+    (runtime, panel, repository, catalog, visual)
+}
+
+/// 面板构造的唯一入口；扩展服务可选，避免所有既有设置测试都创建插件页面。
+fn fixture_with_extensions_and_mcp(
+    app: &mut TestAppContext,
+    mcp_runtime: Option<Arc<dyn kerminal_application::mcp_runtime::McpRuntimeControl>>,
+    extensions: Option<Arc<ExtensionsService>>,
 ) -> (
     Runtime,
     Entity<PreferencesPanel>,
@@ -393,7 +631,16 @@ fn fixture_with_mcp(
     let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
     let mounted_panel = mounted.clone();
     let (_, visual) = app.add_window_view(move |window, cx| {
-        let panel = cx.new(|cx| PreferencesPanel::new(services, window, cx));
+        let panel = cx.new(|cx| {
+            let panel = PreferencesPanel::new(services, window, cx);
+            match extensions {
+                Some(service) => panel.with_extensions(
+                    Some(service),
+                    kerminal_application::plugins::HOST_API_VERSION.into(),
+                ),
+                None => panel,
+            }
+        });
         *mounted_panel.borrow_mut() = Some(panel.clone());
         gpui_kit::base::Root::new(panel, window, cx)
     });
@@ -2717,4 +2964,1024 @@ fn sftp_numeric_input_persists_and_advanced_controls_toggle(app: &mut TestAppCon
 
     click(visual, "preferences-sftp-advanced");
     assert_not_rendered(visual, "sftp-pipeline-depth");
+}
+
+/// 商店来源保存必须经过设置草稿与仓储 CAS，并在真实回读确认后才切换运行源。
+#[gpui_kit::test]
+fn catalog_source_save_uses_settings_cas_and_reads_back_before_switch(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let url = "https://mirror.example.com/catalog.json";
+    let saves_before = repository.snapshot().1;
+    let reads_before = repository.settings_read_count();
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    let (saved, saves_after) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url, "来源必须写入权威设置快照");
+    assert_eq!(saves_after, saves_before + 1);
+    assert!(
+        repository.settings_read_count() > reads_before,
+        "切换运行源前必须真实回读设置"
+    );
+    assert_eq!(catalog.source_url(), url, "回读一致后才切换运行态来源");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert_eq!(page.current_source_url(), url);
+        assert!(!page.catalog_source_saving());
+        assert!(page.catalog_source_error().is_none());
+    });
+}
+
+/// 设置保存失败时不得切换来源，也不得把失败伪装成成功或进入回读。
+#[gpui_kit::test]
+fn catalog_source_save_failure_keeps_effective_source(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    let reads_before = repository.settings_read_count();
+    repository.fail_next_settings_save();
+    let url = "https://broken.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, "", "失败不得写入仓储");
+    assert_eq!(
+        repository.settings_read_count(),
+        reads_before,
+        "保存失败不得进入回读"
+    );
+    assert_eq!(catalog.source_url(), original, "失败不得切换运行态来源");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert_eq!(page.current_source_url(), original);
+        assert!(page.catalog_source_error().is_some(), "失败必须显示原因");
+        assert!(!page.catalog_source_saving());
+    });
+    // 失败地址只存在于弹层输入，草稿必须回到基线，避免之后无关保存静默落盘。
+    let draft_url = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .value()
+            .plugin_catalog_url
+            .clone()
+    });
+    assert_eq!(draft_url, "", "失败后草稿来源字段必须恢复基线");
+    // 模拟一次无关设置编辑并保存：草稿里若仍留着失败地址，它会被静默持久化。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            let draft = panel.settings.as_mut().expect("settings loaded");
+            let mut value = draft.value().clone();
+            value.sftp.global_transfers = 6;
+            draft
+                .replace_value(value)
+                .expect("ready draft accepts edit");
+        });
+    });
+    assert!(visual.update(|_, cx| panel.update(cx, |panel, cx| panel.save_settings(cx))));
+    pump_runtime(&runtime, visual);
+    let (saved_after, _) = repository.snapshot();
+    assert_eq!(
+        saved_after.plugin_catalog_url, "",
+        "无关保存不得静默写入失败来源"
+    );
+    assert_eq!(saved_after.sftp.global_transfers, 6);
+}
+
+/// 已保存但回读失败时必须保留旧运行源，并明确呈现为回读失败而非保存失败。
+#[gpui_kit::test]
+fn catalog_source_readback_failure_keeps_effective_source(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    let reads_before = repository.settings_read_count();
+    repository.fail_next_settings_read();
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url, "保存本身必须成功");
+    assert!(
+        repository.settings_read_count() > reads_before,
+        "必须尝试回读"
+    );
+    assert_eq!(catalog.source_url(), original, "回读失败不得切换运行源");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert_eq!(page.current_source_url(), original);
+        assert!(!page.catalog_source_saving());
+        let error = page.catalog_source_error().expect("回读失败必须显示原因");
+        assert!(
+            error.contains("回读") || error.contains("read"),
+            "文案必须区分已保存但回读失败: {error}"
+        );
+    });
+    // 保存已成功，磁盘基线就是提交地址；回读失败不能把它回退成旧来源。
+    let draft_url = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .value()
+            .plugin_catalog_url
+            .clone()
+    });
+    assert_eq!(draft_url, url, "回读失败不得回退已成功保存的磁盘基线");
+}
+
+/// 回读值与提交地址不一致时不得切换运行源，即使保存回执声称成功。
+#[gpui_kit::test]
+fn catalog_source_readback_mismatch_keeps_effective_source(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    repository.override_next_settings_read_url("https://other.example.com/catalog.json");
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url, "保存本身必须成功");
+    assert_eq!(catalog.source_url(), original, "回读不一致不得切换运行源");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert_eq!(page.current_source_url(), original);
+        assert!(!page.catalog_source_saving());
+        let error = page.catalog_source_error().expect("不一致必须显示原因");
+        assert!(
+            error.contains("不一致") || error.contains("differs"),
+            "文案必须说明回读不一致: {error}"
+        );
+    });
+}
+
+/// clean-ready 重试只做回读、不重复写入；回读仍是切换运行源的必要条件。
+#[gpui_kit::test]
+fn catalog_source_clean_ready_retry_reads_back_without_rewrite(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(catalog.source_url(), url, "首次保存回读后切换");
+    let saves_after_first = repository.snapshot().1;
+    let reads_after_first = repository.settings_read_count();
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        repository.snapshot().1,
+        saves_after_first,
+        "clean-ready 重试不得盲重写设置"
+    );
+    assert!(
+        repository.settings_read_count() > reads_after_first,
+        "clean-ready 分支仍必须真实回读"
+    );
+    assert_eq!(catalog.source_url(), url);
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(page.catalog_source_error().is_none());
+    });
+}
+
+/// 保存未启动（其它字段输入错误）时，来源字段必须恢复基线且不进入回读。
+#[gpui_kit::test]
+fn catalog_source_save_not_started_restores_field(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    let _ = click_terminal_number_input(visual, &panel, "terminal-font-size");
+    visual.simulate_keystrokes("secondary-a backspace");
+    visual.simulate_input("abc");
+    draw(visual);
+    assert!(visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings_input_errors
+            .contains_key("font_size")
+    }));
+
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let saves_before = repository.snapshot().1;
+    let reads_before = repository.settings_read_count();
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+
+    assert_eq!(
+        repository.snapshot().1,
+        saves_before,
+        "输入错误时不得启动保存"
+    );
+    assert_eq!(
+        repository.settings_read_count(),
+        reads_before,
+        "未保存不得进入回读"
+    );
+    assert_eq!(catalog.source_url(), DEFAULT_PLUGIN_CATALOG_URL);
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(
+            page.catalog_source_error().is_some(),
+            "必须显示未能启动的原因"
+        );
+        assert!(!page.catalog_source_saving());
+    });
+    let draft_url = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .value()
+            .plugin_catalog_url
+            .clone()
+    });
+    assert_eq!(draft_url, "", "保存未启动时来源字段必须恢复基线");
+}
+
+/// 替换后草稿恰好回到基线时只真实回读，不空写，也不误报 NoChanges。
+#[gpui_kit::test]
+fn catalog_source_replace_to_baseline_reads_back_without_write(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let url = "https://mirror.example.com/catalog.json";
+    // 构造“上次来源写入已知失败、草稿保留未落盘地址”的状态：值含 X，基线仍是官方来源。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            let draft = panel.settings.as_mut().expect("settings loaded");
+            let mut value = draft.value().clone();
+            value.plugin_catalog_url = url.to_owned();
+            draft
+                .replace_value(value)
+                .expect("ready draft accepts value");
+            draft.begin_save().expect("dirty draft starts save");
+            draft.save_failed().expect("simulated known failure");
+        });
+    });
+    let saves_before = repository.snapshot().1;
+    let reads_before = repository.settings_read_count();
+    // 用户把来源改回已保存的官方来源：替换后草稿恰好变 clean。
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test("", window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+
+    assert_eq!(repository.snapshot().1, saves_before, "回到基线不得空写");
+    assert!(
+        repository.settings_read_count() > reads_before,
+        "必须真实回读"
+    );
+    assert_eq!(catalog.source_url(), DEFAULT_PLUGIN_CATALOG_URL);
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(page.catalog_source_error().is_none(), "不得误报 NoChanges");
+    });
+}
+
+/// 未知保存结果不得擅自回退来源字段，也不得切换运行源。
+#[gpui_kit::test]
+fn catalog_source_unknown_result_does_not_rollback_field(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    repository
+        .state
+        .lock()
+        .expect("test repository")
+        .unknown_after_settings_save = true;
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+
+    let (status, draft_url) = visual.update(|_, cx| {
+        let draft = panel.read(cx).settings.as_ref().expect("settings loaded");
+        (draft.status(), draft.value().plugin_catalog_url.clone())
+    });
+    assert_eq!(status, super::DraftStatus::OutcomeUnknown);
+    assert_eq!(draft_url, url, "未知结果不得擅自回退来源字段");
+    assert_eq!(catalog.source_url(), original, "未知结果不得切换运行源");
+    // 未知结果的恢复读回失败时必须显式结束来源意图并显示原因，不能永久 saving。
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(
+            !page.catalog_source_saving(),
+            "回读失败必须结束来源 pending"
+        );
+        assert!(page.catalog_source_error().is_some(), "回读失败必须可见");
+    });
+}
+
+/// CAS 冲突不得擅自回退来源字段，也不得切换运行源。
+#[gpui_kit::test]
+fn catalog_source_conflict_does_not_rollback_field(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    // 外部写入推进 revision，使来源保存 CAS 冲突；同时让冲突后的核对读回失败，
+    // 固定草稿在冲突状态，避免异步三方合并改变断言对象。
+    repository.state.lock().expect("test repository").revision = Some(ConfigRevision::from_sha256(
+        "external-settings-revision".to_owned(),
+    ));
+    repository.fail_next_settings_read();
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+
+    let (status, draft_url) = visual.update(|_, cx| {
+        let draft = panel.read(cx).settings.as_ref().expect("settings loaded");
+        (draft.status(), draft.value().plugin_catalog_url.clone())
+    });
+    assert_eq!(status, super::DraftStatus::ExternalConflict);
+    assert_eq!(draft_url, url, "冲突不得擅自回退来源字段");
+    assert_eq!(catalog.source_url(), original, "冲突不得切换运行源");
+}
+
+/// 保存真正在途且保存无法启动时，未提交 URL 必须撤回，不能被无关保存带走。
+#[gpui_kit::test]
+fn catalog_source_request_during_saving_with_input_error_withdraws_field(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    let release = repository.hold_next_settings_save();
+    // 启动一次与来源无关的设置保存，并保持其在途。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            let draft = panel.settings.as_mut().expect("settings loaded");
+            let mut value = draft.value().clone();
+            value.sftp.global_transfers = 6;
+            draft
+                .replace_value(value)
+                .expect("ready draft accepts edit");
+        });
+    });
+    assert!(visual.update(|_, cx| panel.update(cx, |panel, cx| panel.save_settings(cx))));
+    pump_runtime(&runtime, visual);
+    let status = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .status()
+    });
+    assert_eq!(status, super::DraftStatus::Saving, "保存必须真正在途");
+    assert_eq!(repository.save_attempt_count(), 1);
+    // 保存中注入输入错误：来源请求无法启动保存，只能撤回未提交字段。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            panel
+                .settings_input_errors
+                .insert("font_size", "invalid".to_owned());
+        });
+    });
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(
+            page.catalog_source_error().is_some(),
+            "必须显示未能启动的原因"
+        );
+        assert!(!page.catalog_source_saving());
+    });
+    let draft_url = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .value()
+            .plugin_catalog_url
+            .clone()
+    });
+    assert_eq!(draft_url, "", "未提交的 URL 必须从草稿撤回");
+    // 放行在途保存：它使用旧快照（URL 为空）成功，不得包含失败地址。
+    release.send(()).expect("release held save");
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        repository.snapshot().0.plugin_catalog_url,
+        "",
+        "在途保存不得写入失败来源"
+    );
+    // 清除输入错误后做一次无关保存，证明失败地址不会被后续 autosave 带走。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            panel.settings_input_errors.clear();
+            let draft = panel.settings.as_mut().expect("settings loaded");
+            let mut value = draft.value().clone();
+            value.sftp.global_transfers = 8;
+            draft
+                .replace_value(value)
+                .expect("draft accepts edit after save");
+        });
+    });
+    assert!(visual.update(|_, cx| panel.update(cx, |panel, cx| panel.save_settings(cx))));
+    pump_runtime(&runtime, visual);
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, "", "无关保存不得静默写入失败来源");
+    assert_eq!(saved.sftp.global_transfers, 8);
+    assert_eq!(catalog.source_url(), original);
+}
+
+/// 已确认 URL 的重试只做权威回读，不因其它字段脏值或输入错误重写整份设置。
+#[gpui_kit::test]
+fn catalog_source_confirmed_url_reads_back_without_rewriting_dirty_draft(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(catalog.source_url(), url);
+    let saves_after_first = repository.snapshot().1;
+    let reads_after_first = repository.settings_read_count();
+    // 其它字段变脏并有输入错误：重试同一已保存 URL 不应重写整份设置。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            let draft = panel.settings.as_mut().expect("settings loaded");
+            let mut value = draft.value().clone();
+            value.sftp.global_transfers = 6;
+            draft
+                .replace_value(value)
+                .expect("ready draft accepts edit");
+            panel
+                .settings_input_errors
+                .insert("font_size", "invalid".to_owned());
+        });
+    });
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        repository.snapshot().1,
+        saves_after_first,
+        "已确认 URL 重试不得重写无关设置"
+    );
+    assert!(
+        repository.settings_read_count() > reads_after_first,
+        "必须真实回读"
+    );
+    assert_eq!(catalog.source_url(), url);
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(page.catalog_source_error().is_none());
+    });
+    let (draft_url, transfers, has_error) = visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let draft = panel.settings.as_ref().expect("settings loaded");
+        (
+            draft.value().plugin_catalog_url.clone(),
+            draft.value().sftp.global_transfers,
+            panel.settings_input_errors.contains_key("font_size"),
+        )
+    });
+    assert_eq!(draft_url, url);
+    assert_eq!(transfers, 6, "其它脏字段必须保留");
+    assert!(has_error, "其它输入错误必须保留");
+}
+
+/// 来源成功后 follow-up 被输入校验拒绝，不得取消来源意图或丢失较新编辑。
+#[gpui_kit::test]
+fn catalog_source_follow_up_validation_rejection_keeps_source_intent(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let release = repository.hold_next_settings_save();
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .settings
+                .as_ref()
+                .expect("settings loaded")
+                .status()
+        }),
+        super::DraftStatus::Saving
+    );
+    // 保存期间走真实编辑入口产生较新编辑，并让防抖计时器把 follow-up 排入单飞队列。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.edit_settings(|settings| settings.sftp.global_transfers = 6, cx);
+        });
+    });
+    pump_runtime(&runtime, visual);
+    // 队列已建立后再注入输入错误，使 follow-up 真正被校验拒绝。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, _| {
+            panel
+                .settings_input_errors
+                .insert("font_size", "invalid".to_owned());
+        });
+    });
+    release.send(()).expect("release held save");
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        repository.save_attempt_count(),
+        1,
+        "输入错误应阻止 follow-up 启动"
+    );
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url);
+    assert_eq!(
+        catalog.source_url(),
+        url,
+        "来源成功后 follow-up 失败不得取消切源"
+    );
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(
+            page.catalog_source_error().is_none(),
+            "follow-up 失败不是来源失败"
+        );
+    });
+    let (status, transfers, has_error) = visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let draft = panel.settings.as_ref().expect("settings loaded");
+        (
+            draft.status(),
+            draft.value().sftp.global_transfers,
+            panel.settings_input_errors.contains_key("font_size"),
+        )
+    });
+    assert_eq!(status, super::DraftStatus::Ready, "输入错误不改变草稿状态");
+    assert_eq!(transfers, 6, "较新编辑必须保留");
+    assert!(has_error, "输入错误必须保留");
+}
+
+/// 来源成功后 follow-up 被已知失败拒绝，不得把无关失败当成来源失败。
+#[gpui_kit::test]
+fn catalog_source_follow_up_known_failure_keeps_source_intent(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let release = repository.hold_next_settings_save();
+    repository.fail_settings_save_attempt(2);
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    assert_eq!(
+        visual.update(|_, cx| {
+            panel
+                .read(cx)
+                .settings
+                .as_ref()
+                .expect("settings loaded")
+                .status()
+        }),
+        super::DraftStatus::Saving
+    );
+    // 保存期间走真实编辑入口产生较新编辑，并让防抖计时器把 follow-up 排入单飞队列。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.edit_settings(|settings| settings.sftp.global_transfers = 6, cx);
+        });
+    });
+    pump_runtime(&runtime, visual);
+    release.send(()).expect("release held save");
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.save_attempt_count(), 2, "必须尝试 follow-up");
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url, "首次保存已写入来源");
+    assert_eq!(
+        catalog.source_url(),
+        url,
+        "follow-up 已知失败不得取消已确认来源"
+    );
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(page.catalog_source_error().is_none());
+    });
+    let (status, transfers) = visual.update(|_, cx| {
+        let draft = panel.read(cx).settings.as_ref().expect("settings loaded");
+        (draft.status(), draft.value().sftp.global_transfers)
+    });
+    assert_eq!(
+        status,
+        super::DraftStatus::Failed,
+        "follow-up 失败仍在草稿中可见"
+    );
+    assert_eq!(transfers, 6, "较新编辑必须保留");
+}
+
+/// 冲突恢复必须走既有三方合并与续写，并在确认后切换来源。
+#[gpui_kit::test]
+fn catalog_source_conflict_recovery_resaves_and_switches(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    repository.state.lock().expect("test repository").revision = Some(ConfigRevision::from_sha256(
+        "external-settings-revision".to_owned(),
+    ));
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    pump_runtime(&runtime, visual);
+    assert_eq!(repository.save_attempt_count(), 2, "冲突后必须重写一次");
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url, "冲突合并后必须写入来源");
+    assert_eq!(catalog.source_url(), url, "冲突恢复确认后必须切换来源");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(
+            page.catalog_source_error().is_none(),
+            "成功恢复不得显示来源错误"
+        );
+    });
+    let (status, dirty) = visual.update(|_, cx| {
+        let draft = panel.read(cx).settings.as_ref().expect("settings loaded");
+        (draft.status(), draft.is_dirty())
+    });
+    assert_eq!(status, super::DraftStatus::Ready);
+    assert!(!dirty, "恢复后草稿应与写入一致");
+}
+
+/// 未知结果经一致回读确认后必须切换来源，不能停在未知状态。
+#[gpui_kit::test]
+fn catalog_source_unknown_confirmation_switches_source(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    repository.return_unknown_after_next_save();
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    pump_runtime(&runtime, visual);
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, url);
+    assert_eq!(
+        catalog.source_url(),
+        url,
+        "未知结果经一致回读确认后必须切换"
+    );
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(page.catalog_source_error().is_none());
+    });
+    let (status, dirty) = visual.update(|_, cx| {
+        let draft = panel.read(cx).settings.as_ref().expect("settings loaded");
+        (draft.status(), draft.is_dirty())
+    });
+    assert_eq!(status, super::DraftStatus::Ready);
+    assert!(!dirty);
+}
+
+/// 未知结果回读不一致时必须失败可见且不切换来源，不能盲目重写。
+#[gpui_kit::test]
+fn catalog_source_unknown_mismatch_fails_visibly(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    repository.return_unknown_after_next_save();
+    repository.override_next_settings_read_url("https://other.example.com/catalog.json");
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    pump_runtime(&runtime, visual);
+    assert_eq!(catalog.source_url(), original, "未知未确认不得切换");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving(), "失败必须结束来源 pending");
+        let error = page.catalog_source_error().expect("必须显示可恢复错误");
+        assert!(!error.is_empty());
+    });
+    let status = visual.update(|_, cx| {
+        panel
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .status()
+    });
+    assert_eq!(
+        status,
+        super::DraftStatus::OutcomeUnknown,
+        "不一致时草稿保持未知"
+    );
+}
+
+/// 构造 application 校验接受、但 UI 表单校验会阻塞的 Windows 快捷键冲突。
+///
+/// 外部配置可能由旧版本或手工编辑写入同一组合；UI 仍要阻止再次保存。
+/// 用默认目录里的两个已知动作，避免测试复制一份快捷键契约。
+///
+/// @author kongweiguang
+fn make_ui_blocked_shortcut_collision(settings: &mut SettingsSnapshot) {
+    let open_binding = settings
+        .keybindings
+        .iter()
+        .find(|binding| binding.action == "settings.open")
+        .map(|binding| binding.windows_binding.clone())
+        .expect("默认设置必须包含 settings.open");
+    let search = settings
+        .keybindings
+        .iter_mut()
+        .find(|binding| binding.action == "terminal.search")
+        .expect("默认设置必须包含 terminal.search");
+    search.windows_binding = open_binding;
+}
+
+/// 冲突恢复续写被 UI 校验拒绝时，来源必须显式失败而不是永久 saving。
+///
+/// 外部设置写入 application 接受、UI 阻塞的快捷键冲突；三方合并保留本地来源
+/// 与远端冲突值后，续写因 UI 校验无法启动。未提交来源必须撤回并失败可见，
+/// 修复阻塞后仍可重试切源，失败地址不能被无关保存带入。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn catalog_source_conflict_resave_blocked_by_ui_validation_fails_visibly(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let original = catalog.source_url();
+    {
+        let mut state = repository.state.lock().expect("test repository");
+        let mut external = state.settings.clone();
+        make_ui_blocked_shortcut_collision(&mut external);
+        state.settings = external;
+        state.revision = Some(ConfigRevision::from_sha256(
+            "external-ui-blocked".to_owned(),
+        ));
+    }
+    let url = "https://mirror.example.com/catalog.json";
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    pump_runtime(&runtime, visual);
+    assert_eq!(catalog.source_url(), original, "续写未启动不得切源");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving(), "必须结束来源 saving");
+        let error = page.catalog_source_error().expect("必须显示来源失败原因");
+        assert!(!error.is_empty());
+    });
+    let (draft_url, has_collision) = visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let draft = panel.settings.as_ref().expect("settings loaded");
+        (
+            draft.value().plugin_catalog_url.clone(),
+            draft.value().keybindings.iter().any(|binding| {
+                binding.action == "terminal.search" && binding.windows_binding == "Ctrl+Alt+S"
+            }),
+        )
+    });
+    assert_eq!(draft_url, "", "未提交来源必须撤回");
+    assert!(has_collision, "外部冲突值必须保留");
+    // 修复 UI 阻塞后做一次无关保存：失败 URL 不得被带入。
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.edit_settings(
+                |settings| {
+                    settings.keybindings = SettingsSnapshot::default().keybindings;
+                    settings.sftp.global_transfers = 8;
+                },
+                cx,
+            );
+        });
+    });
+    assert!(visual.update(|_, cx| panel.update(cx, |panel, cx| panel.save_settings(cx))));
+    pump_runtime(&runtime, visual);
+    let (saved, _) = repository.snapshot();
+    assert_eq!(saved.plugin_catalog_url, "", "无关保存不得带入失败来源");
+    assert_eq!(saved.sftp.global_transfers, 8);
+    // 修复阻塞后可重试来源并切源。
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    pump_runtime(&runtime, visual);
+    assert_eq!(catalog.source_url(), url, "修复阻塞后重试必须切源");
+    assert_eq!(repository.snapshot().0.plugin_catalog_url, url);
+}
+
+/// 冲突恢复续写被 UI 阻塞、但来源已在远端基线时，必须回读确认而不是误报失败。
+///
+/// 远端设置已包含来源 X 并带 UI 阻塞的快捷键冲突，本地另有脏字段；三方合并后
+/// 续写无法启动。来源已在基线，撤回不得清掉它，必须真实回读确认并保留本地脏值。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn catalog_source_conflict_resave_blocked_with_baseline_url_reads_back(app: &mut TestAppContext) {
+    let (runtime, panel, repository, catalog, visual) = fixture_with_extensions(app);
+    visual.update(|window, cx| {
+        panel.update(cx, |panel, cx| panel.open_extensions_section(window, cx));
+    });
+    pump_runtime(&runtime, visual);
+    let url = "https://mirror.example.com/catalog.json";
+    {
+        let mut state = repository.state.lock().expect("test repository");
+        let mut external = state.settings.clone();
+        external.plugin_catalog_url = url.to_owned();
+        make_ui_blocked_shortcut_collision(&mut external);
+        state.settings = external;
+        state.revision = Some(ConfigRevision::from_sha256(
+            "external-baseline-source".to_owned(),
+        ));
+    }
+    visual.update(|_, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.edit_settings(|settings| settings.sftp.global_transfers = 6, cx);
+        });
+    });
+    visual.update(|window, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        page.update(cx, |page, cx| {
+            page.submit_source_url_for_test(url, window, cx)
+        });
+    });
+    pump_runtime(&runtime, visual);
+    pump_runtime(&runtime, visual);
+    assert_eq!(catalog.source_url(), url, "基线已确认来源必须切换");
+    visual.update(|_, cx| {
+        let page = panel.read(cx).extensions_page().expect("扩展页面已创建");
+        let page = page.read(cx);
+        assert!(!page.catalog_source_saving());
+        assert!(
+            page.catalog_source_error().is_none(),
+            "基线已确认不得误报来源失败"
+        );
+    });
+    let (draft_url, transfers, has_collision) = visual.update(|_, cx| {
+        let panel = panel.read(cx);
+        let draft = panel.settings.as_ref().expect("settings loaded");
+        (
+            draft.value().plugin_catalog_url.clone(),
+            draft.value().sftp.global_transfers,
+            draft.value().keybindings.iter().any(|binding| {
+                binding.action == "terminal.search" && binding.windows_binding == "Ctrl+Alt+S"
+            }),
+        )
+    });
+    assert_eq!(draft_url, url);
+    assert_eq!(transfers, 6, "本地脏字段必须保留");
+    assert!(has_collision, "外部冲突值必须保留");
 }

@@ -40,6 +40,8 @@ use kerminal_application::{AppError, AppResult};
 const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 const RESIZE_DIAGNOSTICS_ENV: &str = "KERMINAL_TERMINAL_RESIZE_DIAGNOSTICS";
 static RESIZE_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
+const PTY_SPAWN_PROBE_ENV: &str = "KERMINAL_ACCEPTANCE_PTY_PROBE";
+static PTY_SPAWN_PROBE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// 只在明确 opt-in 时启用尺寸与光标坐标诊断；env 在首次检查时缓存，须在启动候选前设置。
 /// 默认输出读取路径不检查终端字节或产生日志。
@@ -239,7 +241,10 @@ async fn spawn_local_process(
             let command = command_builder(&target, &startup.args, &startup.env, startup.dialect);
             let child = match prepared_job.spawn_command(pair.slave.as_ref(), command) {
                 Ok(child) => child,
-                Err(error) => return Err(pty_error("启动本地终端进程失败", error).into()),
+                Err(error) => {
+                    probe_local_pty_spawn_failure(&error);
+                    return Err(pty_error("启动本地终端进程失败", error).into());
+                }
             };
             let process_tree = Arc::new(prepared_job.into_guard(startup.lifetime_guard));
             (child, process_tree)
@@ -253,7 +258,10 @@ async fn spawn_local_process(
                 startup.dialect,
             )) {
                 Ok(child) => child,
-                Err(error) => return Err(pty_error("启动本地终端进程失败", error).into()),
+                Err(error) => {
+                    probe_local_pty_spawn_failure(&error);
+                    return Err(pty_error("启动本地终端进程失败", error).into());
+                }
             };
             let process_tree = match ProcessTreeGuard::from_pty(
                 pair.master.as_ref(),
@@ -604,6 +612,92 @@ impl std::error::Error for SpawnCleanupFailure {
             .or(self.child_wait.as_ref())
             .map(|error| error as &(dyn std::error::Error + 'static))
     }
+}
+
+/// 本地 PTY spawn 失败的安全阶段分类；只用于显式验收探针，不改变错误展示与生命周期。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpawnProbeStage {
+    Attribute,
+    Job,
+    CreateProcess,
+    Unknown,
+}
+
+impl SpawnProbeStage {
+    /// 固定枚举名，避免把 vendor 错误正文带入 stderr。
+    ///
+    /// @author kongweiguang
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attribute => "attribute",
+            Self::Job => "job",
+            Self::CreateProcess => "create_process",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// vendor 已知的固定上下文；只做前缀匹配，不读取其后的动态 OS 文本。
+const ATTRIBUTE_CONTEXT: &str = "UpdateProcThreadAttribute for Job List failed";
+const JOB_CONTEXT: &str = "AssignProcessToJobObject failed";
+const CREATE_PROCESS_CONTEXT: &str = "CreateProcessW failed";
+
+/// 只在显式验收开关为 `1` 时启用；缓存与 resize 诊断一致，须在启动候选前设置。
+///
+/// @author kongweiguang
+fn pty_spawn_probe_enabled() -> bool {
+    *PTY_SPAWN_PROBE_ENABLED
+        .get_or_init(|| std::env::var_os(PTY_SPAWN_PROBE_ENV).is_some_and(|value| value == "1"))
+}
+
+/// 从 anyhow 链中提取 io::Error 的 raw_os_error，并按固定 vendor context 分类；
+/// 只返回固定枚举与数字，不输出源错误文本、路径、命令、参数或环境。
+///
+/// @author kongweiguang
+fn classify_spawn_error(error: &anyhow::Error) -> (SpawnProbeStage, Option<i32>) {
+    let raw_os_error = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+    });
+    let stage = error
+        .chain()
+        .find_map(|cause| {
+            let text = cause.to_string();
+            if text.starts_with(ATTRIBUTE_CONTEXT) {
+                Some(SpawnProbeStage::Attribute)
+            } else if text.starts_with(JOB_CONTEXT) {
+                Some(SpawnProbeStage::Job)
+            } else if text.starts_with(CREATE_PROCESS_CONTEXT) {
+                Some(SpawnProbeStage::CreateProcess)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(SpawnProbeStage::Unknown);
+    (stage, raw_os_error)
+}
+
+/// 固定探针行；raw_os_error 缺失时输出 unknown，绝不拼接源错误文本。
+///
+/// @author kongweiguang
+fn format_spawn_probe_line(stage: SpawnProbeStage, raw_os_error: Option<i32>) -> String {
+    format!(
+        "KERMINAL_ACCEPTANCE_PTY_PROBE stage={} raw_os_error={}",
+        stage.as_str(),
+        raw_os_error.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    )
+}
+
+/// 仅在显式验收开关下向 stderr 输出固定探针行；默认静默，不改变错误与 Job 生命周期。
+///
+/// @author kongweiguang
+fn probe_local_pty_spawn_failure(error: &anyhow::Error) {
+    if !pty_spawn_probe_enabled() {
+        return;
+    }
+    let (stage, raw_os_error) = classify_spawn_error(error);
+    eprintln!("{}", format_spawn_probe_line(stage, raw_os_error));
 }
 
 /// 把 portable-pty 的 anyhow 根因包装成标准错误，供安全应用错误保留 cause 链。

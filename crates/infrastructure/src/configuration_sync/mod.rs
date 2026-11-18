@@ -4,7 +4,8 @@
 
 mod actions;
 mod git;
-mod gitignore;
+// 启动初始化复用同一份托管忽略规则，避免 Git 提交路径与首次启动各维护一套规则。
+pub(crate) mod gitignore;
 mod protected;
 mod runner;
 mod status;

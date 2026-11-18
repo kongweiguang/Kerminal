@@ -219,6 +219,17 @@ impl PreferencesPanel {
         self.settings_readback_running = false;
         cx.notify();
 
+        // 来源意图在恢复读回期间保持不变；只有代次与地址仍匹配时才允许确认或失败，
+        // 避免迟到的恢复结果取消用户刚发起的新来源请求。只有从冲突/未知状态开始的
+        // 核对才拥有来源恢复职责，普通 watcher 回读不能取消在途来源保存。
+        let source_intent = self.extensions.catalog_source_readback_token();
+        let source_recovery = self.settings.as_ref().is_some_and(|draft| {
+            matches!(
+                draft.status(),
+                DraftStatus::ExternalConflict | DraftStatus::OutcomeUnknown
+            )
+        });
+
         if self.loading_settings && self.settings.is_some() {
             self.finish_settings_load(result, generation, window, cx);
             return;
@@ -243,6 +254,8 @@ impl PreferencesPanel {
                     cx.notify();
                     return;
                 }
+                // 在动作分支可能移动 versioned 之前保留一份权威快照，用于确认来源。
+                let source_readback = source_intent.as_ref().map(|_| versioned.clone());
                 let current = self.settings.as_ref();
                 let action = Self::settings_revision_action(
                     current.map(|draft| draft.status()),
@@ -353,16 +366,34 @@ impl PreferencesPanel {
                         ).to_string());
                     }
                 }
+                // 冲突合并成功且需要续写时保留来源意图，由续写回执继续确认；
+                // 其余情况用本次权威回读确认或显式结束来源意图，避免永久 saving。
+                if !resave_settings_after_readback && let Some(readback) = source_readback {
+                    self.confirm_catalog_source_recovery(
+                        source_intent,
+                        readback,
+                        source_recovery,
+                        cx,
+                    );
+                }
             }
             Err(error) => {
                 self.settings_error = Some(super::localized_error(&error));
                 if initial_load {
                     self.status = None;
                 }
+                // 冲突/未知恢复读回失败时来源无法确认，必须显式结束意图并显示原因；
+                // 只读模式下也不能让来源永久停在保存中。普通 watcher 失败不取消
+                // 正在进行的来源回读，避免无关读错中断来源代次。
+                if source_recovery || self.recovery.mode == ConfigurationMode::ReadOnlyRecovery {
+                    self.fail_catalog_source_recovery(source_intent, cx);
+                }
             }
         }
-        if resave_settings_after_readback {
-            self.save_settings(cx);
+        if resave_settings_after_readback && !self.save_settings(cx) {
+            // 冲突合并续写可能因 UI 校验（如外部写入的快捷键冲突）无法启动；
+            // 没有后续回执，必须在这里收口来源意图，不能让它永久停在保存中。
+            self.finish_unstarted_catalog_source_save(cx);
         }
         self.flush_pending_workbench_layout(cx);
         cx.notify();
@@ -377,6 +408,10 @@ impl PreferencesPanel {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
+        // 未知恢复同样持有来源意图：成功确认后切源，任何无法确认的分支都必须
+        // 显式结束意图并保留可见错误，不能让来源弹层永久停在保存中。
+        let source_intent = self.extensions.catalog_source_readback_token();
+        let source_readback = versioned.clone();
         let submitted = self.settings.as_ref().and_then(|draft| {
             draft
                 .pending_save_value()
@@ -388,6 +423,7 @@ impl PreferencesPanel {
                 "写入结果未知，且没有可核对的提交快照；当前草稿已保留。",
                 "The write result is unknown and its submitted snapshot is unavailable. The draft was preserved.",
             ).to_string());
+            self.fail_catalog_source_recovery(source_intent, cx);
             return;
         };
         let resolution =
@@ -398,6 +434,7 @@ impl PreferencesPanel {
                 "The write result is still unconfirmed because the readback differs from the submitted settings. The draft was preserved.",
             ).to_string());
             self.status = self.settings_error.clone();
+            self.fail_catalog_source_recovery(source_intent, cx);
             return;
         }
 
@@ -414,6 +451,7 @@ impl PreferencesPanel {
                 "写入结果未知；回读内容相同，但草稿状态未能安全确认。",
                 "The readback matches the submitted settings, but the draft state could not be safely confirmed.",
             ).to_string());
+            self.fail_catalog_source_recovery(source_intent, cx);
             return;
         }
         commit_legacy_terminal_theme(resolution, cx);
@@ -438,7 +476,72 @@ impl PreferencesPanel {
         if has_follow_up_edits {
             self.save_settings(cx);
         }
+        // 回读与提交快照一致，来源 URL 已确认落盘；即使 follow-up 已进入保存中，
+        // 也应切换运行源，而不是等待与来源无关的后续回执。
+        self.confirm_catalog_source_recovery(source_intent, source_readback, true, cx);
         self.flush_pending_workbench_layout(cx);
+    }
+
+    /// 用权威回读确认来源意图；仅在草稿已可确认且非只读恢复时切换。
+    ///
+    /// 来源代次与地址必须仍与恢复开始时一致，迟到的旧回读不能覆盖新请求；
+    /// 冲突合并失败、未知未确认或只读恢复时保留可见错误并结束意图，避免永久
+    /// saving。普通 watcher 回读遇到在途保存时不动来源，交给保存回执处理。
+    ///
+    /// @author kongweiguang
+    fn confirm_catalog_source_recovery(
+        &mut self,
+        intent: Option<(String, u64)>,
+        readback: VersionedSettings,
+        source_recovery: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((url, generation)) = intent else {
+            return;
+        };
+        if self.extensions.catalog_source_readback_token() != Some((url.clone(), generation)) {
+            return;
+        }
+        let read_only = self.recovery.mode == ConfigurationMode::ReadOnlyRecovery;
+        let can_confirm = !read_only
+            && self.settings.as_ref().is_some_and(|draft| {
+                matches!(draft.status(), DraftStatus::Ready | DraftStatus::Failed)
+                    || (source_recovery && draft.status() == DraftStatus::Saving)
+            });
+        if can_confirm {
+            self.extensions
+                .finish_catalog_source_readback(&url, generation, Ok(readback), cx);
+        } else if read_only || source_recovery {
+            self.fail_catalog_source_recovery(Some((url, generation)), cx);
+        }
+    }
+
+    /// 恢复读回无法确认来源时显式结束意图；消息优先复用已投影的恢复错误。
+    ///
+    /// @author kongweiguang
+    fn fail_catalog_source_recovery(
+        &mut self,
+        intent: Option<(String, u64)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((url, generation)) = intent else {
+            return;
+        };
+        if self.extensions.catalog_source_readback_token() != Some((url, generation)) {
+            return;
+        }
+        let message = self
+            .settings_error
+            .clone()
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| {
+                crate::locale::text(
+                    "来源写入结果尚未确认，请重新读取设置后重试。",
+                    "The source write is not confirmed yet. Reload settings and try again.",
+                )
+                .to_string()
+            });
+        self.extensions.fail_catalog_source_save(message, cx);
     }
 
     /// 合并或未知结果回读时同步可用快照，但保留当前未解析数字字段的原始文本。

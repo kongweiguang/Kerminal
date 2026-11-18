@@ -65,6 +65,17 @@ impl DesktopIsolationEvidence {
         Ok(())
     }
 
+    /// 原生 activity 验收允许主窗口在已证明的私有桌面上可见/活动；仍拒绝输入桌面或未证明隔离。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn validate_activity_window_state(
+        &self,
+        visible: bool,
+        active: bool,
+    ) -> Result<(), io::Error> {
+        self.validate_plugin_window_state(visible, active)
+    }
+
     /// 动效专项允许显示之前必须先证明 UI 线程属于本轮私有桌面，绝不依赖隐藏窗口的默认状态。
     ///
     /// @author kongweiguang

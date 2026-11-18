@@ -98,6 +98,102 @@ function Get-ExtensionsSnapshotPage {
     return $property.Value
 }
 
+function Get-ExtensionsProperty {
+    # 缺失字段与 null 必须区分；StrictMode 直接访问缺失属性无法把错误定位到调用方字段名。
+    # 返回值用一元逗号包一层：PowerShell 函数输出会枚举数组，空数组直接 return 会变成 $null，
+    # 使 batch_items 等合法空集合被严格类型检查误判；逗号包装同时保留单项数组、标量和 null 语义。
+    # @author kongweiguang
+    param($Object,[string]$Name,[string]$Field)
+    if($null -eq $Object -or $Object -isnot [pscustomobject]){throw "Invalid object field: $Field"}
+    $property=$Object.PSObject.Properties[$Name]
+    if($null -eq $property){throw "Missing field: $Field"}
+    return ,$property.Value
+}
+
+function Get-ExtensionsGroups {
+    # 统一列表的组顺序、计数和折叠事实必须来自真实快照；重复、未知或乱序组都不能通过。
+    # @author kongweiguang
+    param($Page,[string]$Field)
+    $value=Get-ExtensionsProperty -Object $Page -Name 'groups' -Field "$Field.groups"
+    if($value -isnot [System.Collections.IList]){throw "Invalid group array field: $Field.groups"}
+    $rank=[Collections.Generic.Dictionary[string,int]]::new([StringComparer]::Ordinal)
+    $rank.Add('installed',0); $rank.Add('builtin',1); $rank.Add('pending',2); $rank.Add('market',3)
+    $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $last=-1
+    $groups=[Collections.Generic.List[object]]::new()
+    foreach($group in $value){
+        if($null -eq $group -or $group -isnot [pscustomobject]){throw "Invalid group entry: $Field.groups"}
+        $kind=Get-ExtensionsStrictString -Value (Get-ExtensionsProperty -Object $group -Name 'kind' -Field "$Field.groups.kind") -Field "$Field.groups.kind"
+        if(-not $rank.ContainsKey($kind)){throw "Unknown group kind: $Field.groups.kind"}
+        if(-not $seen.Add($kind)){throw "Duplicate group kind: $Field.groups.kind"}
+        $count=Get-ExtensionsStrictInteger -Value (Get-ExtensionsProperty -Object $group -Name 'count' -Field "$Field.groups.count") -Field "$Field.groups.count" -Minimum 1
+        $collapsed=Get-ExtensionsStrictBoolean -Value (Get-ExtensionsProperty -Object $group -Name 'collapsed' -Field "$Field.groups.collapsed") -Field "$Field.groups.collapsed"
+        $current=$rank[$kind]
+        if($current -le $last){throw "Group order is not canonical: $Field.groups.kind"}
+        $last=$current
+        $groups.Add([pscustomobject]@{Kind=$kind;Count=$count;Collapsed=$collapsed})
+    }
+    if($groups.Count -eq 0){throw "Empty group array: $Field.groups"}
+    return $groups.ToArray()
+}
+
+function Get-ExtensionsGroup {
+    # 按稳定 kind 查找组；缺失返回 null，由调用方决定该组是否必须存在。
+    # @author kongweiguang
+    param($Groups,[string]$Kind)
+    foreach($group in $Groups){
+        if($group.Kind -ceq $Kind){return $group}
+    }
+    return $null
+}
+
+function Assert-ExtensionsUnifiedPage {
+    # 统一列表快照必须同时证明分组去重、内置折叠事实和批量范围；不能用返回态或 pending 数量代替。
+    # @author kongweiguang
+    param($Snapshot,[string]$Field,[bool]$BuiltinCollapsed,[bool]$BackToList=$true)
+    $page=Get-ExtensionsSnapshotPage -Snapshot $Snapshot -Field $Field
+    [void](Get-ExtensionsStrictInteger -Value (Get-ExtensionsProperty -Object $page -Name 'catalog_entries' -Field "$Field.catalog_entries") -Field "$Field.catalog_entries" -Minimum 2 -Maximum 2)
+    [void](Get-ExtensionsStrictInteger -Value (Get-ExtensionsProperty -Object $page -Name 'pending' -Field "$Field.pending") -Field "$Field.pending" -Minimum 2 -Maximum 2)
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'offline' -Field "$Field.offline") -Field "$Field.offline" -Expected $false
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'busy' -Field "$Field.busy") -Field "$Field.busy" -Expected $false
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'confirmation_visible' -Field "$Field.confirmation_visible") -Field "$Field.confirmation_visible" -Expected $false
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'pending_restart' -Field "$Field.pending_restart") -Field "$Field.pending_restart" -Expected $true
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'back_to_list' -Field "$Field.back_to_list") -Field "$Field.back_to_list" -Expected $BackToList
+    foreach($name in @('error','catalog_error','state_error','readme_error')){
+        if($null -ne (Get-ExtensionsProperty -Object $page -Name $name -Field "$Field.$name")){throw "Unified list reported $name`: $Field"}
+    }
+    [void](Get-ExtensionsStrictInteger -Value (Get-ExtensionsProperty -Object $page -Name 'update_candidates' -Field "$Field.update_candidates") -Field "$Field.update_candidates" -Minimum 0 -Maximum 0)
+    $batchItems=@(Get-ExtensionsStringSet -Value (Get-ExtensionsProperty -Object $page -Name 'batch_items' -Field "$Field.batch_items") -Field "$Field.batch_items")
+    if($batchItems.Count -ne 0){throw "Unexpected batch items in unified list: $Field.batch_items"}
+    if($null -ne (Get-ExtensionsProperty -Object $page -Name 'batch_progress' -Field "$Field.batch_progress")){throw "Unexpected batch progress in unified list: $Field.batch_progress"}
+    $groups=@(Get-ExtensionsGroups -Page $page -Field $Field)
+    if($groups.Count -ne 3){throw "Unified list must contain exactly builtin, pending and market groups: $Field.groups"}
+    if($null -ne (Get-ExtensionsGroup -Groups $groups -Kind 'installed')){throw "Current fixture has no installed records; installed group must be absent: $Field.groups"}
+    $builtin=Get-ExtensionsGroup -Groups $groups -Kind 'builtin'
+    if($null -eq $builtin){throw "Builtin group is missing: $Field.groups"}
+    if($builtin.Collapsed -ne $BuiltinCollapsed){throw "Builtin group collapsed fact does not match the phase: $Field"}
+    $pending=Get-ExtensionsGroup -Groups $groups -Kind 'pending'
+    if($null -eq $pending -or $pending.Count -ne 2){throw "Pending group must contain the two submitted installs: $Field.groups"}
+    $market=Get-ExtensionsGroup -Groups $groups -Kind 'market'
+    if($null -eq $market -or $market.Count -ne 1){throw "Market group must contain only the remaining catalog entry: $Field.groups"}
+    $installed=Get-ExtensionsStrictInteger -Value (Get-ExtensionsProperty -Object $page -Name 'installed' -Field "$Field.installed") -Field "$Field.installed" -Minimum 1
+    if($installed -ne $builtin.Count){throw "Installed count must equal the builtin group when no external records exist: $Field.installed"}
+    return $page
+}
+
+function Assert-ExtensionsSourcePage {
+    # 来源场景的三个快照必须证明弹层真实开关、保存无错误且来源仍是夹具地址；
+    # 缺失字段不能默认当成 false/null，否则缺少 UI 证据也会假通过。
+    # @author kongweiguang
+    param($Snapshot,[string]$Field,[string]$Url,[bool]$DialogOpen,[bool]$Saving)
+    $page=Get-ExtensionsSnapshotPage -Snapshot $Snapshot -Field $Field
+    [void](Assert-ExtensionsString -Value (Get-ExtensionsProperty -Object $page -Name 'source_url' -Field "$Field.source_url") -Field "$Field.source_url" -Expected $Url)
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'source_dialog_open' -Field "$Field.source_dialog_open") -Field "$Field.source_dialog_open" -Expected $DialogOpen
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $page -Name 'source_saving' -Field "$Field.source_saving") -Field "$Field.source_saving" -Expected $Saving
+    if($null -ne (Get-ExtensionsProperty -Object $page -Name 'source_error' -Field "$Field.source_error")){throw "Source dialog reported an error: $Field.source_error"}
+    return $page
+}
+
 function Get-ExtensionsJobActiveProcesses {
     # Job 计数来自受控 C# launcher 的 uint；拒绝 null、字符串或浮点参与关闭判定。
     # @author kongweiguang
@@ -109,13 +205,14 @@ function Get-ExtensionsJobActiveProcesses {
 }
 
 function Get-ExtensionsFrameDimensions {
-    # 逻辑视口固定来自本轮窗口；截图像素尺寸必须是视口乘缩放因子后的实际绘制目标。
+    # 逻辑视口由各阶段真实窗口尺寸给出；截图像素尺寸必须是该视口乘缩放因子后的实际绘制目标。
+    # 窄窗阶段不能沿用宽窗 1200x800，否则会把错误尺寸的截图当成通过。
     # @author kongweiguang
-    param($Viewport,$Scale,[string]$Stage)
+    param($Viewport,$Scale,[string]$Stage,[double]$ExpectedWidth=1200.0,[double]$ExpectedHeight=800.0)
     if($Viewport -isnot [System.Collections.IList] -or $Viewport.Count -ne 2){throw "Invalid viewport: $Stage"}
     $width=Get-ExtensionsStrictNumber -Value $Viewport[0] -Field 'viewport.width'
     $height=Get-ExtensionsStrictNumber -Value $Viewport[1] -Field 'viewport.height'
-    if([Math]::Abs($width-1200.0) -gt 0.5 -or [Math]::Abs($height-800.0) -gt 0.5){throw "Unexpected logical viewport: $Stage"}
+    if([Math]::Abs($width-$ExpectedWidth) -gt 0.5 -or [Math]::Abs($height-$ExpectedHeight) -gt 0.5){throw "Unexpected logical viewport: $Stage"}
     $scale=Get-ExtensionsStrictNumber -Value $Scale -Field 'scaleFactor'
     if($scale -le 0){throw "Invalid scale factor: $Stage"}
     return [pscustomobject]@{
@@ -273,6 +370,8 @@ function Assert-ExtensionsAcceptanceReport {
     Assert-ExtensionsBoolean -Value $Report.quitReceipt -Field 'report.quitReceipt' -Expected $true
     Assert-ExtensionsBoolean -Value $Report.resourcesShutdownComplete -Field 'report.resourcesShutdownComplete' -Expected $true
     Assert-ExtensionsBoolean -Value $Report.runtimeShutdownObserved -Field 'report.runtimeShutdownObserved' -Expected $false
+    # 键盘证据必须与当前候选一致：列表焦点由一次指针点击建立，随后是真实 Home/End/方向键。
+    [void](Assert-ExtensionsString -Value $Report.inputMode -Field 'report.inputMode' -Expected 'synthetic GPUI pointer dispatch to focus the extension list plus real Home/End/arrow keystrokes; production file-picker result entry')
 
     $reportProcess=Get-ExtensionsStrictInteger -Value $Report.processId -Field 'report.processId' -Minimum 1 -Maximum ([long][uint32]::MaxValue)
     if($reportProcess -ne $ProcessId){throw 'Acceptance report belongs to another process.'}
@@ -310,6 +409,27 @@ function Assert-ExtensionsAcceptanceReport {
     Assert-ExtensionsBoolean -Value $market.offline -Field 'market.offline' -Expected $false
     if($null -ne $market.error){throw 'Market page reported an error.'}
 
+    # 来源保存证据必须来自真实页头点击与设置回读：配置、运行源和启动器注入地址
+    # 三者相同，且弹层前/打开/保存后三个快照都保留正确的来源与错误状态。
+    $source=$Report.source
+    if($null -eq $source -or $source -isnot [pscustomobject]){throw 'Source save evidence is missing.'}
+    [void](Assert-ExtensionsString -Value $source.entry -Field 'source.entry' -Expected 'real header button opens the window dialog; unchanged backfilled fixture URL is saved through the settings CAS and load_settings read-back')
+    [void](Assert-ExtensionsString -Value $source.screenshot -Field 'source.screenshot' -Expected 'source-dialog.png')
+    $configUrl=Get-ExtensionsStrictString -Value $source.configUrl -Field 'source.configUrl'
+    $runtimeUrl=Get-ExtensionsStrictString -Value $source.runtimeUrl -Field 'source.runtimeUrl'
+    $expectedUrl=Get-ExtensionsStrictString -Value $source.expectedUrl -Field 'source.expectedUrl'
+    foreach($url in @($configUrl,$runtimeUrl,$expectedUrl)){
+        if($url -cnotmatch '^http://127\.0\.0\.1:\d{1,5}/catalog\.json$'){throw 'Source URL is not the loopback fixture catalog: source'}
+    }
+    if($configUrl -cne $runtimeUrl -or $runtimeUrl -cne $expectedUrl){throw 'Source config, runtime and expected URLs disagree: source'}
+    Assert-ExtensionsBoolean -Value $source.configMatchesRuntime -Field 'source.configMatchesRuntime' -Expected $true
+    [void](Assert-ExtensionsSourcePage -Snapshot $source.before -Field 'source.before' -Url $expectedUrl -DialogOpen $false -Saving $false)
+    [void](Assert-ExtensionsSourcePage -Snapshot $source.dialog -Field 'source.dialog' -Url $expectedUrl -DialogOpen $true -Saving $false)
+    $sourceSaved=Assert-ExtensionsSourcePage -Snapshot $source.saved -Field 'source.saved' -Url $expectedUrl -DialogOpen $false -Saving $false
+    [void](Get-ExtensionsStrictInteger -Value (Get-ExtensionsProperty -Object $sourceSaved -Name 'catalog_entries' -Field 'source.saved.catalog_entries') -Field 'source.saved.catalog_entries' -Minimum 2 -Maximum 2)
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $sourceSaved -Name 'offline' -Field 'source.saved.offline') -Field 'source.saved.offline' -Expected $false
+    Assert-ExtensionsBoolean -Value (Get-ExtensionsProperty -Object $sourceSaved -Name 'busy' -Field 'source.saved.busy') -Field 'source.saved.busy' -Expected $false
+
     $selection=Get-ExtensionsSnapshotPage -Snapshot $Report.selection -Field 'selection'
     [void](Assert-ExtensionsString -Value $selection.selected -Field 'selection.selected' -Expected 'acme.market-two')
 
@@ -337,6 +457,41 @@ function Assert-ExtensionsAcceptanceReport {
     Assert-ExtensionsBoolean -Value $installed.confirmation_visible -Field 'installed.confirmation_visible' -Expected $false
     Assert-ExtensionsBoolean -Value $installed.pending_restart -Field 'installed.pending_restart' -Expected $true
     if($null -ne $installed.error){throw 'Extensions page reported an error after installation.'}
+
+    # 统一列表证据必须来自真实分组快照：内置组默认收起、展开后为 false、再次收起为 true；
+    # 当前夹具没有已安装外部记录，因此 installed 组缺失、候选数为 0，批量更新未原生覆盖。
+    if($null -ne $Report.PSObject.Properties['installedTab']){throw 'The report still contains installedTab evidence.'}
+    $unified=$Report.unifiedList
+    if($null -eq $unified -or $unified -isnot [pscustomobject]){throw 'Unified list evidence is missing.'}
+    [void](Assert-ExtensionsString -Value $unified.entry -Field 'unifiedList.entry' -Expected 'real unified list; builtin group header click toggles expansion')
+    $unifiedShots=Get-ExtensionsStringSet -Value $unified.screenshots -Field 'unifiedList.screenshots'
+    $expectedUnifiedShots=@('unified-list.png','builtin-expanded.png','builtin-collapsed.png')
+    if($unifiedShots.Count -ne $expectedUnifiedShots.Count){throw 'Invalid unified screenshots: unifiedList.screenshots'}
+    foreach($shot in $expectedUnifiedShots){if($unifiedShots -cnotcontains $shot){throw 'Invalid unified screenshots: unifiedList.screenshots'}}
+    Assert-ExtensionsBoolean -Value $unified.installedGroupObserved -Field 'unifiedList.installedGroupObserved' -Expected $false
+    [void](Get-ExtensionsStrictInteger -Value $unified.updateCandidates -Field 'unifiedList.updateCandidates' -Minimum 0 -Maximum 0)
+    Assert-ExtensionsBoolean -Value $unified.batchUpdateNativeCovered -Field 'unifiedList.batchUpdateNativeCovered' -Expected $false
+    [void](Get-ExtensionsStrictString -Value $unified.batchUpdateNotCoveredReason -Field 'unifiedList.batchUpdateNotCoveredReason')
+    [void](Assert-ExtensionsUnifiedPage -Snapshot $unified.collapsed -Field 'unifiedList.collapsed' -BuiltinCollapsed $true)
+    [void](Assert-ExtensionsUnifiedPage -Snapshot $unified.expanded -Field 'unifiedList.expanded' -BuiltinCollapsed $false)
+    [void](Assert-ExtensionsUnifiedPage -Snapshot $unified.collapsedAgain -Field 'unifiedList.collapsedAgain' -BuiltinCollapsed $true)
+
+    $narrow=$Report.narrow
+    if($null -eq $narrow -or $narrow -isnot [pscustomobject]){throw 'Narrow evidence is missing.'}
+    [void](Get-ExtensionsFrameDimensions -Viewport $narrow.viewport -Scale $Report.scaleFactor -Stage 'narrow' -ExpectedWidth 700.0 -ExpectedHeight 800.0)
+    $narrowShots=Get-ExtensionsStringSet -Value $narrow.screenshots -Field 'narrow.screenshots'
+    $expectedNarrowShots=@('narrow-list.png','narrow-detail.png','narrow-list-returned.png')
+    if($narrowShots.Count -ne $expectedNarrowShots.Count){throw 'Invalid narrow screenshots: narrow.screenshots'}
+    foreach($shot in $expectedNarrowShots){if($narrowShots -cnotcontains $shot){throw 'Invalid narrow screenshots: narrow.screenshots'}}
+    $narrowList=Assert-ExtensionsUnifiedPage -Snapshot $narrow.list -Field 'narrow.list' -BuiltinCollapsed $true
+    $narrowDetail=Assert-ExtensionsUnifiedPage -Snapshot $narrow.detail -Field 'narrow.detail' -BuiltinCollapsed $true -BackToList $false
+    [void](Assert-ExtensionsString -Value $narrowDetail.selected -Field 'narrow.detail.selected' -Expected 'acme.market-one')
+    $narrowReturned=Assert-ExtensionsUnifiedPage -Snapshot $narrow.returned -Field 'narrow.returned' -BuiltinCollapsed $true
+    foreach($page in @($narrowList,$narrowDetail,$narrowReturned)){
+        $width=Get-ExtensionsStrictNumber -Value $page.content_width -Field 'narrow.content_width'
+        if($width -ge 700.0){throw 'Narrow evidence did not report a single-column content width: narrow.content_width'}
+    }
+    if($narrow.dpi200PercentTested -isnot [bool] -or $narrow.dpi200PercentTested){throw 'Narrow DPI claim is invalid: narrow.dpi200PercentTested'}
 
     $pendingIds=Get-ExtensionsStringSet -Value $Report.pendingPluginIds -Field 'report.pendingPluginIds'
     # 权威状态按字典序排序；集合比较只看唯一身份，不依赖安装发生顺序。
@@ -400,6 +555,22 @@ function Stop-ExtensionsFixture {
     if($errors.Count -gt 1){throw [AggregateException]::new('Owned extensions fixture cleanup had multiple failures.',$errors.ToArray())}
 }
 
+function Assert-ExtensionsFixtureLogs {
+    # 真实网络日志必须证明只读取 JSON 目录；任何 minisig 请求都说明客户端仍在验签，
+    # 与当前“目录只读 JSON”的契约冲突，不能把夹具流程当成通过。
+    # @author kongweiguang
+    param([Parameter(Mandatory)][string]$Base)
+    $catalogRequests=0
+    foreach($name in @('fixture.stdout.log','fixture.stderr.log')){
+        $path=Join-Path $Base $name
+        if(-not (Test-Path -LiteralPath $path -PathType Leaf)){throw "Missing fixture log: $name"}
+        $text=[IO.File]::ReadAllText($path)
+        if($text -match '(?i)minisig'){throw "Fixture log contains a signature request: $name"}
+        $catalogRequests+=([regex]::Matches($text,'fixture GET /catalog\.json(?:\s|$)')).Count
+    }
+    if($catalogRequests -lt 1){throw 'Fixture logs contain no catalog JSON request.'}
+}
+
 function Initialize-ExtensionsLauncher {
     # 共用已校验的后台启动器与首线程挂起Job绑定，差异仅限命令和独立类型名。
     # @author kongweiguang
@@ -443,7 +614,7 @@ if(Test-Path -LiteralPath $base){throw 'Output root must not exist.'}
 [void][IO.Directory]::CreateDirectory($base)
 $candidate=Assert-ExtensionsDigest -Value ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()) -Field 'candidate'
 $packageHash=Assert-ExtensionsDigest -Value ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()) -Field 'localPackage'
-$names=@('KERMINAL_PLUGIN_EXTENSIONS_PACKAGE','KERMINAL_PLUGIN_EXTENSIONS_DESKTOP','KERMINAL_PLUGIN_CATALOG_URL','KERMINAL_PLUGIN_CATALOG_PUBKEY','KERMINAL_WEBVIEW_PROBE_THEME','KERMINAL_WEBVIEW_BACKGROUND')
+$names=@('KERMINAL_PLUGIN_EXTENSIONS_PACKAGE','KERMINAL_PLUGIN_EXTENSIONS_DESKTOP','KERMINAL_PLUGIN_CATALOG_URL','KERMINAL_WEBVIEW_PROBE_THEME','KERMINAL_WEBVIEW_BACKGROUND')
 $previous=@{}
 foreach($name in $names){$previous[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $process=$null; $fixture=$null; $fixtureOutput=$null; $fixtureError=$null; $receipts=@(); $failure=$null
@@ -462,19 +633,16 @@ try {
     $fixtureError=$fixture.StandardError.ReadToEndAsync()
     $deadline=[DateTime]::UtcNow.AddSeconds(15)
     while(-not (Test-Path -LiteralPath (Join-Path $base 'fixture-ready.json'))){
-        if($fixture.HasExited){throw "Signed fixture exited: $($fixtureError.GetAwaiter().GetResult())"}
-        if([DateTime]::UtcNow -gt $deadline){throw 'Signed fixture startup timed out.'}
+        if($fixture.HasExited){throw "Fixture exited: $($fixtureError.GetAwaiter().GetResult())"}
+        if([DateTime]::UtcNow -gt $deadline){throw 'Fixture startup timed out.'}
         Start-Sleep -Milliseconds 100
     }
     $ready=Get-Content -LiteralPath (Join-Path $base 'fixture-ready.json') -Raw|ConvertFrom-Json
     $catalogUrl=Get-ExtensionsStrictString -Value $ready.url -Field 'fixture.url'
-    $catalogKey=Get-ExtensionsStrictString -Value $ready.key -Field 'fixture.key'
     $catalogHash=Assert-ExtensionsDigest -Value $ready.catalogSha256 -Field 'fixture.catalogSha256'
-    if($catalogUrl -cnotmatch '^http://127\.0\.0\.1:\d{1,5}/catalog\.json$'){throw 'Signed fixture URL is not a loopback catalog.'}
-    try {[void][Convert]::FromBase64String($catalogKey)} catch {throw 'Signed fixture public key is not base64.'}
+    if($catalogUrl -cnotmatch '^http://127\.0\.0\.1:\d{1,5}/catalog\.json$'){throw 'Fixture URL is not a loopback catalog.'}
     [Environment]::SetEnvironmentVariable('KERMINAL_PLUGIN_EXTENSIONS_PACKAGE',$package,'Process')
     [Environment]::SetEnvironmentVariable('KERMINAL_PLUGIN_CATALOG_URL',$catalogUrl,'Process')
-    [Environment]::SetEnvironmentVariable('KERMINAL_PLUGIN_CATALOG_PUBKEY',$catalogKey,'Process')
     [Environment]::SetEnvironmentVariable('KERMINAL_WEBVIEW_BACKGROUND','0','Process')
     Initialize-ExtensionsLauncher
     Initialize-ExtensionsNativeEvidence
@@ -498,10 +666,27 @@ try {
         $report=Get-Content -LiteralPath $reportPath -Raw|ConvertFrom-Json
         $dimensions=Assert-ExtensionsAcceptanceReport -Report $report -ProcessId $process.ProcessId -Candidate $candidate -PackageHash $packageHash -Theme $currentTheme -Desktop $desktop -InputDesktop $inputDesktop
         $frames=@()
-        foreach($phase in @('catalog','selection','catalog-permissions','permissions','pending-restart')){
-            $png=Read-ExtensionsPngEvidence -Path (Join-Path $output "$phase.png")
-            Assert-ExtensionsFrameDimensions -Evidence $png -Expected $dimensions -Phase $phase
-            $frames+=[pscustomobject]@{Phase=$phase;Width=$png.Width;Height=$png.Height;IdatBytes=$png.IdatBytes;Sha256=$png.Sha256}
+        # 宽窗与窄窗截图分别按各自真实逻辑视口计算像素尺寸；不能用一个 1200x800
+        # 的期望值盖过所有阶段，否则窄窗证据会以错误尺寸通过。
+        $narrowDimensions=Get-ExtensionsFrameDimensions -Viewport $report.narrow.viewport -Scale $report.scaleFactor -Stage 'narrow' -ExpectedWidth 700.0 -ExpectedHeight 800.0
+        $phasePlan=@(
+            @{Phase='catalog';Dimensions=$dimensions},
+            @{Phase='source-dialog';Dimensions=$dimensions},
+            @{Phase='selection';Dimensions=$dimensions},
+            @{Phase='catalog-permissions';Dimensions=$dimensions},
+            @{Phase='permissions';Dimensions=$dimensions},
+            @{Phase='pending-restart';Dimensions=$dimensions},
+            @{Phase='unified-list';Dimensions=$dimensions},
+            @{Phase='builtin-expanded';Dimensions=$dimensions},
+            @{Phase='builtin-collapsed';Dimensions=$dimensions},
+            @{Phase='narrow-list';Dimensions=$narrowDimensions},
+            @{Phase='narrow-detail';Dimensions=$narrowDimensions},
+            @{Phase='narrow-list-returned';Dimensions=$narrowDimensions}
+        )
+        foreach($phase in $phasePlan){
+            $png=Read-ExtensionsPngEvidence -Path (Join-Path $output "$($phase.Phase).png")
+            Assert-ExtensionsFrameDimensions -Evidence $png -Expected $phase.Dimensions -Phase $phase.Phase
+            $frames+=[pscustomobject]@{Phase=$phase.Phase;Width=$png.Width;Height=$png.Height;ViewportWidth=$phase.Dimensions.ViewportWidth;ViewportHeight=$phase.Dimensions.ViewportHeight;IdatBytes=$png.IdatBytes;Sha256=$png.Sha256}
         }
         $deadline=[DateTime]::UtcNow.AddSeconds(10)
         while((Get-ExtensionsJobActiveProcesses -Process $process -Stage 'normal-wait') -gt 0 -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
@@ -515,7 +700,7 @@ try {
             Theme=$currentTheme;ProcessId=$processId;Report="$currentTheme/report.json";ExitCode=$exitCode
             NormalExitJobMembers=$jobActive;JobScope='owned-kill-on-close-job-members-only';NonJobProcessesProven=$false
             DesktopName=$desktop;InputDesktopName=$inputDesktop;DesktopHandleClosed=$true;DesktopHandleScope='candidate-owned-handle-only'
-            FrameDimensions=$dimensions;Frames=$frames
+            FrameDimensions=$dimensions;NarrowFrameDimensions=$narrowDimensions;Frames=$frames
         }
     }
     if((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant() -cne $candidate -or (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant() -cne $packageHash){throw 'Candidate or package changed during acceptance.'}
@@ -541,6 +726,10 @@ finally {
     }
     if($null -ne $fixture){
         try {Stop-ExtensionsFixture -Fixture $fixture -StdoutTask $fixtureOutput -StderrTask $fixtureError -Base $base} catch {$cleanupErrors.Add($_.Exception)}
+    }
+    # 只有验收本身成功且夹具确实启动过时才要求网络日志；失败路径优先保留原始原因。
+    if($null -eq $failure -and $null -ne $fixture){
+        try {Assert-ExtensionsFixtureLogs -Base $base} catch {$cleanupErrors.Add($_.Exception)}
     }
     foreach($name in $names){
         try {[Environment]::SetEnvironmentVariable($name,$previous[$name],'Process')} catch {$cleanupErrors.Add($_.Exception)}

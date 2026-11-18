@@ -1,4 +1,4 @@
-//! 扩展市场通过真实服务、签名目录与安装确认界面完成隔离原生验收。
+//! 扩展市场通过真实服务、HTTP 目录与安装确认界面完成隔离原生验收。
 //! @author kongweiguang
 
 use crate::{
@@ -11,7 +11,8 @@ use crate::{
     runtime::ApplicationRuntime,
 };
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, AsyncApp, Entity, WindowOptions, component::TitleBar,
+    AnyWindowHandle, AppContext as _, AsyncApp, Entity, Keystroke, WindowOptions,
+    component::TitleBar,
 };
 use gpui_pre::{Bounds, TitlebarOptions, WindowBounds, px, size};
 use kerminal_application::preferences::ThemeMode;
@@ -58,11 +59,10 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
 migration_contract = 4
 ",
     )?;
-    if std::env::var("KERMINAL_PLUGIN_CATALOG_URL").is_err()
-        || std::env::var("KERMINAL_PLUGIN_CATALOG_PUBKEY").is_err()
-    {
-        return Err(io::Error::other("缺少一次性签名目录配置").into());
-    }
+    // 验收只要求目录 URL：目录按 JSON 加载，不再需要公钥或签名文件。
+    // 来源保存场景结束后还要用同一地址核对隔离配置与运行源，先在这里固定下来。
+    let expected_source = std::env::var("KERMINAL_PLUGIN_CATALOG_URL")
+        .map_err(|_| io::Error::other("缺少一次性目录配置"))?;
     // SAFETY: 当前入口尚未创建运行时或 UI 线程，仅修改候选进程自己的数据根。
     unsafe {
         std::env::set_var("KERMINAL_CONFIG_ROOT", &config);
@@ -113,6 +113,23 @@ migration_contract = 4
             }),
         None => Err(io::Error::other("缺少正式扩展服务").into()),
     };
+    // 来源保存的最终核对必须在组合根关闭前完成：设置从隔离磁盘真实回读，
+    // 运行源从正式扩展服务读取，两者都必须等于启动器注入的夹具地址。
+    // 这里只证明落盘值与运行源一致，不把 UI 内部回读次数当成证据。
+    let source_check = (|| -> Result<(String, String), Box<dyn Error>> {
+        let runtime_url = services
+            .extensions
+            .as_ref()
+            .map(|service| service.source_url())
+            .ok_or_else(|| io::Error::other("缺少正式扩展服务"))?;
+        let config_url = runtime
+            .block_on(services.preferences.load_settings())
+            .map_err(|error| -> Box<dyn Error> { error.into() })?
+            .settings
+            .plugin_catalog_url;
+        validate_source_urls(&config_url, &runtime_url, &expected_source)?;
+        Ok((config_url, runtime_url))
+    })();
     let deadline = ui
         .as_ref()
         .map(|(_, deadline)| *deadline)
@@ -126,6 +143,13 @@ migration_contract = 4
     // ui 的成功值同时包含生产退出截止时间；截止时间已在关闭阶段使用，报告只取快照。
     let ((mut report, _quit_deadline), pending_ids) =
         combine_acceptance_results(ui, shutdown, pending)?;
+    // 来源场景的配置与运行源核对独立于 UI 快照；两者不一致时整轮验收失败，
+    // 不能只把页面看起来正常当成保存闭环。
+    let (config_url, runtime_url) = source_check?;
+    report["source"]["configUrl"] = json!(config_url);
+    report["source"]["runtimeUrl"] = json!(runtime_url);
+    report["source"]["expectedUrl"] = json!(expected_source);
+    report["source"]["configMatchesRuntime"] = json!(true);
     report["candidateSha256"] = json!(candidate);
     report["localPackageSha256"] = json!(package);
     report["pendingCountReadBack"] = json!(pending_ids.len());
@@ -165,6 +189,27 @@ fn validate_pending_install(
         )));
     }
     Ok(actual)
+}
+
+/// 来源保存的最终一致性只比较配置回读、运行源与启动器注入地址。
+///
+/// 三者任一为空或不同都说明保存、回读或切换没有形成闭环；单独成函数让单元测试
+/// 覆盖缺失、错配和成功路径，而不依赖真实窗口。
+/// @author kongweiguang
+fn validate_source_urls(
+    config_url: &str,
+    runtime_url: &str,
+    expected_url: &str,
+) -> Result<(), io::Error> {
+    if config_url.is_empty() || runtime_url.is_empty() || expected_url.is_empty() {
+        return Err(io::Error::other("来源地址为空，无法证明保存闭环"));
+    }
+    if config_url != runtime_url || runtime_url != expected_url {
+        return Err(io::Error::other(format!(
+            "来源保存未形成闭环：config={config_url}, runtime={runtime_url}, expected={expected_url}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -304,6 +349,19 @@ fn private_desktop_name() -> Result<String, io::Error> {
     Ok(String::new())
 }
 
+/// 把启动器主题字符串映射为运行时主题。
+///
+/// 选项解析阶段已拒绝未知值；这里集中映射，供初次打开页面和来源保存后重新应用
+/// 共用，避免两处分支漂移导致某次回执后主题悄悄退回默认值。
+/// @author kongweiguang
+fn acceptance_theme(theme: &str) -> ThemeMode {
+    match theme {
+        "light" => ThemeMode::Light,
+        "dark" => ThemeMode::Dark,
+        _ => ThemeMode::System,
+    }
+}
+
 /// 普通 Root 窗口在私有桌面绘制；退出以生产 QuitReady 截止时间为唯一成功门禁。
 fn run_window(
     services: AppServices,
@@ -406,37 +464,99 @@ async fn exercise(
         .await?;
     window.update(cx, |_, window, app| {
         root.update(app, |root, cx| {
-            root.set_right_rail_acceptance_theme(
-                match options.theme.as_str() {
-                    "light" => ThemeMode::Light,
-                    "dark" => ThemeMode::Dark,
-                    _ => ThemeMode::System,
-                },
-                cx,
-            );
+            root.set_right_rail_acceptance_theme(acceptance_theme(&options.theme), cx);
             root.extensions_acceptance_open(window, cx)
         })
     })??;
-    let market = wait(cx, root, window, "验签目录", |value| {
+    let market = wait(cx, root, window, "JSON 目录", |value| {
         value["page"]["catalog_entries"] == 2
             && value["page"]["busy"] == false
             && value["page"]["offline"] == false
     })
     .await?;
     capture_frame(cx, window, &options.output.join("catalog.png")).await?;
-    wait_selector(cx, window, "extension-select-acme.market-one").await?;
-    // Button 明确在鼠标按下时阻止抢焦点，Tab 顺序无法从任意行开始；此处用真实指针分发选择第二项，
-    // 键盘路径由 P3 输入与 P7 原生动作覆盖，不在本页把不可达的 Tab 序列伪装成通过。
-    click_selector(cx, window, "extension-select-acme.market-one", false)?;
-    click_selector(cx, window, "extension-select-acme.market-two", false)?;
-    let selection = wait(cx, root, window, "选择第二条目录项", |value| {
+    // 初始目录就绪后真实点击页头来源入口：运行态来源已被验收环境覆盖为夹具地址，
+    // 而隔离设置仍为空；保持回填地址不变点击保存，才能让设置面板真实走一次
+    // 保存→load_settings 回读→切换运行源，而不是直接调用 set_source_url。
+    let source_url = std::env::var("KERMINAL_PLUGIN_CATALOG_URL")
+        .map_err(|_| io::Error::other("缺少一次性目录配置"))?;
+    let source_before = wait(cx, root, window, "来源入口就绪", |value| {
+        value["page"]["source_url"].as_str() == Some(source_url.as_str())
+            && value["page"]["source_dialog_open"] == false
+            && value["page"]["source_saving"] == false
+            && value["page"]
+                .get("source_error")
+                .is_some_and(Value::is_null)
+    })
+    .await?;
+    // 页头的商店来源与文件安装统一收进更多菜单；验收仍走真实点击与键盘选择，
+    // 不再依赖已被移除的独立来源按钮。菜单打开后第一个可选项就是“商店来源…”，
+    // Down 选中第一项、Enter 确认，与应用内键盘操作路径一致。
+    wait_selector(cx, window, "extensions-more").await?;
+    click_selector(cx, window, "extensions-more", false)?;
+    wait_selector(cx, window, "popup-menu").await?;
+    for key in ["down", "enter"] {
+        window.update(cx, |_, window, app| {
+            window.dispatch_keystroke(Keystroke::parse(key).map_err(io::Error::other)?, app);
+            Ok::<_, io::Error>(())
+        })??;
+    }
+    let source_dialog = wait(cx, root, window, "商店来源弹层", |value| {
+        value["page"]["source_dialog_open"] == true
+            && value["page"]["source_saving"] == false
+            && value["page"]
+                .get("source_error")
+                .is_some_and(Value::is_null)
+    })
+    .await?;
+    // 页面在延迟打开前就置位 source_dialog_open；等真实保存按钮进入渲染树后
+    // 再截图，避免把尚未绘制的空弹层当成证据。
+    wait_selector(cx, window, "extensions-source-save").await?;
+    capture_frame(cx, window, &options.output.join("source-dialog.png")).await?;
+    click_selector(cx, window, "extensions-source-save", false)?;
+    let source_saved = wait(
+        cx,
+        root,
+        window,
+        "来源保存回读与目录重载",
+        |value| {
+            value["page"]["source_dialog_open"] == false
+                && value["page"]["source_saving"] == false
+                && value["page"]
+                    .get("source_error")
+                    .is_some_and(Value::is_null)
+                && value["page"]["source_url"].as_str() == Some(source_url.as_str())
+                && value["page"]["catalog_entries"] == 2
+                && value["page"]["offline"] == false
+                && value["page"]["busy"] == false
+        },
+    )
+    .await?;
+    // 来源保存会触发设置面板回读并应用持久化主题，覆盖本轮内存中的验收主题；
+    // 保存闭环确认后重新应用，确保后续安装、统一列表和窄窗截图仍属于所选主题，
+    // 而不是把默认深色误当成 light 主题证据。
+    window.update(cx, |_, _, app| {
+        root.update(app, |root, cx| {
+            root.set_right_rail_acceptance_theme(acceptance_theme(&options.theme), cx)
+        })
+    })?;
+    wait_selector(cx, window, "extension-row-acme.market-one").await?;
+    // 行本身不抢焦点；点击第一行把焦点留在列表，再用真实键盘序列覆盖 Home/End/方向键。
+    click_selector(cx, window, "extension-row-acme.market-one", false)?;
+    for key in ["end", "home", "down"] {
+        window.update(cx, |_, window, app| {
+            window.dispatch_keystroke(Keystroke::parse(key).map_err(io::Error::other)?, app);
+            Ok::<_, io::Error>(())
+        })??;
+    }
+    let selection = wait(cx, root, window, "键盘选择第二条目录项", |value| {
         value["page"]["selected"] == "acme.market-two"
     })
     .await?;
     capture_frame(cx, window, &options.output.join("selection.png")).await?;
     wait_selector(cx, window, "extension-action-acme.market-two").await?;
     click_selector(cx, window, "extension-action-acme.market-two", false)?;
-    let catalog_confirmation = wait(cx, root, window, "签名目录安装确认", |value| {
+    let catalog_confirmation = wait(cx, root, window, "目录安装确认", |value| {
         value["page"]["confirmation_kind"] == "install"
             && value["page"]["confirmation_id"] == "acme.market-two"
     })
@@ -444,7 +564,7 @@ async fn exercise(
     capture_frame(cx, window, &options.output.join("catalog-permissions.png")).await?;
     wait_selector(cx, window, "extensions-confirm").await?;
     click_selector(cx, window, "extensions-confirm", false)?;
-    let catalog_installed = wait(cx, root, window, "签名目录下载与提交", |value| {
+    let catalog_installed = wait(cx, root, window, "目录下载与提交", |value| {
         value["page"]["pending"] == 1
             && value["page"]["busy"] == false
             && value["page"]["confirmation_visible"] == false
@@ -481,8 +601,108 @@ async fn exercise(
     })
     .await?;
     capture_frame(cx, window, &options.output.join("pending-restart.png")).await?;
+    // 宽窗五个标准阶段已在 1200x800 留证；再真实缩放窗口留下单栏列表、行点击详情
+    // 和 Escape 返回列表的关键状态。返回按钮只在窄布局渲染，选择器存在才能证明
+    // 页面确实降级为单栏。200% DPI 需要切换系统缩放，当前私有桌面会话无法可靠模拟，
+    // 报告如实标为未覆盖。
+    // 隐藏窗口只调用 resize 不会更新原生绘制表面；复用设置验收的隐藏窗口门禁，
+    // 真实改变尺寸、投递 WM_PAINT 并等待 GPU 目标同步后再读取页面宽度。
+    crate::settings_acceptance::prepare_capture_surface_for_title(cx, window, 700, 800, TITLE)
+        .await?;
+    // 宽窗键盘选择把 back_to_list 置为真，缩放后先看到列表；等实测宽度降下来再点击。
+    let narrow_list = wait(cx, root, window, "窄窗列表", |value| {
+        value["page"]["back_to_list"] == true
+            && value["page"]["pending"] == 2
+            && builtin_collapsed(value) == Some(true)
+            && value["page"]["content_width"]
+                .as_f64()
+                .is_some_and(|width| width < 700.0)
+    })
+    .await?;
+    wait_selector(cx, window, "extension-row-acme.market-one").await?;
+    capture_frame(cx, window, &options.output.join("narrow-list.png")).await?;
+    click_selector(cx, window, "extension-row-acme.market-one", false)?;
+    let narrow_detail = wait(cx, root, window, "窄窗行点击详情", |value| {
+        value["page"]["back_to_list"] == false && value["page"]["selected"] == "acme.market-one"
+    })
+    .await?;
+    wait_selector(cx, window, "extension-back-to-list").await?;
+    capture_frame(cx, window, &options.output.join("narrow-detail.png")).await?;
+    // 焦点已由行点击交给详情；真实 Escape 必须回到列表而不是关闭设置页。
+    window.update(cx, |_, window, app| {
+        window.dispatch_keystroke(Keystroke::parse("escape").map_err(io::Error::other)?, app);
+        Ok::<_, io::Error>(())
+    })??;
+    let narrow_returned = wait(cx, root, window, "窄窗 Escape 返回列表", |value| {
+        value["page"]["back_to_list"] == true
+    })
+    .await?;
+    wait_selector(cx, window, "extension-row-acme.market-one").await?;
+    capture_frame(cx, window, &options.output.join("narrow-list-returned.png")).await?;
+    // 恢复脚本约定的 1200x800，最终 viewport 与五个标准阶段保持同一尺寸。
+    crate::settings_acceptance::prepare_capture_surface_for_title(cx, window, 1200, 800, TITLE)
+        .await?;
+    wait(cx, root, window, "恢复宽窗", |value| {
+        value["page"]["back_to_list"] == true
+            && value["page"]["pending"] == 2
+            && builtin_collapsed(value) == Some(true)
+            && value["page"]["content_width"]
+                .as_f64()
+                // 1200 窗口的正文宽度约 903（导航与留白占其余部分），
+                // 只要明显高于 700 的窄窗阈值即可证明已恢复双栏。
+                .is_some_and(|width| width > 800.0)
+    })
+    .await?;
+    // 统一列表没有已安装 Tab：安装提交后直接等待真实分组快照。内置组默认收起，
+    // 待重启身份只出现在 pending 组，目录组按稳定身份去重；不能用返回态或
+    // pending 数量代替分组事实。
+    let unified = wait(cx, root, window, "统一扩展列表", |value| {
+        value["page"]["pending"] == 2
+            && value["page"]["busy"] == false
+            && value["page"]["confirmation_visible"] == false
+            && value["page"]["pending_restart"] == true
+            && value["page"]["back_to_list"] == true
+            && builtin_collapsed(value) == Some(true)
+            && group_count(value, "installed").is_none()
+            && group_count(value, "pending") == Some(2)
+            && group_count(value, "market") == Some(1)
+            && value["page"]["update_candidates"] == 0
+    })
+    .await?;
+    wait_selector(cx, window, "extensions-group-builtin").await?;
+    for selector in [
+        "extension-row-acme.market-two",
+        "extension-row-acme.file-search",
+        "extension-row-acme.market-one",
+    ] {
+        wait_selector(cx, window, selector).await?;
+    }
+    capture_frame(cx, window, &options.output.join("unified-list.png")).await?;
+    // 内置组标题本身是真实展开/收起入口；快照中的 collapsed 与渲染同源，
+    // 展开后还必须出现真实内置行，避免只改标题箭头。
+    click_selector(cx, window, "extensions-group-builtin", false)?;
+    let builtin_expanded = wait(cx, root, window, "内置组展开", |value| {
+        builtin_collapsed(value) == Some(false)
+            && group_count(value, "builtin").is_some()
+            && value["page"]["pending"] == 2
+    })
+    .await?;
+    wait_selector(cx, window, "extension-row-builtin-kerminal.core").await?;
+    capture_frame(cx, window, &options.output.join("builtin-expanded.png")).await?;
+    click_selector(cx, window, "extensions-group-builtin", false)?;
+    let builtin_collapsed_again = wait(cx, root, window, "内置组收起", |value| {
+        builtin_collapsed(value) == Some(true) && value["page"]["pending"] == 2
+    })
+    .await?;
+    capture_frame(cx, window, &options.output.join("builtin-collapsed.png")).await?;
     let (viewport, scale) =
         window.update(cx, |_, window, _| viewport_evidence(window, [1200, 800]))??;
+    // 当前夹具没有已安装外部记录，也没有可更新版本；报告只记录真实候选数，
+    // 批量确认/执行没有在本轮原生流程中出现，不能据此宣称批量更新已通过。
+    let installed_group_observed = group_count(&unified, "installed").is_some();
+    let update_candidates = unified["page"]["update_candidates"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("统一列表缺少批量更新候选数"))?;
     window.update(cx, |_, _, app| {
         root.update(app, |root, cx| root.request_quit(QuitIntent::Exit, cx))
     })?;
@@ -491,7 +711,7 @@ async fn exercise(
     })
     .await?;
     Ok(
-        json!({"schemaVersion":1,"mode":ACCEPTANCE_MODE,"processId":std::process::id(),"theme":options.theme,"desktopName":options.desktop,"nativeIsolation":isolation,"viewport":viewport,"scaleFactor":scale,"frameEvidence":frame_evidence(),"market":market,"selection":selection,"catalogConfirmation":catalog_confirmation,"catalogInstalled":catalog_installed,"confirmation":confirmation,"installed":installed,"inputMode":"synthetic GPUI pointer dispatch for extension rows; keyboard row selection is not reachable because buttons prevent focus on mouse down; production file-picker result entry","nativeImeTested":false,"dpiSwitchTested":false,"sleepResumeTested":false}),
+        json!({"schemaVersion":1,"mode":ACCEPTANCE_MODE,"processId":std::process::id(),"theme":options.theme,"desktopName":options.desktop,"nativeIsolation":isolation,"viewport":viewport,"scaleFactor":scale,"frameEvidence":frame_evidence(),"market":market,"source":{"entry":"real header button opens the window dialog; unchanged backfilled fixture URL is saved through the settings CAS and load_settings read-back","before":source_before,"dialog":source_dialog,"saved":source_saved,"screenshot":"source-dialog.png","networkLog":"fixture catalog JSON only; no minisig request"},"selection":selection,"catalogConfirmation":catalog_confirmation,"catalogInstalled":catalog_installed,"confirmation":confirmation,"installed":installed,"unifiedList":{"collapsed":unified,"expanded":builtin_expanded,"collapsedAgain":builtin_collapsed_again,"screenshots":["unified-list.png","builtin-expanded.png","builtin-collapsed.png"],"entry":"real unified list; builtin group header click toggles expansion","installedGroupObserved":installed_group_observed,"updateCandidates":update_candidates,"batchUpdateNativeCovered":false,"batchUpdateNotCoveredReason":"fixture has no installed updatable records; update-all was not exercised"},"narrow":{"viewport":[700,800],"list":narrow_list,"detail":narrow_detail,"returned":narrow_returned,"screenshots":["narrow-list.png","narrow-detail.png","narrow-list-returned.png"],"dpi200PercentTested":false},"inputMode":"synthetic GPUI pointer dispatch to focus the extension list plus real Home/End/arrow keystrokes; production file-picker result entry","nativeImeTested":false,"dpiSwitchTested":false,"sleepResumeTested":false}),
     )
 }
 
@@ -521,6 +741,26 @@ fn validate_private_desktop(isolation: &Value, expected: &str) -> Result<(), io:
         )));
     }
     Ok(())
+}
+
+/// 统一列表的组计数直接读取页面快照；缺失或类型不符返回 None，让等待继续到超时并打印真实快照。
+fn group_count(snapshot: &Value, kind: &str) -> Option<u64> {
+    snapshot["page"]["groups"]
+        .as_array()?
+        .iter()
+        .find(|group| group["kind"].as_str() == Some(kind))?
+        .get("count")?
+        .as_u64()
+}
+
+/// 内置组折叠事实来自与渲染同源的快照；不能用返回列表或待重启数量推断。
+fn builtin_collapsed(snapshot: &Value) -> Option<bool> {
+    snapshot["page"]["groups"]
+        .as_array()?
+        .iter()
+        .find(|group| group["kind"].as_str() == Some("builtin"))?
+        .get("collapsed")?
+        .as_bool()
 }
 
 /// 截图只证明图片结构、CRC 和尺寸；没有同帧特征像素检查时不得宣称主题或系统合成已观察。

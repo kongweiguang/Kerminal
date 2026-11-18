@@ -432,27 +432,30 @@ fn protocol_menu_omits_containers_and_routes_sftp_copy(app: &mut TestAppContext)
     }
 }
 
-/// 快速打开和上下文导航只接受当前目录中的主机；失效快照不得清空选择或发出导航事件。
+/// 快速导航展开命中的分组；失效快照不得清空选择或发出导航事件。
+/// @author kongweiguang
 #[gpui_kit::test]
 fn external_host_selection_rejects_stale_snapshot(app: &mut TestAppContext) {
     init(app);
-    let row = super::host("fixture", "fixture.invalid", None, &[]);
+    let row = super::host("fixture", "fixture.invalid", Some("source"), &[]);
     let host_id = row.id.clone();
     let events = Rc::new(RefCell::new(Vec::new()));
     let (runtime, navigation, _subscription, visual) = fixture(
         app,
         vec![row],
-        Vec::new(),
+        vec![group("source"), group("other")],
         ConfigurationMode::ReadWrite,
         events.clone(),
     );
 
+    visual.update(|_, app| assert!(navigation.read(app).collapsed_groups.contains("source")));
     let selected = visual.update(|_, app| {
         navigation.update(app, |navigation, cx| {
             navigation.select_host_from_external(&host_id, cx)
         })
     });
     assert!(selected);
+    visual.update(|_, app| assert!(!navigation.read(app).collapsed_groups.contains("source")));
     assert_eq!(
         &*events.borrow(),
         &[HostNavigationEvent::HostSelected {
