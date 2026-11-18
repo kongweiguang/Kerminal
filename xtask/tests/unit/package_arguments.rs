@@ -274,6 +274,66 @@ fn dependency_report_requires_license_sections() {
     assert!(command::validate_third_party_report("<html></html>").is_err());
 }
 
+/// 稳定版的只读预检嵌入当前目标二进制；预发布与其他平台不改变安装行为。
+///
+/// @author kongweiguang
+#[test]
+fn stable_windows_preflight_uses_current_target_helper() {
+    let release = PathBuf::from("release-with-$-name");
+    let template = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../packaging/cargo-packager-nsis/installer.nsi");
+    let mut stable: toml::map::Map<String, toml::Value> =
+        toml::from_str("[nsis]\ninstallMode = 'currentUser'\n").unwrap();
+    command::configure_stable_windows_preflight(
+        &mut stable,
+        "x86_64-pc-windows-msvc",
+        "0.4.0+build-with-dash",
+        &release,
+        &template,
+    )
+    .unwrap();
+    let section = stable["nsis"]["preinstallSection"].as_str().unwrap();
+    assert!(section.contains("release-with-$$-name"));
+    assert!(section.contains("kerminal-migrate.exe\" --dry-run"));
+    assert!(!section.contains("--apply"));
+    assert!(section.contains("SetErrorLevel 1"));
+    assert_eq!(
+        stable["nsis"]["template"].as_str(),
+        template.canonicalize().unwrap().to_str()
+    );
+    let template_text = fs::read_to_string(&template).unwrap();
+    assert!(!template_text.contains("Page custom PageReinstall PageLeaveReinstall"));
+    assert!(!template_text.contains("nsis_tauri_utils::KillProcess"));
+    assert!(template_text.contains("nsis_tauri_utils::SemverCompare $R0 \"0.0.0\""));
+    assert!(template_text.contains("nsis_tauri_utils::SemverCompare \"${VERSION}\" $R0"));
+    assert!(
+        command::configure_stable_windows_preflight(
+            &mut stable,
+            "x86_64-pc-windows-msvc",
+            "0.4.0",
+            &release,
+            &template,
+        )
+        .is_err()
+    );
+
+    for (target, version) in [
+        ("x86_64-pc-windows-msvc", "0.4.0-beta.7"),
+        ("x86_64-unknown-linux-gnu", "0.4.0"),
+    ] {
+        let mut config = toml::map::Map::new();
+        command::configure_stable_windows_preflight(
+            &mut config,
+            target,
+            version,
+            &release,
+            &template,
+        )
+        .unwrap();
+        assert!(config.is_empty());
+    }
+}
+
 /// 验证同一 target 的桌面与插件程序来自同一 release 根，且任何 helper 缺失都会阻止打包。
 ///
 /// @author kongweiguang

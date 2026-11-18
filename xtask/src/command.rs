@@ -336,6 +336,13 @@ pub(super) fn prepare_packager_config_at(
 
     absolutize_packager_input_paths(table, &root, config_directory)?;
     append_migration_helper_resource(table, target, &release_directory)?;
+    configure_stable_windows_preflight(
+        table,
+        target,
+        version,
+        &release_directory,
+        &root.join("packaging/cargo-packager-nsis/installer.nsi"),
+    )?;
     validate_packager_binary(table, target, &release_directory)?;
     validate_kerminal_deep_link(table)?;
 
@@ -356,6 +363,57 @@ pub(super) fn prepare_packager_config_at(
     file.write_all(serialized.as_bytes())?;
     file.sync_all()?;
     Ok(temporary_config)
+}
+
+/// 稳定版 Windows 固定使用本仓库维护的覆盖安装模板，并在替换文件前运行随包 helper 的只读预检。
+/// 路径作为 NSIS 编译期常量插入，禁止换行和引号并转义变量标记，避免被解释为脚本。
+///
+/// @author kongweiguang
+pub(super) fn configure_stable_windows_preflight(
+    config: &mut toml::map::Map<String, toml::Value>,
+    target: &str,
+    version: &str,
+    release_directory: &Path,
+    template: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let precedence = version.split('+').next().unwrap_or(version);
+    if target != "x86_64-pc-windows-msvc" || precedence.contains('-') {
+        return Ok(());
+    }
+    let helper = release_directory.join("kerminal-migrate.exe");
+    let helper = path_to_utf8(&helper)?;
+    if helper.contains(['\r', '\n', '"']) {
+        return Err("migration helper path cannot be embedded in NSIS".into());
+    }
+    let escaped_helper = helper.replace('$', "$$");
+    if escaped_helper.contains("$\\n") {
+        return Err("migration helper path conflicts with NSIS template escaping".into());
+    }
+    let section = include_str!("../../packaging/stable-preinstall.nsi")
+        .replace("@MIGRATION_HELPER@", &escaped_helper);
+    let nsis = config
+        .get_mut("nsis")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or("stable Windows packaging requires nsis configuration")?;
+    if nsis.contains_key("template")
+        || nsis.contains_key("preinstallSection")
+        || nsis.contains_key("preinstall-section")
+        || nsis.contains_key("preinstall_section")
+    {
+        return Err(
+            "stable Windows NSIS template or preinstall section is already configured".into(),
+        );
+    }
+    if !fs::symlink_metadata(template)?.file_type().is_file() {
+        return Err("stable Windows NSIS template must be a regular file".into());
+    }
+    let template = template.canonicalize()?;
+    nsis.insert(
+        "template".to_owned(),
+        toml::Value::String(path_to_utf8(&template)?.to_owned()),
+    );
+    nsis.insert("preinstallSection".to_owned(), toml::Value::String(section));
+    Ok(())
 }
 
 /// 将当前 target 的 Rust 迁移可执行文件放在 wrapper 同目录，避免运行时从 PATH 选错程序。
