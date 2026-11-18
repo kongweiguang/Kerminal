@@ -61,7 +61,7 @@ REQUIRED_ARTIFACTS = {
 }
 
 NEW_UPDATER_KINDS = {"nsis", "appimage-updater", "app-updater"}
-LEGACY_UPDATER_KINDS = {"nsis", "appimage", "app-updater"}
+LEGACY_UPDATER_KINDS = {"nsis", "appimage", "deb", "app-updater"}
 KIND_BUNDLE = {
     "nsis": "nsis",
     "appimage": "appimage",
@@ -308,7 +308,7 @@ def validate_inventory(
     verify_crypto: bool = True,
     github_release_assets: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """分别验证两套信任根，并按目标分发布局生成互不混用的更新契约。"""
+    """分别验证两套信任根；旧版 DEB 必须有专用目标，避免将 AppImage 交给 dpkg。"""
     if not isinstance(inventory, dict) or inventory.get("schemaVersion") != 1:
         raise ManifestError("artifact inventory schemaVersion 必须为 1")
     version = validate_version(inventory.get("version"))
@@ -463,7 +463,10 @@ def validate_inventory(
         if needs_new_signature:
             new_updates[identity[0] + "-" + identity[1]] = artifact
         if needs_legacy_signature:
-            legacy_updates[identity[0] + "-" + identity[1]] = artifact
+            key = identity[0] + "-" + identity[1]
+            if kind == "deb":
+                key += "-deb"
+            legacy_updates[key] = artifact
 
     if seen != REQUIRED_ARTIFACTS:
         missing = sorted(REQUIRED_ARTIFACTS - seen)
@@ -508,6 +511,8 @@ def validate_inventory(
     for key, artifact in sorted(legacy_updates.items()):
         old_platform = "darwin" if artifact.platform == "macos" else artifact.platform
         old_key = f"{old_platform}-{artifact.arch}"
+        if artifact.kind == "deb":
+            old_key += "-deb"
         publish_path = (
             github_asset_name(artifact.platform, artifact.arch, artifact.path)
             if github_release_assets else artifact.path
@@ -526,6 +531,7 @@ def validate_inventory(
     if set(tauri_platforms) != {
         "windows-x86_64",
         "linux-x86_64",
+        "linux-x86_64-deb",
         "darwin-x86_64",
         "darwin-aarch64",
     }:

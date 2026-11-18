@@ -145,9 +145,10 @@ class CandidateInventoryTests(unittest.TestCase):
 
         linux_target = "x86_64-unknown-linux-gnu"
         raw_appimage = self._write_package(linux_target, "portable-binary.AppImage")
-        self._write_package(linux_target, "package-from-job.deb")
+        deb = self._write_package(linux_target, "package-from-job.deb")
         appimage_archive = self._write_package(linux_target, "signed-input.AppImage.tar.gz")
         self._write_signature(self.legacy_signatures, linux_target, raw_appimage.name)
+        self._write_signature(self.legacy_signatures, linux_target, deb.name)
         self._write_signature(self.new_signatures, linux_target, appimage_archive.name)
 
         for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
@@ -197,7 +198,7 @@ class CandidateInventoryTests(unittest.TestCase):
             "x86_64-unknown-linux-gnu/signed-input.AppImage.tar.gz",
             records,
         )
-        self.assertEqual(len(verifier_calls), 8)
+        self.assertEqual(len(verifier_calls), 9)
         self.assertEqual(
             {public_key for _, _, public_key in verifier_calls},
             {"RWTnewdevfixture=", "RWTlegacydevfixture="},
@@ -284,12 +285,12 @@ class CandidateInventoryTests(unittest.TestCase):
         stage_release_assets.stage_release_assets(self.candidate, self.metadata_output, assets, arguments.base_url)
         with patch.object(build_manifests, "verify_signature") as verify:
             verify_release_assets.verify_assets(assets, arguments.version, arguments.source_commit, "new", "old")
-            self.assertEqual(verify.call_count, 8)
+            self.assertEqual(verify.call_count, 9)
             with self.assertRaises(ValueError):
                 verify_release_assets.verify_assets(assets, arguments.version, "a" * 40, "new", "old")
             feed_path = assets / "latest.json"
             feed = json.loads(feed_path.read_text(encoding="utf-8"))
-            feed["platforms"]["linux-x86_64"] = feed["platforms"]["windows-x86_64"]
+            feed["platforms"]["linux-x86_64-deb"] = feed["platforms"]["linux-x86_64"]
             feed_path.write_text(json.dumps(feed), encoding="utf-8")
             with self.assertRaises(ValueError):
                 verify_release_assets.verify_assets(assets, arguments.version, arguments.source_commit, "new", "old")
@@ -309,6 +310,14 @@ class CandidateInventoryTests(unittest.TestCase):
             stage_release_assets.stage_release_assets(
                 self.candidate, self.metadata_output, self.base / "release-assets", arguments.base_url
             )
+
+    def test_legacy_deb_requires_signature_before_any_metadata(self) -> None:
+        """旧版 DEB 只能接收独立旧信任根验签的 DEB，缺签名时不产生 feed。"""
+        signature = self.candidate / self.legacy_signatures / "x86_64-unknown-linux-gnu" / "package-from-job.deb.sig"
+        signature.unlink()
+        with self.assertRaises((build_candidate_inventory.CandidateInventoryError, build_manifests.ManifestError)):
+            build_candidate_inventory.build_and_validate(self._arguments("production"))
+        self.assertFalse(self.metadata_output.exists())
 
     def test_missing_required_signature_fails_before_writing_outputs(self) -> None:
         """不能用新旧信任根互相兜底；缺任一所需 sidecar 时不写清单。"""

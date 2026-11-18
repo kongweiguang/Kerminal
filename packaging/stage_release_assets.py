@@ -35,7 +35,7 @@ def _copy_verified(source: Path, destination: Path, expected_hash: str) -> None:
 
 
 def stage_release_assets(candidate: Path, metadata: Path, destination: Path, base_url: str) -> None:
-    """只暂存完整的 production 签验结果；失败时不产生可误上传的目标目录。"""
+    """只暂存完整的双签验结果，并确保旧版 DEB 目标不会回退到 AppImage。"""
     base_url = build_manifests.validate_base_url(base_url, "production")
     if candidate.is_symlink() or metadata.is_symlink() or destination.is_symlink():
         raise build_manifests.ManifestError("发布输入与输出不得是符号链接")
@@ -98,7 +98,7 @@ def stage_release_assets(candidate: Path, metadata: Path, destination: Path, bas
 
     for feed_name, purpose, expected_platforms in (
         (names["cargo"], "new-updater", {"windows-x86_64", "linux-x86_64", "macos-x86_64", "macos-aarch64"}),
-        (names["legacy"], "legacy-tauri", {"windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"}),
+        (names["legacy"], "legacy-tauri", {"windows-x86_64", "linux-x86_64", "linux-x86_64-deb", "darwin-x86_64", "darwin-aarch64"}),
     ):
         feed = documents[feed_name]
         if not isinstance(feed, dict) or feed.get("version") != version:
@@ -114,11 +114,13 @@ def stage_release_assets(candidate: Path, metadata: Path, destination: Path, bas
             if url != f"{base_url}/{asset_name}" or asset_name.casefold() not in by_name:
                 raise build_manifests.ManifestError("更新清单指向未暂存的资源")
             platform, arch = platform_key.split("-", 1)
+            is_deb = arch.endswith("-deb")
+            arch = arch.removesuffix("-deb")
             platform = "macos" if platform == "darwin" else platform
             payload = by_name[asset_name.casefold()]
             expected_kind = {
                 "windows": "nsis",
-                "linux": "appimage-updater" if purpose == "new-updater" else "appimage",
+                "linux": "deb" if is_deb else "appimage-updater" if purpose == "new-updater" else "appimage",
                 "macos": "app-updater",
             }.get(platform)
             if (

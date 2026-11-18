@@ -92,7 +92,7 @@ class ManifestBuilderTests(unittest.TestCase):
         specifications = [
             ("windows", "x86_64", "nsis", "Kerminal_0.4.0_x64-setup.exe", True, True),
             ("linux", "x86_64", "appimage", "Kerminal_0.4.0_amd64.AppImage", False, True),
-            ("linux", "x86_64", "deb", "kerminal_0.4.0_amd64.deb", False, False),
+            ("linux", "x86_64", "deb", "kerminal_0.4.0_amd64.deb", False, True),
             (
                 "linux",
                 "x86_64",
@@ -169,12 +169,13 @@ class ManifestBuilderTests(unittest.TestCase):
         )
         self.assertEqual(
             set(legacy_metadata["platforms"]),
-            {"windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"},
+            {"windows-x86_64", "linux-x86_64", "linux-x86_64-deb", "darwin-x86_64", "darwin-aarch64"},
         )
         self.assertEqual(cargo_metadata["platforms"]["windows-x86_64"]["format"], "nsis")
         self.assertEqual(cargo_metadata["platforms"]["linux-x86_64"]["format"], "appimage")
         self.assertTrue(cargo_metadata["platforms"]["linux-x86_64"]["url"].endswith("AppImage.tar.gz"))
         self.assertTrue(legacy_metadata["platforms"]["linux-x86_64"]["url"].endswith("AppImage"))
+        self.assertTrue(legacy_metadata["platforms"]["linux-x86_64-deb"]["url"].endswith(".deb"))
         self.assertNotEqual(
             cargo_metadata["platforms"]["linux-x86_64"]["signature"],
             legacy_metadata["platforms"]["linux-x86_64"]["signature"],
@@ -245,7 +246,7 @@ class ManifestBuilderTests(unittest.TestCase):
                 legacy_public_key="legacy test public key",
                 verify_crypto=True,
             )
-        self.assertEqual(verifier.call_count, 8)
+        self.assertEqual(verifier.call_count, 9)
         verified_statuses = {
             item["signingStatus"]
             for item in verified_report["artifactManifest"]["artifacts"]

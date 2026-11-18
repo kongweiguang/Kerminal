@@ -17,7 +17,7 @@ import updater_key
 
 
 def verify_assets(root: Path, version: str, commit: str, public_key: str, legacy_key: str) -> None:
-    """复核文件、双 feed 和签名，防止跨运行或文件篡改绕过候选流水线。"""
+    """复核文件、双 feed 和签名，保证旧版 DEB 不会误下载 AppImage。"""
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("无效的发布提交")
     base_url = f"https://github.com/kongweiguang/Kerminal/releases/download/v{version}"
@@ -66,7 +66,7 @@ def verify_assets(root: Path, version: str, commit: str, public_key: str, legacy
         raise ValueError("正式资产包含遗漏或额外文件")
     for feed_name, purpose, key, platform_names in (
         ("kerminal-updater.json", "new-updater", public_key, {"windows-x86_64", "linux-x86_64", "macos-x86_64", "macos-aarch64"}),
-        ("latest.json", "legacy-tauri", legacy_key, {"windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"}),
+        ("latest.json", "legacy-tauri", legacy_key, {"windows-x86_64", "linux-x86_64", "linux-x86_64-deb", "darwin-x86_64", "darwin-aarch64"}),
     ):
         feed = json.loads((root / feed_name).read_text(encoding="utf-8"))
         platforms = feed.get("platforms")
@@ -74,8 +74,10 @@ def verify_assets(root: Path, version: str, commit: str, public_key: str, legacy
             raise ValueError("更新清单版本或平台不完整")
         for platform_key, entry in platforms.items():
             platform, arch = platform_key.split("-", 1)
+            is_deb = arch.endswith("-deb")
+            arch = arch.removesuffix("-deb")
             platform = "macos" if platform == "darwin" else platform
-            kind = {"windows": "nsis", "macos": "app-updater", "linux": "appimage-updater" if purpose == "new-updater" else "appimage"}[platform]
+            kind = {"windows": "nsis", "macos": "app-updater", "linux": "deb" if is_deb else "appimage-updater" if purpose == "new-updater" else "appimage"}[platform]
             matches = [row for row in by_name.values() if (row.get("platform"), row.get("arch"), row.get("kind")) == (platform, arch, kind)]
             if len(matches) != 1:
                 raise ValueError("更新目标没有唯一产物")
