@@ -708,6 +708,11 @@ fn saved_navigation_state_restores_only_current_groups(app: &mut TestAppContext)
     });
     visual.simulate_resize(size(px(440.), px(300.)));
     draw(visual);
+    // 无头测试没有平台帧循环，必须显式投递 production 排到下一帧的滚动恢复回调；
+    // 先画一帧让真实列表完成布局，再恢复偏移，才能验证列表可滚动时不会被夹回顶部。
+    visual.update(|window, app| {
+        assert!(window.simulate_next_frame(app) > 0);
+    });
     draw(visual);
     visual.update(|_, app| {
         let navigation = navigation.read(app);
