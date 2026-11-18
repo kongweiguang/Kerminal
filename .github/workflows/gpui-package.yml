@@ -64,7 +64,7 @@ jobs:
     name: ${{ matrix.name }}
     # 探针在未签名运行中会跳过；仅在成功或跳过时放行，失败仍阻断整个矩阵。
     needs: signing-probe
-    if: always() && (needs.signing-probe.result == 'success' || needs.signing-probe.result == 'skipped')
+    if: ${{ !cancelled() && (needs.signing-probe.result == 'success' || needs.signing-probe.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
