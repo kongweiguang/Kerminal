@@ -91,6 +91,8 @@ $script:AppProcess = $null
 $script:InstalledDirs = [Collections.Generic.List[string]]::new()
 $script:CleanupErrors = [Collections.Generic.List[string]]::new()
 $script:SavedConfigRoot = [Environment]::GetEnvironmentVariable('KERMINAL_CONFIG_ROOT', 'Process')
+# 空字符串与缺失不同：把它当成“未设置”才能避免 finally 再次写回无效覆盖。
+if ([string]::IsNullOrEmpty($script:SavedConfigRoot)) { $script:SavedConfigRoot = $null }
 $script:Failure = $null
 
 function Write-JsonFile {
@@ -1021,7 +1023,8 @@ function Start-AcceptanceApp {
             foreach ($name in $saved.Keys) {
                 $value = $saved[$name]
                 if ($null -eq $value) {
-                    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+                    # 恢复缺失变量时必须删除；$null 赋值在 Windows 上会留下空字符串并继续传给子进程。
+                    Remove-Item "Env:$name" -ErrorAction SilentlyContinue
                 } else {
                     [Environment]::SetEnvironmentVariable($name, $value, 'Process')
                 }
@@ -1274,11 +1277,14 @@ $script:Report = [ordered]@{
 }
 
 try {
-    # 安装器预检必须看到真实默认数据根；清除外部残留覆盖，避免 dry-run 读取错误目录。
-    [Environment]::SetEnvironmentVariable('KERMINAL_CONFIG_ROOT', $null, 'Process')
+    # PowerShell 把 $null 传给 .NET string 参数会写成空值；空值仍会被安装器预检当作无效覆盖并中止。
+    # 必须真正移除变量，让安装器读取正式默认数据根。
+    Remove-Item Env:KERMINAL_CONFIG_ROOT -ErrorAction SilentlyContinue
 
     Invoke-Step -Name 'preflight' -Action {
         Assert-CleanRunner -RequireFormalRootAbsent
+        # 空字符串也会进入子进程环境；确认变量确实不存在，避免安装器预检把空覆盖读成无效根。
+        Assert-True ($null -eq [Environment]::GetEnvironmentVariable('KERMINAL_CONFIG_ROOT', 'Process')) 'KERMINAL_CONFIG_ROOT 必须真正移除，空值会让安装器预检失败'
         [ordered]@{ clean = $true; defaultInstallDir = $script:DefaultInstallDir }
     } | Out-Null
 
