@@ -21,6 +21,7 @@ import build_candidate_inventory
 import build_manifests
 import collect_candidates
 import stage_release_assets
+import verify_release_assets
 
 
 class CandidateInventoryTests(unittest.TestCase):
@@ -270,6 +271,28 @@ class CandidateInventoryTests(unittest.TestCase):
                 self.candidate, self.metadata_output, release_assets, arguments.base_url
             )
         self.assertFalse(release_assets.exists())
+
+    def test_stable_draft_rechecks_signed_assets_and_rejects_tampering(self) -> None:
+        """草稿复核同一提交、两套签名及资产摘要，拒绝文件或旧 feed 被替换。"""
+        arguments = self._arguments("production")
+        arguments.version = "0.4.0"
+        arguments.github_release_assets = True
+        arguments.base_url = "https://github.com/kongweiguang/Kerminal/releases/download/v0.4.0"
+        with patch.object(build_manifests, "verify_signature"):
+            build_candidate_inventory.build_and_validate(arguments)
+        assets = self.base / "release-assets"
+        stage_release_assets.stage_release_assets(self.candidate, self.metadata_output, assets, arguments.base_url)
+        with patch.object(build_manifests, "verify_signature") as verify:
+            verify_release_assets.verify_assets(assets, arguments.version, arguments.source_commit, "new", "old")
+            self.assertEqual(verify.call_count, 8)
+            with self.assertRaises(ValueError):
+                verify_release_assets.verify_assets(assets, arguments.version, "a" * 40, "new", "old")
+            feed_path = assets / "latest.json"
+            feed = json.loads(feed_path.read_text(encoding="utf-8"))
+            feed["platforms"]["linux-x86_64"] = feed["platforms"]["windows-x86_64"]
+            feed_path.write_text(json.dumps(feed), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                verify_release_assets.verify_assets(assets, arguments.version, arguments.source_commit, "new", "old")
 
     def test_release_staging_rejects_cross_architecture_feed(self) -> None:
         """即便两个架构都已验签，也不能让 arm64 更新项指向 x64 包。"""

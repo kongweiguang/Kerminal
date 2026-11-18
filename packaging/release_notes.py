@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # @author kongweiguang
-"""按约定式提交生成 GPUI beta 发布说明的新功能、改进、修复分节。
+"""按约定式提交生成 GPUI 发布说明的新功能、改进、修复分节。
 
 发布说明正文由代码生成而不是在 workflow 里手写固定文本，原因是每个 beta 的实际变更
 来自上一个发布 tag 到当前 tag 之间的提交，手写正文容易和真实产出脱节。分类只依赖提交
@@ -56,6 +56,15 @@ NOTICE_SECTION = (
     "- 下载后可用 `SHA256SUMS.txt` 校验安装包。",
 )
 
+STABLE_NOTICE_SECTION = (
+    "### 注意",
+    "",
+    "- 更新包已使用更新器密钥签名；系统安装包未做平台代码签名，macOS 和 Windows 可能显示安全提示。",
+    "- 正式版使用 `~/.kerminal`；首次启动会检查并迁移受支持的旧版数据。",
+    "- 迁移前请退出旧版 Kerminal，迁移后的数据不支持旧版读取。",
+    "- 下载后可用发布资产中的 `SHA256SUMS.json` 校验文件。",
+)
+
 
 def classify(subject: str) -> tuple[str, str] | None:
     """把单条提交标题映射为（分节，说明）；返回 None 表示该提交不进入发布说明。
@@ -99,11 +108,12 @@ def render(version: str, sections: dict[str, list[str]], source_commit: str) -> 
     正文保持固定顺序：变更分节在前，下载与注意事项在后，即读者先看“这版改了什么”，
     再看“怎么拿到它、有什么限制”。
     """
-    lines = [
-        f"**Kerminal GPUI {version} beta**",
-        "",
-        "这是 Kerminal 原生 GPUI 重写分支的 beta 测试包。功能迁移和原生验收仍在进行中，请勿用于生产环境。",
-    ]
+    beta = "-" in version
+    lines = [f"**Kerminal GPUI {version}{' beta' if beta else ''}**", ""]
+    if beta:
+        lines.append("这是 Kerminal 原生 GPUI 重写分支的 beta 测试包。功能迁移和原生验收仍在进行中，请勿用于生产环境。")
+    else:
+        lines.append("这是 Kerminal 原生 GPUI 正式版。")
 
     populated = [section for section in SECTION_ORDER if sections.get(section)]
     if populated:
@@ -113,7 +123,7 @@ def render(version: str, sections: dict[str, list[str]], source_commit: str) -> 
     else:
         lines.extend(["", "本次发布没有可归类的变更提交。"])
 
-    lines.extend(["", *DOWNLOAD_SECTION, "", *NOTICE_SECTION])
+    lines.extend(["", *DOWNLOAD_SECTION, "", *(NOTICE_SECTION if beta else STABLE_NOTICE_SECTION)])
     lines.extend(["", f"提交：`{source_commit}`"])
     return "\n".join(lines) + "\n"
 

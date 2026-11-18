@@ -65,6 +65,15 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertLess(rendered.index("### 修复"), rendered.index("### 下载"))
         self.assertIn("提交：`abc123`", rendered)
 
+    def test_stable_notes_describe_formal_data_and_signed_updater(self) -> None:
+        """正式包文案必须匹配双签更新与数据迁移，避免误称仍为 beta。"""
+        rendered = release_notes.render("0.4.0", {}, "abc123")
+
+        self.assertIn("`~/.kerminal`", rendered)
+        self.assertIn("更新器密钥签名", rendered)
+        self.assertNotIn("beta 测试包", rendered)
+        self.assertNotIn("不会自动更新", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

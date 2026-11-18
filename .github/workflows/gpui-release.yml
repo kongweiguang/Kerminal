@@ -1,5 +1,5 @@
 # @author kongweiguang
-name: GPUI beta release
+name: GPUI release
 
 on:
   # Git 推送 tag 和 REST API 创建 tag ref 都会触发 create；push 只作为后续兼容入口。
@@ -10,8 +10,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing beta tag to rebuild, for example v0.4.0-beta.1"
+        description: "Existing release tag, for example v0.4.0 or v0.4.0-beta.1"
         required: true
+        type: string
+      candidate_run_id:
+        description: "Required for a stable draft: successful signed candidate workflow run ID"
+        required: false
         type: string
 
 concurrency:
@@ -25,7 +29,7 @@ permissions:
 
 jobs:
   preflight:
-    name: GPUI beta preflight
+    name: GPUI release preflight
     # create 也会在创建分支时触发，这里只接受 tag 引用。
     if: github.event_name != 'create' || github.ref_type == 'tag'
     runs-on: ubuntu-22.04
@@ -33,6 +37,8 @@ jobs:
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       release_version: ${{ steps.release.outputs.release_version }}
+      release_class: ${{ steps.release.outputs.release_class }}
+      release_commit: ${{ steps.release.outputs.release_commit }}
     steps:
       - name: Checkout release refs and tags
         uses: actions/checkout@v7
@@ -45,7 +51,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify beta tag and workspace version
+      - name: Verify tag and workspace version
         id: release
         shell: bash
         env:
@@ -59,8 +65,12 @@ jobs:
             tag="${REQUESTED_TAG}"
           fi
 
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
-            echo "::error title=Invalid beta tag::Expected vX.Y.Z-beta.N, got ${tag}."
+          if [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            release_class=beta
+          elif [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch && "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            release_class=stable
+          else
+            echo "::error title=Invalid release tag::Stable releases require manual dispatch and vX.Y.Z."
             exit 1
           fi
 
@@ -104,10 +114,13 @@ jobs:
 
           echo "release_tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "release_version=${RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "release_class=${release_class}" >> "${GITHUB_OUTPUT}"
+          echo "release_commit=$(git rev-parse "${tag}^{commit}")" >> "${GITHUB_OUTPUT}"
 
   package:
     name: Package ${{ matrix.name }}
     needs: preflight
+    if: needs.preflight.outputs.release_class == 'beta'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -229,6 +242,7 @@ jobs:
     needs:
       - preflight
       - package
+    if: needs.preflight.outputs.release_class == 'beta'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -301,7 +315,7 @@ jobs:
             --out release-notes.md
           cat release-notes.md
 
-      - name: Create or update prerelease
+      - name: Create prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -309,19 +323,15 @@ jobs:
           set -euo pipefail
           title="Kerminal GPUI ${RELEASE_TAG} (beta)"
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" \
-              --prerelease \
-              --title "${title}" \
-              --notes-file release-notes.md
-            gh release upload "${RELEASE_TAG}" release/* --clobber
-          else
-            gh release create "${RELEASE_TAG}" \
-              --verify-tag \
-              --prerelease \
-              --title "${title}" \
-              --notes-file release-notes.md \
-              release/*
+            echo 'A release already exists for this tag; refusing to replace published assets.'
+            exit 1
           fi
+          gh release create "${RELEASE_TAG}" \
+            --verify-tag \
+            --prerelease \
+            --title "${title}" \
+            --notes-file release-notes.md \
+            release/*
 
       - name: Verify published prerelease
         shell: bash
@@ -335,3 +345,83 @@ jobs:
           [[ "$(gh release view "${RELEASE_TAG}" --json isPrerelease --jq '.isPrerelease')" == "true" ]]
           [[ "$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets | length')" -ge 6 ]]
           printf '%s\n' "Published ${RELEASE_TAG} as a GitHub prerelease with the beta installers and SHA256SUMS.txt." >> "${GITHUB_STEP_SUMMARY}"
+
+  stable-draft:
+    name: Verify signed candidate and create stable draft
+    needs: preflight
+    if: needs.preflight.outputs.release_class == 'stable'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.release_version }}
+      RELEASE_COMMIT: ${{ needs.preflight.outputs.release_commit }}
+      KERMINAL_GPUI_UPDATER_PUBLIC_KEY: ${{ vars.KERMINAL_GPUI_UPDATER_PUBLIC_KEY }}
+    steps:
+      - name: Checkout frozen release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up validation Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check candidate run identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == 'kongweiguang/Kerminal' && "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'Official repository and numeric candidate run ID are required.'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > candidate-run.json
+          python - <<'PY'
+          import json, os, sys
+          run = json.load(open('candidate-run.json', encoding='utf-8'))
+          if (run.get('path'), run.get('event'), run.get('status'), run.get('conclusion'), run.get('head_sha')) != (
+              '.github/workflows/gpui-package.yml', 'workflow_dispatch', 'completed', 'success', os.environ['RELEASE_COMMIT']
+          ):
+              sys.exit('Candidate must be a successful package workflow for the exact tagged commit.')
+          print(f"CANDIDATE_ATTEMPT={run['run_attempt']}", file=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8'))
+          PY
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'A release already exists for this tag; refusing to replace any assets.'
+            exit 1
+          fi
+
+      - name: Download the signed candidate from this run
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$CANDIDATE_RUN_ID" --name "gpui-signed-candidate-${CANDIDATE_RUN_ID}-${CANDIDATE_ATTEMPT}" --dir release
+
+      - name: Reverify both updater contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends minisign
+          python packaging/verify_release_assets.py --assets release --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+          python packaging/release_notes.py --tag "$RELEASE_TAG" --version "$RELEASE_VERSION" --out release-notes.md
+
+      - name: Create draft without replacing existing assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" --verify-tag --draft --title "Kerminal $RELEASE_TAG" --notes-file release-notes.md release/*
+
+      - name: Verify uploaded draft assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" == true ]]
+          gh release download "$RELEASE_TAG" --dir uploaded
+          python packaging/verify_release_assets.py --assets uploaded --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+          diff -qr release uploaded
+          printf '%s\n' 'Signed draft verified. Review installation and upgrade evidence before manually publishing; no Latest pointer was changed.' >> "$GITHUB_STEP_SUMMARY"
