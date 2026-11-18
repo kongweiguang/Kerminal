@@ -67,6 +67,25 @@ fn ambiguous_or_incomplete_arguments_are_rejected() {
     }
 }
 
+/// 安装器入口只接受独立只读模式，禁止借显式根绕开安装器环境根校验。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+#[test]
+fn installer_preflight_is_read_only_and_disallows_explicit_root() {
+    let parsed = parse_migration_arguments([OsString::from("--installer-dry-run")])
+        .expect("installer mode is available on Windows");
+    assert_eq!(parsed.action, MigrationAction::InstallerDryRun);
+    assert!(parsed.root.is_none());
+    for arguments in [
+        vec!["--installer-dry-run", "--apply"],
+        vec!["--installer-dry-run", "--dry-run"],
+        vec!["--root", "C:\\test", "--installer-dry-run"],
+    ] {
+        assert!(parse_migration_arguments(arguments.into_iter().map(OsString::from)).is_err());
+    }
+}
+
 /// Unix 允许非 UTF-8 路径，维护入口不能用有损字符串替代真实目录身份。
 ///
 /// @author kongweiguang

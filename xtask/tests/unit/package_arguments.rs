@@ -294,7 +294,8 @@ fn stable_windows_preflight_uses_current_target_helper() {
     .unwrap();
     let section = stable["nsis"]["preinstallSection"].as_str().unwrap();
     assert!(section.contains("release-with-$$-name"));
-    assert!(section.contains("--dry-run"));
+    assert!(section.contains("kerminal-migrate.exe\" --installer-dry-run"));
+    assert!(!section.contains("powershell.exe"));
     assert!(!section.contains("--apply"));
     assert!(section.contains("SetErrorLevel 1"));
     assert!(section.contains("SetDetailsView show"));

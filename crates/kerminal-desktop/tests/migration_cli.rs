@@ -220,6 +220,54 @@ fn document(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("one maintenance JSON document")
 }
 
+/// 安装器使用 BOM UTF-16LE 输出错误与结果，既保留中文也不把隔离根误解析为插件临时目录。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+#[test]
+fn installer_preflight_requires_absolute_environment_root_and_emits_utf16() {
+    let fixture = tempfile::tempdir().expect("isolated installer working directory");
+    let mut relative = Command::new(env!("CARGO_BIN_EXE_kerminal-migrate"));
+    relative
+        .arg("--installer-dry-run")
+        .env("KERMINAL_CONFIG_ROOT", "relative-root")
+        .current_dir(fixture.path());
+    let output = run_bounded(relative);
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.starts_with(&[0xff, 0xfe]));
+    let utf16: Vec<u16> = output.stdout[2..]
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect();
+    let text = String::from_utf16(&utf16).expect("valid UTF-16 report");
+    let report: Value = serde_json::from_str(&text).expect("one JSON report");
+    assert_eq!(report["ok"], false);
+    assert!(text.contains("绝对配置根目录"));
+    assert!(!fixture.path().join("relative-root").exists());
+
+    let root = fixture.path().join("隔离配置目录");
+    let mut absolute = Command::new(env!("CARGO_BIN_EXE_kerminal-migrate"));
+    absolute
+        .arg("--installer-dry-run")
+        .env("KERMINAL_CONFIG_ROOT", &root)
+        .current_dir(fixture.path());
+    let output = run_bounded(absolute);
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(&[0xff, 0xfe]));
+    assert!(!root.exists());
+
+    let mut normal = Command::new(env!("CARGO_BIN_EXE_kerminal-migrate"));
+    normal
+        .arg("--dry-run")
+        .env("KERMINAL_CONFIG_ROOT", "relative-root")
+        .current_dir(fixture.path());
+    let output = run_bounded(normal);
+    assert!(output.status.success());
+    assert_eq!(document(&output)["mode"], "dry_run");
+    assert!(!fixture.path().join("relative-root").exists());
+}
+
 /// 按相对名称和原字节记录已有目录，用于证明 dry-run 不新增锁、备份、日志或 SQLite 辅助文件。
 ///
 /// @author kongweiguang

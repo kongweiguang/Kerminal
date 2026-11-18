@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MigrationAction {
     DryRun,
+    #[cfg(windows)]
+    InstallerDryRun,
     Apply,
 }
 
@@ -42,14 +44,21 @@ struct CommandOutput {
 ///
 /// @author kongweiguang
 fn main() -> ExitCode {
-    if let Some(exit_code) = profile_import::run_from_args(std::env::args_os().skip(1)) {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(exit_code) = profile_import::run_from_args(arguments.iter().cloned()) {
         return match exit_code {
             0 => ExitCode::SUCCESS,
             1 => ExitCode::FAILURE,
             _ => ExitCode::from(2),
         };
     }
-    let output = match run_command(std::env::args_os().skip(1)) {
+    #[cfg(windows)]
+    let installer_output = arguments
+        .iter()
+        .any(|argument| argument == "--installer-dry-run");
+    #[cfg(not(windows))]
+    let installer_output = false;
+    let output = match run_command(arguments) {
         Ok(output) => output,
         Err(error) => CommandOutput {
             success: false,
@@ -61,7 +70,7 @@ fn main() -> ExitCode {
         },
     };
     let success = output.success;
-    if write_output(&output.document).is_err() {
+    if write_output(&output.document, installer_output).is_err() {
         eprintln!("Kerminal migration report could not be written");
         return ExitCode::FAILURE;
     }
@@ -89,27 +98,39 @@ fn parse_migration_arguments(
             let value = arguments
                 .next()
                 .ok_or_else(|| AppError::invalid("迁移根目录缺少参数"))?;
-            if value.is_empty() || value == "--root" || value == "--dry-run" || value == "--apply" {
+            if value.is_empty()
+                || value == "--root"
+                || value == "--dry-run"
+                || value == "--apply"
+                || value == "--installer-dry-run"
+            {
                 return Err(AppError::invalid("迁移根目录缺少有效参数"));
             }
             root = Some(PathBuf::from(value));
-        } else if argument == "--dry-run" || argument == "--apply" {
+        } else if argument == "--dry-run"
+            || argument == "--apply"
+            || argument == "--installer-dry-run"
+        {
             if action.is_some() {
                 return Err(AppError::invalid("必须且只能选择一种迁移模式"));
             }
-            action = Some(if argument == "--dry-run" {
-                MigrationAction::DryRun
-            } else {
-                MigrationAction::Apply
+            action = Some(match argument.to_str() {
+                Some("--dry-run") => MigrationAction::DryRun,
+                Some("--apply") => MigrationAction::Apply,
+                #[cfg(windows)]
+                Some("--installer-dry-run") => MigrationAction::InstallerDryRun,
+                _ => return Err(AppError::invalid("迁移命令包含不支持的参数")),
             });
         } else {
             return Err(AppError::invalid("迁移命令包含不支持的参数"));
         }
     }
-    Ok(MigrationArguments {
-        root,
-        action: action.ok_or_else(|| AppError::invalid("必须显式指定 --dry-run 或 --apply"))?,
-    })
+    let action = action.ok_or_else(|| AppError::invalid("必须显式指定迁移模式"))?;
+    #[cfg(windows)]
+    if action == MigrationAction::InstallerDryRun && root.is_some() {
+        return Err(AppError::invalid("安装器预检不接受显式根目录"));
+    }
+    Ok(MigrationArguments { root, action })
 }
 
 /// inspect 直接保持只读，Blocked 仍返回完整安全检查结果但以失败退出；apply 复用启动屏障。
@@ -117,6 +138,13 @@ fn parse_migration_arguments(
 /// @author kongweiguang
 fn run_command(arguments: impl IntoIterator<Item = OsString>) -> AppResult<CommandOutput> {
     let arguments = parse_migration_arguments(arguments)?;
+    #[cfg(windows)]
+    if arguments.action == MigrationAction::InstallerDryRun
+        && let Some(root) = std::env::var_os("KERMINAL_CONFIG_ROOT")
+        && !PathBuf::from(root).is_absolute()
+    {
+        return Err(AppError::invalid("安装器预检要求绝对配置根目录"));
+    }
     let explicit_root = arguments.root.is_some();
     let root = match arguments.root {
         Some(root) => root,
@@ -136,6 +164,15 @@ fn run_command(arguments: impl IntoIterator<Item = OsString>) -> AppResult<Comma
                 document: json!({"ok": success, "mode": "dry_run", "inspection": inspection}),
             })
         }
+        #[cfg(windows)]
+        MigrationAction::InstallerDryRun => {
+            let inspection = service.inspect()?;
+            let success = !matches!(&inspection.readiness, DataMigrationReadiness::Blocked);
+            Ok(CommandOutput {
+                success,
+                document: json!({"ok": success, "mode": "dry_run", "inspection": inspection}),
+            })
+        }
         MigrationAction::Apply => {
             bootstrap::run_after_migration(&service, false, |report| CommandOutput {
                 success: true,
@@ -145,13 +182,21 @@ fn run_command(arguments: impl IntoIterator<Item = OsString>) -> AppResult<Comma
     }
 }
 
-/// stdout 只承载一条 JSON 记录，原始错误链、配置路径和底层调试字串均不进入维护协议。
+/// 普通 CLI 保持 UTF-8 协议；安装器专用结果带 UTF-16LE BOM，避免 NSIS 按系统代码页破坏中文。
 ///
 /// @author kongweiguang
-fn write_output(document: &Value) -> io::Result<()> {
+fn write_output(document: &Value, installer_output: bool) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, document).map_err(io::Error::other)?;
-    stdout.write_all(b"\n")?;
+    if installer_output {
+        let json = serde_json::to_string(document).map_err(io::Error::other)?;
+        stdout.write_all(&[0xff, 0xfe])?;
+        for unit in json.encode_utf16().chain([u16::from(b'\n')]) {
+            stdout.write_all(&unit.to_le_bytes())?;
+        }
+    } else {
+        serde_json::to_writer(&mut stdout, document).map_err(io::Error::other)?;
+        stdout.write_all(b"\n")?;
+    }
     stdout.flush()
 }
 
