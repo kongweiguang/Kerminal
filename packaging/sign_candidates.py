@@ -143,12 +143,14 @@ def _sign_artifact(
 
 
 def _verify_public_key(
-    artifact: Path, sidecar: Path, public_key: str, purpose: str
+    artifact: Path, sidecar: Path, public_key: str, purpose: str,
+    base_environment: dict[str, str],
 ) -> None:
-    """复用发布阶段的 Minisign 调用，独立于签名工具判断私钥与公钥是否配对。"""
+    """复用发布阶段的 Minisign 调用，避免只需公钥的验签进程继承私钥。"""
     try:
         build_manifests.verify_signature(
-            artifact.parent, artifact, sidecar, public_key, "minisign"
+            artifact.parent, artifact, sidecar, public_key, "minisign",
+            environment=base_environment,
         )
     except build_manifests.ManifestError as error:
         raise CandidateSigningError(_FAILURE_CODES[(purpose, _STAGE_PUBLIC_KEY)]) from error
@@ -191,7 +193,7 @@ def probe_signing(signer: str, legacy_public_key_path: Path) -> None:
             generated = _sign_artifact(
                 signer_path, artifact, private_key, password, base_environment, purpose, root
             )
-            _verify_public_key(artifact, generated, public_keys[purpose], purpose)
+            _verify_public_key(artifact, generated, public_keys[purpose], purpose, base_environment)
 
 
 def sign_candidates(candidate_directory: Path, signer: str) -> None:

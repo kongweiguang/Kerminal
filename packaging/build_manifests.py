@@ -246,9 +246,10 @@ def read_signature(root: Path, relative: str | None) -> tuple[str | None, str | 
 
 
 def verify_signature(
-    root: Path, artifact_path: Path, signature_path: Path, public_key: str, verifier: str
+    root: Path, artifact_path: Path, signature_path: Path, public_key: str, verifier: str,
+    *, environment: dict[str, str] | None = None,
 ) -> None:
-    """对原始产物验签；官方 CLI 接受原始文本而 updater 接受其 Base64 包装。"""
+    """对原始产物验签；探针可显式剥离私钥环境，因为验签只需要公钥。"""
     try:
         payload = _signature_payload(signature_path.read_bytes())
         with tempfile.TemporaryDirectory(prefix="kerminal-signature-") as directory:
@@ -263,7 +264,7 @@ def verify_signature(
                 "-x",
                 str(decoded_signature),
             ]
-            result = subprocess.run(command, check=False, capture_output=True, text=True)
+            result = subprocess.run(command, check=False, capture_output=True, text=True, env=environment)
     except OSError as error:
         raise ManifestError("无法读取签名或启动 minisign 验签程序") from error
     if result.returncode != 0:

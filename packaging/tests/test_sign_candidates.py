@@ -92,8 +92,9 @@ class CandidateSigningTests(unittest.TestCase):
             artifact.with_name(artifact.name + ".sig").write_bytes(b"probe sidecar")
             return SimpleNamespace(returncode=0)
 
-        def record_verify(root: Path, artifact: Path, sidecar: Path, public_key: str, verifier: str) -> None:
-            """只记录验签参数，测试不调用宿主 Minisign。"""
+        def record_verify(root: Path, artifact: Path, sidecar: Path, public_key: str, verifier: str, *, environment: dict[str, str]) -> None:
+            """验证公钥检查没有继承任一签名私钥，不调用宿主 Minisign。"""
+            self.assertFalse(any("SIGNING_PRIVATE_KEY" in key or "SIGN_PRIVATE_KEY" in key for key in environment))
             verify_calls.append((artifact.read_bytes(), public_key, verifier))
 
         with tempfile.TemporaryDirectory() as directory:
@@ -172,7 +173,7 @@ class CandidateSigningTests(unittest.TestCase):
             artifact.with_name(artifact.name + ".sig").write_bytes(b"probe sidecar")
             return SimpleNamespace(returncode=0)
 
-        def reject_gpui_verify(root: Path, artifact: Path, sidecar: Path, public_key: str, verifier: str) -> None:
+        def reject_gpui_verify(root: Path, artifact: Path, sidecar: Path, public_key: str, verifier: str, *, environment: dict[str, str]) -> None:
             """只让 GPUI 验签失败，确认失败标签携带用途与阶段。"""
             if artifact.name.startswith("gpui"):
                 raise build_manifests.ManifestError("minisign 验签失败")
