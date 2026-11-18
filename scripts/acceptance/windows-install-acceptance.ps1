@@ -609,10 +609,13 @@ function Assert-CleanRunner {
     #>
     param([switch]$RequireFormalRootAbsent)
 
-    $hkcu = @(Get-InstalledKerminal -Hive HKCU)
-    $hklm = @(Get-InstalledKerminal -Hive HKLM)
-    Assert-True ($hkcu.Count -eq 0) "HKCU 仍有 Kerminal 卸载项：$($hkcu.KeyPath -join ', ')"
-    Assert-True ($hklm.Count -eq 0) "HKLM 仍有 Kerminal 卸载项：$($hklm.KeyPath -join ', ')"
+    foreach ($hive in @('HKCU', 'HKLM')) {
+        $entries = @(Get-InstalledKerminal -Hive $hive)
+        # 空列表正是预检成功条件；只在失败时构建属性诊断，避免严格模式拒绝空列表。
+        if ($entries.Count -gt 0) {
+            throw "${hive} 仍有 Kerminal 卸载项：$($entries.KeyPath -join ', ')"
+        }
+    }
     Assert-True (-not (Test-Path -LiteralPath $script:DefaultInstallDir)) "默认安装目录仍存在：$script:DefaultInstallDir"
     Assert-True (-not (Test-Path -LiteralPath $script:ProtocolKey)) "协议键仍存在：$script:ProtocolKey"
     Assert-True (-not (Test-Path -LiteralPath $script:ManufacturerKey)) "厂商键仍存在：$script:ManufacturerKey"
