@@ -294,9 +294,12 @@ fn stable_windows_preflight_uses_current_target_helper() {
     .unwrap();
     let section = stable["nsis"]["preinstallSection"].as_str().unwrap();
     assert!(section.contains("release-with-$$-name"));
-    assert!(section.contains("kerminal-migrate.exe\" --dry-run"));
+    assert!(section.contains("--dry-run"));
     assert!(!section.contains("--apply"));
     assert!(section.contains("SetErrorLevel 1"));
+    assert!(section.contains("SetDetailsView show"));
+    assert!(section.contains("DetailPrint \"$1\""));
+    assert!(section.contains("No preflight report was returned"));
     assert_eq!(
         stable["nsis"]["template"].as_str(),
         template.canonicalize().unwrap().to_str()
