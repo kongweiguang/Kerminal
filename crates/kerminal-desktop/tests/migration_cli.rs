@@ -220,7 +220,7 @@ fn document(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("one maintenance JSON document")
 }
 
-/// 安装器使用 BOM UTF-16LE 输出错误与结果，既保留中文也不把隔离根误解析为插件临时目录。
+/// 安装器依赖完整的 BOM UTF-16LE 诊断来保留中文，测试不能忽略截断的码元或把隔离根误解析为插件临时目录。
 ///
 /// @author kongweiguang
 #[cfg(windows)]
@@ -236,10 +236,9 @@ fn installer_preflight_requires_absolute_environment_root_and_emits_utf16() {
     assert!(!output.status.success());
     assert!(output.stderr.is_empty());
     assert!(output.stdout.starts_with(&[0xff, 0xfe]));
-    let utf16: Vec<u16> = output.stdout[2..]
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-        .collect();
+    let (code_units, trailing) = output.stdout[2..].as_chunks::<2>();
+    assert!(trailing.is_empty(), "truncated UTF-16 report");
+    let utf16: Vec<u16> = code_units.iter().copied().map(u16::from_le_bytes).collect();
     let text = String::from_utf16(&utf16).expect("valid UTF-16 report");
     let report: Value = serde_json::from_str(&text).expect("one JSON report");
     assert_eq!(report["ok"], false);
