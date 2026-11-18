@@ -680,6 +680,7 @@ impl RootView {
     /// 先订阅并同步当前 palette；终态更新回到所属 Window 线程，以便只在旧 Agent 仍聚焦时归还父级焦点。
     /// Exited 仅保留快照订阅，关闭、失败及其它非运行态停止。
     /// 搜索重查跟随已接受的新网格，覆盖订阅先于显式补帧到达的路径；普通输出不形成搜索回路。
+    /// 画布读取取决于面板是否挂载；窗口失焦只影响焦点与附属工具，不中断终端输出投影。
     ///
     /// @author kongweiguang
     fn start_agent_terminal_watch(
@@ -736,7 +737,7 @@ impl RootView {
             let mut request = this
                 .update(cx, |root, _| {
                     root.plugin_tools
-                        .projected_tool_active(ToolRailToolId::AgentLauncher)
+                        .projected_tool_visible(ToolRailToolId::AgentLauncher)
                         .then(RenderSnapshotRequest::default)
                 })
                 .ok()
@@ -768,7 +769,7 @@ impl RootView {
                     let frame_projection_generation = request.as_ref().and_then(|_| {
                         this.update(cx, |root, _| {
                             root.plugin_tools
-                                .active_projection_generation(ToolRailToolId::AgentLauncher)
+                                .visible_projection_generation(ToolRailToolId::AgentLauncher)
                         })
                         .ok()
                         .flatten()
@@ -833,7 +834,7 @@ impl RootView {
                                         if let Some(snapshot) = frame.snapshot {
                                             if !agent_snapshot_projection_is_current(
                                                 frame_projection_generation,
-                                                root.plugin_tools.active_projection_generation(
+                                                root.plugin_tools.visible_projection_generation(
                                                     ToolRailToolId::AgentLauncher,
                                                 ),
                                             ) {
@@ -939,7 +940,7 @@ impl RootView {
                             request = this
                                 .update(cx, |root, _| {
                                     root.plugin_tools
-                                        .projected_tool_active(ToolRailToolId::AgentLauncher)
+                                        .projected_tool_visible(ToolRailToolId::AgentLauncher)
                                         .then(RenderSnapshotRequest::default)
                                 })
                                 .ok()
@@ -1078,7 +1079,7 @@ impl RootView {
                         return None;
                     }
                     root.agent_needs_snapshot = true;
-                    Some(root.plugin_tools.projected_tool_active(ToolRailToolId::AgentLauncher).then(|| {
+                    Some(root.plugin_tools.projected_tool_visible(ToolRailToolId::AgentLauncher).then(|| {
                         let current = root.agent_terminal_snapshot.as_ref();
                         RenderSnapshotRequest {
                             since_revision: current.map(|snapshot| snapshot.revision),
@@ -1093,7 +1094,7 @@ impl RootView {
         .detach();
     }
 
-    /// 重新显示只补取隐藏期间的画布；迟到帧必须匹配当前 palette 与 watcher，NotFound 在对应窗口线程收敛关闭并归还旧终端焦点。
+    /// 可见画布在失焦时也补取脏帧；迟到结果仍须匹配挂载代次、主题与 watcher，NotFound 由对应窗口收敛关闭和焦点。
     /// 同代次但实际配色仍旧时保留脏标记，交由已订阅的配色变更刷新，避免 render 通知形成即时重试环。
     /// 新网格接受后重查当前搜索，不能在 resize ACK 时使用旧尺寸坐标，也不对普通输出快照重复重搜。
     ///
@@ -1105,10 +1106,7 @@ impl RootView {
         ) else {
             return;
         };
-        if !self
-            .plugin_tools
-            .projected_tool_active(ToolRailToolId::AgentLauncher)
-            || !self.agent_needs_snapshot
+        if !self.agent_needs_snapshot
             || self
                 .agent_terminal_lifecycle
                 .is_none_or(|lifecycle| !agent_lifecycle_allows_snapshot(lifecycle))
@@ -1117,7 +1115,7 @@ impl RootView {
         }
         let Some(projection_generation) = self
             .plugin_tools
-            .active_projection_generation(ToolRailToolId::AgentLauncher)
+            .visible_projection_generation(ToolRailToolId::AgentLauncher)
         else {
             return;
         };
@@ -1176,7 +1174,7 @@ impl RootView {
                         && !agent_snapshot_projection_is_current(
                             Some(projection_generation),
                             root.plugin_tools
-                                .active_projection_generation(ToolRailToolId::AgentLauncher),
+                                .visible_projection_generation(ToolRailToolId::AgentLauncher),
                         )
                     {
                         root.agent_needs_snapshot = true;

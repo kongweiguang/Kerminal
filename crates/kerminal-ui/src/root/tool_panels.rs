@@ -1204,6 +1204,8 @@ impl RootView {
     /// 只应用仍然有效的挂载票据；同一代只发起一次插件生命周期，旧代次即使投影值相同也拒绝。
     /// 内置面板活动和目标刷新每帧仍执行，避免把“值未变”误当成宿主状态无需更新。
     ///
+    /// 补取终端快照时沿用画布自己的挂载门禁，插件活动状态只管插件生命周期。
+    ///
     /// @author kongweiguang
     fn apply_tool_projection(
         &mut self,
@@ -1301,12 +1303,7 @@ impl RootView {
                     );
                 }
             }
-            if self
-                .plugin_tools
-                .projected_tool_active(ToolRailToolId::AgentLauncher)
-            {
-                self.request_agent_snapshot(cx);
-            }
+            self.request_agent_snapshot(cx);
         }
         let mounts_changed = projection
             .visible

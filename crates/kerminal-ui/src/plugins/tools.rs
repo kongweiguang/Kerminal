@@ -307,7 +307,7 @@ impl PluginTools {
         }
     }
 
-    /// 后台订阅只在最近一次真实挂载投影处于活动窗口时抓取画布。
+    /// 附属工具的后台采集需要已挂载且窗口激活，终端画布则单独按可见性更新。
     ///
     /// @author kongweiguang
     pub(crate) fn projected_tool_active(&self, tool: ToolRailToolId) -> bool {
@@ -325,11 +325,11 @@ impl PluginTools {
             .is_some_and(|projection| projection.visible.contains(&tool))
     }
 
-    /// 异步画布请求绑定实际挂载代次，隐藏后重新显示也不能接受之前的回执。
+    /// 终端画布失焦时仍可更新；保留投影代次，拒绝隐藏、换挂或投影变化前的迟到回执。
     ///
     /// @author kongweiguang
-    pub(crate) fn active_projection_generation(&self, tool: ToolRailToolId) -> Option<u64> {
-        self.projected_tool_active(tool)
+    pub(crate) fn visible_projection_generation(&self, tool: ToolRailToolId) -> Option<u64> {
+        self.projected_tool_visible(tool)
             .then_some(self.projection_generation)
     }
 

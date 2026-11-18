@@ -4,15 +4,44 @@
 
 use super::*;
 
-/// 隐藏或重新挂载后的旧快照不能清除新一轮读取所需的脏状态。
+/// 失焦时可见画布仍接受本代快照；隐藏或重新挂载后不能提交旧投影的结果。
 ///
 /// @author kongweiguang
 #[test]
-fn agent_snapshot_requires_the_same_active_projection() {
-    assert!(agent_snapshot_projection_is_current(Some(1), Some(1)));
-    assert!(!agent_snapshot_projection_is_current(Some(1), None));
-    assert!(!agent_snapshot_projection_is_current(Some(1), Some(2)));
-    assert!(!agent_snapshot_projection_is_current(None, None));
+fn agent_snapshot_requires_the_same_visible_projection_regardless_of_window_focus() {
+    use crate::plugins::tools::{PluginTools, ToolContext, ToolProjection};
+
+    let tool = ToolRailToolId::AgentLauncher;
+    let mut tools = PluginTools::default();
+    let mut projection = ToolProjection {
+        context: ToolContext::default(),
+        visible: vec![tool],
+        window_active: true,
+    };
+    tools.stage_projection(projection.clone());
+    let foreground = tools.visible_projection_generation(tool);
+    assert!(agent_snapshot_projection_is_current(foreground, foreground));
+
+    projection.window_active = false;
+    tools.stage_projection(projection.clone());
+    let background = tools.visible_projection_generation(tool);
+    assert!(!tools.projected_tool_active(tool));
+    assert!(!agent_snapshot_projection_is_current(
+        foreground, background
+    ));
+    assert!(agent_snapshot_projection_is_current(background, background));
+
+    projection.visible.clear();
+    tools.stage_projection(projection.clone());
+    let hidden = tools.visible_projection_generation(tool);
+    assert_eq!(hidden, None);
+    assert!(!agent_snapshot_projection_is_current(background, hidden));
+
+    projection.visible.push(tool);
+    tools.stage_projection(projection);
+    let remounted = tools.visible_projection_generation(tool);
+    assert!(agent_snapshot_projection_is_current(remounted, remounted));
+    assert!(!agent_snapshot_projection_is_current(background, remounted));
 }
 
 /// 用户切换 compact 工具或主机时即使共享句柄未变，迟到 Ready 也不能越过已推进的导航代次。
