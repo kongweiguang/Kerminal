@@ -5,11 +5,168 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
 };
 
 use kerminal_domain::{connections::RemoteShellDialect, sessions::LocalSessionTarget};
 
 use super::*;
+
+/// 创建带 `usr/bin` 与 AppRun 标记的临时 AppDir，复现 raw FUSE 挂载和直接执行解包
+/// AppRun 两种启动方式共有的目录契约，供识别与环境恢复测试使用。
+///
+/// @author kongweiguang
+fn fake_appdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("临时 AppDir");
+    std::fs::create_dir_all(directory.path().join("usr/bin")).expect("创建 usr/bin");
+    std::fs::write(directory.path().join("AppRun"), b"stub").expect("写入 AppRun 标记");
+    directory
+}
+
+/// raw FUSE 挂载路径和直接执行解包后的 AppRun 都由同一 `<AppDir>/usr/bin` + AppRun
+/// 契约识别；缺少 AppRun 的 DEB 式布局和异常层级必须保持不处理。
+///
+/// @author kongweiguang
+#[test]
+fn appimage_appdir_detection_requires_apprun_marker() {
+    use super::appimage_env::appdir_from_executable;
+
+    let directory = tempfile::tempdir().expect("临时目录");
+    let binary = directory.path().join("usr/bin/kerminal");
+    std::fs::create_dir_all(binary.parent().expect("bin 目录")).expect("创建 bin 目录");
+    assert_eq!(appdir_from_executable(&binary), None);
+
+    std::fs::write(directory.path().join("AppRun"), b"stub").expect("写入 AppRun");
+    assert_eq!(
+        appdir_from_executable(&binary),
+        Some(directory.path().to_path_buf())
+    );
+
+    // DEB 的 /usr/bin/kerminal 没有 /AppRun；开发构建的 target/debug 也不满足 usr/bin 层级。
+    assert_eq!(appdir_from_executable(Path::new("/usr/bin/kerminal")), None);
+    assert_eq!(
+        appdir_from_executable(&directory.path().join("usr/lib/kerminal")),
+        None
+    );
+}
+
+/// 按 AppRun 模板补上目录尾部平台分隔符，确保回归覆盖真实注入值而不是规范路径。
+///
+/// @author kongweiguang
+fn apprun_path(path: PathBuf) -> PathBuf {
+    let mut value = path.into_os_string();
+    value.push(std::path::MAIN_SEPARATOR.to_string());
+    PathBuf::from(value)
+}
+
+/// AppRun 追加在宿主原值前的 AppDir 组件必须被剔除，宿主搜索顺序保持不变；
+/// profile 随后写入的显式值仍要覆盖恢复结果。
+///
+/// @author kongweiguang
+#[test]
+fn appimage_restore_recovers_host_paths_before_profile_environment() {
+    let directory = fake_appdir();
+    let appdir = directory.path();
+    let host_path = std::env::join_paths([Path::new("/opt/host/bin"), Path::new("/usr/bin")])
+        .expect("宿主 PATH");
+    let injected_path = std::env::join_paths([
+        apprun_path(appdir.join("usr/bin")),
+        apprun_path(appdir.join("usr/sbin")),
+        PathBuf::from("/opt/host/bin"),
+        PathBuf::from("/usr/bin"),
+    ])
+    .expect("注入 PATH");
+    let host_ld_library_path =
+        std::env::join_paths([Path::new("/opt/host/lib")]).expect("宿主 LD_LIBRARY_PATH");
+    let injected_ld_library_path = std::env::join_paths([
+        apprun_path(appdir.join("usr/lib")),
+        PathBuf::from("/opt/host/lib"),
+    ])
+    .expect("注入 LD_LIBRARY_PATH");
+    let injected_python_path = std::env::join_paths([
+        apprun_path(appdir.join("usr/share/pyshared")),
+        PathBuf::from(""),
+    ])
+    .expect("注入 PYTHONPATH");
+    let host_perl_lib = std::env::join_paths([Path::new("/opt/host/perl")]).expect("宿主 PERLLIB");
+    let injected_perl_lib = std::env::join_paths([
+        apprun_path(appdir.join("usr/share/perl5")),
+        PathBuf::from("/opt/host/perl"),
+    ])
+    .expect("注入 PERLLIB");
+
+    let mut command = portable_pty::CommandBuilder::new("selected-shell");
+    command.env("PATH", &injected_path);
+    command.env("LD_LIBRARY_PATH", &injected_ld_library_path);
+    command.env("PYTHONPATH", &injected_python_path);
+    command.env("PYTHONHOME", apprun_path(appdir.join("usr")));
+    command.env("PERLLIB", &injected_perl_lib);
+
+    let mut profile_env = BTreeMap::new();
+    profile_env.insert(
+        OsString::from("PYTHONHOME"),
+        OsString::from("/profile/python"),
+    );
+    let session_target = target(profile_env);
+    super::apply_environment(
+        &mut command,
+        &session_target,
+        &BTreeMap::new(),
+        Some(appdir),
+    );
+
+    assert_eq!(command.get_env("PATH"), Some(host_path.as_os_str()));
+    assert_eq!(
+        command.get_env("LD_LIBRARY_PATH"),
+        Some(host_ld_library_path.as_os_str())
+    );
+    assert_eq!(command.get_env("PERLLIB"), Some(host_perl_lib.as_os_str()));
+    assert_eq!(command.get_env("PYTHONPATH"), None);
+    // AppRun 无条件覆盖 PYTHONHOME；恢复阶段移除伪造根，随后 profile 的显式值生效。
+    assert_eq!(
+        command.get_env("PYTHONHOME"),
+        Some(OsStr::new("/profile/python"))
+    );
+}
+
+/// 只过滤 AppDir 内组件：同名前缀目录、非 AppDir 的显式 PYTHONHOME 以及未检测到
+/// AppImage 的普通 DEB/开发环境都必须保持原值。
+///
+/// @author kongweiguang
+#[test]
+fn appimage_restore_leaves_unrelated_and_non_appimage_environment_untouched() {
+    let directory = fake_appdir();
+    let appdir = directory.path();
+    let sibling = appdir.with_file_name(format!(
+        "{}-sibling",
+        appdir.file_name().expect("AppDir 名称").to_string_lossy()
+    ));
+    let sibling_path =
+        std::env::join_paths([sibling.clone(), PathBuf::from("/usr/bin")]).expect("同前缀 PATH");
+
+    let mut command = portable_pty::CommandBuilder::new("selected-shell");
+    command.env("PATH", &sibling_path);
+    command.env("PYTHONHOME", "/opt/host/python");
+    super::appimage_env::restore_host_environment(&mut command, appdir);
+    assert_eq!(command.get_env("PATH"), Some(sibling_path.as_os_str()));
+    assert_eq!(
+        command.get_env("PYTHONHOME"),
+        Some(OsStr::new("/opt/host/python"))
+    );
+
+    let mut untouched = portable_pty::CommandBuilder::new("selected-shell");
+    untouched.env("PATH", appdir.join("usr/bin"));
+    super::apply_environment(
+        &mut untouched,
+        &target(BTreeMap::new()),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        untouched.get_env("PATH"),
+        Some(appdir.join("usr/bin").as_os_str())
+    );
+}
 
 /// 创建只供 CommandBuilder 环境投影测试使用的最小本地目标，不启动子进程。
 ///

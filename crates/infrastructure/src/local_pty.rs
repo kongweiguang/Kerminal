@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use tokio_util::io::SyncIoBridge;
 use tokio_util::sync::CancellationToken;
 
+mod appimage_env;
 mod reader;
 use reader::{PtyReaderStats, output_reader_channel, spawn_pty_reader};
 
@@ -761,6 +762,43 @@ fn command_builder(
     startup_env: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     shell_dialect: RemoteShellDialect,
 ) -> portable_pty::CommandBuilder {
+    command_builder_with_appdir(
+        target,
+        startup_args,
+        startup_env,
+        shell_dialect,
+        detected_appimage_appdir().as_deref(),
+    )
+}
+
+/// 读取当前进程的真实可执行文件并识别 AppImage AppDir；非 Linux 平台没有该启动器。
+///
+/// @author kongweiguang
+#[cfg(target_os = "linux")]
+fn detected_appimage_appdir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| appimage_env::appdir_from_executable(&executable))
+}
+
+/// 非 Linux 平台保持原有环境继承语义，不进行 AppImage 路径恢复。
+///
+/// @author kongweiguang
+#[cfg(not(target_os = "linux"))]
+fn detected_appimage_appdir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// 用显式 AppDir 投影启动环境，供测试固定注入而不依赖宿主是否运行在 AppImage 内。
+///
+/// @author kongweiguang
+fn command_builder_with_appdir(
+    target: &LocalSessionTarget,
+    startup_args: &[std::ffi::OsString],
+    startup_env: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    shell_dialect: RemoteShellDialect,
+    appimage_appdir: Option<&std::path::Path>,
+) -> portable_pty::CommandBuilder {
     let mut command = portable_pty::CommandBuilder::new(&target.program);
     command.args(startup_args);
     if let Some(directory) = &target.working_directory {
@@ -776,12 +814,7 @@ fn command_builder(
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
-    for (name, value) in &target.environment {
-        command.env(name, value);
-    }
-    for (name, value) in startup_env {
-        command.env(name, value);
-    }
+    apply_environment(&mut command, target, startup_env, appimage_appdir);
     if !has_explicit_environment_override(target, startup_env, "TERM") {
         // Finder 等 GUI 启动通常不继承终端 TERM；真实 PTY 明确提供本引擎支持的 xterm 协议。
         command.env("TERM", "xterm-256color");
@@ -796,6 +829,29 @@ fn command_builder(
     #[cfg(windows)]
     let _ = shell_dialect;
     command
+}
+
+/// 先恢复 AppImage 启动器注入的宿主环境，再按 profile、shell startup 的顺序覆盖。
+///
+/// 顺序保证显式配置最终生效：AppImage 恢复只处理继承快照，profile 和启动层随后
+/// 写入的值仍可覆盖任何默认或恢复值，DEB/开发构建不传 AppDir 时行为完全不变。
+///
+/// @author kongweiguang
+fn apply_environment(
+    command: &mut portable_pty::CommandBuilder,
+    target: &LocalSessionTarget,
+    startup_env: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    appimage_appdir: Option<&std::path::Path>,
+) {
+    if let Some(appdir) = appimage_appdir {
+        appimage_env::restore_host_environment(command, appdir);
+    }
+    for (name, value) in &target.environment {
+        command.env(name, value);
+    }
+    for (name, value) in startup_env {
+        command.env(name, value);
+    }
 }
 
 /// 判断 Profile 或 shell integration 是否明确设置了环境键，保留用户覆盖的大小写语义。
