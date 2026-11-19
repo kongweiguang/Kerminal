@@ -244,6 +244,14 @@ impl ShellEditingFrameFilter {
             frames: Vec::new(),
             overflowed: false,
         };
+        self.advance_into(bytes, &mut output);
+        output
+    }
+
+    /// 分段追加到同一交付批次，让帧偏移与每批帧数上限不受底层读取边界影响。
+    ///
+    /// @author kongweiguang
+    pub fn advance_into(&mut self, bytes: &[u8], output: &mut FilteredShellEditingOutput) {
         for &byte in bytes {
             if self.in_frame {
                 let was_overflowed = self.overflowed;
@@ -253,7 +261,6 @@ impl ShellEditingFrameFilter {
                 self.consume_visible_byte(byte, &mut output.visible);
             }
         }
-        output
     }
 
     /// 前缀不匹配时完整退还普通输出；重复 ESC 可立即成为下一次候选前缀。

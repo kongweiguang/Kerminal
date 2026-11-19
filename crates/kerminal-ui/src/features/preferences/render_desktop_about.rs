@@ -5,7 +5,8 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    ClickEvent, Context, Entity, FocusHandle, IntoElement, Keystroke, SharedString,
+    AnyElement, ClickEvent, Context, Div, Entity, FocusHandle, IntoElement, Keystroke,
+    SharedString,
     assets::IconName,
     base::Selectable,
     component::{
@@ -16,7 +17,7 @@ use gpui_kit::{
     },
     div,
     prelude::*,
-    px,
+    px, relative,
 };
 use kerminal_application::preferences::{KeybindingPreference, KeybindingScope, SettingsSnapshot};
 
@@ -29,7 +30,7 @@ use super::{
     KeyboardPlatform,
     panel::{PreferencesPanel, ShortcutBindingField, keyboard_platform},
     validate_settings,
-    validation::{binding_for_platform, binding_is_customized},
+    validation::{binding_for_platform, binding_is_customized, missing_default_keybindings},
 };
 
 /// main v0.3.48 的动作说明作为默认文案，实际范围始终来自配置。
@@ -522,7 +523,7 @@ impl PreferencesPanel {
             .child(self.render_save_notice(theme))
     }
 
-    /// 关于页呈现真实版本、许可、仓库和更新事务状态；刷新使用原按钮忙态，避免内容位移。
+    /// 关于页共用行布局，让元数据和更新状态对齐，同时用原按钮忙态避免刷新时位移。
     pub(super) fn render_about_settings(
         &mut self,
         theme: ThemeTokens,
@@ -627,28 +628,36 @@ impl PreferencesPanel {
                         IconName::Hash,
                         crate::locale::text("版本", "Version"),
                         version,
+                        None,
+                        None,
+                        true,
                         theme,
                     ))
                     .child(about_row(
                         IconName::Scale,
                         crate::locale::text("协议", "License"),
                         license,
+                        None,
+                        None,
+                        true,
                         theme,
                     ))
-                    .child(about_action_row(
+                    .child(about_row(
                         IconName::GitBranch,
                         crate::locale::text("GitHub", "GitHub"),
                         github_label,
-                        github,
+                        None,
+                        Some(github.into_any_element()),
+                        true,
                         theme,
                     ))
-                    .child(about_status_row(
+                    .child(about_row(
                         IconName::RotateCcw,
                         crate::locale::text("更新", "Updates"),
-                        update_label,
                         update_status,
-                        update_tone,
-                        actions,
+                        Some(about_status_badge(update_label, update_tone, theme)),
+                        update.as_ref().map(|_| actions.into_any_element()),
+                        false,
                         theme,
                     )),
             );
@@ -684,6 +693,7 @@ impl PreferencesPanel {
             validate_settings(&settings, platform)
         };
         let defaults = SettingsSnapshot::default().keybindings;
+        let missing_shortcut_count = missing_default_keybindings(&settings.keybindings).len();
         let groups = [
             KeybindingScope::Global,
             KeybindingScope::Terminal,
@@ -900,12 +910,45 @@ impl PreferencesPanel {
                 .border_color(theme.border)
                 .px_1()
                 .pt_3()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(crate::locale::text(
-                    "选择平台后点击铅笔录制；恢复默认只影响当前平台。",
-                    "Pick a platform, then use the pencil to record. Restore affects only that platform.",
-                )),
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.))
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "选择平台后点击铅笔录制；恢复默认只影响当前平台。",
+                            "Pick a platform, then use the pencil to record. Restore affects only that platform.",
+                        )),
+                )
+                .when(missing_shortcut_count > 0, |footer| {
+                    footer.child(
+                        Button::new("settings-shortcut-restore-missing")
+                            .compact()
+                            .ghost()
+                            .icon(IconName::RotateCcw)
+                            .label(crate::locale::text(
+                                "恢复缺失动作",
+                                "Restore missing actions",
+                            ))
+                            .tooltip(crate::locale::text(
+                                "补入各平台缺失的默认动作，保留已有自定义行",
+                                "Restore missing default actions across platforms and keep existing rows.",
+                            ))
+                            .accessibility_label(crate::locale::text(
+                                "恢复缺失动作",
+                                "Restore missing actions",
+                            ))
+                            .disabled(disabled)
+                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                panel.restore_missing_shortcuts(cx)
+                            })),
+                    )
+                }),
         )
         .child(self.render_save_notice(theme))
     }
@@ -982,158 +1025,85 @@ fn notification_number_field(
         )
 }
 
-/// 用共享图标和间距展示元数据，行与标题对齐，不叠加第二层容器。
+/// 将图标与标题放在同一横排，避免状态徽标或多行说明改变对齐基准。
+/// 右侧操作以整行内容为基准居中，窄窗口至少留出半行给正文，让按钮组优先换行。
 fn about_row(
     icon: IconName,
     label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .items_start()
-        .gap(theme.metrics.gap)
-        .border_b_1()
-        .border_color(theme.border)
-        .py(theme.metrics.gap)
-        .child(
-            Icon::new(icon)
-                .size(theme.metrics.icon_size)
-                .mt(px(2.))
-                .text_color(theme.muted),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(theme.text_sm)
-                        .font_weight(theme.settings_medium_font_weight())
-                        .child(label.into()),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(value.into()),
-                ),
-        )
-}
-
-/// 外链与其对象保持邻近，并允许长 URL 在窄窗口中收缩。
-fn about_action_row(
-    icon: IconName,
-    label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    action: impl IntoElement,
-    theme: ThemeTokens,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_wrap()
-        .items_start()
-        .gap(theme.metrics.gap)
-        .border_b_1()
-        .border_color(theme.border)
-        .py(theme.metrics.gap)
-        .child(
-            Icon::new(icon)
-                .size(theme.metrics.icon_size)
-                .mt(px(2.))
-                .text_color(theme.muted),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(theme.text_sm)
-                        .font_weight(theme.settings_medium_font_weight())
-                        .child(label.into()),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(value.into()),
-                ),
-        )
-        .child(action)
-}
-
-/// 更新状态与操作可换行，避免文字放大时固定最小宽度挤出视口。
-fn about_status_row(
-    icon: IconName,
-    label: impl Into<SharedString>,
-    status: impl Into<SharedString>,
     detail: impl Into<SharedString>,
-    tone: gpui_kit::Hsla,
-    actions: impl IntoElement,
+    status: Option<Div>,
+    actions: Option<AnyElement>,
+    divided: bool,
     theme: ThemeTokens,
 ) -> impl IntoElement {
+    let icon_size = theme.metrics.icon_size;
+    let gap = theme.metrics.gap;
     div()
         .w_full()
         .flex()
         .flex_wrap()
         .items_center()
-        .gap(theme.metrics.gap)
-        .py(theme.metrics.gap)
-        .child(
-            Icon::new(icon)
-                .size(theme.metrics.icon_size)
-                .mt(px(2.))
-                .text_color(theme.muted),
-        )
+        .gap(gap)
+        .when(divided, |row| row.border_b_1().border_color(theme.border))
+        .py(gap)
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w(relative(0.5))
                 .flex()
                 .flex_col()
                 .gap_1()
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .gap_2()
+                        .gap(gap)
                         .child(
                             div()
-                                .text_size(theme.text_sm)
-                                .font_weight(theme.settings_medium_font_weight())
-                                .child(label.into()),
+                                .flex_shrink_0()
+                                .child(Icon::new(icon).size(icon_size).text_color(theme.muted)),
                         )
                         .child(
                             div()
-                                .px_2()
-                                .py(px(2.))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(tone.opacity(0.25))
-                                .bg(tone.opacity(0.1))
-                                .text_size(theme.text_xs)
-                                .text_color(tone)
-                                .child(status.into()),
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .min_w(px(0.))
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(theme.text_sm)
+                                        .font_weight(theme.settings_medium_font_weight())
+                                        .child(label.into()),
+                                )
+                                .children(status),
                         ),
                 )
                 .child(
                     div()
+                        .ml(icon_size + gap)
                         .text_size(theme.text_xs)
                         .text_color(theme.muted)
                         .child(detail.into()),
                 ),
         )
-        .child(actions)
+        .children(
+            actions.map(|actions| div().ml_auto().max_w_full().flex_shrink_0().child(actions)),
+        )
+}
+
+/// 徽标只负责状态语义，图标、标题和按钮的位置由共享行布局决定。
+fn about_status_badge(status: SharedString, tone: gpui_kit::Hsla, theme: ThemeTokens) -> Div {
+    div()
+        .px_2()
+        .py(px(2.))
+        .rounded_full()
+        .border_1()
+        .border_color(tone.opacity(0.25))
+        .bg(tone.opacity(0.1))
+        .text_size(theme.text_xs)
+        .text_color(tone)
+        .child(status)
 }
 
 /// 平台按钮沿用选中令牌，点击只更新局部投影状态而不写配置。
@@ -1200,6 +1170,7 @@ struct ShortcutControlConfig<'a> {
 }
 
 /// 录制值在确认前只存在于局部草稿；显示值始终来自所选平台的有效绑定。
+/// 长绑定可悬停查看全值，避免多段快捷键撑开设置列表。
 ///
 /// @author kongweiguang
 fn shortcut_control(
@@ -1322,6 +1293,7 @@ fn shortcut_control(
     } else {
         display_shortcut(&value, platform)
     };
+    let tooltip_value = display_value.clone();
     div()
         .id(format!("shortcut-value-{suffix}"))
         .w_full()
@@ -1331,6 +1303,11 @@ fn shortcut_control(
         .gap_1()
         .child(
             div()
+                .id(format!("shortcut-value-text-{suffix}"))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip_value.clone())
+                        .build(window, cx)
+                })
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()

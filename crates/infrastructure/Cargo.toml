@@ -73,6 +73,12 @@ tokio-rustls.workspace = true
 name = "session-acceptance"
 path = "../../tests/acceptance/session_runtime.rs"
 
+# 手动主机列表 I/O 基准；使用 dev profile 运行以与既有 debug 基线比较。
+[[bench]]
+name = "host_list_io"
+path = "benches/host_list_io.rs"
+harness = false
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
@@ -80,6 +86,8 @@ libc.workspace = true
 zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(windows)'.dependencies]
+# 更新检查和下载继承 Windows 系统代理，避免浏览器可访问而更新器直连超时。
+reqwest = { workspace = true, features = ["system-proxy"] }
 windows.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Graphics_Gdi",

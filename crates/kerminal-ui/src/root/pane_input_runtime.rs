@@ -944,16 +944,25 @@ impl RootView {
                 .suspend_for_pending_input();
             self.sync_suggestion_menu(cx);
         }
+        let plain_text_origin = matches!(
+            (&event.event, event.text_origin),
+            (TerminalInputEvent::Text(_), Some(PaneTextOrigin::Plain))
+        );
         let accepted = self.enqueue_session_command(
-            SessionCommand::UiInput(Box::new(super::session_queue::UiInputWork::new(
-                UiTerminalInputRequest {
-                    binding: event.binding.clone(),
-                    expected_context: None,
-                    projection,
-                    event: event.event.clone(),
-                },
-                None,
-            ))),
+            SessionCommand::UiInput(Box::new({
+                let mut work = super::session_queue::UiInputWork::new(
+                    UiTerminalInputRequest {
+                        binding: event.binding.clone(),
+                        expected_context: None,
+                        projection,
+                        event: event.event.clone(),
+                    },
+                    None,
+                );
+                // 只有真实普通键盘提交可进入 ASCII 小批；IME 即使提交单字符也保留原 FIFO 路径。
+                work.plain_text_origin = plain_text_origin;
+                work
+            })),
             cx,
         );
         if !accepted && suspended_suggestions {

@@ -617,6 +617,29 @@ async fn capture_settings(
     if suggestions_only {
         return suggestions::capture_only(cx, &root, window, &services, &context).await;
     }
+    if std::env::var("KERMINAL_SETTINGS_ACCEPTANCE_SCOPE")
+        .is_ok_and(|scope| scope == "terminal-shortcuts")
+    {
+        shortcuts::verify_terminal_input(cx, &root, window, &services, &context).await?;
+        // 复用实窗录制流程，快捷键专项无需先跑完与键位无关的设置页面和截图。
+        press_key(cx, window, "ctrl-alt-s")?;
+        wait_for_state(
+            cx,
+            &root,
+            window,
+            Instant::now() + ACTION_TIMEOUT,
+            |state| state.modal_open() && state.settings_ready() && state.draft_ready(),
+        )
+        .await?;
+        let mut captures = Vec::new();
+        let checks =
+            shortcuts::verify(cx, &root, window, &services, &context, &mut captures).await?;
+        fs::write(
+            context.output_directory.join("shortcut-settings.json"),
+            serde_json::to_vec_pretty(&checks)?,
+        )?;
+        return Ok(());
+    }
     let mut themes = Vec::with_capacity(THEMES.len());
     let mut screenshots = Vec::with_capacity(THEMES.len() * SETTINGS_PAGES.len() * 2 + 10);
     press_key(cx, window, "ctrl-alt-s")?;
@@ -2412,6 +2435,33 @@ fn press_key(cx: &mut AsyncApp, window: AnyWindowHandle, key: &str) -> Result<()
     window.update(cx, |_, window, app| {
         ensure_hidden_window(window)?;
         window.dispatch_keystroke(keystroke, app);
+        Ok::<_, io::Error>(())
+    })??;
+    Ok(())
+}
+
+/// 补发程序模拟的长按和释放，专门覆盖首次按下已经改变焦点或关闭浮层的情况。
+///
+/// @author kongweiguang
+fn repeat_then_release_key(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    key: &str,
+) -> Result<(), Box<dyn Error>> {
+    let keystroke = Keystroke::parse(key)
+        .map_err(|error| io::Error::other(format!("invalid acceptance key {key}: {error}")))?;
+    window.update(cx, |_, window, app| {
+        ensure_hidden_window(window)?;
+        window.dispatch_event(
+            gpui_kit::KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: true,
+                prefer_character_input: false,
+            }
+            .to_platform_input(),
+            app,
+        );
+        window.dispatch_event(gpui_kit::KeyUpEvent { keystroke }.to_platform_input(), app);
         Ok::<_, io::Error>(())
     })??;
     Ok(())

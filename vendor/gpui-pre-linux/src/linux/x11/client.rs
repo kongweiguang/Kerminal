@@ -186,6 +186,157 @@ struct SmoothScrollMotion {
     delta: Point<f32>,
 }
 
+/// 判定一次 KeyRelease/KeyPress 是否是旧式 X11 自动重复的合成对。
+///
+/// Xorg/Xvfb 为每次重复生成的释放与按下共享键码、目标窗口和服务器时间戳；
+/// 三者同时相等才成立，避免把不同窗口或不同时刻的真实点按误当成重复。该判定
+/// 只作用于紧邻且已排队的一对事件，不跨事件或跨轮询批次推断。
+fn is_synthetic_key_release_pair(
+    release: &xproto::KeyReleaseEvent,
+    press: &xproto::KeyPressEvent,
+) -> bool {
+    release.detail == press.detail && release.event == press.event && release.time == press.time
+}
+
+/// 一次轮询到的原始事件及其按键重复标记。
+///
+/// 重复判定必须发生在 XIM 过滤之前：XIM 可能吞掉 KeyPress，但物理按键的按下/
+/// 抬起生命周期仍要在任何窗口和输入法状态下保持一致。
+struct PendingX11Event {
+    event: Event,
+    key_press_is_repeat: bool,
+}
+
+impl From<Event> for PendingX11Event {
+    fn from(event: Event) -> Self {
+        Self {
+            event,
+            key_press_is_repeat: false,
+        }
+    }
+}
+
+/// 跟踪物理按键的按下/抬起生命周期，仅在 XKB 可检测自动重复模式下使用。
+///
+/// 该模式下服务器只发送连续的 KeyPress，同一键码仍在按下集合中即为重复。旧式
+/// 服务器没有可靠状态可跨事件保留：合成释放一旦被丢弃，配对是否成立只能由轮询层
+/// 的紧邻事件判定，因此这里不保存释放时间，避免已经下发 KeyUp 后把下一次
+/// KeyPress 误标为 held。焦点丢失或窗口销毁可能永远收不到 KeyRelease，必须清空。
+struct KeyRepeatTracker {
+    /// 已收到 KeyPress、尚未收到 KeyRelease 的键码。
+    pressed: HashSet<u8>,
+}
+
+impl KeyRepeatTracker {
+    fn new() -> Self {
+        Self {
+            pressed: HashSet::new(),
+        }
+    }
+
+    /// 记录物理抬键，使同一键码之后的 KeyPress 重新成为首次按下。
+    fn release(&mut self, detail: u8) {
+        self.pressed.remove(&detail);
+    }
+
+    /// 返回该 KeyPress 是否为仍处于按下状态的同一键码的自动重复。
+    fn press(&mut self, detail: u8) -> bool {
+        let is_repeat = self.pressed.contains(&detail);
+        self.pressed.insert(detail);
+        is_repeat
+    }
+
+    /// 焦点切换或窗口销毁后无法保证收到抬键事件，清空状态以免残留键码伪装成重复。
+    fn reset(&mut self) {
+        self.pressed.clear();
+    }
+}
+
+/// 在途 KeyPress 的身份：XIM 协议原样保留目标窗口、键码和服务器时间戳。
+///
+/// 转发是异步的，多个 KeyPress 可能在首个回调前排队；以原始事件身份匹配，
+/// 才能让乱序返回的回调各自认领自己的重复标记。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForwardedKeyPressId {
+    window: xproto::Window,
+    detail: u8,
+    time: xproto::Timestamp,
+}
+
+impl From<&xproto::KeyPressEvent> for ForwardedKeyPressId {
+    fn from(event: &xproto::KeyPressEvent) -> Self {
+        Self {
+            window: event.event,
+            detail: event.detail,
+            time: event.time,
+        }
+    }
+}
+
+struct ForwardedKeyPress {
+    id: ForwardedKeyPressId,
+    is_repeat: bool,
+    forwarded_at: Instant,
+}
+
+/// XIM 转发通常很快返回，但输入法吞掉事件时不会回调；超时后标记作废，
+/// 避免陈旧标记套到之后恰好同键码、同时间戳的新按键上。
+const FORWARDED_KEY_PRESS_TTL: Duration = Duration::from_secs(5);
+/// 连续按键可在首个回调前排队；上限覆盖正常输入法往返，溢出按 FIFO 淘汰最旧项。
+const FORWARDED_KEY_PRESS_LIMIT: usize = 32;
+
+/// 保存尚未回调的 XIM 转发按键与其重复标记。
+///
+/// 队列按原始事件身份匹配而非假定 FIFO：XIM 服务器可能乱序返回，两个在途的
+/// 重复按键也必须各自匹配。淘汰只依赖本地单调时间，与服务器时间戳无关。
+#[derive(Default)]
+struct ForwardedKeyPressQueue {
+    entries: VecDeque<ForwardedKeyPress>,
+}
+
+impl ForwardedKeyPressQueue {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次转发；先淘汰过期项，再限制队列长度后追加。
+    fn push(&mut self, event: &xproto::KeyPressEvent, is_repeat: bool, now: Instant) {
+        self.evict_expired(now);
+        self.entries.push_back(ForwardedKeyPress {
+            id: event.into(),
+            is_repeat,
+            forwarded_at: now,
+        });
+        while self.entries.len() > FORWARDED_KEY_PRESS_LIMIT {
+            self.entries.pop_front();
+        }
+    }
+
+    /// 按身份取回并移除标记；找不到或已过期时返回 `None`，调用方按首次按下处理。
+    fn take(&mut self, event: &xproto::KeyPressEvent, now: Instant) -> Option<bool> {
+        self.evict_expired(now);
+        let id = ForwardedKeyPressId::from(event);
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        self.entries.remove(index).map(|entry| entry.is_repeat)
+    }
+
+    /// XIM 连接失效或焦点转移后，在途回调不会再按原语义到达，整体丢弃。
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// 队首是最早转发的项；本地时间单调递增，因此从队首淘汰即覆盖全部过期项。
+    fn evict_expired(&mut self, now: Instant) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| now.duration_since(entry.forwarded_at) > FORWARDED_KEY_PRESS_TTL)
+        {
+            self.entries.pop_front();
+        }
+    }
+}
+
 pub struct X11ClientState {
     /// A weak pointer to this state, for event-loop callbacks registered by its methods.
     this: X11ClientStatePtr,
@@ -219,6 +370,15 @@ pub struct X11ClientState {
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
     keyboard_layout: LinuxKeyboardLayout,
+    /// 服务器是否接受本连接的 XKB 可检测自动重复，决定重复按键的识别方式。
+    detectable_auto_repeat: bool,
+    /// 物理按键生命周期，用于把自动重复的 KeyPress 标记为 `is_held`。
+    key_repeat_tracker: KeyRepeatTracker,
+    /// 尚未回调的在途 XIM 转发按键及其重复标记。
+    ///
+    /// 转发是异步的，可能同时有多条在途事件；按原始事件身份保存，回调按身份
+    /// 认领，避免后一个 KeyPress 覆盖前一个的 held 标记。
+    forwarded_key_presses: ForwardedKeyPressQueue,
     pub(crate) ximc: Option<X11rbClient<Rc<XCBConnection>>>,
     pub(crate) xim_handler: Option<XimHandler>,
     pub modifiers: Modifiers,
@@ -275,6 +435,9 @@ impl X11ClientStatePtr {
         }
         if state.keyboard_focused_window == Some(x_window) {
             state.keyboard_focused_window = None;
+            // 窗口销毁后收不到仍按住按键的 KeyRelease，清空以免残留键码被判为重复。
+            state.key_repeat_tracker.reset();
+            state.forwarded_key_presses.clear();
         }
         if state.cursor_hidden_window == Some(x_window) {
             state.cursor_hidden_window = None;
@@ -441,6 +604,32 @@ impl X11Connection {
         )?;
         anyhow::ensure!(xkb.supported, "X server does not support XKB");
 
+        // 启用本连接的 XKB 可检测自动重复后，服务器不再为每次重复伪造 KeyRelease，
+        // 客户端可凭实际按下集合把重复 KeyPress 标记为 is_held。旧服务器或拒绝该
+        // 标志时保留合成释放对兜底，避免把重复按键误当成新的快捷键触发。
+        let detectable_auto_repeat = get_reply(
+            || "Failed to enable XKB detectable auto-repeat",
+            xcb_connection.xkb_per_client_flags(
+                xkb::ID::USE_CORE_KBD.into(),
+                xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+                xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+                xkb::BoolCtrl::default(),
+                xkb::BoolCtrl::default(),
+                xkb::BoolCtrl::default(),
+            ),
+        )
+        .map(|reply| {
+            reply
+                .supported
+                .contains(xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT)
+                && reply
+                    .value
+                    .contains(xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT)
+        })
+        .log_err()
+        .unwrap_or(false);
+        log::info!("X11 detectable auto-repeat: {detectable_auto_repeat}");
+
         let events = xkb::EventType::STATE_NOTIFY
             | xkb::EventType::MAP_NOTIFY
             | xkb::EventType::NEW_KEYBOARD_NOTIFY;
@@ -541,6 +730,9 @@ impl X11Connection {
                 keyboard_focused_window: None,
                 xkb: xkb_state,
                 keyboard_layout,
+                detectable_auto_repeat,
+                key_repeat_tracker: KeyRepeatTracker::new(),
+                forwarded_key_presses: ForwardedKeyPressQueue::new(),
                 ximc,
                 xim_handler,
 
@@ -658,15 +850,22 @@ impl X11Client {
         self.0.borrow().graphical_environment.clone()
     }
 
+    /// 轮询并分发 X11 事件；按键重复在原始事件层判定后随事件一起下发。
+    ///
+    /// 重复判定依赖完整且未被 XIM 过滤的 KeyPress/KeyRelease 顺序，先在这里
+    /// 标记再分发，避免终端快捷键在长按时被当成新的按下而重复触发。
+    ///
+    /// @author kongweiguang
     pub fn process_x11_events(
         &self,
         xcb_connection: &XCBConnection,
     ) -> Result<(), EventHandlerError> {
+        let detectable_auto_repeat = self.0.borrow().detectable_auto_repeat;
         loop {
-            let mut events = Vec::new();
+            let mut events: Vec<PendingX11Event> = Vec::new();
             let mut windows_to_refresh = HashSet::new();
 
-            let mut last_key_release = None;
+            let mut last_key_release: Option<Event> = None;
 
             // event handlers for new keyboard / remapping refresh the state without using event
             // details, this deduplicates them.
@@ -677,54 +876,107 @@ impl X11Client {
                     Ok(Some(event)) => {
                         match event {
                             Event::Expose(expose_event) => {
+                                // Expose 不可能是合成重复对的一部分，排队的释放是真实抬键。
+                                if let Some(last_key_release) = last_key_release.take() {
+                                    events.push(last_key_release.into());
+                                }
                                 windows_to_refresh.insert(expose_event.window);
                             }
-                            Event::KeyRelease(_) => {
+                            Event::KeyRelease(key_release) => {
                                 if let Some(last_keymap_change_event) =
                                     last_keymap_change_event.take()
                                 {
                                     if let Some(last_key_release) = last_key_release.take() {
-                                        events.push(last_key_release);
+                                        events.push(last_key_release.into());
                                     }
-                                    events.push(last_keymap_change_event);
+                                    events.push(last_keymap_change_event.into());
+                                } else if let Some(last_key_release) = last_key_release.take() {
+                                    // 两个 KeyRelease 之间没有 KeyPress，前一个不可能是自动
+                                    // 重复的合成释放，必须补发，否则该键会一直停在按下状态。
+                                    events.push(last_key_release.into());
                                 }
 
-                                last_key_release = Some(event);
+                                // 物理抬键必须先于任何过滤被记录：可检测模式下它决定
+                                // 后续 KeyPress 是否为重复，旧式合成对则由下面的紧邻
+                                // 判定处理。
+                                self.0
+                                    .borrow_mut()
+                                    .key_repeat_tracker
+                                    .release(key_release.detail);
+                                last_key_release = Some(Event::KeyRelease(key_release));
                             }
                             Event::KeyPress(key_press) => {
                                 if let Some(last_keymap_change_event) =
                                     last_keymap_change_event.take()
                                 {
                                     if let Some(last_key_release) = last_key_release.take() {
-                                        events.push(last_key_release);
+                                        events.push(last_key_release.into());
                                     }
-                                    events.push(last_keymap_change_event);
+                                    events.push(last_keymap_change_event.into());
                                 }
 
+                                // 旧式兜底只在释放与按下紧邻且键码、目标窗口、服务器
+                                // 时间戳全部相同时认定合成对。释放一旦被其他事件或批次
+                                // 边界隔开，就已经按真实 KeyUp 下发，不能再凭历史时间把它
+                                // 之后的按下标成 held，否则 UI 的按键所有权会与 KeyUp 冲突。
+                                let mut key_press_is_repeat = false;
                                 if let Some(Event::KeyRelease(key_release)) =
                                     last_key_release.take()
                                 {
-                                    // We ignore that last KeyRelease if it's too close to this KeyPress,
-                                    // suggesting that it's auto-generated by X11 as a key-repeat event.
-                                    if key_release.detail != key_press.detail
-                                        || key_press.time.saturating_sub(key_release.time) > 20
+                                    if !detectable_auto_repeat
+                                        && is_synthetic_key_release_pair(&key_release, &key_press)
                                     {
-                                        events.push(Event::KeyRelease(key_release));
+                                        key_press_is_repeat = true;
+                                    } else {
+                                        events.push(Event::KeyRelease(key_release).into());
                                     }
                                 }
-                                events.push(Event::KeyPress(key_press));
+
+                                if detectable_auto_repeat {
+                                    key_press_is_repeat = self
+                                        .0
+                                        .borrow_mut()
+                                        .key_repeat_tracker
+                                        .press(key_press.detail);
+                                }
+                                events.push(PendingX11Event {
+                                    event: Event::KeyPress(key_press),
+                                    key_press_is_repeat,
+                                });
                             }
-                            Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) => {
+                            Event::XkbNewKeyboardNotify(_) => {
                                 if let Some(release_event) = last_key_release.take() {
-                                    events.push(release_event);
+                                    events.push(release_event.into());
+                                }
+                                // 新键盘设备可能收不到旧设备上仍按住按键的 KeyRelease，
+                                // 旧设备在途的 XIM 转发也不再对应同一物理按键；在排队
+                                // 键盘映射刷新前清空，避免残留键码或标记把新设备的首次
+                                // 按下误判为重复（纯映射重绑定不改变物理按键状态）。
+                                let mut state = self.0.borrow_mut();
+                                state.key_repeat_tracker.reset();
+                                state.forwarded_key_presses.clear();
+                                drop(state);
+                                last_keymap_change_event = Some(event);
+                            }
+                            Event::XkbMapNotify(_) => {
+                                if let Some(release_event) = last_key_release.take() {
+                                    events.push(release_event.into());
                                 }
                                 last_keymap_change_event = Some(event);
                             }
                             _ => {
-                                if let Some(release_event) = last_key_release.take() {
-                                    events.push(release_event);
+                                if matches!(&event, Event::FocusOut(_)) {
+                                    // 焦点离开后旧窗口可能收不到仍按住按键的 KeyRelease，
+                                    // 残留键码会把之后的真实按键误判为重复；在途 XIM
+                                    // 回调也已失去原焦点语义，一并丢弃。
+                                    let mut state = self.0.borrow_mut();
+                                    state.key_repeat_tracker.reset();
+                                    state.forwarded_key_presses.clear();
                                 }
-                                events.push(event);
+                                if let Some(release_event) = last_key_release.take() {
+                                    events.push(release_event.into());
+                                }
+                                events.push(event.into());
                             }
                         }
                     }
@@ -743,21 +995,25 @@ impl X11Client {
             }
 
             if let Some(release_event) = last_key_release.take() {
-                events.push(release_event);
+                events.push(release_event.into());
             }
             if let Some(keymap_change_event) = last_keymap_change_event.take() {
-                events.push(keymap_change_event);
+                events.push(keymap_change_event.into());
             }
 
             if events.is_empty() && windows_to_refresh.is_empty() {
                 break;
             }
 
-            for event in events.into_iter() {
+            for PendingX11Event {
+                event,
+                key_press_is_repeat,
+            } in events.into_iter()
+            {
                 let mut state = self.0.borrow_mut();
                 if !state.has_xim() {
                     drop(state);
-                    self.handle_event(event);
+                    self.handle_event_with_repeat(event, key_press_is_repeat);
                     continue;
                 }
 
@@ -784,9 +1040,9 @@ impl X11Client {
                             continue;
                         }
                         if xim_connected {
-                            self.xim_handle_event(event);
+                            self.xim_handle_event(event, key_press_is_repeat);
                         } else {
-                            self.handle_event(event);
+                            self.handle_event_with_repeat(event, key_press_is_repeat);
                         }
                     }
                     Err(err) => {
@@ -797,8 +1053,10 @@ impl X11Client {
                         log::error!("XIMClientError: {}", err);
                         let mut state = self.0.borrow_mut();
                         state.take_xim();
+                        // 连接已失效，在途转发不会再回调；保留标记只会污染之后的按键。
+                        state.forwarded_key_presses.clear();
                         drop(state);
-                        self.handle_event(event);
+                        self.handle_event_with_repeat(event, key_press_is_repeat);
                     }
                 }
             }
@@ -897,6 +1155,16 @@ impl X11Client {
     ///
     /// @author kongweiguang
     fn handle_event(&self, event: Event) -> Option<()> {
+        self.handle_event_with_repeat(event, false)
+    }
+
+    /// 处理单个 X11 事件，并携带原始轮询层判定的按键重复标记。
+    ///
+    /// 重复标记只能由看到完整 KeyPress/KeyRelease 序列的轮询层给出；事件处理层
+    /// 单独判断会漏掉被 XIM 过滤或在批次边界分开的重复，导致终端快捷键重复触发。
+    ///
+    /// @author kongweiguang
+    fn handle_event_with_repeat(&self, event: Event, key_press_is_repeat: bool) -> Option<()> {
         match event {
             Event::UnmapNotify(event) => {
                 let mut state = self.0.borrow_mut();
@@ -1221,7 +1489,7 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
                     keystroke,
-                    is_held: false,
+                    is_held: key_press_is_repeat,
                     prefer_character_input: false,
                 }));
             }
@@ -1548,10 +1816,14 @@ impl X11Client {
         Some(())
     }
 
+    /// 处理 XIM 回调；转发回来的按键要恢复转发前记录的重复语义。
+    ///
+    /// @author kongweiguang
     fn handle_xim_callback_event(&self, event: XimCallbackEvent) {
         match event {
             XimCallbackEvent::XimXEvent(event) => {
-                self.handle_event(event);
+                let key_press_is_repeat = self.take_forwarded_key_press_repeat(&event);
+                self.handle_event_with_repeat(event, key_press_is_repeat);
             }
             XimCallbackEvent::XimCommitEvent(window, text) => {
                 self.xim_handle_commit(window, text);
@@ -1562,7 +1834,29 @@ impl X11Client {
         };
     }
 
-    fn xim_handle_event(&self, event: Event) -> Option<()> {
+    /// 取回 XIM 原样转发回调所对应按键的重复标记。
+    ///
+    /// XIM 协议保留目标窗口、键码与时间戳，多条转发可能先后甚至乱序返回；按身份
+    /// 从有界队列认领，匹配不到（被输入法消费或已过期）就按首次按下处理。
+    fn take_forwarded_key_press_repeat(&self, event: &Event) -> bool {
+        let Event::KeyPress(key_press) = event else {
+            return false;
+        };
+        self.0
+            .borrow_mut()
+            .forwarded_key_presses
+            .take(key_press, Instant::now())
+            .unwrap_or(false)
+    }
+
+    /// 把原始按键转交 XIM，并在转发前记住 KeyPress 的重复标记。
+    ///
+    /// 转发是异步的，多个 KeyPress 可能同时处于在途状态；标记必须按原始事件身份
+    /// 排队保存，否则后一个按键会覆盖前一个的 held 语义。
+    ///
+    /// @author kongweiguang
+    fn xim_handle_event(&self, event: Event, key_press_is_repeat: bool) -> Option<()> {
+        let is_key_press = matches!(&event, Event::KeyPress(_));
         match event {
             Event::KeyPress(event) | Event::KeyRelease(event) => {
                 let mut state = self.0.borrow_mut();
@@ -1571,6 +1865,13 @@ impl X11Client {
                     state.modifiers,
                     event.detail.into(),
                 ));
+                if is_key_press {
+                    // 先入队再转发：XIM_FORWARD_EVENT 回调只带回事件本身，
+                    // 没有这份标记，重复按键会在回调路径上退化成全新按下。
+                    state
+                        .forwarded_key_presses
+                        .push(&event, key_press_is_repeat, Instant::now());
+                }
                 let (mut ximc, mut xim_handler) = state.take_xim()?;
                 drop(state);
                 xim_handler.window = event.event;
@@ -3575,5 +3876,145 @@ mod tests {
 
         // Assert pressing space while on the Czech layout still types a space.
         assert_eq!(key_event_state.key_get_utf8(space), " ");
+    }
+
+    /// Confirms detectable auto-repeat marks every press of a still-down keycode as a
+    /// repeat and stops once the real release arrives.
+    ///
+    /// @author kongweiguang
+    #[test]
+    fn key_repeat_tracker_marks_detectable_repeats() {
+        let mut tracker = KeyRepeatTracker::new();
+
+        assert!(!tracker.press(38));
+        assert!(tracker.press(38));
+        assert!(tracker.press(38));
+        assert!(!tracker.press(39));
+
+        tracker.release(38);
+        assert!(!tracker.press(38));
+    }
+
+    /// Builds a minimal key event so pair checks can vary keycode, target window, and
+    /// timestamp without depending on a live X server.
+    ///
+    /// @author kongweiguang
+    fn test_key_event(
+        detail: u8,
+        time: xproto::Timestamp,
+        event: xproto::Window,
+    ) -> xproto::KeyPressEvent {
+        xproto::KeyPressEvent {
+            response_type: xproto::KEY_PRESS_EVENT,
+            detail,
+            sequence: 0,
+            time,
+            root: 1,
+            event,
+            child: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: xproto::KeyButMask::default(),
+            same_screen: true,
+        }
+    }
+
+    /// Confirms only an adjacent legacy pair with the same keycode, target window, and
+    /// server timestamp is treated as X11 auto-repeat; anything else stays a real press.
+    ///
+    /// @author kongweiguang
+    #[test]
+    fn synthetic_release_pair_requires_same_key_target_and_timestamp() {
+        let mut release = test_key_event(38, 100, 0x200000);
+        release.response_type = xproto::KEY_RELEASE_EVENT;
+        let press = test_key_event(38, 100, 0x200000);
+        assert!(is_synthetic_key_release_pair(&release, &press));
+
+        let mut different_key = release.clone();
+        different_key.detail = 39;
+        assert!(!is_synthetic_key_release_pair(&different_key, &press));
+
+        let mut different_target = release.clone();
+        different_target.event = 0x300000;
+        assert!(!is_synthetic_key_release_pair(&different_target, &press));
+
+        let mut different_time = release.clone();
+        different_time.time = 101;
+        assert!(!is_synthetic_key_release_pair(&different_time, &press));
+    }
+
+    /// Confirms queued XIM markers follow the original event identity even when callbacks
+    /// arrive out of order, and that expired, cleared, or overflowed entries stay inactive.
+    ///
+    /// @author kongweiguang
+    #[test]
+    fn forwarded_key_press_queue_matches_by_identity_and_evicts() {
+        let mut queue = ForwardedKeyPressQueue::new();
+        let start = Instant::now();
+        let held = test_key_event(38, 100, 0x200000);
+        let fresh = test_key_event(38, 140, 0x200000);
+        queue.push(&held, true, start);
+        queue.push(&fresh, false, start);
+
+        // 后转发的先回调：两个在途按键各自认领自己的标记。
+        assert_eq!(
+            queue.take(&fresh, start + Duration::from_millis(1)),
+            Some(false)
+        );
+        assert_eq!(
+            queue.take(&held, start + Duration::from_millis(1)),
+            Some(true)
+        );
+        assert_eq!(queue.take(&held, start + Duration::from_millis(1)), None);
+
+        queue.push(&held, true, start);
+        assert_eq!(
+            queue.take(
+                &held,
+                start + FORWARDED_KEY_PRESS_TTL + Duration::from_millis(1)
+            ),
+            None
+        );
+
+        queue.push(&held, true, start);
+        queue.clear();
+        assert_eq!(queue.take(&held, start), None);
+
+        let oldest = test_key_event(10, 0, 0x200000);
+        for index in 0..=FORWARDED_KEY_PRESS_LIMIT {
+            queue.push(
+                &test_key_event(10 + index as u8, index as u32, 0x200000),
+                true,
+                start,
+            );
+        }
+        assert_eq!(queue.take(&oldest, start), None);
+        assert_eq!(
+            queue.take(
+                &test_key_event(
+                    10 + FORWARDED_KEY_PRESS_LIMIT as u8,
+                    FORWARDED_KEY_PRESS_LIMIT as u32,
+                    0x200000,
+                ),
+                start,
+            ),
+            Some(true)
+        );
+    }
+
+    /// Confirms a focus transition drops held keys so their missing releases cannot turn
+    /// the next press into a phantom repeat.
+    ///
+    /// @author kongweiguang
+    #[test]
+    fn key_repeat_tracker_reset_forgets_focus_lost_keys() {
+        let mut tracker = KeyRepeatTracker::new();
+
+        assert!(!tracker.press(38));
+        assert!(tracker.press(38));
+        tracker.reset();
+        assert!(!tracker.press(38));
     }
 }

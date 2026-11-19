@@ -17,12 +17,61 @@ pub(super) async fn verify(
     context: &AcceptanceContext,
     screenshots: &mut Vec<CaptureRecord>,
 ) -> Result<Vec<SettingCheck>, Box<dyn Error>> {
-    let mut checks = Vec::with_capacity(4);
+    let mut checks = Vec::with_capacity(5);
+    checks.push(verify_assistant_routing(cx, root, window, services, context, screenshots).await?);
     checks.push(verify_theme(cx, root, window, services, context, screenshots).await?);
     checks.push(verify_font(cx, root, window, services, context, screenshots).await?);
     checks.push(verify_font_size(cx, root, window, services, context, screenshots).await?);
     checks.push(verify_line_height(cx, root, window, services, context, screenshots).await?);
     Ok(checks)
+}
+
+/// 从真实设置控件往返切换并读取磁盘，避免仅更新草稿也被误判为执行位置已保存。
+async fn verify_assistant_routing(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    services: &kerminal_ui::AppServices,
+    context: &AcceptanceContext,
+    screenshots: &mut Vec<CaptureRecord>,
+) -> Result<SettingCheck, Box<dyn Error>> {
+    let selector = "terminal-agent-commands-in-terminal";
+    let initial = load_persisted_settings(services)
+        .await?
+        .settings
+        .terminal
+        .agent_commands_in_terminal;
+    for expected in [!initial, initial] {
+        ensure_page(cx, root, window, "terminal", "terminal").await?;
+        reveal_settings_selector(cx, root, window, "terminal", selector).await?;
+        click_selector(cx, window, selector)?;
+        wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+            state.draft_ready() && !state.draft_dirty()
+        })
+        .await?;
+        let saved = load_persisted_settings(services).await?;
+        if saved.settings.terminal.agent_commands_in_terminal != expected {
+            return Err(io::Error::other(format!(
+                "assistant command routing readback did not match {expected}"
+            ))
+            .into());
+        }
+    }
+    let capture = save_frame(
+        cx,
+        window,
+        context
+            .output_directory
+            .join("settings-functional-terminal-assistant-routing.png"),
+    )?;
+    screenshots.push(capture.clone());
+    Ok(SettingCheck {
+        action: "terminal-assistant-command-routing",
+        passed: true,
+        expected: "both-modes-persisted|original-restored".to_owned(),
+        observed: "both-modes-persisted|original-restored".to_owned(),
+        capture: Some(capture),
+    })
 }
 
 /// 选定一个与初始值不同的终端主题，再核对深浅应用主题下的 PTY 实际色盘。

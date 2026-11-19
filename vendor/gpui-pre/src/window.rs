@@ -2772,9 +2772,13 @@ impl Window {
     /// which automatically respects [`App::reduce_motion`]. When using this
     /// method directly for decorative motion, check [`App::reduce_motion`]
     /// and skip the frame request when it is set.
+    /// 鼠标等输入回调没有渲染视图，按窗口刷新；绘制期间仍只通知所属视图。
     pub fn request_animation_frame(&self) {
-        let entity = self.current_view();
-        self.on_next_frame(move |_, cx| cx.notify(entity));
+        let entity = self.rendered_entity_stack.last().copied();
+        self.on_next_frame(move |window, cx| match entity {
+            Some(entity) => cx.notify(entity),
+            None => window.refresh(),
+        });
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.

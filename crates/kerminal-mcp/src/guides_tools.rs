@@ -273,7 +273,7 @@ fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallTo
                     "scope": "global",
                     "preferredTarget": "targetBinding",
                     "externalMcpDefault": external_mcp_default,
-                    "visiblePtyFirst": "仅内置 Agent 的目标上下文流程使用 targetBinding 作为首选目标。",
+                    "visiblePtyFirst": "内置 Agent 通过 target_context 的 nextHints 确认执行方式。设置开启时，targetBinding 是首选可见终端。关闭时，请使用后台 SSH 命令或显式创建后台 PTY。",
                     "otherTerminals": "读取 terminal.list 不会切换 UI Tab；指定目标失效时不回退。",
                     "headlessFallback": "创建后台 PTY 后，使用其明确 sessionId 执行 snapshot、write 和 close。",
                     "backgroundFallback": "后台失败不自动改为向可见终端写入。",

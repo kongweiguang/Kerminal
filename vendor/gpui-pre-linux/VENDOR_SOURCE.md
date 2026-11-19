@@ -26,6 +26,11 @@ the parent frame if they remain registered; XDG popups are left to their close
 lifecycle. Pure state regressions are maintained in
 `tests/wayland_visibility.rs` and `tests/wayland_clipboard.rs`, included by the
 backend's test modules.
+The X11 connection requests XKB detectable auto-repeat and reports repeated
+presses as held keys. Servers without the flag use the legacy synthetic
+release/press pairing. The backend retains real releases and carries the
+repeat flag through XIM forwarding when the returned event matches.
+
 Protocol behavior was checked against the lockfile-resolved
 `wayland-protocols 0.32.13` `xdg-shell.xml`. The original crate manifest, source
 files, and license are retained.

@@ -17,7 +17,7 @@ use kerminal_domain::{
     connections::{HostEndpoint, RemoteProtocol, SshAuthentication},
     identity::HostId,
 };
-use kerminal_ui::SuggestionsAcceptanceState;
+use kerminal_ui::{AcceptanceImeEvent, SuggestionsAcceptanceState};
 
 use super::*;
 
@@ -262,7 +262,7 @@ fn state(
 /// 只等待真实生产状态，超时诊断不输出终端输入或用户路径。
 ///
 /// @author kongweiguang
-async fn wait_state(
+pub(super) async fn wait_state(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
     window: AnyWindowHandle,
@@ -382,6 +382,20 @@ async fn read_shell(
 ) -> Result<ShellEditingSnapshot, Box<dyn Error>> {
     if !before.input_idle || !matches!(before.menu_state, Some("ready" | "empty")) {
         return Err(io::Error::other("Shell readback requires a settled production menu").into());
+    }
+    read_focused_shell(cx, root, window, services, before).await
+}
+
+/// 输入法验收不应依赖建议菜单能否打开，但回读仍须核对同一个空闲且聚焦的 pane。
+async fn read_focused_shell(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    services: &kerminal_ui::AppServices,
+    before: &SuggestionsAcceptanceState,
+) -> Result<ShellEditingSnapshot, Box<dyn Error>> {
+    if !before.focused || !before.input_idle {
+        return Err(io::Error::other("Shell readback requires a focused idle pane").into());
     }
     let binding = before.binding.clone();
     let sessions = services.sessions.clone();
@@ -1003,6 +1017,104 @@ async fn wait_fixture_pane(
     }
 }
 
+/// 在原生窗口注入平台输入法回调并核对 Shell 回读，防止预编辑键漏入 PTY 或中文重复提交。
+async fn verify_chinese_composition(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    services: &kerminal_ui::AppServices,
+    pane: &SuggestionsAcceptanceState,
+    baseline: &ShellEditingSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    const CHINESE: &str = "中文";
+    let binding = &pane.binding;
+    let inject = |cx: &mut AsyncApp, event| -> Result<(), Box<dyn Error>> {
+        let accepted = window.update(cx, |_, window, app| {
+            root.update(app, |root, cx| {
+                root.suggestions_acceptance_ime(binding, event, window, cx)
+            })
+        })?;
+        if !accepted {
+            return Err(io::Error::other("focused pane rejected the IME fixture callback").into());
+        }
+        Ok(())
+    };
+    let read_version = || {
+        let sessions = services.sessions.clone();
+        let id = binding.session_id.clone();
+        services
+            .executor
+            .run(move |_| async move { Ok(sessions.terminal_command_context(id).await?.version()) })
+    };
+    wait_state(cx, root, window, "IME fixture baseline", |state| {
+        state.binding == *binding && state.focused && state.input_idle
+    })
+    .await?;
+    let before = read_version().await?;
+    if before.prompt_epoch != baseline.context.prompt_epoch {
+        return Err(io::Error::other("prompt changed before IME fixture started").into());
+    }
+    for (key, end) in [
+        ("escape", AcceptanceImeEvent::Cancel),
+        ("enter", AcceptanceImeEvent::Commit(CHINESE)),
+    ] {
+        inject(cx, AcceptanceImeEvent::Mark("zhongwen"))?;
+        for composing_key in ["up", "down", "ctrl-f", key] {
+            // 组合文本只由下方回调提交；dispatch_keystroke 会额外为 Enter 合成换行。
+            let keystroke = Keystroke::parse(composing_key).map_err(io::Error::other)?;
+            window.update(cx, |_, window, app| {
+                window.dispatch_event(
+                    gpui_kit::KeyDownEvent {
+                        keystroke: keystroke.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    }
+                    .to_platform_input(),
+                    app,
+                );
+                window.dispatch_event(gpui_kit::KeyUpEvent { keystroke }.to_platform_input(), app);
+            })?;
+            wait_state(cx, root, window, composing_key, |state| {
+                state.binding == *binding && state.focused && state.input_idle
+            })
+            .await?;
+            let observed = read_version().await?;
+            if observed != before {
+                return Err(io::Error::other(format!(
+                    "IME preedit or {composing_key} changed the PTY: {before:?} -> {observed:?}"
+                ))
+                .into());
+            }
+        }
+        inject(cx, end)?;
+    }
+    let committed = wait_state(cx, root, window, "Chinese text committed", |state| {
+        state.binding == *binding
+            && state.focused
+            && state.input_idle
+            && state
+                .context
+                .as_ref()
+                .is_some_and(|context| context.input_generation > before.input_generation)
+    })
+    .await?;
+    let readback = read_focused_shell(cx, root, window, services, &committed).await?;
+    let text_matches = readback.input == format!("{}{CHINESE}", baseline.input);
+    if !text_matches
+        || readback.context.prompt_epoch != before.prompt_epoch
+        || readback.context.input_generation != before.input_generation + 1
+        || !readback.cursor_at_end()
+    {
+        return Err(io::Error::other(format!(
+            "Chinese IME readback mismatch: text_match={text_matches}, cursor_at_end={}, {before:?} -> {:?}",
+            readback.cursor_at_end(),
+            readback.context
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// 通过真实输入和 Shell 回读验证追加与未提交；任何阶段失败都不生成通过报告。
 /// 基线快照仅用于关联同一 prompt 和失败时的绑定诊断，不输出输入正文。
 ///
@@ -1076,10 +1188,12 @@ pub(super) async fn capture_only(
             })
     })
     .await?;
+    repeat_then_release_key(cx, window, "right")?;
     cx.background_executor().timer(Duration::from_secs(2)).await;
     let menu = open_menu(cx, root, window).await?;
     let right_readback = read_shell(cx, root, window, services, &menu).await?;
     if right_readback.input != COMPLETE
+        || right_readback.context.input_generation != before_generation + 1
         || !right_readback.cursor_at_end()
         || right_readback.context.prompt_epoch != prompt_epoch
     {
@@ -1116,10 +1230,12 @@ pub(super) async fn capture_only(
             })
     })
     .await?;
+    repeat_then_release_key(cx, window, "enter")?;
     cx.background_executor().timer(Duration::from_secs(2)).await;
     let menu = open_menu(cx, root, window).await?;
     let menu_readback = read_shell(cx, root, window, services, &menu).await?;
     if menu_readback.input != COMPLETE
+        || menu_readback.context.input_generation != before_generation + 1
         || !menu_readback.cursor_at_end()
         || menu_readback.context.prompt_epoch != prompt_epoch
     {
@@ -1178,6 +1294,13 @@ pub(super) async fn capture_only(
         )
         .await?;
     }
+    // 中文留在本轮最后一个未执行的 prompt，避免用退格恢复后再跑依赖原编辑状态的用例。
+    let ime_pane = wait_state(cx, root, window, "IME fixture focus", |state| {
+        state.binding == initial.binding && state.focused && state.input_idle
+    })
+    .await?;
+    let ime_baseline = read_focused_shell(cx, root, window, services, &ime_pane).await?;
+    verify_chinese_composition(cx, root, window, services, &ime_pane, &ime_baseline).await?;
     verify_capture_dimensions(cx, window, context.width, context.height, &screenshots)?;
     let (visible, active, bounds, isolation) = window.update(cx, |_, window, _| {
         let isolation = crate::right_rail_acceptance::isolation::capture()?;
@@ -1194,6 +1317,7 @@ pub(super) async fn capture_only(
     let p95 = sorted_latency[18];
     let mut checks = vec![
         "history-recorded",
+        "simulated-ime-chinese-commit-once-and-cancel",
         "ghost-at-cursor",
         "native-tab-recovers",
         "cursor-move-recovers",

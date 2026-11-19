@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 
 use kerminal_application::{
-    AppError,
+    AppError, AppResult,
     agents::AgentTerminalSnapshotRequest,
     plugins::capabilities,
     sessions::{
@@ -239,6 +239,13 @@ pub(crate) async fn create(
 }
 
 /// 原样提交 UTF-8 输入；历史资格和失败隔离由 application 用例处理，Agent endpoint 仍显式解析目标。
+///
+/// 右栏 Agent 的显式目标先按真实 owner 判定：只有 Running 的 MCP headless 会话
+/// 可以绕过路由设置，因为它由 terminal.create 为后台执行创建，不存在改写用户可见
+/// 终端的风险。其余显式目标和隐式首选目标都必须先读到已提交设置；设置缺失或不可读
+/// 时 fail closed，不能把生产装配缺项静默当成“可见终端”放行。
+///
+/// @author kongweiguang
 pub(crate) async fn write(
     services: &McpServices,
     arguments: Map<String, Value>,
@@ -253,6 +260,68 @@ pub(crate) async fn write(
     };
     if args.data.is_empty() {
         return failure(AppError::invalid("terminal input is empty"));
+    }
+    let scoped = services.agent_scope.is_some();
+    // 显式 scoped 目标先查真实会话，使已确认安全的 headless 写入不受设置读取故障影响；
+    // 同时避免在后台模式下先解析首选绑定、再发现目标是用户可见终端。
+    if scoped && let Some(explicit_session_id) = args.session_id.as_deref() {
+        let session_id = match resolve_session_id(
+            services,
+            Some(explicit_session_id),
+            args.agent_session_id.as_deref(),
+            args.binding_generation,
+            cancellation.clone(),
+        )
+        .await
+        {
+            Ok(session_id) => session_id,
+            Err(error) => return failure(error),
+        };
+        let session = match find_session(services, &session_id).await {
+            Ok(session) => session,
+            Err(error) => return failure(error),
+        };
+        if session.as_ref().is_some_and(is_running_mcp_session) {
+            if let Some(result) =
+                session_target_gate_for(services, "terminal.write", session.as_ref())
+            {
+                return result;
+            }
+            return write_terminal_input(services, session_id, args.data, cancellation).await;
+        }
+        let routing = match require_agent_command_routing(services).await {
+            Ok(routing) => routing,
+            Err(result) => return *result,
+        };
+        if routing == AgentCommandRouting::Background {
+            let Some(session) = session else {
+                return agent_background_session_missing();
+            };
+            // 已退出或正在关闭的会话即使 owner 正确也不能继续写入；让调用方重新 create，
+            // 而不是把 application 的通用 not-found 当成可以回退到其它终端的信号。
+            if session.lifecycle != SessionLifecycle::Running {
+                return agent_background_session_missing();
+            }
+            // 后台模式只接受 terminal.create 创建的 Running MCP headless 会话；
+            // Agent 自身的 CLI、UI pane 和内部 service 会话都不是命令落点。
+            return agent_write_requires_explicit_headless(ssh_command_available(services));
+        }
+        if let Some(result) = session_target_gate_for(services, "terminal.write", session.as_ref())
+        {
+            return result;
+        }
+        return write_terminal_input(services, session_id, args.data, cancellation).await;
+    }
+    // 隐式 scoped 写入必须在解析首选绑定之前确认路由，避免后台模式触碰用户可见终端。
+    // 全局 endpoint 即使携带显式 agentSessionId 也保持原行为，不受该开关约束。
+    if scoped {
+        let routing = match require_agent_command_routing(services).await {
+            Ok(routing) => routing,
+            Err(result) => return *result,
+        };
+        if routing == AgentCommandRouting::Background {
+            return agent_write_requires_explicit_headless(ssh_command_available(services));
+        }
     }
     let session_id = match resolve_session_id(
         services,
@@ -269,13 +338,23 @@ pub(crate) async fn write(
     if let Some(result) = session_target_gate(services, "terminal.write", &session_id).await {
         return result;
     }
-    let bytes_written = args.data.len();
+    write_terminal_input(services, session_id, args.data, cancellation).await
+}
+
+/// 统一执行实际写入，避免路由分支各自复制字节计数和错误映射。
+async fn write_terminal_input(
+    services: &McpServices,
+    session_id: SessionId,
+    data: String,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    let bytes_written = data.len();
     let commands = match services.require_commands() {
         Ok(commands) => commands,
         Err(error) => return failure(error),
     };
     match commands
-        .write_mcp_terminal_input(session_id, args.data, cancellation)
+        .write_mcp_terminal_input(session_id, data, cancellation)
         .await
     {
         Ok(receipt) => success(
@@ -872,6 +951,25 @@ async fn session_target_gate(
     let session = sessions
         .iter()
         .find(|session| &session.session_id == session_id)?;
+    session_target_gate_for(services, tool, Some(session))
+}
+
+/// 复用调用方已读取的会话执行协议门禁，后台路由的 owner 判定不重复 list。
+///
+/// @author kongweiguang
+fn session_target_gate_for(
+    services: &McpServices,
+    tool: &str,
+    session: Option<&SessionInfo>,
+) -> Option<CallToolResult> {
+    let registry = services.plugins.as_deref()?;
+    if registry.is_enabled(capabilities::SSH_UNIT)
+        && registry.is_enabled(capabilities::TELNET_UNIT)
+        && registry.is_enabled(capabilities::SERIAL_UNIT)
+    {
+        return None;
+    }
+    let session = session?;
     let required_units: &[&str] = match &session.target {
         SessionTarget::Ssh(_) => capabilities::host_protocol_units("ssh"),
         SessionTarget::Telnet(_) => capabilities::host_protocol_units("telnet"),
@@ -881,13 +979,204 @@ async fn session_target_gate(
     units_gate(services, tool, required_units)
 }
 
+/// Agent 终端命令的当前路由；与设置页共用同一已提交设置，不建立第二份运行态缓存。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentCommandRouting {
+    /// 写入首选可见终端，保持 0.4 之前的交互。
+    Visible,
+    /// 只允许显式 headless 会话，避免后台 Agent 改写用户正在看的终端。
+    Background,
+}
+
+/// 读取已提交设置；未注入设置仓储时返回 None，保持旧 fixture 的空 nextHints 契约。
+///
+/// 真实读取失败必须上抛，不能静默把损坏或不可读配置当成“可见终端”继续写入。
+///
+/// @author kongweiguang
+async fn stored_agent_command_routing(
+    services: &McpServices,
+) -> AppResult<Option<AgentCommandRouting>> {
+    let Some(preferences) = services.preferences.as_ref() else {
+        return Ok(None);
+    };
+    let loaded = preferences.load_settings().await?;
+    Ok(Some(
+        if loaded.settings.terminal.agent_commands_in_terminal {
+            AgentCommandRouting::Visible
+        } else {
+            AgentCommandRouting::Background
+        },
+    ))
+}
+
+/// 写入路径需要确定的策略；缺失设置仓储时 fail closed。
+///
+/// 生产组合根必须注入 preferences，只有离线 fixture 会缺省。显式 Running MCP
+/// headless 目标在调用本函数前已经放行，因此这里的拒绝不会阻断安全的后台会话；
+/// 其余隐式或可见目标拿不到路由时宁可失败，也不能默认按可见终端写入。
+/// 仅在失败路径分配完整 MCP 错误响应，保持既有响应结构和提示。
+///
+/// @author kongweiguang
+async fn require_agent_command_routing(
+    services: &McpServices,
+) -> Result<AgentCommandRouting, Box<CallToolResult>> {
+    match stored_agent_command_routing(services).await {
+        Ok(Some(routing)) => Ok(routing),
+        Ok(None) => Err(Box::new(agent_routing_settings_unavailable())),
+        Err(error) => Err(Box::new(failure(error))),
+    }
+}
+
+/// 设置仓储缺失时拒绝依赖路由的写入，避免生产装配缺项被静默当成可见终端。
+///
+/// 替代路径仍是 terminal.create 创建的显式 headless 会话；该路径不读取本设置。
+///
+/// @author kongweiguang
+fn agent_routing_settings_unavailable() -> CallToolResult {
+    failure_with_data(
+        AppError::unsupported(
+            "Agent command routing settings are unavailable; create a headless session with terminal.create and pass its explicit sessionId",
+        ),
+        json!({
+            "setting": "terminal.agentCommandsInTerminal",
+            "required": "explicitHeadlessSessionId",
+            "route": "unavailable",
+            "fallback": "terminal.create"
+        }),
+    )
+}
+
+/// 判断显式目标是否为 terminal.create 创建的 Running headless 会话。
+///
+/// 只接受 MCP owner：UI pane 是用户正在观看的终端，Agent 自身的 CLI 是助手进程，
+/// Service 会话属于内部编排目标；即使它们都是 headless，也不能作为右栏命令落点。
+///
+/// @author kongweiguang
+fn is_running_mcp_session(session: &SessionInfo) -> bool {
+    session.lifecycle == SessionLifecycle::Running && matches!(session.owner, SessionOwner::Mcp)
+}
+
+/// 用现有会话列表读取目标；不在 adapter 内维护第二份 session registry。
+///
+/// @author kongweiguang
+async fn find_session(
+    services: &McpServices,
+    session_id: &SessionId,
+) -> AppResult<Option<SessionInfo>> {
+    Ok(services
+        .sessions
+        .list(SessionFilter::default())
+        .await?
+        .into_iter()
+        .find(|session| &session.session_id == session_id))
+}
+
+/// 后台模式下拒绝可见终端写入，并给出可执行的替代路径。
+///
+/// SSH 替代路径只在 ssh.command 通过插件门禁时出现；关闭 SSH 后仍然只提示
+/// terminal.create，避免调用方按提示调用一个已被目录隐藏的工具。两条文案都保持
+/// `&'static str`，以沿用稳定的 conflict 错误构造而不拼接用户输入。
+///
+/// @author kongweiguang
+fn agent_write_requires_explicit_headless(ssh_available: bool) -> CallToolResult {
+    let message = if ssh_available {
+        "Agent command routing is set to background; use terminal.create with an explicit headless sessionId, or ssh.command for non-interactive remote work"
+    } else {
+        "Agent command routing is set to background; use terminal.create with an explicit headless sessionId"
+    };
+    failure_with_data(
+        AppError::conflict(message),
+        json!({
+            "setting": "terminal.agentCommandsInTerminal",
+            "required": "explicitHeadlessSessionId",
+            "route": "background"
+        }),
+    )
+}
+
+/// 判断 ssh.command 是否通过当前插件门禁；目录隐藏时提示不能把它当作备用路径。
+///
+/// 未注入 registry 的离线装配按可用处理，与插件门禁工具的宽松分支保持一致。
+fn ssh_command_available(services: &McpServices) -> bool {
+    services.plugins.as_deref().is_none_or(|registry| {
+        capabilities::tool_visibility_gate(registry, "ssh.command").is_none()
+    })
+}
+
+/// 后台模式下显式 session 已消失或退出时，在 writer 前给出可恢复的替代路径。
+///
+/// 这里使用 conflict 而不是把 application 的 not-found 原样透出，是因为调用方真正
+/// 需要知道的是“不要回退到可见终端，重新创建一个 headless 会话”；退出中的会话
+/// 即使仍出现在列表里也不能继续写入。
+///
+/// @author kongweiguang
+fn agent_background_session_missing() -> CallToolResult {
+    failure_with_data(
+        AppError::conflict(
+            "Terminal session was not found or is no longer running; create a headless session with terminal.create and pass its sessionId",
+        ),
+        json!({
+            "setting": "terminal.agentCommandsInTerminal",
+            "required": "explicitHeadlessSessionId",
+            "route": "background",
+            "fallback": "terminal.create"
+        }),
+    )
+}
+
+/// 提示必须结合本次解析出的目标，避免开启可见模式时引导助手写入未绑定或已失效的终端。
+///
+/// 未注入设置仓储时保持原有空 nextHints；读取失败时不推测模式。
+///
+/// @author kongweiguang
+pub(crate) async fn agent_routing_hints(
+    services: &McpServices,
+    has_live_preferred_target: bool,
+) -> Vec<String> {
+    let ssh_available = ssh_command_available(services);
+    match stored_agent_command_routing(services).await {
+        Ok(None) => Vec::new(),
+        Ok(Some(AgentCommandRouting::Visible)) if has_live_preferred_target => vec![
+            "当前设置为在绑定的主终端 Tab 中执行：对首选终端使用 terminal.write 写入，并用 terminal.snapshot 读取输出；普通切换 Tab 不会重新绑定本会话。".to_owned(),
+        ],
+        Ok(Some(AgentCommandRouting::Visible)) => vec![
+            "可见终端模式已开启，但当前没有可用的首选终端。请让用户确认目标，或在已确认的后台目标执行；不要自动选择其他标签页。".to_owned(),
+        ],
+        Ok(Some(AgentCommandRouting::Background)) => {
+            let ssh_hint = if ssh_available {
+                "，非交互远程命令也可使用 ssh.command"
+            } else {
+                ""
+            };
+            vec![format!(
+                "当前设置为后台执行：不要写入首选可见终端；一次性或交互式命令都先用 terminal.create 创建 headless 会话并显式传入返回的 sessionId{ssh_hint}。"
+            )]
+        }
+        Err(_) => vec![
+            "无法读取 Agent 命令路由设置；写入可见终端前请先确认设置页中的终端命令路由状态。".to_owned(),
+        ],
+    }
+}
+
 /// 生成既兼容旧 MCP schema 又携带稳定 success/error 字段的结构化成功响应。
 pub(crate) fn success(summary: String, data: Value, entities: Vec<Value>) -> CallToolResult {
+    success_with_hints(summary, data, entities, Vec::new())
+}
+
+/// 在成功响应中填入实时路由提示，复用既有 nextHints 字段而不扩张 wire 外形。
+///
+/// @author kongweiguang
+pub(crate) fn success_with_hints(
+    summary: String,
+    data: Value,
+    entities: Vec<Value>,
+    next_hints: Vec<String>,
+) -> CallToolResult {
     CallToolResult::structured(json!({
         "summary": summary,
         "data": data,
         "entities": entities,
-        "nextHints": []
+        "nextHints": next_hints
     }))
 }
 

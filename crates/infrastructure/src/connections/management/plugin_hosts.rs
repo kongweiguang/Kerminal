@@ -184,18 +184,15 @@ impl HostConfigurationRepository {
     }
 
     /// 列表逐项校验外部编辑；只有合法文档才能参与任一目录投影。
+    ///
+    /// 原始文档复用与远程/本地列表相同的单次锁内快照，插件 codec 仍在锁外执行，
+    /// 避免按文件重复获取跨进程锁，同时保持未知提供方和坏文档的原有分类。
+    ///
+    /// @author kongweiguang
     pub(super) async fn list_plugin_host_records(&self) -> AppResult<Vec<PluginHost>> {
-        let mut hosts = Vec::new();
-        for id in self.host_ids().await? {
-            let Some(document) = self
-                .configuration
-                .read(ConfigDocumentPath::Host(id.as_str().to_owned()))
-                .await?
-            else {
-                return Err(AppError::conflict(
-                    "主机目录在读取期间发生变化，请刷新后重试",
-                ));
-            };
+        let snapshot = self.host_document_snapshot().await?;
+        let mut hosts = Vec::with_capacity(snapshot.len());
+        for (id, document) in snapshot {
             self.store
                 .validate_host_document(id.as_str(), &document.source)?;
             if Self::document_is_plugin(&document)? {

@@ -745,15 +745,26 @@ impl RootView {
             let mut applied_palette_generation = None;
             loop {
                 if refresh_lifecycle || request.is_some() {
-                    let palette_target = match this.update(cx, |root, _| {
+                    let (palette_target, selection_target) = match this.update(cx, |root, cx| {
                         root.agent_terminal_watch_is_current(
                             generation,
                             &agent_session_id,
                             &session_id,
                         )
-                        .then(|| AgentTerminalPaletteTarget {
-                            palette: root.current_terminal_palette(),
-                            generation: root.palette_update_generation,
+                        .then(|| {
+                            (
+                                AgentTerminalPaletteTarget {
+                                    palette: root.current_terminal_palette(),
+                                    generation: root.palette_update_generation,
+                                },
+                                // 冻结本帧读取启动时的确认水位，避免 watcher 迟到帧撤销读取后到达的新 ACK。
+                                super::terminal_tools_runtime::selection_reconcile_target(
+                                    root,
+                                    root.agent_terminal_tools.as_ref(),
+                                    &session_id,
+                                    cx,
+                                ),
+                            )
                         })
                     }) {
                         Ok(Some(target)) => target,
@@ -849,9 +860,17 @@ impl RootView {
                                                     current.size != snapshot.size
                                                         || current.grid_epoch != snapshot.grid_epoch
                                                 });
+                                            let snapshot_has_selection = snapshot.selection.is_some();
                                             root.agent_terminal_size = Some(snapshot.size);
                                             root.agent_terminal_snapshot = Some(snapshot);
                                             root.agent_needs_snapshot = false;
+                                            super::terminal_tools_runtime::reconcile_confirmed_selection_after_snapshot(
+                                                root,
+                                                selection_target.as_ref(),
+                                                true,
+                                                snapshot_has_selection,
+                                                cx,
+                                            );
                                             if view_grid_changed {
                                                 root.refresh_open_terminal_search_for_view_revision(
                                                     &session_id,
@@ -1132,6 +1151,13 @@ impl RootView {
                 since_revision: Some(snapshot.revision),
             })
             .unwrap_or_default();
+        // 在 spawn 前冻结确认水位：之后到达的选择 ACK 不能被这次读取的无选区结果撤销。
+        let selection_target = super::terminal_tools_runtime::selection_reconcile_target(
+            self,
+            self.agent_terminal_tools.as_ref(),
+            &session_id,
+            cx,
+        );
         let sessions = self.services.sessions.clone();
         let executor = self.services.executor.clone();
         let window_handle = self.window_handle;
@@ -1193,8 +1219,16 @@ impl RootView {
                                     current.size != snapshot.size
                                         || current.grid_epoch != snapshot.grid_epoch
                                 });
+                            let snapshot_has_selection = snapshot.selection.is_some();
                             root.agent_terminal_size = Some(snapshot.size);
                             root.agent_terminal_snapshot = Some(snapshot);
+                            super::terminal_tools_runtime::reconcile_confirmed_selection_after_snapshot(
+                                root,
+                                selection_target.as_ref(),
+                                true,
+                                snapshot_has_selection,
+                                cx,
+                            );
                             if view_grid_changed {
                                 root.refresh_open_terminal_search_for_view_revision(
                                     &session_id,

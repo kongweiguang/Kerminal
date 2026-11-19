@@ -1528,6 +1528,29 @@ fn terminal_cursor_choices_and_blink_share_persisted_draft(app: &mut TestAppCont
     }
 }
 
+/// 通过真实设置控件验证两种模式都保存到共享仓储，避免开关只改变界面状态。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn sidebar_assistant_command_switch_persists_both_modes(app: &mut TestAppContext) {
+    let (runtime, panel, repository, visual) = fixture(app);
+    visual.simulate_resize(size(px(1440.), px(900.)));
+    draw(visual);
+    click(visual, "preferences-nav-terminal");
+    let switch = "terminal-agent-commands-in-terminal";
+    assert!(repository.snapshot().0.terminal.agent_commands_in_terminal);
+
+    for expected in [false, true] {
+        scroll_target_fully_into_content_clip(visual, &panel, switch);
+        click(visual, switch);
+        pump_runtime(&runtime, visual);
+        assert_eq!(
+            repository.snapshot().0.terminal.agent_commands_in_terminal,
+            expected
+        );
+    }
+}
+
 /// 只读恢复期间拒绝终端控件操作并保留已有草稿；恢复写入后明确编辑才重新提交。
 ///
 /// @author kongweiguang

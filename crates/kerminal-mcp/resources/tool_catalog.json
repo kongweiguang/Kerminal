@@ -173,7 +173,7 @@
     {
       "name": "terminal.write",
       "title": "写入终端",
-      "description": "向既有终端写入原始输入。外部 MCP 仅在 terminal.create 返回的 headless sessionId 或用户明确指定并确认的 UI Tab sessionId 上使用；可见输入/输出不是默认路径。内置右栏 Agent/session-terminal 仍使用 global scope 和 targetBinding 首选目标，不额外创建 Kerminal 确认步骤。",
+      "description": "向既有终端写入原始输入。外部 MCP 仅在 terminal.create 返回的 headless sessionId 或用户明确指定并确认的 UI Tab sessionId 上使用；可见输入/输出不是默认路径。内置右栏 Agent/session-terminal 仍使用 global scope 和 targetBinding 首选目标，不额外创建 Kerminal 确认步骤。本描述是静态目录说明；实际命令路由（可见终端或后台 headless）以每次调用读取的已提交设置为准，响应的 nextHints 会实时说明当前路径，设置不可读时不会静默按可见终端放行。",
       "category": "terminal",
       "annotations": {
         "readOnlyHint": false,

@@ -308,7 +308,7 @@ fn explicit_close_dismisses_ime_composition_and_cancels_pending_preview(cx: &mut
 
     cx.update(|window, app| {
         toolbar.update(app, |toolbar, cx| {
-            assert!(toolbar.close(window, cx));
+            toolbar.close(false, window, cx);
             assert!(!toolbar.is_open);
             assert!(!toolbar.query_is_composing(window, cx));
             assert_eq!(toolbar.query.read(cx).value(), "组合查询");

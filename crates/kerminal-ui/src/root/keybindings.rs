@@ -3,7 +3,7 @@
 //! @author kongweiguang
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -56,7 +56,13 @@ pub(super) struct RootKeybindingRuntime {
     pending_strokes: Vec<Keystroke>,
     pending_scope: Option<KeybindingFocusScope>,
     pending_since: Option<Instant>,
-    terminal_shortcut_keys: HashSet<String>,
+    terminal_shortcut_keys: HashMap<String, TerminalShortcutKind>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalShortcutKind {
+    SingleAction,
+    ViewportScroll,
 }
 
 impl Default for RootKeybindingRuntime {
@@ -70,7 +76,7 @@ impl Default for RootKeybindingRuntime {
             pending_strokes: Vec::new(),
             pending_scope: None,
             pending_since: None,
-            terminal_shortcut_keys: HashSet::new(),
+            terminal_shortcut_keys: HashMap::new(),
         }
     }
 }
@@ -271,9 +277,30 @@ impl RootKeybindingRuntime {
     /// @author kongweiguang
     pub(super) fn remember_terminal_shortcut_key(&mut self, keystroke: &Keystroke) {
         if !keystroke.key.is_empty() {
-            self.terminal_shortcut_keys
-                .insert(keystroke.key.to_ascii_lowercase());
+            self.terminal_shortcut_keys.insert(
+                keystroke.key.to_ascii_lowercase(),
+                TerminalShortcutKind::SingleAction,
+            );
         }
+    }
+
+    /// 单独保留滚动归属，避免已改绑的 Shift+PageUp 长按后又执行默认滚动动作。
+    ///
+    /// @author kongweiguang
+    pub(super) fn remember_terminal_scroll_key(&mut self, keystroke: &Keystroke) {
+        self.terminal_shortcut_keys.insert(
+            keystroke.key.to_ascii_lowercase(),
+            TerminalShortcutKind::ViewportScroll,
+        );
+    }
+
+    /// 只有按下时确实归属视口的键才允许在重复时继续滚动。
+    ///
+    /// @author kongweiguang
+    pub(super) fn is_terminal_scroll_key(&self, keystroke: &Keystroke) -> bool {
+        self.terminal_shortcut_keys
+            .get(&keystroke.key.to_ascii_lowercase())
+            == Some(&TerminalShortcutKind::ViewportScroll)
     }
 
     /// 比较物理主键而非修饰键快照，处理用户先松开 Ctrl/Shift 后主键仍在重复的情况。
@@ -281,7 +308,7 @@ impl RootKeybindingRuntime {
     /// @author kongweiguang
     pub(super) fn is_terminal_shortcut_repeat(&self, keystroke: &Keystroke) -> bool {
         self.terminal_shortcut_keys
-            .contains(&keystroke.key.to_ascii_lowercase())
+            .contains_key(&keystroke.key.to_ascii_lowercase())
     }
 
     /// keyup 清除对应身份并告诉调用方吞掉该释放事件，避免 Kitty 接收没有 press 的 release。
@@ -290,6 +317,7 @@ impl RootKeybindingRuntime {
     pub(super) fn release_terminal_shortcut_key(&mut self, keystroke: &Keystroke) -> bool {
         self.terminal_shortcut_keys
             .remove(&keystroke.key.to_ascii_lowercase())
+            .is_some()
     }
 
     /// 焦点、输入法与配置变化后不能把旧 pane 的按键身份用于新目标。

@@ -4,6 +4,9 @@
 
 use gpui_kit::{Context, FocusHandle, InputPreference, Keystroke, Subscription, Window};
 
+use crate::features::preferences::validation::{
+    ShortcutProblem, is_focus_navigation_stroke, shortcut_sequence_problem, shortcut_stroke_problem,
+};
 use crate::keybindings::KeybindingAction;
 
 use super::{PreferencesPanel, ShortcutBindingField, ShortcutBindingUpdate};
@@ -80,12 +83,15 @@ impl PreferencesPanel {
             if !active {
                 return;
             }
+            // Tab/Shift+Tab 始终交给焦点系统；录制中也不应把它们存成绑定或吞掉键盘导航。
+            if is_focus_navigation_stroke(&event.keystroke) {
+                return;
+            }
             let focused = focus_for_interceptor.is_focused(window);
             let key = event.keystroke.key.to_ascii_lowercase();
             if !focused
-                && (is_focus_navigation_stroke(&event.keystroke)
-                    || (!event.keystroke.modifiers.modified()
-                        && matches!(key.as_str(), "enter" | "space")))
+                && !event.keystroke.modifiers.modified()
+                && matches!(key.as_str(), "enter" | "space")
             {
                 return;
             }
@@ -104,7 +110,11 @@ impl PreferencesPanel {
         });
         let focus_for_blur = capture_focus.clone();
         let owner_for_blur = cx.weak_entity();
-        let focus_subscription = window.on_focus_out(&capture_focus, cx, move |_, _, app| {
+        let focus_subscription = window.on_focus_out(&capture_focus, cx, move |_, window, app| {
+            // Tab 进入录制控件内部的添加/确认/取消按钮时保持录制；只有焦点真正离开控件才取消。
+            if focus_for_blur.contains_focused(window, app) {
+                return;
+            }
             if let Some(panel) = owner_for_blur.upgrade() {
                 let active = panel
                     .read(app)
@@ -154,7 +164,7 @@ impl PreferencesPanel {
         cx.notify();
     }
 
-    /// 捕获阶段消费组合键；预览阶段仅 Enter 确认、Escape 取消，不转发应用动作。
+    /// 捕获阶段消费组合键；预览阶段仅 Enter 确认、Escape 取消，Tab/Shift+Tab 始终保留焦点导航。
     ///
     /// @author kongweiguang
     fn capture_shortcut_keystroke(
@@ -168,42 +178,28 @@ impl PreferencesPanel {
             self.finish_shortcut_capture(window, cx);
             return true;
         }
+        // 录制和预览共用同一导航规则；提前退出后由 GPUI 继续移动焦点，焦点离开会取消录制。
+        if is_focus_navigation_stroke(stroke) {
+            return false;
+        }
         let Some(capture) = self.shortcut_capture.as_mut() else {
             return false;
         };
         if !capture.recording {
-            if is_focus_navigation_stroke(stroke) {
-                return false;
-            }
             if key == "enter" && !stroke.modifiers.modified() {
                 self.confirm_shortcut_capture(window, cx);
             }
             return true;
         }
-        if is_modifier_key(&key) {
-            return true;
-        }
-        if is_terminal_reserved_stroke(stroke) {
-            capture.error = Some(
-                crate::locale::text(
-                    "此按键已由终端复制、中断或滚动使用。",
-                    "This key is reserved for terminal copy, interrupt, or scrolling.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return true;
-        }
-        if is_plain_character_stroke(stroke) {
-            capture.error = Some(
-                crate::locale::text(
-                    "字符按键需要搭配 Ctrl、Alt 或系统键。",
-                    "Use Ctrl, Alt, or the system key with a character.",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return true;
+        match shortcut_stroke_problem(stroke, capture.field.platform()) {
+            // 纯修饰键只是组合输入的前半段，保持录制等待真正的可执行主键。
+            Some(ShortcutProblem::ModifierOnly) => return true,
+            None => {}
+            Some(problem) => {
+                capture.error = Some(problem.message());
+                cx.notify();
+                return true;
+            }
         }
         capture.strokes.push(stroke.unparse());
         capture.recording = false;
@@ -268,104 +264,14 @@ impl PreferencesPanel {
     }
 }
 
-/// 纯修饰键没有可执行主键，保留录制状态等待下一次按键。
+/// 录制入口与保存校验共用同一规则；这里只做消息投影，避免两处判断漂移。
 ///
 /// @author kongweiguang
-fn is_modifier_key(key: &str) -> bool {
-    matches!(
-        key,
-        "ctrl"
-            | "control"
-            | "shift"
-            | "alt"
-            | "cmd"
-            | "win"
-            | "super"
-            | "fn"
-            | "platform"
-            | "function"
-    )
-}
-
-/// 预览状态允许 Tab 和 Shift+Tab 在录制控件及其按钮间移动焦点。
-///
-/// @author kongweiguang
-fn is_focus_navigation_stroke(stroke: &Keystroke) -> bool {
-    let modifiers = stroke.modifiers;
-    stroke.key.eq_ignore_ascii_case("tab")
-        && !modifiers.control
-        && !modifiers.alt
-        && !modifiers.platform
-        && !modifiers.function
-}
-
-/// 运行态会把纯字符及 Shift 字符留给文本输入，因此不能接受无法执行的绑定。
-///
-/// @author kongweiguang
-fn is_plain_character_stroke(stroke: &Keystroke) -> bool {
-    let modifiers = stroke.modifiers;
-    !modifiers.control
-        && !modifiers.alt
-        && !modifiers.platform
-        && !modifiers.function
-        && stroke.key.chars().count() == 1
-}
-
-/// 终端复制、中断和只读历史滚动在配置 keymap 前处理，录制时显式拒绝这些组合。
-///
-/// @author kongweiguang
-fn is_terminal_reserved_stroke(stroke: &Keystroke) -> bool {
-    let modifiers = stroke.modifiers;
-    if modifiers.alt {
-        return false;
-    }
-    let key = stroke.key.to_ascii_lowercase();
-    (key == "c" && (modifiers.platform || modifiers.control))
-        || (matches!(key.as_str(), "pageup" | "pagedown")
-            && modifiers.shift
-            && !modifiers.control
-            && !modifiers.platform)
-        || (matches!(key.as_str(), "home" | "end")
-            && modifiers.shift
-            && modifiers.control
-            && !modifiers.platform)
-}
-
-/// 与录制入口共用终端保留键规则，避免恢复默认或回退值提交运行时无法触发的组合。
-///
-/// @author kongweiguang
-pub(super) fn shortcut_sequence_issue(value: &str) -> Option<String> {
-    let normalized = crate::keybindings::normalize_legacy_binding(value);
-    for part in normalized.split_whitespace() {
-        let Ok(stroke) = Keystroke::parse(part) else {
-            continue;
-        };
-        if is_modifier_key(&stroke.key.to_ascii_lowercase()) {
-            return Some(
-                crate::locale::text("请在修饰键后添加按键。", "Add a key after the modifiers.")
-                    .to_string(),
-            );
-        }
-        if is_terminal_reserved_stroke(&stroke) {
-            return Some(
-                crate::locale::text(
-                    "此按键已由终端复制、中断或滚动使用。",
-                    "This key is reserved for terminal copy, interrupt, or scrolling.",
-                )
-                .to_string(),
-            );
-        }
-        if is_plain_character_stroke(&stroke) {
-            return Some(
-                crate::locale::text(
-                    "字符按键需要搭配 Ctrl、Alt 或系统键。",
-                    "Use Ctrl, Alt, or the system key with a character.",
-                )
-                .to_string(),
-            );
-        }
-    }
-    None
+pub(super) fn shortcut_sequence_issue(
+    value: &str,
+    platform: crate::keybindings::KeybindingPlatform,
+) -> Option<String> {
+    shortcut_sequence_problem(value, platform).map(ShortcutProblem::message)
 }
 
 #[cfg(test)]

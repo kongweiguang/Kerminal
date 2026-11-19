@@ -836,6 +836,36 @@ async fn plugin_catalog_url_roundtrips_through_typed_settings_without_losing_unk
     );
 }
 
+/// 旧配置沿用可见终端默认值，切到后台后需由真实设置文件保留选择，供后续 MCP 调用读取。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn agent_commands_in_terminal_defaults_to_visible_and_persists_background() {
+    let temp = TemporaryConfigRoot::new();
+    let path = temp.0.join("settings.toml");
+    fs::write(&path, "schema_version = 1\n[terminal]\n").expect("写入旧设置");
+    let store = ConfigurationStore::initialize(&temp.0).expect("初始化隔离配置仓储");
+    let service = PreferencesService::new(Arc::new(store));
+
+    let loaded = service.load_settings().await.expect("读取旧设置");
+    let mut changed = loaded.settings;
+    assert!(changed.terminal.agent_commands_in_terminal);
+    changed.terminal.agent_commands_in_terminal = false;
+    service
+        .save_settings(changed, loaded.revision)
+        .await
+        .expect("按当前 revision 保存后台模式");
+
+    let source = fs::read_to_string(&path).expect("读取保存后的设置");
+    let parsed = toml::from_str::<toml::Value>(&source).expect("确认写入合法 TOML");
+    assert_eq!(
+        parsed["terminal"]["agentCommandsInTerminal"].as_bool(),
+        Some(false)
+    );
+    let reloaded = service.load_settings().await.expect("重新读取终端设置");
+    assert!(!reloaded.settings.terminal.agent_commands_in_terminal);
+}
+
 #[tokio::test]
 /// validator 将未来 schema 返回为 invalid 诊断，并保持原配置字节不变。
 ///

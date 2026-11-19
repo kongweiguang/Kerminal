@@ -7,7 +7,7 @@ mod support;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -15,11 +15,12 @@ use std::{
 use kerminal_application::{
     AppError, AppResult, PublicErrorCode,
     connections::{
-        CommandEvent, CommandStreamHandle, ConnectionIntent, ExecRequest, HostKeyIdentity,
-        HostKeyStatus, KnownHostsRepository, OpenSftpRequest, RemoteConnectionHandle,
-        RemoteConnectionLease, RemoteConnectionService, RemoteForwardHandle, RemoteForwardRequest,
-        RemoteShellKind, SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest,
-        TunnelChannelHandle, TunnelRequest,
+        CommandEvent, CommandStreamHandle, ConnectionIntent, CredentialResolver, ExecRequest,
+        HostKeyIdentity, HostKeyStatus, KnownHostsRepository, OpenSftpRequest,
+        RemoteConnectionHandle, RemoteConnectionLease, RemoteConnectionService,
+        RemoteForwardHandle, RemoteForwardRequest, RemoteShellKind, ResolvedCredential,
+        SftpChannelHandle, ShellScriptRequest, TerminalOpenRequest, TunnelChannelHandle,
+        TunnelRequest,
     },
     sessions::{SessionTransport, SessionTransportFactory},
 };
@@ -42,6 +43,7 @@ mod exec;
 use exec::encode_exec_command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use support::ssh_harness::{
     SshServerFixture, SshServerOptions, TestCredentialResolver, TestKnownHostsRepository,
@@ -1209,6 +1211,285 @@ async fn password_and_private_key_authentication_complete_over_russh() {
         .close("private key test complete")
         .await
         .expect("key lease closes");
+    server.shutdown().await;
+}
+
+/// 覆盖 Vault 与文件两种 RSA 私钥来源在只公布 rsa-sha2-512 的 peer 上完成认证。
+/// 该 fixture 对 SHA-1/SHA-2 都能验签，所以本用例只证明两种来源汇合后的密钥加载与
+/// 认证路径可用；真正“选中了哪个签名算法”由 agent 线协议的单元测试断言。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn rsa_private_key_sources_authenticate_against_sha2_advertising_server() {
+    let server = SshServerFixture::spawn(SshServerOptions {
+        preferred_key_algorithms: Some(vec![
+            russh::keys::Algorithm::Ecdsa {
+                curve: russh::keys::EcdsaCurve::NistP256,
+            },
+            russh::keys::Algorithm::Rsa {
+                hash: Some(russh::keys::HashAlg::Sha512),
+            },
+        ]),
+        ..SshServerOptions::default()
+    })
+    .await
+    .expect("loopback server starts");
+
+    let rsa_key = support::ssh_test_keys::test_rsa_private_key();
+
+    let vault_ref = CredentialRef::new("test:rsa-vault-key").expect("static ref is valid");
+    let vault_profile = profile_for(
+        &server,
+        RemoteProtocol::Ssh,
+        SshAuthentication::PrivateKey {
+            path: None,
+            secret: Some(vault_ref),
+            passphrase: None,
+        },
+    );
+    let vault_host_id = vault_profile.host_id.clone();
+    let vault_credentials = Arc::new(TestCredentialResolver::default());
+    vault_credentials.insert_private_key("test:rsa-vault-key", &rsa_key);
+    let vault_known_hosts = trusted_known_hosts(&server, &vault_profile.endpoint);
+    let vault_service = connection_service(vault_profile, vault_credentials, vault_known_hosts);
+    let vault_lease = vault_service
+        .connect(
+            vault_host_id,
+            ConnectionIntent::Exec,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("RSA Vault private-key authentication succeeds");
+    vault_lease
+        .close("RSA vault key test complete")
+        .await
+        .expect("vault key lease closes");
+
+    let directory = tempfile::tempdir().expect("create isolated key directory");
+    let key_path = directory.path().join("id_rsa");
+    std::fs::write(&key_path, &rsa_key).expect("write RSA fixture key");
+    let file_profile = profile_for(
+        &server,
+        RemoteProtocol::Ssh,
+        SshAuthentication::PrivateKey {
+            path: Some(key_path),
+            secret: None,
+            passphrase: None,
+        },
+    );
+    let file_host_id = file_profile.host_id.clone();
+    let file_known_hosts = trusted_known_hosts(&server, &file_profile.endpoint);
+    let file_service = connection_service(
+        file_profile,
+        Arc::new(TestCredentialResolver::default()),
+        file_known_hosts,
+    );
+    let file_lease = file_service
+        .connect(
+            file_host_id,
+            ConnectionIntent::Exec,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("RSA file private-key authentication succeeds");
+    file_lease
+        .close("RSA file key test complete")
+        .await
+        .expect("file key lease closes");
+    server.shutdown().await;
+}
+
+/// 以文件形式加载 OpenSSH 格式的 Ed25519 与 ECDSA P-256 私钥，验证常见客户端算法
+/// 都能走完整 handshake 与 public-key 认证。现有用例只覆盖 RSA 的 vault/文件来源，
+/// 这两种密钥使用不同的签名算法，必须在真实 russh peer 上分别回归。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn common_openssh_private_key_algorithms_authenticate_over_russh() {
+    let server = SshServerFixture::spawn(SshServerOptions::default())
+        .await
+        .expect("loopback server starts");
+    let cases = [
+        (
+            "ed25519",
+            support::ssh_test_keys::test_ed25519_private_key(),
+        ),
+        (
+            "ecdsa-p256",
+            support::ssh_test_keys::test_ecdsa_p256_private_key(),
+        ),
+    ];
+    for (name, key_bytes) in cases {
+        let directory = tempfile::tempdir().expect("create isolated key directory");
+        let key_path = directory.path().join(format!("id_{name}"));
+        std::fs::write(&key_path, &key_bytes).expect("write OpenSSH fixture key");
+        let profile = profile_for(
+            &server,
+            RemoteProtocol::Ssh,
+            SshAuthentication::PrivateKey {
+                path: Some(key_path),
+                secret: None,
+                passphrase: None,
+            },
+        );
+        let host_id = profile.host_id.clone();
+        let known_hosts = trusted_known_hosts(&server, &profile.endpoint);
+        let service = connection_service(
+            profile,
+            Arc::new(TestCredentialResolver::default()),
+            known_hosts,
+        );
+        let lease = service
+            .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{name} private-key authentication must succeed: {error:?}")
+            });
+        lease
+            .close_until(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                "common key algorithm test complete",
+            )
+            .await
+            .expect("common key lease closes");
+    }
+    server.shutdown().await;
+}
+
+/// 覆盖带口令 OpenSSH 私钥的隔离解析器：key 与 passphrase 拆成独立引用，
+/// 与产品 vault 的解析粒度一致，便于在不改 profile 的前提下模拟用户更正口令后重试。
+struct PassphraseCredentialResolver {
+    key: Vec<u8>,
+    passphrase: StdMutex<String>,
+    resolve_count: AtomicUsize,
+}
+
+impl PassphraseCredentialResolver {
+    /// 先持有错误口令，让同一 service 的首个连接尝试进入真实解密失败分支。
+    ///
+    /// @author kongweiguang
+    fn new(key: Vec<u8>, passphrase: &str) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            passphrase: StdMutex::new(passphrase.to_owned()),
+            resolve_count: AtomicUsize::new(0),
+        })
+    }
+
+    /// 模拟用户在凭据库更正口令；只改运行态秘密，不触碰 profile 或密码学参数。
+    ///
+    /// @author kongweiguang
+    fn set_passphrase(&self, passphrase: &str) {
+        *self
+            .passphrase
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = passphrase.to_owned();
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialResolver for PassphraseCredentialResolver {
+    /// 每次认证都重新解析 key 和 passphrase，证明重试不会复用上一次失败的凭据。
+    ///
+    /// @author kongweiguang
+    async fn resolve(
+        &self,
+        reference: &kerminal_domain::connections::CredentialRef,
+        cancel: &CancellationToken,
+    ) -> AppResult<ResolvedCredential> {
+        self.resolve_count.fetch_add(1, Ordering::Relaxed);
+        if cancel.is_cancelled() {
+            return Err(AppError::cancelled("test credential resolution cancelled"));
+        }
+        match reference.as_str() {
+            "test:encrypted-private-key" => Ok(ResolvedCredential::PrivateKey(Zeroizing::new(
+                self.key.clone(),
+            ))),
+            "test:key-passphrase" => Ok(ResolvedCredential::KeyPassphrase(Zeroizing::new(
+                self.passphrase
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            ))),
+            _ => Err(AppError::not_found("unexpected test credential reference")),
+        }
+    }
+}
+
+/// 带口令私钥必须先经产品 `KeyPassphrase` 分支解密：错误口令只让本次认证失败，
+/// 用户更正口令后同一 service 重连必须成功，证明失败尝试已完整回收且每次认证都重新取密。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn passphrase_private_key_retries_after_wrong_passphrase() {
+    let server = SshServerFixture::spawn(SshServerOptions::default())
+        .await
+        .expect("loopback server starts");
+    let key_ref = CredentialRef::new("test:encrypted-private-key").expect("static ref is valid");
+    let passphrase_ref = CredentialRef::new("test:key-passphrase").expect("static ref is valid");
+    let profile = profile_for(
+        &server,
+        RemoteProtocol::Ssh,
+        SshAuthentication::PrivateKey {
+            path: None,
+            secret: Some(key_ref),
+            passphrase: Some(passphrase_ref),
+        },
+    );
+    let host_id = profile.host_id.clone();
+    let credentials = PassphraseCredentialResolver::new(
+        support::ssh_test_keys::test_passphrase_private_key(),
+        "wrong-passphrase",
+    );
+    let known_hosts = trusted_known_hosts(&server, &profile.endpoint);
+    let service = connection_service(profile, credentials.clone(), known_hosts);
+
+    let error = service
+        .connect(
+            host_id.clone(),
+            ConnectionIntent::Exec,
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("a wrong key passphrase must fail the authentication attempt");
+    assert!(
+        matches!(error, AppError::Infrastructure { .. }),
+        "a key that cannot be decrypted is a local credential failure, not an auth rejection"
+    );
+    assert_eq!(
+        credentials.resolve_count.load(Ordering::Relaxed),
+        2,
+        "the failed attempt resolves the key and passphrase exactly once"
+    );
+    assert_eq!(
+        server.accepted_connections.load(Ordering::Relaxed),
+        1,
+        "the failed attempt still completes a real handshake before decryption"
+    );
+
+    credentials.set_passphrase(support::ssh_test_keys::TEST_KEY_PASSPHRASE);
+    let lease = service
+        .connect(host_id, ConnectionIntent::Exec, CancellationToken::new())
+        .await
+        .expect("the same service connects after the passphrase is corrected");
+    assert_eq!(
+        credentials.resolve_count.load(Ordering::Relaxed),
+        4,
+        "the retry resolves a fresh key and passphrase instead of reusing the failure"
+    );
+    assert_eq!(
+        server.accepted_connections.load(Ordering::Relaxed),
+        2,
+        "the retry opens a new peer after the failed attempt is cleaned up"
+    );
+    lease
+        .close_until(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            "passphrase retry test complete",
+        )
+        .await
+        .expect("passphrase-protected lease closes");
     server.shutdown().await;
 }
 

@@ -592,3 +592,32 @@ async fn stale_settings_revision_is_returned_without_overwriting_external_change
         external
     );
 }
+
+/// Agent 终端命令路由默认可见执行，旧设置缺少字段时仍保持既有交互。
+///
+/// 该开关由 MCP 在每次请求时读取已提交值，因此序列化字段名也是外部配置契约的一部分。
+///
+/// @author kongweiguang
+#[test]
+fn terminal_agent_command_routing_defaults_to_visible_and_uses_camel_case() {
+    let default = SettingsSnapshot::default();
+    assert!(default.terminal.agent_commands_in_terminal);
+
+    let encoded = serde_json::to_value(&default).expect("encode settings snapshot");
+    assert_eq!(
+        encoded["terminal"]["agentCommandsInTerminal"],
+        serde_json::json!(true)
+    );
+
+    let mut legacy = encoded;
+    legacy["terminal"]
+        .as_object_mut()
+        .expect("terminal settings are an object")
+        .remove("agentCommandsInTerminal");
+    let restored: SettingsSnapshot =
+        serde_json::from_value(legacy).expect("legacy settings can omit the routing field");
+    assert!(
+        restored.terminal.agent_commands_in_terminal,
+        "missing field keeps the pre-change visible terminal behavior"
+    );
+}

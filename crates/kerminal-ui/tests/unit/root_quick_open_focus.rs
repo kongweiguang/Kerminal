@@ -15,7 +15,7 @@ use kerminal_application::connections::management::HostManagementService;
 use kerminal_domain::identity::HostId;
 
 /// 使用真实 Root 控件和 Command 查询框，确保模态内 Tab 不泄漏到被遮挡的工作台。
-/// Escape 走生产事件订阅，不能用手动关闭来掩盖失去取消入口的问题。
+/// Escape 走生产事件订阅，并验证面板内丢失的终端 keyup 不会影响恢复后的长按。
 ///
 /// @author kongweiguang
 #[gpui_kit::test]
@@ -29,9 +29,17 @@ fn quick_open_tab_stays_modal_and_escape_restores_trigger(app: &mut TestAppConte
         assert_ne!(origin, root.read(app).focus_handle);
         origin
     });
-    for mode in [QuickOpenMode::QuickOpen, QuickOpenMode::CommandPalette] {
+    for (mode, binding) in [
+        (QuickOpenMode::QuickOpen, "ctrl-p"),
+        (QuickOpenMode::CommandPalette, "ctrl-shift-p"),
+    ] {
+        let opening_key = gpui_kit::Keystroke::parse(binding).expect("合法的面板快捷键");
         visual.update(|window, app| {
-            root.update(app, |root, cx| root.open_quick_open(mode, window, cx));
+            root.update(app, |root, cx| {
+                root.keybinding_runtime
+                    .remember_terminal_shortcut_key(&opening_key);
+                root.open_quick_open(mode, window, cx);
+            });
         });
         settle(&runtime, visual);
         visual.update(|window, app| window.draw(app).clear(app));
@@ -56,6 +64,13 @@ fn quick_open_tab_stays_modal_and_escape_restores_trigger(app: &mut TestAppConte
             window.draw(app).clear(app);
             assert!(!root.read(app).quick_open_modal_open);
             assert!(origin.is_focused(window), "取消后返回实际发起控件");
+            assert!(
+                !root
+                    .read(app)
+                    .keybinding_runtime
+                    .is_terminal_shortcut_repeat(&opening_key),
+                "关闭面板后不能把下一次普通按键当作旧快捷键的重复"
+            );
         });
     }
 }

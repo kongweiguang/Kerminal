@@ -7,6 +7,7 @@ use kerminal_domain::{
     agents::{AgentProvider, AgentProviderSession, AgentSession, AgentSessionLaunch},
     identity::AgentSessionId,
 };
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use toml_edit::DocumentMut;
 
@@ -19,7 +20,10 @@ use crate::{
     },
 };
 
-use super::{agent_instructions_with, codex_config};
+use super::{
+    SessionDocumentWrite, WorkspaceSnapshotInput, agent_instructions_with, codex_config,
+    compose_workspace_documents,
+};
 
 /// 测试复用生产模板入口，不在 src 暴露 test-only 包装。
 ///
@@ -74,7 +78,8 @@ impl AgentWorkspaceRepository for CodexConfigRepository {
         Err(AppError::unsupported("测试仓储不支持列出会话"))
     }
 
-    /// 只允许 helper 读取目标 session 的 Codex 配置，并原样返回同次读取的 CAS revision。
+    /// Codex 配置返回固定快照；其他受管文档按首次创建返回缺失快照，
+    /// 让组合装配测试不需要文件系统即可验证实际写入的 endpoint。
     async fn read_document(
         &self,
         agent_session_id: AgentSessionId,
@@ -84,10 +89,16 @@ impl AgentWorkspaceRepository for CodexConfigRepository {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("测试读取已取消"));
         }
-        if agent_session_id != self.session_id || kind != AgentWorkspaceDocumentKind::CodexConfig {
+        if agent_session_id != self.session_id {
             return Err(AppError::invalid("测试读取目标与固定快照不匹配"));
         }
-        Ok(self.snapshot.clone())
+        if kind == AgentWorkspaceDocumentKind::CodexConfig {
+            return Ok(self.snapshot.clone());
+        }
+        Ok(AgentWorkspaceDocumentSnapshot {
+            contents: None,
+            revision: AgentWorkspaceRevision::Missing,
+        })
     }
 
     /// Provider 状态不参与 Codex patch 回归，拒绝提供虚构快照。
@@ -156,6 +167,73 @@ fn agent_instructions_reference_the_retained_runtime_tools() {
     assert!(instructions.contains("`terminal.create`"));
     assert!(!instructions.contains("`container.files."));
     assert!(!instructions.contains("`tmux."));
+}
+
+/// 组合装配必须把已验证的全局 base 派生为 session-scoped 地址，并同时写进
+/// provider 原生配置和 endpoint context；否则 CLI 会连到全局路由，Agent 目标隔离失效。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn composed_provider_config_and_context_share_scoped_endpoint() {
+    let session = codex_session();
+    let repository = CodexConfigRepository {
+        session_id: session.agent_session_id.clone(),
+        snapshot: AgentWorkspaceDocumentSnapshot {
+            contents: None,
+            revision: AgentWorkspaceRevision::Missing,
+        },
+    };
+    let documents = compose_workspace_documents(
+        &repository,
+        SessionDocumentWrite {
+            session: &session,
+            expected_revision: AgentWorkspaceRevision::Missing,
+        },
+        None,
+        "http://127.0.0.1:40137/mcp",
+        None,
+        WorkspaceSnapshotInput {
+            target_session_id: None,
+            output: "",
+            max_bytes: 1024,
+            truncated: false,
+            redacted: false,
+        },
+        None,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("组合装配应生成任务会话文档");
+    let expected = format!(
+        "http://127.0.0.1:40137/mcp/agents/{}",
+        session.agent_session_id.as_str()
+    );
+
+    let codex = documents
+        .iter()
+        .find(|document| document.kind == AgentWorkspaceDocumentKind::CodexConfig)
+        .expect("Codex 会话必须生成 provider 配置");
+    let AgentWorkspaceDocumentContent::Text(codex) = &codex.content else {
+        panic!("Codex configuration must remain a text document");
+    };
+    let codex = codex
+        .parse::<DocumentMut>()
+        .expect("组合后的 Codex 配置仍是有效 TOML");
+    assert_eq!(
+        codex["mcp_servers"]["kerminal"]["url"].as_str(),
+        Some(expected.as_str()),
+        "provider 配置必须使用与 HTTP server 相同的 scoped 路径"
+    );
+
+    let context = documents
+        .iter()
+        .find(|document| document.kind == AgentWorkspaceDocumentKind::McpEndpointContext)
+        .expect("组合装配必须生成 endpoint context");
+    let AgentWorkspaceDocumentContent::Text(context) = &context.content else {
+        panic!("endpoint context must remain a text document");
+    };
+    let context: Value = serde_json::from_str(context).expect("endpoint context 仍是有效 JSON");
+    assert_eq!(context["endpoint"].as_str(), Some(expected.as_str()));
 }
 
 /// 真实 patch 应只更新 Kerminal 管理字段，保留注释、其他 server 和未知扩展键。

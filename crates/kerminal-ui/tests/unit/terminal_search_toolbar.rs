@@ -889,7 +889,7 @@ mod accepted_revision_gpui {
 
         // 关闭操作经过真实工具栏事件订阅；已有投影缓存也必须先清除，再绘制同一快照。
         cx.update(|window, app| {
-            toolbar.update(app, |toolbar, cx| toolbar.close(window, cx));
+            toolbar.update(app, |toolbar, cx| toolbar.close(false, window, cx));
         });
         cx.run_until_parked();
         assert!(cx.update(|_, app| {

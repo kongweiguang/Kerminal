@@ -128,6 +128,173 @@ fn staged_entry(
     (entry, target, stage)
 }
 
+/// 保存两个首建目标及 context 暂存，使注入故障覆盖真实目录结构和 CAS 基线。
+///
+/// @author kongweiguang
+fn stage_first_creation(session_root: &Path, id: &AgentSessionId) -> WorkspaceTransactionJournal {
+    let entries = [
+        (AgentWorkspaceDocumentKind::Session, b"session".as_slice()),
+        (AgentWorkspaceDocumentKind::Provider, b"provider".as_slice()),
+        (
+            AgentWorkspaceDocumentKind::McpEndpointContext,
+            b"endpoint".as_slice(),
+        ),
+    ]
+    .map(|(kind, contents)| staged_entry(session_root, kind, None, contents).0);
+    let mut journal = WorkspaceTransactionJournal {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        agent_session_id: id.clone(),
+        phase: WorkspaceTransactionPhase::Preparing,
+        resume_attempt_id: None,
+        entries: entries.into(),
+    };
+    write_journal(session_root, &journal, CommitMode::CreateNew).expect("publish Preparing");
+    journal.phase = WorkspaceTransactionPhase::Prepared;
+    journal
+}
+
+/// 模拟 1175 留下 Prepared 暂存的两种发布前状态，验证回收与应用层回滚均幂等。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn first_creation_unknown_journal_replacement_releases_uncommitted_reservation() {
+    for destination_disappears in [false, true] {
+        let (_root, store, id, root, session_root) = prepare_store().await;
+        let journal = stage_first_creation(&session_root, &id);
+        let lock = store.storage.lock().expect("hold storage lock");
+        let result =
+            publish_prepared_journal(&root, &session_root, &id, &journal, |_, path, mode| {
+                assert_eq!(mode, CommitMode::ReplaceExisting);
+                if destination_disappears {
+                    fs::remove_file(path).expect("simulate missing journal destination");
+                }
+                Err(AtomicCommitError::CommitUnknown(
+                    std::io::Error::from_raw_os_error(1175),
+                ))
+            });
+        drop(lock);
+        assert_eq!(
+            result.expect_err("creation did not commit").public_code(),
+            PublicErrorCode::Infrastructure
+        );
+        assert!(!session_root.exists());
+        assert!(
+            store
+                .list_sessions()
+                .await
+                .expect("list after cleanup")
+                .is_empty()
+        );
+        store
+            .remove_created_session_root(&id)
+            .await
+            .expect("application rollback is idempotent");
+        assert_eq!(fs::read_dir(root.join("temp")).unwrap().count(), 0);
+    }
+}
+
+/// 原子替换实际完成时，即使返回未知也必须留下 Prepared 供正常回读前滚。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn first_creation_unknown_after_publication_retains_prepared_journal() {
+    let (_test_root, store, id, root, session_root) = prepare_store().await;
+    let journal = stage_first_creation(&session_root, &id);
+    let _lock = store.storage.lock().expect("hold storage lock");
+    let result =
+        publish_prepared_journal(&root, &session_root, &id, &journal, |stage, path, mode| {
+            let contents = fs::read(stage).unwrap();
+            commit_staged_file(stage, path, mode)?;
+            write_new_synced_file(stage, &contents).unwrap();
+            Err(AtomicCommitError::CommitUnknown(
+                std::io::Error::from_raw_os_error(1175),
+            ))
+        });
+    assert_eq!(
+        result
+            .expect_err("the publication outcome is still unknown")
+            .public_code(),
+        PublicErrorCode::OutcomeUnknown
+    );
+    recover_workspace_transaction(&root, &session_root, &id).expect("Prepared rolls forward");
+    assert_eq!(
+        fs::read(session_root.join("session.toml")).unwrap(),
+        b"session"
+    );
+    assert_eq!(
+        fs::read(session_root.join("provider.toml")).unwrap(),
+        b"provider"
+    );
+}
+
+/// 进程在 Prepared 暂存生成前终止时，活 Preparing 应足以恢复列表可用性。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn list_recovers_first_creation_interrupted_during_preparing() {
+    let (_test_root, store, id, root, session_root) = prepare_store().await;
+    let _journal = stage_first_creation(&session_root, &id);
+    assert!(
+        store
+            .list_sessions()
+            .await
+            .expect("recover Preparing")
+            .is_empty()
+    );
+    assert!(!session_root.exists());
+    assert_eq!(fs::read_dir(root.join("temp")).unwrap().count(), 0);
+}
+
+/// 重现旧列表清理 Preparing 后留下孤立暂存的现场，并确认真实损坏和外部数据仍可见。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn list_reclaims_only_proven_unpublished_creation() {
+    for external_file in [None, Some("context/unrelated.txt"), Some("provider.toml")] {
+        let (_test_root, store, id, root, session_root) = prepare_store().await;
+        let journal = stage_first_creation(&session_root, &id);
+        let stage = journal_stage_path(&session_root, &Uuid::new_v4());
+        write_new_synced_file(&stage, &serde_json::to_vec(&journal).unwrap()).unwrap();
+        recover_workspace_transaction(&root, &session_root, &id)
+            .expect("simulate old Preparing cleanup");
+        if let Some(file) = external_file {
+            let path = session_root.join(file);
+            fs::write(&path, b"external contents").unwrap();
+            assert_eq!(
+                store
+                    .list_sessions()
+                    .await
+                    .expect_err("missing session is corruption")
+                    .public_code(),
+                PublicErrorCode::ConfigurationCorrupt
+            );
+            assert_eq!(fs::read(path).unwrap(), b"external contents");
+            assert!(stage.exists());
+        } else {
+            assert!(
+                store
+                    .list_sessions()
+                    .await
+                    .expect("list recovers legacy residue")
+                    .is_empty()
+            );
+            assert!(!session_root.exists());
+            store
+                .create_session_root(&id)
+                .await
+                .expect("bare directory simulates missing metadata");
+            assert_eq!(
+                store
+                    .list_sessions()
+                    .await
+                    .expect_err("cannot prove a bare directory is abandoned")
+                    .public_code(),
+                PublicErrorCode::ConfigurationCorrupt
+            );
+        }
+    }
+}
+
 /// 进程在一次提交后退出时，下一次读取按 journal 前滚其余文件并清除恢复材料。
 #[tokio::test]
 async fn prepared_journal_rolls_forward_partial_commit() {

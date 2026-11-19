@@ -2,15 +2,47 @@
 //!
 //! @author kongweiguang
 
-use gpui_kit::{KeyDownEvent, Keystroke};
+use gpui_kit::{KeyDownEvent, Keystroke, Modifiers};
 use kerminal_terminal::input::InputModifiers;
 
 use super::{
     KeyPhase, TerminalClipboardAction, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
-    TerminalModes, TerminalViewportScroll, encode_input, resolve_terminal_shortcut,
-    terminal_clipboard_action, terminal_key_input, terminal_key_release_input,
-    viewport_scroll_action, viewport_scroll_action_for_keys,
+    TerminalModes, TerminalViewportScroll, consumed_terminal_shortcut_repeat,
+    ctrl_insert_override_wins, encode_input, platform_preferred_terminal_text,
+    resolve_ctrl_insert_override, resolve_terminal_shortcut,
+    terminal_clipboard_action_for_platform, terminal_clipboard_shortcut, terminal_key_input,
+    terminal_key_release_input, viewport_scroll_action, viewport_scroll_action_for_keys,
 };
+
+/// 右栏终端的复制、搜索和粘贴仍归原会话，中央布局动作只有中央 pane 可承接。
+#[test]
+fn agent_terminal_cannot_close_or_split_the_central_workspace() {
+    use super::{KeybindingAction, SessionOwner, terminal_action_can_target_workspace};
+    use kerminal_domain::identity::{AgentSessionId, PaneId, TabId};
+
+    let agent = SessionOwner::Agent {
+        agent_session_id: AgentSessionId::parse("agent-test").unwrap(),
+    };
+    let workspace = SessionOwner::Ui {
+        tab_id: TabId::parse("tab-test").unwrap(),
+        pane_id: PaneId::parse("pane-test").unwrap(),
+    };
+    for action in [
+        KeybindingAction::TerminalCloseTab,
+        KeybindingAction::TerminalClosePane,
+        KeybindingAction::TerminalSplitHorizontal,
+        KeybindingAction::TerminalSplitVertical,
+    ] {
+        assert!(!terminal_action_can_target_workspace(action, &agent));
+        assert!(terminal_action_can_target_workspace(action, &workspace));
+    }
+    for action in [
+        KeybindingAction::TerminalSearch,
+        KeybindingAction::TerminalPaste,
+    ] {
+        assert!(terminal_action_can_target_workspace(action, &agent));
+    }
+}
 
 /// 用户修改后只有新粘贴键在终端解析器生效，旧键不再被本地剪贴板手势抢占。
 ///
@@ -82,7 +114,13 @@ fn character_preference_keeps_altgr_in_the_terminal_input_path() {
         resolve_terminal_shortcut(&mut runtime, &event, false),
         super::keybindings::KeybindingDispatch::Unhandled
     );
+    event.keystroke.key_char = Some("@".into());
+    assert_eq!(platform_preferred_terminal_text(&event), Some("@"));
+    event.keystroke.key_char = Some("\u{11}".into());
+    assert_eq!(platform_preferred_terminal_text(&event), None);
+    event.keystroke.key_char = Some("@".into());
     event.prefer_character_input = false;
+    assert_eq!(platform_preferred_terminal_text(&event), None);
     assert_eq!(
         resolve_terminal_shortcut(&mut runtime, &event, false),
         super::keybindings::KeybindingDispatch::Action(
@@ -368,43 +406,510 @@ fn key_release_is_routed_only_when_the_terminal_protocol_encodes_it() {
 /// @author kongweiguang
 #[test]
 fn clipboard_shortcuts_route_selection_and_interrupt_without_selection() {
-    let control = InputModifiers {
+    let control = Modifiers {
         control: true,
-        ..InputModifiers::default()
+        ..Modifiers::default()
     };
     assert_eq!(
-        terminal_clipboard_action(TerminalKey::Character('c'), control, false),
+        terminal_clipboard_action_for_platform(TerminalKey::Character('c'), control, false, false),
         Some(TerminalClipboardAction::Interrupt)
     );
     assert_eq!(
-        terminal_clipboard_action(TerminalKey::Character('c'), control, true),
+        terminal_clipboard_action_for_platform(TerminalKey::Character('c'), control, true, false),
         Some(TerminalClipboardAction::CopySelection)
     );
-    let control_shift = InputModifiers {
+    let control_shift = Modifiers {
         control: true,
         shift: true,
-        ..InputModifiers::default()
+        ..Modifiers::default()
     };
     assert_eq!(
-        terminal_clipboard_action(TerminalKey::Character('C'), control_shift, false),
+        terminal_clipboard_action_for_platform(
+            TerminalKey::Character('C'),
+            control_shift,
+            false,
+            false,
+        ),
         Some(TerminalClipboardAction::CopySelection)
     );
     assert_eq!(
-        terminal_clipboard_action(TerminalKey::Character('v'), control_shift, false),
-        None
-    );
-    assert_eq!(
-        terminal_clipboard_action(
-            TerminalKey::Character('c'),
-            InputModifiers {
-                control: true,
-                alt: true,
-                ..InputModifiers::default()
-            },
-            true,
+        terminal_clipboard_action_for_platform(
+            TerminalKey::Character('v'),
+            control_shift,
+            false,
+            false,
         ),
         None
     );
+    assert_eq!(
+        terminal_clipboard_action_for_platform(
+            TerminalKey::Character('c'),
+            Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::default()
+            },
+            true,
+            false,
+        ),
+        None
+    );
+}
+
+/// 构造单个普通 keydown；特判测试只关心 Keystroke 和平台优先级标记。
+///
+/// @author kongweiguang
+fn key_down(text: &str) -> KeyDownEvent {
+    KeyDownEvent {
+        keystroke: Keystroke::parse(text).unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    }
+}
+
+/// 把粘贴动作在三套平台字段上都设为同一序列，避免测试随宿主平台漂移。
+///
+/// @author kongweiguang
+#[cfg(not(target_os = "macos"))]
+fn settings_with_terminal_paste(
+    sequence: &str,
+) -> kerminal_application::preferences::SettingsSnapshot {
+    let mut settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let paste = settings
+        .keybindings
+        .iter_mut()
+        .find(|binding| binding.action == "terminal.paste")
+        .unwrap();
+    paste.windows_binding = sequence.to_owned();
+    paste.mac_binding = sequence.to_owned();
+    paste.linux_binding = Some(sequence.to_owned());
+    settings
+}
+
+/// 用户显式配置的 Ctrl+Insert 先经现有 keymap 解析；命中时跳过默认复制，未命中才复制。
+///
+/// @author kongweiguang
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn configured_ctrl_insert_precedes_the_default_copy_gesture() {
+    let event = key_down("ctrl-insert");
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&kerminal_application::preferences::SettingsSnapshot::default().keybindings);
+    let unconfigured =
+        resolve_ctrl_insert_override(&mut runtime, TerminalKey::Insert, &event, false);
+    assert_eq!(
+        unconfigured,
+        Some(super::keybindings::KeybindingDispatch::Unhandled)
+    );
+    assert!(!ctrl_insert_override_wins(unconfigured.as_ref()));
+    assert_eq!(
+        terminal_clipboard_shortcut(TerminalKey::Insert, &event, true, false),
+        Some(TerminalClipboardAction::CopySelection)
+    );
+
+    let settings = settings_with_terminal_paste("Ctrl+Insert");
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    let configured = resolve_ctrl_insert_override(&mut runtime, TerminalKey::Insert, &event, false);
+    assert_eq!(
+        configured,
+        Some(super::keybindings::KeybindingDispatch::Action(
+            crate::keybindings::KeybindingAction::TerminalPaste
+        ))
+    );
+    assert!(ctrl_insert_override_wins(configured.as_ref()));
+}
+
+/// Ctrl+Insert 作为已配置多段序列的后一段或前缀时都必须压过默认复制。
+///
+/// @author kongweiguang
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ctrl_insert_keeps_configured_sequence_priority_over_local_copy() {
+    let settings = settings_with_terminal_paste("Ctrl+K Ctrl+Insert");
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &key_down("ctrl-k"), false),
+        super::keybindings::KeybindingDispatch::Pending
+    );
+    let second = resolve_ctrl_insert_override(
+        &mut runtime,
+        TerminalKey::Insert,
+        &key_down("ctrl-insert"),
+        false,
+    );
+    assert_eq!(
+        second,
+        Some(super::keybindings::KeybindingDispatch::Action(
+            crate::keybindings::KeybindingAction::TerminalPaste
+        ))
+    );
+    assert!(ctrl_insert_override_wins(second.as_ref()));
+
+    // Ctrl+Insert 也可以是前缀：此时必须保持等待下一段，不能先复制选择。
+    let settings = settings_with_terminal_paste("Ctrl+Insert Ctrl+V");
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    let prefix = resolve_ctrl_insert_override(
+        &mut runtime,
+        TerminalKey::Insert,
+        &key_down("ctrl-insert"),
+        false,
+    );
+    assert_eq!(
+        prefix,
+        Some(super::keybindings::KeybindingDispatch::Pending)
+    );
+    assert!(ctrl_insert_override_wins(prefix.as_ref()));
+}
+
+/// 只有大小写/输入法无关的精确物理 Ctrl+Insert 才进入 keymap 优先判断。
+///
+/// @author kongweiguang
+#[test]
+fn ctrl_insert_override_only_accepts_exact_physical_shortcut() {
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    let event = key_down("ctrl-insert");
+    for modifiers in [
+        Modifiers {
+            control: true,
+            shift: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            control: true,
+            platform: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            control: true,
+            function: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        },
+    ] {
+        let mut mixed = event.clone();
+        mixed.keystroke.modifiers = modifiers;
+        assert_eq!(
+            resolve_ctrl_insert_override(&mut runtime, TerminalKey::Insert, &mixed, false),
+            None,
+            "mixed modifiers must keep their original routing"
+        );
+    }
+
+    let mut altgr = event.clone();
+    altgr.prefer_character_input = true;
+    assert_eq!(
+        resolve_ctrl_insert_override(&mut runtime, TerminalKey::Insert, &altgr, false),
+        None
+    );
+    assert_eq!(
+        resolve_ctrl_insert_override(&mut runtime, TerminalKey::Insert, &event, true),
+        None
+    );
+    // Ctrl+C 仍由原有剪贴板/中断分支处理，不进入 Ctrl+Insert 特判。
+    assert_eq!(
+        resolve_ctrl_insert_override(&mut runtime, TerminalKey::Character('c'), &event, false),
+        None
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            resolve_ctrl_insert_override(&mut runtime, TerminalKey::Insert, &event, false),
+            None
+        );
+    }
+}
+
+/// Zed/Windows Terminal 在 Windows/Linux 用 Ctrl+Insert 复制；mac 与混合修饰不得触发。
+///
+/// 无选择时仍返回复制动作，由选择工具以 None 结束，从而消费按键但不改剪贴板、不写终端。
+///
+/// @author kongweiguang
+#[test]
+fn ctrl_insert_is_a_windows_linux_copy_shortcut_only() {
+    let control = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(
+        terminal_clipboard_action_for_platform(TerminalKey::Insert, control, false, false),
+        Some(TerminalClipboardAction::CopySelection)
+    );
+    assert_eq!(
+        terminal_clipboard_action_for_platform(TerminalKey::Insert, control, true, false),
+        Some(TerminalClipboardAction::CopySelection)
+    );
+    assert_eq!(
+        terminal_clipboard_action_for_platform(TerminalKey::Insert, control, true, true),
+        None
+    );
+    for modifiers in [
+        Modifiers {
+            control: true,
+            shift: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            control: true,
+            platform: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            control: true,
+            function: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            control: true,
+            alt: true,
+            ..Modifiers::default()
+        },
+        Modifiers::default(),
+    ] {
+        assert_eq!(
+            terminal_clipboard_action_for_platform(TerminalKey::Insert, modifiers, true, false),
+            None,
+            "mixed modifiers must not trigger the local copy shortcut"
+        );
+    }
+}
+
+/// 剪贴板只看物理修饰键：mac Option-as-Meta 关闭后 Cmd+Option+C 仍须排除；
+/// Win+C 以及 Win/Ctrl/Shift/Fn 的混合组合不能误触发本地复制。
+///
+/// @author kongweiguang
+#[test]
+fn clipboard_uses_raw_physical_modifiers_without_mixed_shortcuts() {
+    let command = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(
+        terminal_clipboard_action_for_platform(TerminalKey::Character('c'), command, false, true,),
+        Some(TerminalClipboardAction::CopySelection)
+    );
+    assert_eq!(
+        terminal_clipboard_action_for_platform(TerminalKey::Character('c'), command, false, false,),
+        None,
+        "Win+C is a system shortcut, not a terminal copy"
+    );
+    for modifiers in [
+        Modifiers {
+            platform: true,
+            alt: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            platform: true,
+            control: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            platform: true,
+            shift: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            platform: true,
+            function: true,
+            ..Modifiers::default()
+        },
+    ] {
+        assert_eq!(
+            terminal_clipboard_action_for_platform(
+                TerminalKey::Character('c'),
+                modifiers,
+                true,
+                true,
+            ),
+            None,
+            "macOS copy must use exact raw Cmd+C modifiers"
+        );
+    }
+}
+
+/// IME 组合或 AltGr 声明字符优先时，即使物理组合像复制也必须交还文本通道。
+///
+/// @author kongweiguang
+#[test]
+fn clipboard_shortcut_honors_character_input_and_ime_gate() {
+    let ctrl_insert = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-insert").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    assert_eq!(
+        terminal_clipboard_shortcut(TerminalKey::Insert, &ctrl_insert, true, false),
+        terminal_clipboard_action_for_platform(
+            TerminalKey::Insert,
+            ctrl_insert.keystroke.modifiers,
+            true,
+            cfg!(target_os = "macos"),
+        )
+    );
+    let mut gated = ctrl_insert.clone();
+    gated.prefer_character_input = true;
+    assert_eq!(
+        terminal_clipboard_shortcut(TerminalKey::Insert, &gated, true, false),
+        None
+    );
+    assert_eq!(
+        terminal_clipboard_shortcut(TerminalKey::Insert, &ctrl_insert, true, true),
+        None
+    );
+
+    let ctrl_c = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-c").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    assert_eq!(
+        terminal_clipboard_shortcut(TerminalKey::Character('c'), &ctrl_c, false, false),
+        Some(TerminalClipboardAction::Interrupt)
+    );
+}
+
+/// 本地复制 press 登记物理主键后，修饰键先松开的重复与 keyup 都按已消费处理。
+///
+/// @author kongweiguang
+#[test]
+fn local_copy_repeat_tracking_survives_modifier_release() {
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    let press = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-insert").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    };
+    runtime.remember_terminal_shortcut_key(&press.keystroke);
+    let repeat_without_control = KeyDownEvent {
+        keystroke: Keystroke::parse("insert").unwrap(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &repeat_without_control, false),
+        super::keybindings::KeybindingDispatch::Pending
+    );
+    assert!(runtime.release_terminal_shortcut_key(&repeat_without_control.keystroke));
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &repeat_without_control, false),
+        super::keybindings::KeybindingDispatch::Unhandled
+    );
+}
+
+/// 已消费的复制/粘贴长按必须先于动作重算被识别：选择消失后的 Ctrl+C 不能改判成
+/// Interrupt；自定义的 Shift+Insert 在 Shift 先松开时也不能从更早的剪贴板或滚动分支漏进终端。
+///
+/// @author kongweiguang
+#[test]
+fn consumed_copy_and_paste_repeats_cannot_recompute_into_other_actions() {
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    let copy_press = Keystroke::parse("ctrl-c").unwrap();
+    runtime.remember_terminal_shortcut_key(&copy_press);
+    let copy_repeat = KeyDownEvent {
+        keystroke: copy_press,
+        is_held: true,
+        prefer_character_input: false,
+    };
+    // 选择消失后原始组合会重算为 Interrupt，但 tracking 必须仍然优先。
+    assert_eq!(
+        terminal_clipboard_action_for_platform(
+            TerminalKey::Character('c'),
+            copy_repeat.keystroke.modifiers,
+            false,
+            false,
+        ),
+        Some(TerminalClipboardAction::Interrupt)
+    );
+    assert!(consumed_terminal_shortcut_repeat(&runtime, &copy_repeat));
+
+    let mut paste_runtime = super::keybindings::RootKeybindingRuntime::default();
+    paste_runtime.remember_terminal_shortcut_key(&Keystroke::parse("shift-insert").unwrap());
+    let paste_repeat = KeyDownEvent {
+        keystroke: Keystroke::parse("insert").unwrap(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    assert!(consumed_terminal_shortcut_repeat(
+        &paste_runtime,
+        &paste_repeat
+    ));
+    assert_eq!(
+        terminal_clipboard_action_for_platform(
+            TerminalKey::Insert,
+            paste_repeat.keystroke.modifiers,
+            true,
+            false,
+        ),
+        None
+    );
+
+    let untracked_repeat = KeyDownEvent {
+        keystroke: Keystroke::parse("ctrl-c").unwrap(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    assert!(!consumed_terminal_shortcut_repeat(
+        &super::keybindings::RootKeybindingRuntime::default(),
+        &untracked_repeat,
+    ));
+    let mut prefer_character_input = copy_repeat.clone();
+    prefer_character_input.prefer_character_input = true;
+    assert!(!consumed_terminal_shortcut_repeat(
+        &runtime,
+        &prefer_character_input
+    ));
+}
+
+/// 本地滚动保持连续重复：模式与修饰键仍匹配时继续滚动；Kitty/alternate 切换后
+/// 同一个 tracked 主键由更早的重复门禁吞掉，keyup 再清除记录。
+///
+/// @author kongweiguang
+#[test]
+fn tracked_scroll_repeats_keep_scrolling_and_swallow_orphans() {
+    let mut runtime = super::keybindings::RootKeybindingRuntime::default();
+    let press = Keystroke::parse("shift-pageup").unwrap();
+    runtime.remember_terminal_shortcut_key(&press);
+    let repeat = KeyDownEvent {
+        keystroke: press.clone(),
+        is_held: true,
+        prefer_character_input: false,
+    };
+    let shift = InputModifiers {
+        shift: true,
+        ..InputModifiers::default()
+    };
+    assert!(consumed_terminal_shortcut_repeat(&runtime, &repeat));
+    assert!(!runtime.is_terminal_scroll_key(&press));
+    runtime.remember_terminal_scroll_key(&press);
+    assert!(runtime.is_terminal_scroll_key(&press));
+    assert_eq!(
+        viewport_scroll_action(TerminalKey::PageUp, shift, TerminalModes::default(), 24),
+        Some(TerminalViewportScroll::Relative(24))
+    );
+    assert_eq!(
+        viewport_scroll_action(
+            TerminalKey::PageUp,
+            shift,
+            TerminalModes {
+                kitty_keyboard_flags: 1,
+                ..TerminalModes::default()
+            },
+            24,
+        ),
+        None
+    );
+    assert!(runtime.release_terminal_shortcut_key(&press));
+    assert!(!consumed_terminal_shortcut_repeat(&runtime, &repeat));
 }
 
 /// 重复翻页使用相对步长，顶部/底部快捷键使用 Root 的明确绝对边界哨兵。
@@ -424,6 +929,18 @@ fn viewport_shortcuts_page_and_jump_only_on_primary_screen() {
         viewport_scroll_action(TerminalKey::PageDown, shift, TerminalModes::default(), 24),
         Some(TerminalViewportScroll::Relative(-24))
     );
+    // 保留原有键位，Shift+方向键和 Shift+Home/End 由终端程序处理。
+    for key in [
+        TerminalKey::Up,
+        TerminalKey::Down,
+        TerminalKey::Home,
+        TerminalKey::End,
+    ] {
+        assert_eq!(
+            viewport_scroll_action(key, shift, TerminalModes::default(), 24),
+            None
+        );
+    }
     let control_shift = InputModifiers {
         control: true,
         shift: true,

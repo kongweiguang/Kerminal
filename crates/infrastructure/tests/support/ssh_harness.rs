@@ -5,6 +5,7 @@
 //! @author kongweiguang
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     net::SocketAddr,
     sync::{
@@ -68,6 +69,9 @@ pub struct SshServerOptions {
     pub send_shell_exit_signal: bool,
     /// 模拟只读 nonce shell probe 的应答类型；Unknown 继续使用普通 exec fixture 响应。
     pub shell_probe_kind: RemoteShellKind,
+    /// 覆盖 server-sig-algs 与 host key 广告的算法列表；None 保留 russh 默认安全列表。
+    /// 用例借此模拟只公布 rsa-sha2-*、只保留旧 ssh-rsa 或完全不支持的 peer。
+    pub preferred_key_algorithms: Option<Vec<russh::keys::Algorithm>>,
 }
 
 impl Default for SshServerOptions {
@@ -93,6 +97,7 @@ impl Default for SshServerOptions {
             close_shell_without_exit_status: false,
             send_shell_exit_signal: false,
             shell_probe_kind: RemoteShellKind::Unknown,
+            preferred_key_algorithms: None,
         }
     }
 }
@@ -136,6 +141,10 @@ impl SshServerFixture {
         let mut config = server::Config::default();
         config.keys.push(private_key);
         config.inactivity_timeout = None;
+        // server-sig-algs 直接来自 preferred.key；先于移动 options 设置，便于按用例模拟 OpenSSH 广告。
+        if let Some(algorithms) = options.preferred_key_algorithms.clone() {
+            config.preferred.key = Cow::Owned(algorithms);
+        }
         let config = Arc::new(config);
         let shutdown = CancellationToken::new();
         let task_shutdown = shutdown.clone();

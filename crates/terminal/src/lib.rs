@@ -3,6 +3,7 @@
 //! @author kongweiguang
 
 mod cursor_style;
+pub mod cursor_visibility;
 pub mod engine;
 pub mod input;
 pub mod output_capture;

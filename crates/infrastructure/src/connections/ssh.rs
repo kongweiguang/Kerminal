@@ -39,7 +39,10 @@ use kerminal_domain::{
 use russh::{
     ChannelMsg,
     client::{self, AuthResult, Handle, Msg},
-    keys::{PrivateKeyWithHashAlg, agent::client::AgentClient},
+    keys::{
+        HashAlg, PrivateKeyWithHashAlg,
+        agent::client::{AgentClient, AgentStream},
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
@@ -1622,13 +1625,24 @@ async fn authenticate_peer(
                     Err(_) => return Err(AppError::timeout("SSH private-key decoding")),
                 }
             };
-            let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            // RSA 服务器常同时公布 rsa-sha2-* 并拒绝旧 ssh-rsa；必须按当前 peer 的
+            // server-sig-algs 选择哈希，否则同一 id_rsa 在 OpenSSH 可用而这里认证失败。
+            // 协商与签名共用一次认证超时，避免扩展信息等待另占一份完整预算。
             let mut handle = session.handle.lock().await;
             tokio::select! {
                 _ = cancel.cancelled() => return Err(AppError::cancelled("SSH authentication cancelled")),
-                result = tokio::time::timeout(connect_timeout(timeout_ms), handle.authenticate_publickey(username, key)) => match result {
+                result = tokio::time::timeout(connect_timeout(timeout_ms), async {
+                    let rsa_hash = if key.algorithm().is_rsa() {
+                        negotiated_rsa_hash(&handle).await?
+                    } else {
+                        None
+                    };
+                    let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
+                    handle.authenticate_publickey(username, key).await
+                        .map_err(|error| russh_error("SSH public-key authentication failed", error))
+                }) => match result {
                     Ok(Ok(result)) => result,
-                    Ok(Err(error)) => return Err(russh_error("SSH public-key authentication failed", error)),
+                    Ok(Err(error)) => return Err(error),
                     Err(_) => return Err(AppError::timeout("SSH authentication")),
                 }
             }
@@ -1678,31 +1692,84 @@ async fn authenticate_agent(
 
     #[cfg(any(unix, windows))]
     {
-        let identities = tokio::select! {
-            _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent identity request cancelled")),
-            result = tokio::time::timeout(connect_timeout(timeout_ms), agent.request_identities()) => match result {
-                Ok(Ok(identities)) => identities,
-                Ok(Err(error)) => return Err(unavailable_ssh_agent(error)),
-                Err(_) => return Err(AppError::timeout("SSH agent identity request")),
+        authenticate_agent_identities(session, &mut agent, cancel, timeout_ms).await
+    }
+}
+
+/// 逐个尝试 agent 身份。RSA 身份按当前 peer 公布的 server-sig-algs 选择 SHA-2，非 RSA
+/// 身份继续传 `None`；协商结果在同一 peer 内缓存，避免每个身份重复等待扩展信息。
+///
+/// @author kongweiguang
+async fn authenticate_agent_identities<S>(
+    session: &Arc<RusshPeerSession>,
+    agent: &mut AgentClient<S>,
+    cancel: &CancellationToken,
+    timeout_ms: u64,
+) -> AppResult<()>
+where
+    S: AgentStream + Send + Unpin,
+{
+    let identities = tokio::select! {
+        _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent identity request cancelled")),
+        result = tokio::time::timeout(connect_timeout(timeout_ms), agent.request_identities()) => match result {
+            Ok(Ok(identities)) => identities,
+            Ok(Err(error)) => return Err(unavailable_ssh_agent(error)),
+            Err(_) => return Err(AppError::timeout("SSH agent identity request")),
+        }
+    };
+    let mut handle = session.handle.lock().await;
+    // 外层 None 表示尚未查询；Some(None) 表示服务端明确未公布 SHA-2，应沿用旧签名。
+    let mut rsa_hash: Option<Option<HashAlg>> = None;
+    for identity in identities {
+        let public_key = identity.public_key().into_owned();
+        let is_rsa = public_key.algorithm().is_rsa();
+        let cached_rsa_hash = rsa_hash;
+        let (result, used_rsa_hash) = tokio::select! {
+            _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent authentication cancelled")),
+            result = tokio::time::timeout(connect_timeout(timeout_ms), async {
+                // RSA 身份的协商与本次签名共用同一认证超时，避免每个身份额外增加一份等待预算。
+                let hash_alg = if is_rsa {
+                    match cached_rsa_hash {
+                        Some(hash) => hash,
+                        None => negotiated_rsa_hash(&handle).await?,
+                    }
+                } else {
+                    None
+                };
+                let result = handle
+                    .authenticate_publickey_with(session.endpoint.username.clone(), public_key, hash_alg, agent)
+                    .await
+                    .map_err(|error| AppError::infrastructure_with_source("SSH agent signing failed", error))?;
+                Ok::<_, AppError>((result, hash_alg))
+            }) => match result {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(AppError::timeout("SSH agent authentication")),
             }
         };
-        let mut handle = session.handle.lock().await;
-        for identity in identities {
-            let public_key = identity.public_key().into_owned();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => return Err(AppError::cancelled("SSH agent authentication cancelled")),
-                result = tokio::time::timeout(connect_timeout(timeout_ms), handle.authenticate_publickey_with(session.endpoint.username.clone(), public_key, None, &mut agent)) => match result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => return Err(AppError::infrastructure_with_source("SSH agent signing failed", error)),
-                    Err(_) => return Err(AppError::timeout("SSH agent authentication")),
-                }
-            };
-            if result == AuthResult::Success {
-                return Ok(());
-            }
+        // 只缓存 RSA 身份的结果；非 RSA 的 None 不覆盖“尚未查询”状态。
+        if is_rsa {
+            rsa_hash = Some(used_rsa_hash);
         }
-        Err(AppError::authentication_failed())
+        if result == AuthResult::Success {
+            return Ok(());
+        }
     }
+    Err(AppError::authentication_failed())
+}
+
+/// 查询当前 peer 的 RSA 签名算法。服务端未支持扩展或没有公布 SHA-2 时返回 `None`，
+/// 沿用 russh 原有的旧 ssh-rsa 签名以保持老服务器兼容；认证被拒后不静默降级重试，
+/// 避免把真实的授权失败掩盖成算法回退。调用方把本调用放在既有认证超时与取消范围内，
+/// 因此这里不再单独叠加超时；russh 内部等待扩展信息最多 1 秒。
+///
+/// @author kongweiguang
+async fn negotiated_rsa_hash(handle: &Handle<RusshHandler>) -> AppResult<Option<HashAlg>> {
+    handle
+        .best_supported_rsa_hash()
+        .await
+        .map(|rsa_hash| rsa_hash.flatten())
+        .map_err(|error| russh_error("SSH RSA signature negotiation failed", error))
 }
 
 /// 将认证提供方不可用转为稳定认证分类，底层原因仅留在受控的诊断链中。
@@ -1932,6 +1999,16 @@ mod disconnect_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/ssh_agent_error.rs"]
 mod agent_error_tests;
+
+// 单元测试需要 RSA 夹具；夹具只有常量，避免把集成测试的 app 适配层编进 lib。
+#[cfg(test)]
+#[path = "../../tests/support/ssh_test_keys.rs"]
+#[allow(dead_code, reason = "单元测试只需 RSA，其余密钥由集成测试使用")]
+mod ssh_test_keys;
+
+#[cfg(test)]
+#[path = "../../tests/unit/ssh_rsa_negotiation.rs"]
+mod rsa_negotiation_tests;
 
 #[cfg(test)]
 #[path = "../../tests/unit/ssh_proxy_reference.rs"]

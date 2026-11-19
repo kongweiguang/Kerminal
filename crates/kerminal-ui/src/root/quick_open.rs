@@ -151,6 +151,8 @@ impl RootView {
             return;
         }
         self.quick_open_modal_open = false;
+        // 模态面板接收按键释放；归还原焦点前清除终端旧记录，避免下一次长按误用旧手势。
+        self.clear_keybinding_chord();
         let return_focus = self.quick_open_return_focus.take();
         let binding = match event {
             QuickOpenEvent::Dismissed { origin_binding } => origin_binding.as_ref(),

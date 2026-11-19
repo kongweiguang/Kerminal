@@ -13,7 +13,7 @@ use std::{
 use std::fs::File;
 
 use kerminal_application::{
-    AppError, AppResult,
+    AppError, AppResult, PublicErrorCode,
     agents::{
         AgentProviderSessionSnapshot, AgentProviderSessionStatus, AgentResumeCheckpoint,
         AgentResumeCheckpointPhase, AgentResumeCheckpointSnapshot, AgentWorkspaceDocumentKind,
@@ -484,6 +484,18 @@ impl AgentSessionStore {
         &self,
         id: &AgentSessionId,
     ) -> AppResult<(AgentSession, AgentWorkspaceRevision)> {
+        self.read_session_entry(id)
+            .await?
+            .ok_or_else(|| AppError::not_found("Agent session not found"))
+    }
+
+    /// 将已证实未提交并回收的预留与缺少元数据的损坏会话区分开。
+    ///
+    /// @author kongweiguang
+    async fn read_session_entry(
+        &self,
+        id: &AgentSessionId,
+    ) -> AppResult<Option<(AgentSession, AgentWorkspaceRevision)>> {
         let store = self.clone();
         let id = id.clone();
         tokio::task::spawn_blocking(move || store.read_session_blocking(&id))
@@ -590,7 +602,8 @@ impl AgentSessionStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(io_error(error)),
         };
-        let mut sessions = Vec::new();
+        // 先完成枚举，再恢复单个会话，避免目录重命名干扰 Windows 枚举器。
+        let mut ids = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(io_error)? {
             let entry_type = entry.file_type().await.map_err(io_error)?;
             if entry_type.is_symlink() {
@@ -608,8 +621,14 @@ impl AgentSessionStore {
             if validate_path_id(&id).is_err() {
                 continue;
             }
-            match self.read_session(&id).await {
-                Ok((session, revision)) => sessions.push((session, revision)),
+            ids.push(id);
+        }
+        drop(entries);
+        let mut sessions = Vec::new();
+        for id in ids {
+            match self.read_session_entry(&id).await {
+                Ok(Some((session, revision))) => sessions.push((session, revision)),
+                Ok(None) => {}
                 Err(error)
                     if error.public_code() == kerminal_application::PublicErrorCode::NotFound =>
                 {
@@ -665,17 +684,26 @@ impl AgentSessionStore {
         Ok(())
     }
 
-    /// 原始 session 读取必须与 journal 恢复在同一锁内完成，revision 对应返回的字节。
+    /// journal 回读、预留回收与 session 读取共享锁，避免列表看见中间状态。
+    ///
+    /// @author kongweiguang
     fn read_session_blocking(
         &self,
         id: &AgentSessionId,
-    ) -> AppResult<(AgentSession, AgentWorkspaceRevision)> {
-        let root = self
-            .canonical_root_if_present()?
-            .ok_or_else(|| AppError::not_found("Agent session not found"))?;
+    ) -> AppResult<Option<(AgentSession, AgentWorkspaceRevision)>> {
+        let Some(root) = self.canonical_root_if_present()? else {
+            return Ok(None);
+        };
         let _lock = self.storage.lock().map_err(storage_lock_error)?;
         let session_root = self.session_root(id)?;
-        ensure_existing_session_directory(&root, &session_root)?;
+        match ensure_existing_session_directory(&root, &session_root) {
+            Ok(()) => {}
+            Err(error) if error.public_code() == PublicErrorCode::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        if discard_unpublished_creation(&root, &session_root, id, None)? {
+            return Ok(None);
+        }
         recover_workspace_transaction(&root, &session_root, id)?;
         let metadata_path = session_root.join("session.toml");
         let bytes = read_required_file(&root, &session_root, &metadata_path)?;
@@ -688,7 +716,7 @@ impl AgentSessionStore {
         if session.agent_session_id != *id {
             return Err(AppError::configuration_corrupt("Agent session"));
         }
-        Ok((session, revision))
+        Ok(Some((session, revision)))
     }
 
     /// 在同一锁内读取 session 与 provider，确保状态、路径和 revision 指向同一磁盘快照。
@@ -1206,7 +1234,7 @@ impl AgentSessionStore {
             }
         }
         journal.phase = WorkspaceTransactionPhase::Prepared;
-        write_journal(session_root, &journal, CommitMode::ReplaceExisting)?;
+        publish_prepared_journal(root, session_root, id, &journal, commit_staged_file)?;
         recover_workspace_transaction(root, session_root, id)?;
 
         let mut receipts = Vec::with_capacity(journal.entries.len());
@@ -1286,12 +1314,15 @@ impl AgentSessionStore {
 
     /// 校验现有目录的 canonical path，避免读历史会话时跟随配置根内的外部目录链接。
     async fn ensure_directory_is_contained(&self, path: &Path) -> AppResult<()> {
-        fs::create_dir_all(&self.workspace_root)
-            .await
-            .map_err(io_error)?;
         let canonical_root = fs::canonicalize(&self.workspace_root)
             .await
-            .map_err(io_error)?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::not_found("Agent workspace root not found")
+                } else {
+                    io_error(error)
+                }
+            })?;
         let canonical_path = fs::canonicalize(path).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 AppError::not_found("Agent session directory not found")
@@ -1358,7 +1389,7 @@ impl AgentSessionStore {
 }
 
 /// 持久化 journal 只存固定路径与哈希，不重复写入包含 launch env 的文档正文。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct WorkspaceTransactionJournal {
     schema_version: u32,
@@ -1378,7 +1409,7 @@ enum WorkspaceTransactionPhase {
 }
 
 /// 每项 journal 绑定固定文档类型、兄弟 staging 路径及提交前后的原始字节哈希。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct WorkspaceTransactionEntry {
     kind: String,
@@ -1405,6 +1436,242 @@ fn validate_path_id(id: &AgentSessionId) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+/// 发布失败时只用持锁回读判定首次创建未提交，不能依据 Win32 错误码推定结果。
+///
+/// @author kongweiguang
+fn publish_prepared_journal(
+    root: &Path,
+    session_root: &Path,
+    id: &AgentSessionId,
+    journal: &WorkspaceTransactionJournal,
+    commit: impl FnOnce(&Path, &Path, CommitMode) -> Result<(), AtomicCommitError>,
+) -> AppResult<()> {
+    match write_journal_with_commit(session_root, journal, CommitMode::ReplaceExisting, commit) {
+        Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
+            match discard_unpublished_creation(root, session_root, id, Some(journal)) {
+                Ok(true) => Err(AppError::infrastructure_with_source(
+                    "Agent creation did not commit; its workspace reservation was released",
+                    error,
+                )),
+                Ok(false) => Err(error),
+                Err(recovery_error) => Err(error.with_source(recovery_error)),
+            }
+        }
+        result => result,
+    }
+}
+
+/// 识别首次创建的私有事务形状，避免把历史更新或 resume 误判为可回收预留。
+///
+/// @author kongweiguang
+fn is_initial_creation(journal: &WorkspaceTransactionJournal) -> bool {
+    journal.phase == WorkspaceTransactionPhase::Prepared
+        && journal.resume_attempt_id.is_none()
+        && journal
+            .entries
+            .iter()
+            .all(|entry| entry.before_sha256.is_none())
+        && journal.entries.iter().any(|entry| entry.kind == "session")
+        && journal.entries.iter().any(|entry| entry.kind == "provider")
+}
+
+/// 仅在 Prepared 没有发布、所有目标仍缺失且目录只含本次记录的材料时回收预留。
+/// 同时兼容旧读路径先清掉 Preparing 及文档 staging 后只剩 Prepared 暂存的现场。
+///
+/// @author kongweiguang
+fn discard_unpublished_creation(
+    root: &Path,
+    session_root: &Path,
+    id: &AgentSessionId,
+    expected: Option<&WorkspaceTransactionJournal>,
+) -> AppResult<bool> {
+    if expected.is_some_and(|journal| !is_initial_creation(journal)) {
+        return Ok(false);
+    }
+    match sync_fs::symlink_metadata(session_root.join("session.toml")) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
+    // 只接受创建入口生成的 UUID，历史 opaque ID 继续走普通损坏校验。
+    if !Uuid::parse_str(id.as_str()).is_ok_and(|uuid| uuid.to_string() == id.as_str()) {
+        return Ok(false);
+    }
+
+    let journal_path = session_root.join(JOURNAL_FILE);
+    let mut owned_paths = HashSet::new();
+    let active = if let Some(bytes) = read_optional_file(root, session_root, &journal_path)? {
+        let Ok(mut active) = serde_json::from_slice::<WorkspaceTransactionJournal>(&bytes) else {
+            return Ok(false);
+        };
+        if active.phase != WorkspaceTransactionPhase::Preparing {
+            return Ok(false);
+        }
+        active.phase = WorkspaceTransactionPhase::Prepared;
+        owned_paths.insert(journal_path);
+        Some(active)
+    } else {
+        None
+    };
+    let journal = if let Some(journal_stage) = find_unpublished_journal_stage(session_root)? {
+        let Some(bytes) = read_optional_file(root, session_root, &journal_stage)? else {
+            return Ok(false);
+        };
+        let Ok(staged) = serde_json::from_slice::<WorkspaceTransactionJournal>(&bytes) else {
+            return Ok(false);
+        };
+        if staged.phase != WorkspaceTransactionPhase::Prepared
+            || active.as_ref().is_some_and(|active| *active != staged)
+        {
+            return Ok(false);
+        }
+        owned_paths.insert(journal_stage);
+        staged
+    } else if let Some(active) = active {
+        // 进程可能在写 Prepared 暂存之前退出，活 Preparing 同样禁止提交任何目标。
+        active
+    } else {
+        return Ok(false);
+    };
+    if !is_initial_creation(&journal)
+        || validate_journal(&journal, session_root, id).is_err()
+        || expected.is_some_and(|expected| *expected != journal)
+    {
+        return Ok(false);
+    }
+
+    let mut owned_dirs = HashSet::new();
+    for entry in &journal.entries {
+        let (_, target, stage) = validated_entry_paths_with_target(session_root, entry)?;
+        if read_optional_file(root, session_root, &target)?.is_some()
+            || read_optional_file(root, session_root, &stage)?
+                .is_some_and(|bytes| sha256_hex(&bytes) != entry.after_sha256)
+        {
+            return Ok(false);
+        }
+        for parent in stage
+            .ancestors()
+            .skip(1)
+            .take_while(|path| *path != session_root)
+        {
+            owned_dirs.insert(parent.to_path_buf());
+        }
+        owned_paths.insert(stage);
+    }
+    if !contains_only_creation_paths(session_root, &owned_paths, &owned_dirs)? {
+        return Ok(false);
+    }
+
+    // 在删除任何证据前原子移出列表目录；中途失败仍保留可诊断材料，且不能覆盖其他目录。
+    // temp 属于配置同步保护范围，删除受阻时私有暂存也不会进入 Git。
+    let archive = root
+        .join("temp")
+        .join(format!(".aborted-agent-creation-{}", Uuid::new_v4()));
+    ensure_parent_sync(root, root, &archive)?;
+    commit_staged_file(session_root, &archive, CommitMode::MoveNoReplace).map_err(|error| {
+        AppError::outcome_unknown_with_source(
+            "Agent creation reservation cleanup is pending",
+            error,
+        )
+    })?;
+    remove_archived_creation(root, session_root, &archive, owned_paths, owned_dirs)?;
+    sync_directory(archive.parent().unwrap_or(root)).map_err(|error| {
+        AppError::outcome_unknown_with_source(
+            "Agent creation staging cleanup durability is unknown",
+            error,
+        )
+    })?;
+    Ok(true)
+}
+
+/// 逐项移除登记的材料，避免并发写入的未登记文件随隔离目录一起删除。
+///
+/// @author kongweiguang
+fn remove_archived_creation(
+    root: &Path,
+    session_root: &Path,
+    archive: &Path,
+    owned_paths: HashSet<PathBuf>,
+    owned_dirs: HashSet<PathBuf>,
+) -> AppResult<()> {
+    let archived_path = |path: &Path| {
+        path.strip_prefix(session_root)
+            .map(|relative| archive.join(relative))
+            .map_err(|_| AppError::invalid("Agent creation staging path escaped its reservation"))
+    };
+    let pending = |error| {
+        AppError::outcome_unknown_with_source("Agent creation staging cleanup is pending", error)
+    };
+    for path in owned_paths {
+        let path = archived_path(&path)?;
+        if ensure_existing_parent_sync(root, archive, &path)? {
+            remove_prepared_stage(&path).map_err(pending)?;
+        }
+    }
+    let mut directories: Vec<_> = owned_dirs.into_iter().collect();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match sync_fs::remove_dir(archived_path(&directory)?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(pending(error)),
+        }
+    }
+    sync_fs::remove_dir(archive).map_err(pending)
+}
+
+/// 仅接受唯一且由 journal 写入器格式化的暂存名，避免多笔事务之间借用证据。
+///
+/// @author kongweiguang
+fn find_unpublished_journal_stage(session_root: &Path) -> AppResult<Option<PathBuf>> {
+    let mut stage = None;
+    for entry in sync_fs::read_dir(session_root).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let Some(candidate) = name.to_str().and_then(|name| {
+            name.strip_prefix(JOURNAL_FILE)?
+                .strip_prefix('.')?
+                .strip_suffix(".agent-stage")
+        }) else {
+            continue;
+        };
+        let Ok(nonce) = Uuid::parse_str(candidate) else {
+            continue;
+        };
+        if journal_stage_path(session_root, &nonce) != entry.path() || stage.is_some() {
+            return Ok(None);
+        }
+        stage = Some(entry.path());
+    }
+    Ok(stage)
+}
+
+/// 清理前枚举实际目录，避免把未登记的文件、目录或链接当作本次创建的副产物。
+///
+/// @author kongweiguang
+fn contains_only_creation_paths(
+    directory: &Path,
+    owned_files: &HashSet<PathBuf>,
+    owned_dirs: &HashSet<PathBuf>,
+) -> AppResult<bool> {
+    for entry in sync_fs::read_dir(directory).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let kind = entry.file_type().map_err(io_error)?;
+        let path = entry.path();
+        if kind.is_file() && owned_files.contains(&path) {
+            continue;
+        }
+        if kind.is_dir()
+            && owned_dirs.contains(&path)
+            && contains_only_creation_paths(&path, owned_files, owned_dirs)?
+        {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// 在锁内幂等恢复一个 session journal；第三方内容不匹配时保留 journal 与 staging。
@@ -1540,6 +1807,18 @@ fn write_journal(
     journal: &WorkspaceTransactionJournal,
     mode: CommitMode,
 ) -> AppResult<()> {
+    write_journal_with_commit(session_root, journal, mode, commit_staged_file)
+}
+
+/// 保持失败路径与真实临时文件一致，使测试能在原子发布边界注入未知结果。
+///
+/// @author kongweiguang
+fn write_journal_with_commit(
+    session_root: &Path,
+    journal: &WorkspaceTransactionJournal,
+    mode: CommitMode,
+    commit: impl FnOnce(&Path, &Path, CommitMode) -> Result<(), AtomicCommitError>,
+) -> AppResult<()> {
     let bytes = serde_json::to_vec(journal).map_err(|error| {
         AppError::infrastructure_with_source(
             "Agent transaction journal serialization failed",
@@ -1550,7 +1829,7 @@ fn write_journal(
     write_new_synced_file(&stage, &bytes).map_err(|error| {
         io_error_with_context("Agent transaction journal staging failed", error)
     })?;
-    match commit_staged_file(&stage, &session_root.join(JOURNAL_FILE), mode) {
+    match commit(&stage, &session_root.join(JOURNAL_FILE), mode) {
         Ok(()) => Ok(()),
         Err(error @ AtomicCommitError::CommitUnknown(_)) => {
             Err(AppError::outcome_unknown_with_source(

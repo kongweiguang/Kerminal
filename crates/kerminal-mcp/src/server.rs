@@ -23,7 +23,7 @@ use axum::{
 use kerminal_application::{
     AppError, AppResult, PublicErrorCode, agents::AgentService, mcp_runtime::McpAccessToken,
 };
-use kerminal_domain::identity::AgentSessionId;
+use kerminal_domain::{agents::agent_mcp_endpoint, identity::AgentSessionId};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig,
     session::{SessionManager, local::LocalSessionManager},
@@ -307,7 +307,7 @@ impl McpServerHandle {
 
     /// 为受管 Agent 构造只注入首选目标上下文的 endpoint，保持审批仍由 MCP host 负责。
     pub fn agent_endpoint(&self, agent_session_id: &AgentSessionId) -> String {
-        format!("{}/agents/{}", self.endpoint, agent_session_id.as_str())
+        agent_mcp_endpoint(&self.endpoint, agent_session_id)
     }
 
     /// 便捷关闭入口使用短的本地预算；失败时保留句柄供组合根用共享 deadline 重试。

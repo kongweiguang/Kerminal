@@ -92,6 +92,21 @@ pub(super) async fn verify(
     if Keystroke::parse(recorded_key).map_err(io::Error::other)? != expected {
         return Err(io::Error::other("shortcut recorder captured a different key").into());
     }
+    const ADD_STROKE: &str = "shortcut-add-stroke-settings.open-windows";
+    reveal_settings_selector(cx, root, window, "shortcuts", ADD_STROKE).await?;
+    click_selector(cx, window, ADD_STROKE)?;
+    wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+        state.shortcut_capture_recording()
+    })
+    .await?;
+    press_key(cx, window, "ctrl-f12")?;
+    wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
+        !state.shortcut_capture_recording()
+            && state
+                .shortcut_capture_strokes()
+                .is_some_and(|keys| keys.len() == 2)
+    })
+    .await?;
     reveal_settings_selector(cx, root, window, "shortcuts", CONFIRM).await?;
     click_selector(cx, window, CONFIRM)?;
     wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
@@ -99,15 +114,21 @@ pub(super) async fn verify(
     })
     .await?;
     let saved = load_persisted_settings(services).await?;
-    if Keystroke::parse(
-        &binding(&saved.settings)?
-            .replace('+', "-")
-            .to_ascii_lowercase(),
-    )
-    .map_err(io::Error::other)?
-        != expected
+    let saved_keys = binding(&saved.settings)?
+        .replace('+', "-")
+        .to_ascii_lowercase();
+    let saved_strokes = saved_keys
+        .split_whitespace()
+        .map(Keystroke::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?;
+    if saved_strokes
+        != [
+            expected,
+            Keystroke::parse("ctrl-f12").map_err(io::Error::other)?,
+        ]
     {
-        return Err(io::Error::other("recorded shortcut did not persist").into());
+        return Err(io::Error::other("recorded chord did not persist").into());
     }
 
     click_selector(cx, window, "preferences-close")?;
@@ -123,6 +144,10 @@ pub(super) async fn verify(
         return Err(io::Error::other("old settings shortcut still opens the modal").into());
     }
     press_key(cx, window, "ctrl-shift-f12")?;
+    if root_state(cx, root, window)?.modal_open() {
+        return Err(io::Error::other("the first stroke opened settings on its own").into());
+    }
+    press_key(cx, window, "ctrl-f12")?;
     wait_for_state(cx, root, window, Instant::now() + ACTION_TIMEOUT, |state| {
         state.modal_open() && state.settings_ready() && state.draft_ready()
     })
@@ -185,6 +210,154 @@ pub(super) async fn verify(
     }
 
     Ok(checks)
+}
+
+/// 通过隐藏窗口的生产焦点和真实 PTY 输入代次检查分流，避免 Shell 吞掉控制序列后误判通过。
+///
+/// @author kongweiguang
+pub(super) async fn verify_terminal_input(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    services: &kerminal_ui::AppServices,
+    context: &AcceptanceContext,
+) -> Result<(), Box<dyn Error>> {
+    press_key(cx, window, "alt-f12")?;
+    let initial = suggestions::wait_state(cx, root, window, "terminal keyboard focus", |state| {
+        state.focused && state.input_idle && !state.ssh_fixture
+    })
+    .await?;
+    let read_version = |id: &kerminal_domain::identity::SessionId| {
+        let sessions = services.sessions.clone();
+        let id = id.clone();
+        services
+            .executor
+            .run(move |_| async move { Ok(sessions.terminal_command_context(id).await?.version()) })
+    };
+    let before = read_version(&initial.binding.session_id).await?;
+    press_key(cx, window, "ctrl-insert")?;
+    suggestions::wait_state(cx, root, window, "Ctrl+Insert stays local", |state| {
+        state.binding == initial.binding && state.focused && state.input_idle
+    })
+    .await?;
+    if read_version(&initial.binding.session_id).await? != before {
+        return Err(io::Error::other("Ctrl+Insert wrote to PTY without a selection").into());
+    }
+    press_key(cx, window, "ctrl-b")?;
+    suggestions::wait_state(cx, root, window, "Shell Ctrl+B completion", |state| {
+        state.binding == initial.binding && state.focused && state.input_idle
+    })
+    .await?;
+    let after = read_version(&initial.binding.session_id).await?;
+    if after.session_generation != before.session_generation
+        || after.input_generation != before.input_generation + 1
+    {
+        return Err(io::Error::other(format!(
+            "Ctrl+Insert and Ctrl+B must produce exactly one PTY input: {before:?} -> {after:?}"
+        ))
+        .into());
+    }
+
+    press_key(cx, window, "ctrl-f")?;
+    suggestions::wait_state(cx, root, window, "terminal search focus", |state| {
+        state.binding == initial.binding && !state.focused && state.input_idle
+    })
+    .await?;
+    press_key(cx, window, "escape")?;
+    suggestions::wait_state(
+        cx,
+        root,
+        window,
+        "search restores terminal focus",
+        |state| state.binding == initial.binding && state.focused && state.input_idle,
+    )
+    .await?;
+    repeat_then_release_key(cx, window, "escape")?;
+    suggestions::wait_state(cx, root, window, "held Escape stays local", |state| {
+        state.binding == initial.binding && state.focused && state.input_idle
+    })
+    .await?;
+    if read_version(&initial.binding.session_id).await? != after {
+        return Err(io::Error::other("terminal search or held Escape wrote to PTY").into());
+    }
+    press_key(cx, window, "ctrl-shift-t")?;
+    let second = suggestions::wait_state(cx, root, window, "new local tab", |state| {
+        state.binding != initial.binding && state.focused && state.input_idle && !state.ssh_fixture
+    })
+    .await?;
+    // 切换会改变窗口布局，Shell 可以重绘提示符；只比较两个 PTY 的输入代次。
+    let first_before_switch = read_version(&initial.binding.session_id).await?;
+    let second_before_switch = read_version(&second.binding.session_id).await?;
+    for (key, target) in [
+        ("alt-left", &initial.binding),
+        ("alt-right", &second.binding),
+    ] {
+        press_key(cx, window, key)?;
+        suggestions::wait_state(cx, root, window, key, |state| {
+            state.binding == *target && state.focused && state.input_idle
+        })
+        .await?;
+    }
+    let first_after_switch = read_version(&initial.binding.session_id).await?;
+    let second_after_switch = read_version(&second.binding.session_id).await?;
+    if first_before_switch.input_generation != after.input_generation
+        || first_after_switch.input_generation != first_before_switch.input_generation
+        || second_after_switch.input_generation != second_before_switch.input_generation
+    {
+        return Err(io::Error::other(format!(
+            "tab shortcuts changed a PTY input generation: {after:?}, {first_before_switch:?} -> {first_after_switch:?}; {second_before_switch:?} -> {second_after_switch:?}"
+        ))
+        .into());
+    }
+    for key in ["ctrl-p", "ctrl-shift-p"] {
+        press_key(cx, window, key)?;
+        let deadline = Instant::now() + ACTION_TIMEOUT;
+        // 等焦点陷阱落在实际窗口，避免仅凭快捷键被消费就判定面板已打开。
+        loop {
+            let opened = window.update(cx, |_, window, app| {
+                draw_acceptance_frame(window, app);
+                selector_bounds(window, "quick-open-modal").is_ok()
+                    && gpui_kit::base::active_focus_trap(window, app).is_some()
+            })?;
+            if opened {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!("{key} did not open the palette")).into());
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        press_key(cx, window, "escape")?;
+        suggestions::wait_state(cx, root, window, "palette returns focus", |state| {
+            state.binding == second.binding && state.focused && state.input_idle
+        })
+        .await?;
+    }
+    if read_version(&second.binding.session_id)
+        .await?
+        .input_generation
+        != second_after_switch.input_generation
+    {
+        return Err(io::Error::other("palette shortcuts changed the PTY input generation").into());
+    }
+    let report = serde_json::json!({
+        "ctrl_p_quick_open": true,
+        "ctrl_shift_p_command_palette": true,
+        "ctrl_insert_without_selection_writes": 0,
+        "ctrl_b_pty_writes": 1,
+        "ctrl_f_and_escape_restore_focus": true,
+        "held_escape_after_search_writes": 0,
+        "ctrl_shift_t_creates_tab": true,
+        "alt_left_previous_tab": true,
+        "alt_right_next_tab": true
+    });
+    std::fs::write(
+        context.output_directory.join("terminal-shortcuts.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    Ok(())
 }
 
 /// 等待录制专用焦点真正挂载，避免隐藏窗口将组合键发送给旧焦点。

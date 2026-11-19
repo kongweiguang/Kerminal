@@ -130,11 +130,24 @@ pub(crate) async fn target_context(
                 terminal_summary,
                 max_bytes,
             ) {
-                Ok(value) => terminal_tools::success(
-                    "已读取 Agent 目标上下文。".to_owned(),
-                    value,
-                    Vec::new(),
-                ),
+                Ok(value) => {
+                    // scoped endpoint 的提示反映已提交设置；全局/测试装配保持原空提示。
+                    let hints = if services.agent_scope.is_some() {
+                        terminal_tools::agent_routing_hints(
+                            services,
+                            context.target.resolved_session_id.is_some(),
+                        )
+                        .await
+                    } else {
+                        Vec::new()
+                    };
+                    terminal_tools::success_with_hints(
+                        "已读取 Agent 目标上下文。".to_owned(),
+                        value,
+                        Vec::new(),
+                        hints,
+                    )
+                }
                 Err(error) => terminal_tools::failure(error),
             }
         }

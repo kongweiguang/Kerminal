@@ -503,6 +503,7 @@ fn close_failed_ticket_admits_history_work_but_not_input_or_live_resize() {
             command_line_ticket: None,
             origin: InputOrigin::Direct,
             wheel_input: false,
+            plain_text_origin: false,
             #[cfg(feature = "acceptance-metrics")]
             echo_probe_id: None,
         })),

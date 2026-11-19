@@ -2,7 +2,13 @@
 //!
 //! @author kongweiguang
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use kerminal_application::sessions::{UiInputProjection, UiSessionBinding, UiTerminalInputRequest};
 use kerminal_domain::{
@@ -17,6 +23,45 @@ use kerminal_domain::commands::SuggestionQueryMode;
 
 const MAX_WHEEL_BATCH_EVENTS: usize = 256;
 const MAX_WHEEL_BATCH_BYTES: usize = 8 * 1024;
+const MAX_PLAIN_TEXT_BATCH: usize = 32;
+const BATCH_STOPPED: usize = MAX_PLAIN_TEXT_BATCH + 1;
+
+/// 已出队的字符仍可被关闭流程撤销。把准入游标与取消位放在同一原子值，避免检查与开始写入之间的竞态。
+#[derive(Default)]
+pub(super) struct PlainTextDispatch(AtomicUsize);
+
+impl PlainTextDispatch {
+    /// 与撤销争用同一个原子游标。只有已经取得当前项资格的后台任务可以完成它。
+    ///
+    /// @author kongweiguang
+    pub(super) fn begin_next(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                (next < MAX_PLAIN_TEXT_BATCH).then_some(next + 1)
+            })
+            .is_ok()
+    }
+
+    /// 关闭失败后原绑定可能恢复，旧批次的回执仍不能覆盖恢复后的状态。
+    ///
+    /// @author kongweiguang
+    pub(super) fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Acquire) == BATCH_STOPPED
+    }
+
+    /// 返回已经开始的项数，让关闭流程计入批次中真正尚未派发的字符。重复取消不重复计数。
+    ///
+    /// @author kongweiguang
+    fn stop(&self) -> usize {
+        self.0.swap(BATCH_STOPPED, Ordering::AcqRel)
+    }
+}
+
+/// 小批沿用单个在途槽位，并把可取消边界随原始输入交给共享执行器。
+pub(super) struct PlainTextBatch {
+    pub(super) dispatch: Arc<PlainTextDispatch>,
+    pub(super) following: Vec<UiInputWork>,
+}
 
 /// 焦点通告和释放事件不更改编辑内容，其余协议输入保守视为可能改变 Shell 行状态。
 fn input_can_change_editing(event: &TerminalInputEvent) -> bool {
@@ -97,6 +142,8 @@ pub(super) struct UiInputWork {
     pub command_line_ticket: Option<CommandLineInputTicket>,
     pub origin: InputOrigin,
     pub(super) wheel_input: bool,
+    /// 由 pane 文本入口标记，IME 提交和程序合成输入保持各自的单项派发。
+    pub(super) plain_text_origin: bool,
     /// Acceptance-metrics-only correlation; never crosses the application/session API.
     #[cfg(feature = "acceptance-metrics")]
     pub echo_probe_id: Option<String>,
@@ -116,6 +163,7 @@ impl UiInputWork {
             command_line_ticket: None,
             origin: InputOrigin::Direct,
             wheel_input: false,
+            plain_text_origin: false,
             #[cfg(feature = "acceptance-metrics")]
             echo_probe_id: None,
         }
@@ -128,6 +176,24 @@ impl UiInputWork {
         let mut work = Self::new(request, None);
         work.wheel_input = true;
         work
+    }
+
+    /// 仅合批一个可打印 ASCII 字符，避免跨过 Enter、IME、Kitty 事件、CAS 或诊断探针的独立回执边界。
+    ///
+    /// @author kongweiguang
+    fn is_batchable_plain_text(&self) -> bool {
+        #[cfg(feature = "acceptance-metrics")]
+        if self.echo_probe_id.is_some() {
+            return false;
+        }
+        self.plain_text_origin
+            && !self.wheel_input
+            && self.acceptance.is_none()
+            && self.origin == InputOrigin::Direct
+            && self.request.expected_context.is_none()
+            && matches!(&self.request.binding.owner, SessionOwner::Ui { .. })
+            && matches!(&self.request.event, TerminalInputEvent::Text(text)
+                if matches!(text.as_bytes(), [b' '..=b'~']))
     }
 }
 
@@ -260,6 +326,7 @@ struct SessionLane {
     scheduled: bool,
     in_flight: bool,
     in_flight_history_resize_size: Option<TerminalSize>,
+    plain_text_dispatch: Option<(Arc<PlainTextDispatch>, usize)>,
 }
 
 struct ActiveBroadcast {
@@ -535,6 +602,12 @@ impl SessionCommandQueues {
                     .saturating_sub(work_input_size(&work));
             }
             lane.scheduled = false;
+            if let Some((dispatch, count)) = &lane.plain_text_dispatch {
+                let unsent = count.saturating_sub(dispatch.stop());
+                dropped.commands += unsent;
+                dropped.input_events += unsent;
+                dropped.input_bytes += unsent; // 每项准入时已限定为一个 ASCII 字节。
+            }
             lane.in_flight
         } else {
             return dropped;
@@ -588,7 +661,49 @@ impl SessionCommandQueues {
         None
     }
 
-    /// 工作结果已处理后调度 FIFO 下一项；关闭与重试不在此队列中执行。
+    /// 只从当前在途项之后取相同绑定的连续普通文本，沿用已占用的并发槽。没有积压时保留单字符快路径。
+    /// 离开队列后直接使用连续批次存储，避免继续保留队列元素的独立堆分配。
+    ///
+    /// @author kongweiguang
+    pub(super) fn take_plain_text_following(
+        &mut self,
+        first: &UiInputWork,
+    ) -> Option<PlainTextBatch> {
+        if !first.is_batchable_plain_text() {
+            return None;
+        }
+        let lane = self.lanes.get_mut(&first.request.binding.session_id)?;
+        if !lane.in_flight || lane.plain_text_dispatch.is_some() {
+            return None;
+        }
+        let mut following = Vec::new();
+        while following.len() < MAX_PLAIN_TEXT_BATCH - 1 {
+            let Some(SessionWork::UiInput(next)) = lane.pending.front() else {
+                break;
+            };
+            if next.request.binding != first.request.binding || !next.is_batchable_plain_text() {
+                break;
+            }
+            if let Some(SessionWork::UiInput(next)) = lane.pending.pop_front() {
+                following.push(*next);
+            }
+        }
+        if following.is_empty() {
+            return None;
+        }
+        self.queued_commands -= following.len();
+        self.queued_input_bytes -= following.len();
+        let dispatch = Arc::new(PlainTextDispatch::default());
+        lane.plain_text_dispatch = Some((Arc::clone(&dispatch), following.len() + 1));
+        Some(PlainTextBatch {
+            dispatch,
+            following,
+        })
+    }
+
+    /// 工作结果已处理后调度 FIFO 下一项；不让批次的旧取消状态进入下一项。
+    ///
+    /// @author kongweiguang
     pub fn complete(&mut self, session_id: &SessionId) -> bool {
         if !self.in_flight.remove(session_id) {
             return false;
@@ -596,6 +711,7 @@ impl SessionCommandQueues {
         let Some(lane_is_empty) = self.lanes.get_mut(session_id).map(|lane| {
             lane.in_flight = false;
             lane.in_flight_history_resize_size = None;
+            lane.plain_text_dispatch = None;
             lane.pending.is_empty()
         }) else {
             return true;
@@ -778,6 +894,7 @@ impl SessionLane {
             scheduled: false,
             in_flight: false,
             in_flight_history_resize_size: None,
+            plain_text_dispatch: None,
         }
     }
 }

@@ -323,6 +323,7 @@ $script:ExpectedKeywordAdjustmentChecks = @(
     [pscustomobject]@{ Action = 'keyword-limit-and-footer'; File = 'settings-functional-keyword-limit-footer.png' }
 )
 $script:ExpectedTerminalChecks = @(
+    [pscustomobject]@{ Action = 'terminal-assistant-command-routing'; File = 'settings-functional-terminal-assistant-routing.png' },
     [pscustomobject]@{ Action = 'terminal-theme-and-live-palette'; File = 'settings-functional-terminal-theme.png' },
     [pscustomobject]@{ Action = 'terminal-system-font-search'; File = 'settings-functional-terminal-font.png' },
     [pscustomobject]@{ Action = 'terminal-font-size-step-and-bounds'; File = 'settings-functional-terminal-font-size.png' },
@@ -2085,7 +2086,8 @@ function Assert-SettingsParityReport {
     }
     if ($SuggestionsOnly) {
         # 终端专项没有打开设置弹窗；仍严格检查所有操作、主题和本轮截图。
-        $expectedChecks = @('history-recorded', 'ghost-at-cursor', 'native-tab-recovers', 'cursor-move-recovers', 'right-append-same-prompt',
+        $expectedChecks = @('history-recorded', 'simulated-ime-chinese-commit-once-and-cancel',
+            'ghost-at-cursor', 'native-tab-recovers', 'cursor-move-recovers', 'right-append-same-prompt',
             'menu-inside-pane', 'enter-append-same-prompt', 'escape-suppresses',
             'mouse-dismiss-keeps-input', 'mouse-append-same-prompt', 'mouse-accept-keeps-input')
         $expectedSuggestionCaptures = 6

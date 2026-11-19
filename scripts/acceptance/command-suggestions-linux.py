@@ -148,7 +148,8 @@ class PrivateSshServer:
             "PermitTTY yes",
             "Subsystem sftp internal-sftp",
             "LogLevel VERBOSE",
-            f"SetEnv HOME={self.home} BASH_ENV=/dev/null ENV=/dev/null HISTFILE=/dev/null",
+            # 固定 UTF-8 locale，避免隔离 sshd 继承 C locale 后 Readline 误解中文输入字节。
+            f"SetEnv HOME={self.home} BASH_ENV=/dev/null ENV=/dev/null HISTFILE=/dev/null LANG=C.UTF-8 LC_ALL=C.UTF-8",
             "",
         ]), encoding="utf-8")
         subprocess.run(["/usr/sbin/sshd", "-t", "-f", str(configuration)], check=True, timeout=10)

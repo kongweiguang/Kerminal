@@ -6,7 +6,7 @@ use super::draft::{CloseRequest, ConfigDraft, DraftSnapshot, DraftStatus, DraftT
 use super::panel::parse_environment;
 use super::validation::{
     KeybindingDraft, KeyboardPlatform, ProfileIssueKind, SettingsDraft, SettingsIssueKind,
-    validate_profile, validate_settings,
+    missing_default_keybindings, validate_profile, validate_settings,
 };
 use super::{InterfaceLanguage, KeybindingScope, ProfileDraft, ThemeMode};
 
@@ -522,6 +522,119 @@ fn unknown_keybinding_action_is_visible_but_non_blocking() {
         .expect("unknown action should be diagnosed");
     assert!(diagnostic.message.contains("future.action"));
     assert!(!diagnostic.blocks_save());
+}
+
+/// 已保存的终端保留键必须按当前平台的有效值给出诊断；非终端作用域只提示，不阻断保存。
+///
+/// @author kongweiguang
+#[test]
+fn reserved_terminal_bindings_are_diagnosed_from_effective_platform_values() {
+    let mut settings = settings_draft();
+    settings.keybindings = vec![
+        keybinding(
+            "terminal.paste",
+            KeybindingScope::Terminal,
+            "Ctrl+Shift+C",
+            "Cmd+V",
+        ),
+        keybinding("tool.system", KeybindingScope::Global, "Ctrl+C", "Cmd+3"),
+    ];
+
+    let windows = validate_settings(&settings, KeyboardPlatform::Windows);
+    let paste = windows
+        .iter()
+        .find(|issue| {
+            issue.kind == SettingsIssueKind::InvalidKeybinding
+                && issue
+                    .actions
+                    .iter()
+                    .any(|action| action == "terminal.paste")
+        })
+        .expect("terminal-scoped Ctrl+Shift+C can never dispatch");
+    assert!(paste.blocks_save());
+
+    let global = windows
+        .iter()
+        .find(|issue| {
+            issue.kind == SettingsIssueKind::TerminalReservedKeybinding
+                && issue.actions.iter().any(|action| action == "tool.system")
+        })
+        .expect("global Ctrl+C still works outside the terminal");
+    assert!(!global.blocks_save());
+
+    // macOS 的粘贴动作使用 Cmd+V，Windows/Linux 字段在该平台不生效，不能继续报告终端作用域错误。
+    let mac = validate_settings(&settings, KeyboardPlatform::Mac);
+    assert!(!mac.iter().any(|issue| {
+        issue.kind == SettingsIssueKind::InvalidKeybinding
+            && issue
+                .actions
+                .iter()
+                .any(|action| action == "terminal.paste")
+    }));
+}
+
+/// Ctrl+Insert 只是未配置时的默认复制手势；显式保存到终端动作后应可直接执行。
+///
+/// @author kongweiguang
+#[test]
+fn configured_ctrl_insert_remains_saveable_on_windows_and_linux() {
+    let mut settings = settings_draft();
+    settings.keybindings = vec![keybinding(
+        "terminal.paste",
+        KeybindingScope::Terminal,
+        "Ctrl+Insert",
+        "Cmd+V",
+    )];
+
+    for platform in [KeyboardPlatform::Windows, KeyboardPlatform::Linux] {
+        let issues = validate_settings(&settings, platform);
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue.kind,
+                SettingsIssueKind::InvalidKeybinding
+                    | SettingsIssueKind::TerminalReservedKeybinding
+            ) && issue
+                .actions
+                .iter()
+                .any(|action| action == "terminal.paste")),
+            "Ctrl+Insert must stay saveable on {platform:?}"
+        );
+    }
+}
+
+/// 恢复缺失动作只补齐默认目录中不存在的 action，未知行和显式清空的已有行都不被替换。
+///
+/// @author kongweiguang
+#[test]
+fn missing_default_keybindings_keep_existing_and_unknown_rows() {
+    let existing = vec![
+        keybinding("terminal.paste", KeybindingScope::Terminal, "", ""),
+        keybinding(
+            "future.action",
+            KeybindingScope::Global,
+            "Ctrl+Alt+F",
+            "Cmd+Alt+F",
+        ),
+    ];
+
+    let missing = missing_default_keybindings(&existing);
+    assert!(
+        missing
+            .iter()
+            .any(|binding| binding.action == "settings.open")
+    );
+    assert!(
+        !missing
+            .iter()
+            .any(|binding| binding.action == "terminal.paste"),
+        "an explicitly disabled row must stay in place"
+    );
+    assert!(
+        !missing
+            .iter()
+            .any(|binding| binding.action == "future.action"),
+        "unknown rows must not be duplicated"
+    );
 }
 
 /// Profile 校验拒绝不能启动的空 shell 和不可表示的环境变量，同时允许参数空格。

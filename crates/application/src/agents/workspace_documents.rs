@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use kerminal_domain::agents::{
-    AgentProvider, AgentProviderSession, AgentSession, AgentTargetLiveStatus,
+    AgentProvider, AgentProviderSession, AgentSession, AgentTargetLiveStatus, agent_mcp_endpoint,
 };
 use kerminal_domain::identity::SessionId;
 use kerminal_domain::sessions::{SessionInfo, SessionLifecycle};
@@ -101,66 +101,18 @@ pub(super) async fn compose_workspace_documents(
             expected_revision,
         )?);
     }
-    let instructions = managed_markdown(
-        repository,
-        session,
-        AgentWorkspaceDocumentKind::AgentInstructions,
-        &agent_instructions_with(session, endpoint, plugins),
-        cancellation.clone(),
-    )
-    .await?;
-    documents.push(instructions);
-
-    match session.agent_id {
-        AgentProvider::Codex => {
-            documents.push(codex_config(repository, session, endpoint, cancellation.clone()).await?)
-        }
-        AgentProvider::Claude => {
-            documents.push(
-                managed_markdown(
-                    repository,
-                    session,
-                    AgentWorkspaceDocumentKind::ClaudeInstructions,
-                    &claude_instructions(endpoint, plugins),
-                    cancellation.clone(),
-                )
-                .await?,
-            );
-            documents.push(
-                json_mcp_config(
-                    repository,
-                    session,
-                    AgentWorkspaceDocumentKind::ClaudeMcpConfig,
-                    endpoint,
-                    60_000,
-                    cancellation.clone(),
-                )
-                .await?,
-            );
-        }
-        AgentProvider::Pi => documents.push(
-            json_mcp_config(
-                repository,
-                session,
-                AgentWorkspaceDocumentKind::PiMcpConfig,
-                endpoint,
-                60,
-                cancellation.clone(),
-            )
-            .await?,
-        ),
-        AgentProvider::Custom => {}
-    }
-
-    documents.extend([
-        json_document(
+    documents.extend(
+        compose_agent_runtime_documents(
             repository,
             session,
-            AgentWorkspaceDocumentKind::McpEndpointContext,
-            &McpEndpointContext::new(session, Some(endpoint)),
+            endpoint,
+            plugins,
             cancellation.clone(),
         )
         .await?,
+    );
+
+    documents.extend([
         json_document(
             repository,
             session,
@@ -193,6 +145,86 @@ pub(super) async fn compose_workspace_documents(
         )
         .await?,
     ]);
+    Ok(documents)
+}
+
+/// 生成恢复 CLI 启动前必须刷新的运行时文档：说明、provider MCP 配置和 endpoint context。
+///
+/// 创建与恢复共用同一 builder，避免两处 endpoint、插件门禁或用户内容合并规则漂移。
+/// 这里刻意不包含 Session/Provider 文档，使恢复前刷新不会改变 checkpoint 的 CAS 基线；
+/// 用户自定义段落和未知配置仍由各自的 patch 逻辑保留。
+///
+/// @author kongweiguang
+pub(super) async fn compose_agent_runtime_documents(
+    repository: &dyn AgentWorkspaceRepository,
+    session: &AgentSession,
+    endpoint: &str,
+    plugins: Option<&PluginRegistry>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> AppResult<Vec<AgentWorkspaceDocument>> {
+    // 调用方只提供已验证的全局 listener 基地址；写入磁盘前统一派生 scoped 路径，
+    // 使 provider 原生配置与 context 元数据使用同一个入口。
+    let endpoint = agent_mcp_endpoint(endpoint, &session.agent_session_id);
+    let instructions = managed_markdown(
+        repository,
+        session,
+        AgentWorkspaceDocumentKind::AgentInstructions,
+        &agent_instructions_with(session, &endpoint, plugins),
+        cancellation.clone(),
+    )
+    .await?;
+    let mut documents = vec![instructions];
+
+    match session.agent_id {
+        AgentProvider::Codex => documents
+            .push(codex_config(repository, session, &endpoint, cancellation.clone()).await?),
+        AgentProvider::Claude => {
+            documents.push(
+                managed_markdown(
+                    repository,
+                    session,
+                    AgentWorkspaceDocumentKind::ClaudeInstructions,
+                    &claude_instructions(&endpoint, plugins),
+                    cancellation.clone(),
+                )
+                .await?,
+            );
+            documents.push(
+                json_mcp_config(
+                    repository,
+                    session,
+                    AgentWorkspaceDocumentKind::ClaudeMcpConfig,
+                    &endpoint,
+                    60_000,
+                    cancellation.clone(),
+                )
+                .await?,
+            );
+        }
+        AgentProvider::Pi => documents.push(
+            json_mcp_config(
+                repository,
+                session,
+                AgentWorkspaceDocumentKind::PiMcpConfig,
+                &endpoint,
+                60,
+                cancellation.clone(),
+            )
+            .await?,
+        ),
+        AgentProvider::Custom => {}
+    }
+
+    documents.push(
+        json_document(
+            repository,
+            session,
+            AgentWorkspaceDocumentKind::McpEndpointContext,
+            &McpEndpointContext::new(session, Some(&endpoint)),
+            cancellation,
+        )
+        .await?,
+    );
     Ok(documents)
 }
 
@@ -424,6 +456,22 @@ fn agent_instructions_with(
     if !runtime_segments.is_empty() {
         bullets.push(format!("- {}", runtime_segments.join(" ")));
     }
+    // Agent 命令路由由已提交终端设置决定；提示当前模式，避免 provider 继续把可见终端
+    // 当成唯一入口，也避免关闭后仍向用户正在看的终端写入。
+    if agents_enabled {
+        let mut routing_segments = vec![
+            "Read the live `nextHints` from `kerminal.agent.target_context` before sending terminal commands; they state whether this session runs commands in the visible terminal or in background.",
+            "When the hint allows the visible terminal, use `terminal.write` for input meant to be seen and `terminal.snapshot` to read the output.",
+            "When the hint requires background execution, do not write to the preferred visible terminal; call `terminal.create` for local or remote one-shot and interactive work, and keep using its explicit `sessionId`.",
+        ];
+        if ssh_enabled {
+            routing_segments.push("Use `ssh.command` for non-interactive server commands.");
+        }
+        routing_segments.push(
+            "Do not intercept or replace the user's own Agent CLI shell; these rules apply only to Kerminal terminal tools.",
+        );
+        bullets.push(format!("- {}", routing_segments.join(" ")));
+    }
     let mut terminal_line = "- For a new interactive shell, call `terminal.create`, then use its explicit `sessionId` for read/write and close it after the task.".to_owned();
     if agents_enabled {
         terminal_line.push_str(
@@ -448,10 +496,23 @@ fn agent_instructions_with(
 /// @author kongweiguang
 fn claude_instructions(endpoint: &str, plugins: Option<&PluginRegistry>) -> String {
     let agents_enabled = unit_enabled(plugins, crate::plugins::capabilities::AGENTS_UNIT);
+    let ssh_enabled = unit_enabled(plugins, crate::plugins::capabilities::SSH_UNIT);
     let mut section: Vec<String> = Vec::new();
     if agents_enabled {
         section.push(
             "- Follow `AGENTS.md` and refresh the live target with `kerminal.agent.target_context` before using a preferred terminal.".to_owned(),
+        );
+        section.push(
+            "- Read the live `nextHints` before terminal commands: with visible routing use `terminal.write` and `terminal.snapshot`; in background routing do not write to the preferred visible terminal and use `terminal.create` with an explicit `sessionId` instead.".to_owned(),
+        );
+        if ssh_enabled {
+            section.push(
+                "- Use `ssh.command` for non-interactive server commands in background routing."
+                    .to_owned(),
+            );
+        }
+        section.push(
+            "- Do not intercept or replace the user's own Agent CLI shell; these rules apply only to Kerminal terminal tools.".to_owned(),
         );
     }
     section.extend([

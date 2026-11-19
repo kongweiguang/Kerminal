@@ -10,14 +10,20 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Convert-ToWslPath {
-    # 由 WSL 自己转换绝对路径，避免盘符或中文目录被手工拼接误解。
+    # wslpath 输出 UTF-8；显式解码，避免 Windows 控制台代码页损坏中文目录。
     # @author kongweiguang
     param([Parameter(Mandatory = $true)][string]$Path)
-    $converted = & wsl.exe --user root --exec wslpath -a $Path
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($converted)) {
-        throw 'Cannot convert the isolated fixture path for WSL.'
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        $converted = & wsl.exe --user root --exec wslpath -a $Path
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($converted)) {
+            throw 'Cannot convert the isolated fixture path for WSL.'
+        }
+        return ([string]$converted).Trim()
+    } finally {
+        [Console]::OutputEncoding = $previousEncoding
     }
-    return ([string]$converted).Trim()
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))

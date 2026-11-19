@@ -435,6 +435,27 @@ impl PreferencesPanel {
                 panel.edit_settings(|settings| settings.terminal.auto_reconnect = *enabled, cx);
             }),
         ))
+        .child(section_separator(theme))
+        .child(policy_switch(
+            "terminal-agent-commands-in-terminal",
+            crate::locale::text(
+                "在终端标签页显示助手命令",
+                "Show sidebar assistant commands in the terminal tab",
+            ),
+            Some(crate::locale::text(
+                "开启后，右栏助手通过 Kerminal 执行的命令和输出显示在绑定的终端标签页。关闭后走后台。",
+                "Kerminal commands from the sidebar assistant appear with their output in the linked terminal tab. Turn off to run in the background.",
+            )),
+            terminal.agent_commands_in_terminal,
+            locked,
+            theme,
+            cx.listener(|panel, enabled: &bool, _, cx| {
+                panel.edit_settings(
+                    |settings| settings.terminal.agent_commands_in_terminal = *enabled,
+                    cx,
+                );
+            }),
+        ))
         .when(cfg!(target_os = "macos"), |group| {
             group.child(section_separator(theme)).child(policy_switch(
                 "terminal-mac-option-meta",

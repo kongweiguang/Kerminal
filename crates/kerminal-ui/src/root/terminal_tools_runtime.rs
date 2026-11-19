@@ -114,10 +114,17 @@ impl SelectionAcknowledgement {
         }
     }
 
-    /// 用单次结果唤醒所有等待者，重复完成仍保持幂等可读。
+    /// 用单次结果唤醒所有等待者；终态先写先得，避免已接受的选择被随后的替换或关闭改写成拒绝。
+    ///
+    /// 替换/关闭仍能拒绝尚未得到 service 回执的等待者；而 once-accepted 表示选择已真实写入引擎，
+    /// 迟到的取消不能再推翻这一事实，否则 Copy 会在选择仍可用时误报“未确认”。
     fn finish(&self, accepted: bool) {
-        self.result
-            .store(if accepted { 1 } else { 2 }, Ordering::Release);
+        let _ = self.result.compare_exchange(
+            0,
+            if accepted { 1 } else { 2 },
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.completed.cancel();
     }
 
@@ -153,7 +160,9 @@ impl SelectionAcknowledgement {
 pub(super) struct TerminalToolsRuntime {
     next_generation: u64,
     active: HashMap<RequestKey, ActiveRequest>,
-    confirmed_selection_present: HashSet<TerminalToolsOwner>,
+    /// 每次已验收的选择 ACK 推进一次水位；值随条目一起删除，旧水位因此永远对不上新 ACK。
+    confirmed_selection_present: HashMap<TerminalToolsOwner, u64>,
+    next_selection_confirmation: u64,
 }
 
 impl TerminalToolsRuntime {
@@ -322,20 +331,53 @@ impl TerminalToolsRuntime {
 
     /// 最终选择 ACK 到新快照之间沿用已确认文本状态，避免 Ctrl+C 把刚完成的拖选误判为中断。
     pub(super) fn selection_may_be_present(&self, owner: &TerminalToolsOwner) -> bool {
-        self.confirmed_selection_present.contains(owner) || self.has_pending_selection(owner)
+        self.confirmed_selection_present.contains_key(owner) || self.has_pending_selection(owner)
     }
 
     /// 仅在 service 已确认新手势或最终文本后更新 marker；失败请求不得抹掉旧的有效选择。
+    /// 每次确认都推进水位，让在途快照只能撤销它启动时看到的旧确认。
     pub(super) fn set_confirmed_selection_present(
         &mut self,
         owner: &TerminalToolsOwner,
         present: bool,
     ) {
         if present {
-            self.confirmed_selection_present.insert(owner.clone());
+            self.next_selection_confirmation =
+                self.next_selection_confirmation.wrapping_add(1).max(1);
+            self.confirmed_selection_present
+                .insert(owner.clone(), self.next_selection_confirmation);
         } else {
             self.confirmed_selection_present.remove(owner);
         }
+    }
+
+    /// 快照请求启动时冻结该 owner 的确认水位；没有标记则不参与后续撤销。
+    ///
+    /// @author kongweiguang
+    pub(super) fn confirmed_selection_watermark(&self, owner: &TerminalToolsOwner) -> Option<u64> {
+        self.confirmed_selection_present.get(owner).copied()
+    }
+
+    /// 只有水位自请求启动后未推进时，才允许新帧的无选区状态撤销旧确认。
+    ///
+    /// 用单调水位而不是快照 revision 判断：selection 更新不推进输出 revision，且任意更新
+    /// revision 无法区分“这之后到达的新 ACK”。水位变化即代表请求启动后已有更新的选择被接纳，
+    /// 此帧即使没有选区也不能推翻它；新 ACK 自己触发的后续快照会再收敛。
+    ///
+    /// @author kongweiguang
+    pub(super) fn clear_confirmed_selection_if_unchanged(
+        &mut self,
+        owner: &TerminalToolsOwner,
+        watermark: Option<u64>,
+    ) -> bool {
+        let Some(watermark) = watermark else {
+            return false;
+        };
+        if self.confirmed_selection_present.get(owner).copied() != Some(watermark) {
+            return false;
+        }
+        self.confirmed_selection_present.remove(owner);
+        true
     }
 
     /// 判断请求是否仍是该来源/操作的最后一轮，防止旧回执覆盖新状态。
@@ -426,7 +468,7 @@ impl TerminalToolsRuntime {
     /// 资源关闭时取消该 SessionId 的读取任务，但保留日志 start/stop 的结果所有者。
     pub(super) fn cancel_session(&mut self, session_id: &SessionId) {
         self.confirmed_selection_present
-            .retain(|owner| &owner.session_id != session_id);
+            .retain(|owner, _| &owner.session_id != session_id);
         self.active.retain(|_, active| {
             let keep = &active.owner.session_id != session_id || !active.cancellable;
             if !keep {
@@ -439,7 +481,7 @@ impl TerminalToolsRuntime {
     /// Agent 或 Pane 的工具视图重新绑定时取消其旧读取任务。
     pub(super) fn cancel_source(&mut self, source_id: EntityId) {
         self.confirmed_selection_present
-            .retain(|owner| owner.source_id != source_id);
+            .retain(|owner, _| owner.source_id != source_id);
         self.active.retain(|key, active| {
             let keep = key.source_id != source_id || !active.cancellable;
             if !keep {
@@ -639,12 +681,27 @@ impl RootView {
                         .cancel(&owner, TerminalToolsRequestKind::Search);
                 }
             }
-            TerminalToolsEvent::CloseSearch { session_id } => {
+            TerminalToolsEvent::CloseSearch {
+                session_id,
+                via_escape,
+            } => {
                 if let Some(owner) = resolve_owner(self, &source, session_id, cx) {
                     self.terminal_tools_runtime
                         .cancel(&owner, TerminalToolsRequestKind::Search);
-                    if let Some(binding) = self.terminal_view_bindings.get(session_id).cloned() {
-                        self.restore_terminal_focus_after_search_close(&binding, window, cx);
+                    if let Some(binding) = self.terminal_view_bindings.get(session_id).cloned()
+                        && self.restore_terminal_focus_after_search_close(&binding, window, cx)
+                        && *via_escape
+                        && self.pane_input_binding_is_focused(&binding, window, cx)
+                    {
+                        // 先更新焦点身份，避免第一次重复事件清除刚恢复的按键归属。
+                        self.observe_keybinding_focus(window, cx);
+                        self.keybinding_runtime.remember_terminal_shortcut_key(
+                            &gpui_kit::Keystroke {
+                                key: "escape".into(),
+                                key_char: None,
+                                modifiers: gpui_kit::Modifiers::default(),
+                            },
+                        );
                     }
                 }
             }
@@ -1391,6 +1448,64 @@ pub(super) fn source_is_current(
         .session_id()
         .and_then(|session_id| resolve_owner(root, source, session_id, cx))
         .is_some_and(|owner| owner_is_current(root, &owner, cx))
+}
+
+/// 快照读取启动时冻结同一 owner 的确认水位；无工具视图的 pane 不参与选择标记协调。
+///
+/// 水位必须在 spawn 前取得：之后到达的 ACK 会推进水位，使这次读取无法撤销更新的确认。
+///
+/// @author kongweiguang
+pub(super) fn selection_reconcile_target(
+    root: &RootView,
+    source: Option<&Entity<TerminalToolsView>>,
+    session_id: &SessionId,
+    cx: &App,
+) -> Option<(TerminalToolsOwner, Option<u64>)> {
+    let source = source?;
+    let owner = resolve_owner(root, source, session_id, cx)?;
+    let watermark = root
+        .terminal_tools_runtime
+        .confirmed_selection_watermark(&owner);
+    Some((owner, watermark))
+}
+
+/// 已接纳的同 owner 新帧显示无选区时撤销旧确认；水位推进或 owner/binding 失效都保留新 ACK。
+///
+/// 引擎在 alternate screen、erase 或 reflow 后清除选区时，只有这条路径能把“可复制”标记
+/// 收敛为“无选区”，否则 Ctrl+C/Esc 会被旧标记永久吞掉。不能在这里补发 Ctrl+C：
+/// 键盘路径会在标记撤销后按正常中断处理，异步 Copy 失败也不得偷偷改写成中断。
+///
+/// @author kongweiguang
+pub(super) fn reconcile_confirmed_selection_after_snapshot(
+    root: &mut RootView,
+    target: Option<&(TerminalToolsOwner, Option<u64>)>,
+    binding_is_current: bool,
+    snapshot_has_selection: bool,
+    cx: &mut Context<RootView>,
+) {
+    if snapshot_has_selection || !binding_is_current {
+        return;
+    }
+    let Some((owner, watermark)) = target else {
+        return;
+    };
+    if !owner_is_current(root, owner, cx)
+        || !root
+            .terminal_tools_runtime
+            .clear_confirmed_selection_if_unchanged(owner, *watermark)
+    {
+        return;
+    }
+    // 摘要与键盘判定使用同一份失效证据，避免工具面板继续显示旧字符数与复制按钮。
+    let source = match &owner.scope {
+        TerminalToolsOwnerScope::Workspace { .. } => root.workspace_tools.get(&owner.session_id),
+        TerminalToolsOwnerScope::Agent { .. } => root.agent_terminal_tools.as_ref(),
+    };
+    if let Some(source) = source {
+        source.update(cx, |tools, cx| {
+            tools.set_selection_summary(&owner.session_id, None, cx);
+        });
+    }
 }
 
 #[cfg(test)]

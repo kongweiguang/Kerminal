@@ -450,6 +450,7 @@ fn fixture(
         let navigation = cx.new(|cx| {
             HostNavigation::new(
                 service,
+                None,
                 executor,
                 ConfigurationRecoveryState {
                     mode,
@@ -1490,10 +1491,18 @@ fn another_navigation_payload_is_not_accepted(app: &mut TestAppContext) {
             issues: Vec::new(),
         };
         let first = cx.new(|cx| {
-            HostNavigation::new(first_service, first_executor, recovery.clone(), window, cx)
+            HostNavigation::new(
+                first_service,
+                None,
+                first_executor,
+                recovery.clone(),
+                window,
+                cx,
+            )
         });
-        let second =
-            cx.new(|cx| HostNavigation::new(second_service, second_executor, recovery, window, cx));
+        let second = cx.new(|cx| {
+            HostNavigation::new(second_service, None, second_executor, recovery, window, cx)
+        });
         *mounted.borrow_mut() = Some((first.clone(), second.clone()));
         let harness = cx.new(|_| ForeignDragHarness {
             navigations: vec![first, second],
@@ -1552,6 +1561,7 @@ fn foreign_payload_is_not_accepted_by_host_groups(
         let navigation = cx.new(|cx| {
             HostNavigation::new(
                 service,
+                None,
                 executor,
                 ConfigurationRecoveryState {
                     mode: ConfigurationMode::ReadWrite,

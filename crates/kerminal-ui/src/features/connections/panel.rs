@@ -5526,9 +5526,26 @@ fn rdp_status_text(status: RdpLaunchStatus, lifecycle: RdpClientLifecycle) -> (S
 #[path = "../../../tests/unit/rdp_status.rs"]
 mod rdp_status_tests;
 
-/// 将受控错误文案按 Kit 当前语言映射；已知 TCP 失败提供可操作指引，不暴露底层路径、命令或 source。
+/// 只翻译受控错误文案，让用户从连接详情恢复，同时避免显示凭据、路径或底层错误。
 /// @author kongweiguang
 pub(super) fn localized_error(error: &AppError) -> String {
+    if let Some((chinese, english)) = match error.public_message() {
+        "SSH private-key file could not be read" => Some((
+            "无法读取私钥文件。请重新选择可读取的私钥文件。",
+            "Couldn't read the private key file. Select a readable private key file and try again.",
+        )),
+        "SSH private-key encoding is invalid" | "SSH private key could not be decoded" => Some((
+            "无法打开 SSH 私钥。请确认选择的是私钥而非公钥，并检查私钥格式和口令。",
+            "Couldn't open the SSH private key. Check that you selected a private key, then verify its format and passphrase.",
+        )),
+        _ if error.public_code() == PublicErrorCode::AuthenticationFailed => Some((
+            "连接认证失败。请检查用户名和凭据后重试。",
+            "Authentication failed. Check the username and credentials, then try again.",
+        )),
+        _ => None,
+    } {
+        return crate::locale::text(chinese, english).to_string();
+    }
     let message = match error.public_message() {
         "SSH TCP connection failed" => "无法连接 SSH 主机，请检查网络、地址和端口后重试。",
         message => message,

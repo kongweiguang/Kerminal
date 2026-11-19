@@ -43,7 +43,7 @@ pub use root::RightRailAcceptanceShellSnapshot;
 #[cfg(feature = "right-rail-acceptance")]
 pub use root::SettingsAcceptanceState;
 #[cfg(feature = "right-rail-acceptance")]
-pub use root::SuggestionsAcceptanceState;
+pub use root::{AcceptanceImeEvent, SuggestionsAcceptanceState};
 #[cfg(feature = "right-rail-acceptance")]
 pub use root::{AgentAcceptanceSetup, ComposeAcceptanceOpenRequest};
 pub use root::{AppServices, QuitIntent, RootHostLifecycle, RootView, RootViewEvent};

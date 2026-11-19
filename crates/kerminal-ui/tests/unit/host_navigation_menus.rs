@@ -6,7 +6,8 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use async_trait::async_trait;
 use gpui_kit::{
-    AppContext as _, Entity, MouseButton, Role, Subscription, TestAppContext, VisualTestContext,
+    AppContext as _, Entity, Focusable as _, MouseButton, Role, Subscription, TestAppContext,
+    VisualTestContext, Window,
 };
 use kerminal_application::{
     AppResult, ApplicationTaskExecutor,
@@ -147,6 +148,7 @@ fn fixture_with_plugins(
         let navigation = cx.new(|cx| {
             HostNavigation::new(
                 hosts,
+                None,
                 executor,
                 ConfigurationRecoveryState {
                     mode,
@@ -271,6 +273,61 @@ fn click_menu_item(visual: &mut VisualTestContext, label: &str) {
     visual.simulate_mouse_move(target, None, Default::default());
     visual.simulate_click(target, Default::default());
     draw(visual);
+}
+
+/// 从真实点击验证输入和目录一起复位，防止只清空文本而遗留筛选或丢失焦点。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn clear_search_restores_directory_and_focus(app: &mut TestAppContext) {
+    init(app);
+    let row = super::host("fixture", "fixture.invalid", None, &[]);
+    let selector = format!("host-navigation-host-{}", row.id.as_str()).into();
+    let (_runtime, navigation, _subscription, visual) = fixture(
+        app,
+        vec![row],
+        Vec::new(),
+        ConfigurationMode::ReadWrite,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let label = crate::locale::text("清除搜索", "Clear search");
+    let clear_button = |window: &Window| {
+        gpui_kit::base::test_support::snapshots(window)
+            .into_iter()
+            .find(|node| node.visible() && node.label() == Some(label.as_ref()))
+    };
+
+    visual.update(|window, app| {
+        assert!(clear_button(window).is_none());
+        navigation
+            .read(app)
+            .search_input
+            .read(app)
+            .focus_handle(app)
+            .focus(window, app);
+    });
+    draw(visual);
+    visual.simulate_input("unmatched");
+    draw(visual);
+    let target = visual.update(|window, app| {
+        assert_eq!(navigation.read(app).search, "unmatched");
+        assert!(gpui_kit::base::test_support::find(window, &[], &selector).is_none());
+        clear_button(window)
+            .expect("有搜索内容时可清除")
+            .bounds()
+            .center()
+    });
+    visual.simulate_click(target, Default::default());
+    draw(visual);
+
+    visual.update(|window, app| {
+        let navigation = navigation.read(app);
+        let input = navigation.search_input.read(app);
+        assert!(input.value().is_empty());
+        assert!(navigation.search.is_empty());
+        assert!(input.focus_handle(app).is_focused(window));
+        assert!(clear_button(window).is_none());
+        assert!(gpui_kit::base::test_support::find(window, &[], &selector).is_some());
+    });
 }
 
 /// 分组测试统一使用真实目录中可匹配的 ID，不把树中的显示标签当作分组身份。

@@ -194,6 +194,19 @@ pub struct ManagedLocalHost {
     pub migration_origin: Option<String>,
 }
 
+/// 侧栏一次加载所需的远程、扩展和本地主机投影。
+///
+/// 保留侧栏合并读取时的分类和整体失败语义。生产仓储在一次目录快照中填充全部
+/// 字段，避免为三类主机分别扫描共享目录。
+///
+/// @author kongweiguang
+#[derive(Clone, Default)]
+pub struct HostCatalog {
+    pub hosts: Vec<ManagedHost>,
+    pub plugin_hosts: Vec<PluginHost>,
+    pub local_hosts: Vec<ManagedLocalHost>,
+}
+
 /// 编辑器提交完整环境快照；调试输出不泄露环境变量或其内容。
 ///
 /// @author kongweiguang
@@ -667,6 +680,21 @@ pub trait HostManagementRepository: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// 一次取得侧栏需要的三类主机投影。
+    ///
+    /// 默认实现沿用原三次列表调用，测试替身与不共享目录的仓储无需感知新接口；
+    /// 生产仓储覆盖为单次目录快照，避免同一批 host 文件被三类列表各扫描一次。
+    /// 调用顺序与侧栏原有串行链保持一致，任一列表失败仍然整体失败。
+    ///
+    /// @author kongweiguang
+    async fn list_catalog(&self) -> AppResult<HostCatalog> {
+        Ok(HostCatalog {
+            hosts: self.list_hosts().await?,
+            plugin_hosts: self.list_plugin_hosts().await?,
+            local_hosts: self.list_local_hosts().await?,
+        })
+    }
+
     /// 不把本地主机解释成远程 endpoint，缺失以 None 表示。
     ///
     /// @author kongweiguang
@@ -791,6 +819,45 @@ pub struct HostManagementService {
     plugins: Option<Arc<PluginRegistry>>,
 }
 
+/// 远程主机沿用目录的 sort_order、名称大小写无关和稳定 ID 次序。
+///
+/// 单独提取是为了让逐列表读取和一次目录快照共用同一排序定义，避免两条路径
+/// 在侧栏中给出不同顺序。
+///
+/// @author kongweiguang
+fn sort_managed_hosts(hosts: &mut [ManagedHost]) {
+    hosts.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+}
+
+/// 扩展主机与远程主机保持同一可见排序，未知提供方仍参与稳定排序。
+///
+/// @author kongweiguang
+fn sort_plugin_hosts(hosts: &mut [PluginHost]) {
+    hosts.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+}
+
+/// 本地主机不因新增批量入口改变原排序规则。
+///
+/// @author kongweiguang
+fn sort_local_hosts(hosts: &mut [ManagedLocalHost]) {
+    hosts.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+}
+
 impl HostManagementService {
     /// 只读用例不默认装配凭据写入，避免测试或只读场景触碰 Vault。
     ///
@@ -889,13 +956,22 @@ impl HostManagementService {
     /// 返回主机目录的稳定排序视图；目录损坏会回到调用方显示错误，而非部分成功。
     pub async fn list_hosts(&self) -> AppResult<Vec<ManagedHost>> {
         let mut hosts = self.repository.list_hosts().await?;
-        hosts.sort_by(|left, right| {
-            left.sort_order
-                .cmp(&right.sort_order)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-        });
+        sort_managed_hosts(&mut hosts);
         Ok(hosts)
+    }
+
+    /// 一次取得侧栏所需的远程、扩展和本地主机，并保持各自原有排序。
+    ///
+    /// 生产仓储用单次目录快照填充三个投影；默认回退仍分别调用三次列表，
+    /// 因此 UI 只需替换为这一入口，失败时依旧整体报错，不会展示部分目录。
+    ///
+    /// @author kongweiguang
+    pub async fn list_catalog(&self) -> AppResult<HostCatalog> {
+        let mut catalog = self.repository.list_catalog().await?;
+        sort_managed_hosts(&mut catalog.hosts);
+        sort_plugin_hosts(&mut catalog.plugin_hosts);
+        sort_local_hosts(&mut catalog.local_hosts);
+        Ok(catalog)
     }
 
     /// 在编辑前按稳定 ID 刷新单条主机，供外部文件变更后的安全重载使用。
@@ -906,12 +982,7 @@ impl HostManagementService {
     /// 扩展主机按现有目录排序语义返回，包括保留原文的不可用提供方。
     pub async fn list_plugin_hosts(&self) -> AppResult<Vec<PluginHost>> {
         let mut hosts = self.repository.list_plugin_hosts().await?;
-        hosts.sort_by(|left, right| {
-            left.sort_order
-                .cmp(&right.sort_order)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-        });
+        sort_plugin_hosts(&mut hosts);
         Ok(hosts)
     }
 

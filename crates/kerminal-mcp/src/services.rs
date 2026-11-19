@@ -14,7 +14,7 @@ use kerminal_application::{
     executor::ApplicationTaskExecutor,
     operations::OperationsService,
     plugins::PluginRegistry,
-    preferences::{ConfigurationValidationService, ProfileService},
+    preferences::{ConfigurationValidationService, PreferencesService, ProfileService},
     sessions::SessionService,
     transfers::TransferService,
 };
@@ -38,6 +38,8 @@ pub struct McpServices {
     pub(crate) plugins: Option<Arc<PluginRegistry>>,
     pub(crate) task_executor: Option<ApplicationTaskExecutor>,
     pub(crate) agent_scope: Option<AgentSessionId>,
+    /// Agent 终端命令路由在每次请求时读取已提交设置，保持与设置页即时一致。
+    pub(crate) preferences: Option<PreferencesService>,
 }
 
 impl McpServices {
@@ -57,6 +59,7 @@ impl McpServices {
             plugins: None,
             task_executor: None,
             agent_scope: None,
+            preferences: None,
         }
     }
 
@@ -115,6 +118,17 @@ impl McpServices {
         validation: ConfigurationValidationService,
     ) -> Self {
         self.configuration_validation = Some(validation);
+        self
+    }
+
+    /// 复用组合根的设置仓储读取 Agent 命令路由，不复制设置或建立第二份缓存。
+    ///
+    /// 请求时读取已提交值，使设置页切换无需重启 MCP；未注入时，右栏会话仍能写入
+    /// 显式指定的后台终端，但不能依赖未知路由写入可见终端。
+    ///
+    /// @author kongweiguang
+    pub fn with_preferences(mut self, preferences: PreferencesService) -> Self {
+        self.preferences = Some(preferences);
         self
     }
 

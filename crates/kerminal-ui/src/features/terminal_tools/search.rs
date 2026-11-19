@@ -61,6 +61,7 @@ pub enum TerminalSearchEvent {
     },
     Close {
         session_id: SessionId,
+        via_escape: bool,
     },
 }
 
@@ -166,14 +167,13 @@ impl TerminalSearchToolbar {
     }
 
     /// 以固定 session 和 GPUI 输入状态创建控件，避免搜索因 Tab 切换转投其它终端。
+    /// 提示文案保持简短，给结果计数和导航按钮留出空间。
     ///
     /// @author kongweiguang
     pub fn new(session_id: Option<SessionId>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::locale::text(
-                "搜索终端内容",
-                "Search terminal output",
-            ))
+            InputState::new(window, cx)
+                .placeholder(crate::locale::text("搜索终端内容", "Find in terminal"))
         });
         let query_for_events = query.clone();
         let window_handle = window.window_handle();
@@ -295,7 +295,7 @@ impl TerminalSearchToolbar {
     pub(super) fn refresh_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.query.update(cx, |input, cx| {
             input.set_placeholder(
-                crate::locale::text("搜索终端内容", "Search terminal output"),
+                crate::locale::text("搜索终端内容", "Find in terminal"),
                 window,
                 cx,
             );
@@ -790,12 +790,15 @@ impl TerminalSearchToolbar {
     /// × 与 Esc 共用关闭事件；组合态拦截只属于键盘 Esc，显式点击关闭仍应可靠生效。
     ///
     /// @author kongweiguang
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn close(&mut self, via_escape: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session_id) = self.session_id.clone() {
-            cx.emit(TerminalSearchEvent::Close { session_id });
+            // Root 恢复终端焦点后仍需吞掉本次 Escape 的重复和释放。
+            cx.emit(TerminalSearchEvent::Close {
+                session_id,
+                via_escape,
+            });
         }
         self.dismiss_local(window, cx);
-        true
     }
 
     /// 读取真实 IME marked range，让 Esc 在组合事务中优先回到原生输入处理。
@@ -920,7 +923,7 @@ impl Render for TerminalSearchToolbar {
             .accessibility_label(crate::locale::text("关闭搜索", "Close search"))
             .tooltip(crate::locale::text("关闭搜索", "Close search"))
             .on_click(cx.listener(|toolbar, _: &ClickEvent, window, cx| {
-                toolbar.close(window, cx);
+                toolbar.close(false, window, cx);
             }));
         let case_button = Button::new("terminal-search-case")
             .compact()
@@ -1027,7 +1030,10 @@ impl Render for TerminalSearchToolbar {
                 {
                     if toolbar.suppress_composition_escape {
                         toolbar.suppress_composition_escape = false;
-                    } else if toolbar.close(window, cx) {
+                    } else {
+                        if !event.is_held {
+                            toolbar.close(true, window, cx);
+                        }
                         window.prevent_default();
                         cx.stop_propagation();
                     }

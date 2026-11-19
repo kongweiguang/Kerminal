@@ -20,6 +20,7 @@ use kerminal_domain::{
     agents::{
         AgentDomainError, AgentLauncherKey, AgentProvider, AgentProviderSession, AgentSession,
         AgentSessionScope, AgentSessionStatus, AgentTargetBinding, AgentTargetLiveStatus,
+        agent_mcp_endpoint,
     },
     identity::AgentSessionId,
     sessions::{
@@ -69,7 +70,7 @@ use super::{
     },
     workspace_documents::{
         ProviderDocumentWrite, SessionDocumentWrite, WorkspaceSnapshotInput,
-        compose_workspace_documents,
+        compose_agent_runtime_documents, compose_workspace_documents,
     },
 };
 
@@ -343,9 +344,13 @@ impl AgentSessionService {
                     continue;
                 }
             }
+            // endpoint 是已校验的全局 listener 基地址；context 文件必须记录派生后的
+            // session-scoped 路径，与新建/恢复时 compose 写入的内容保持一致。
+            let scoped_endpoint =
+                endpoint.map(|base| agent_mcp_endpoint(base, &snapshot.session.agent_session_id));
             let document = match super::workspace_documents::serialize_mcp_endpoint_document(
                 &snapshot.session,
-                endpoint,
+                scoped_endpoint.as_deref(),
                 document.revision,
             ) {
                 Ok(document) => document,
@@ -844,6 +849,12 @@ impl AgentSessionService {
             .mark_resumed(launch.clone(), resumed_at.clone())
             .map_err(domain_error)?;
         provider_session.last_resume_at = Some(resumed_at);
+
+        // 恢复会启动新的 CLI；先在 checkpoint 之前刷新其读取的说明、provider 配置和
+        // endpoint context，避免旧全局地址或旧端口继续被使用。这里只写运行时文档，
+        // 不改变 session/provider revision，prepare 阶段的 CAS 基线仍然有效。
+        self.refresh_resume_runtime_documents(&resumed_session, &endpoint, &cancellation)
+            .await?;
 
         let attempt_id = Uuid::new_v4();
         let terminal_session_id = kerminal_domain::identity::SessionId::new();
@@ -2597,6 +2608,38 @@ impl AgentSessionService {
         .await
     }
 
+    /// 恢复 CLI 启动前刷新运行时文档；只写说明、provider 配置和 endpoint context。
+    ///
+    /// 恢复路径不能复用整批 workspace 写入，否则会提前改动 Session/Provider 文档并破坏
+    /// `prepare_resume_checkpoint` 的 revision 比较；这里复用创建时的同一 builder，
+    /// 由各文档自己的 patch 逻辑保留用户内容。
+    ///
+    /// @author kongweiguang
+    async fn refresh_resume_runtime_documents(
+        &self,
+        session: &AgentSession,
+        endpoint: &str,
+        cancellation: &CancellationToken,
+    ) -> AppResult<()> {
+        let documents = self
+            .await_cancellable(cancellation, |token| {
+                compose_agent_runtime_documents(
+                    self.workspace.as_ref(),
+                    session,
+                    endpoint,
+                    self.plugins.as_deref(),
+                    token,
+                )
+            })
+            .await?;
+        self.await_cancellable(cancellation, |token| {
+            self.workspace
+                .write_documents(session.agent_session_id.clone(), documents, token)
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Session/provider 保持同批 CAS；组合阶段借用正文，提交后仍等待实际回执并返回新版本。
     ///
     /// @author kongweiguang
@@ -2691,7 +2734,7 @@ impl AgentSessionService {
         );
         environment.insert(
             OsString::from("KERMINAL_MCP_ENDPOINT"),
-            OsString::from(endpoint),
+            OsString::from(agent_mcp_endpoint(endpoint, &session.agent_session_id)),
         );
         environment.insert(
             OsString::from("KERMINAL_WORKSPACE_ROOT"),
@@ -3056,7 +3099,22 @@ fn validate_mcp_endpoint(endpoint: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 只接受现行全局 MCP 路径，旧 session-scoped 地址由一次性迁移清理。
+/// 当前写入必须匹配本会话的 scoped 路径；全局 `/mcp` 只用于兼容旧 workspace 文件，
+/// 否则升级前已存在的会话会在下一次同步时被判为损坏。
+///
+/// @author kongweiguang
+fn validate_stored_mcp_endpoint(endpoint: &str, session: &AgentSession) -> AppResult<()> {
+    let parsed = parse_loopback_mcp_endpoint(endpoint)?;
+    let scoped_path = format!("/mcp/agents/{}", session.agent_session_id.as_str());
+    if parsed.path() != "/mcp" && parsed.path() != scoped_path {
+        return Err(AppError::invalid(
+            "Agent MCP endpoint must match the session-scoped path",
+        ));
+    }
+    Ok(())
+}
+
+/// 只接受 loopback HTTP 地址；路径由调用方按全局或 scoped 语义进一步校验。
 ///
 /// @author kongweiguang
 fn parse_loopback_mcp_endpoint(endpoint: &str) -> AppResult<url::Url> {
@@ -3369,7 +3427,7 @@ struct StoredMcpEndpointContext {
 }
 
 impl StoredMcpEndpointContext {
-    /// 运行时只读当前全局 endpoint；旧 scoped endpoint 必须先由数据迁移清理。
+    /// 运行时接受本会话的 scoped endpoint，同时兼容旧版本写入的全局 `/mcp`。
     ///
     /// @author kongweiguang
     fn validate_for(&self, session: &AgentSession) -> AppResult<()> {
@@ -3383,7 +3441,7 @@ impl StoredMcpEndpointContext {
             ));
         }
         if let Some(endpoint) = self.endpoint.as_deref() {
-            validate_mcp_endpoint(endpoint)?;
+            validate_stored_mcp_endpoint(endpoint, session)?;
         }
         if self.generated_at.trim().is_empty() {
             return Err(AppError::configuration_corrupt(

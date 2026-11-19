@@ -51,7 +51,7 @@ use kerminal_terminal::snapshot::{
     PlainTextSnapshot, PlainTextSnapshotRequest, RenderSnapshot, RenderSnapshotRequest,
     TerminalPalette, TerminalSearchRequest, TerminalSearchResult, TerminalSelection,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{
     Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, oneshot, watch,
 };
@@ -65,10 +65,13 @@ use kerminal_application::{AppError, AppResult};
 #[path = "sessions/auto_reconnect.rs"]
 mod auto_reconnect;
 
+#[path = "sessions/conpty_output_coalescer.rs"]
+mod conpty_output_coalescer;
 #[path = "sessions/editing_runtime.rs"]
 mod editing_runtime;
 
 use auto_reconnect::{AutoReconnectContext, AutoReconnectDecision, AutoReconnectPolicy};
+use conpty_output_coalescer::{ReaderEvent, SessionOutputReader};
 
 const SHELL_EVENT_CAPACITY: usize = 64;
 const COMMAND_INTERRUPT_NONE: u8 = 0;
@@ -968,6 +971,7 @@ impl SessionManager {
         drop(receiver);
         let (shell_events, unused_shell_receiver) = broadcast::channel(SHELL_EVENT_CAPACITY);
         drop(unused_shell_receiver);
+        let coalesce_cursor = conpty_output_coalescer::enabled(&info.target, &transport);
         let shell_dialect = transport.shell_dialect;
         let process_id = transport.process_id;
         let shell_integration_enabled = transport.shell_integration_enabled;
@@ -1022,6 +1026,7 @@ impl SessionManager {
             cancellation.clone(),
             Arc::clone(&transport.control),
             generation,
+            coalesce_cursor,
         );
         *session.reader_task.lock().await = Some(reader_task);
         let publication = tokio::select! {
@@ -1549,10 +1554,11 @@ impl SessionManager {
     fn spawn_reader(
         &self,
         session: Arc<ManagedSession>,
-        mut reader: std::pin::Pin<Box<dyn AsyncRead + Send + 'static>>,
+        reader: std::pin::Pin<Box<dyn AsyncRead + Send + 'static>>,
         cancellation: CancellationToken,
         control: Arc<dyn SessionTransportControl>,
         transport_generation: u64,
+        coalesce_cursor: bool,
     ) -> JoinHandle<()> {
         let maximum_chunk = self.config.read_chunk_bytes.clamp(1, 1024 * 1024);
         let close_wait = self.config.close_wait;
@@ -1560,36 +1566,62 @@ impl SessionManager {
         let manager = self.clone();
         self.runtime.spawn(async move {
             let mut buffer = vec![0_u8; maximum_chunk];
-            let mut editing_filter =
-                kerminal_terminal::shell_editing::ShellEditingFrameFilter::default();
+            let mut reader =
+                SessionOutputReader::new(reader, cancellation.clone(), coalesce_cursor);
+            // 回写失败后留给读泵确认真实退出的绝对截止时间；Some 表示不再向坏 writer 交付。
+            // 只对已识别的 SSH 当前代启用，避免把任意 I/O 错误猜成可重连的断线。
+            let mut exit_confirmation_deadline: Option<Instant> = None;
             loop {
-                let read = tokio::select! {
-                    _ = cancellation.cancelled() => break,
-                    result = reader.read(&mut buffer) => result,
+                let event = match exit_confirmation_deadline {
+                    Some(deadline) => {
+                        match tokio::time::timeout_at(deadline, reader.read(&mut buffer)).await {
+                            Ok(event) => event,
+                            Err(_) => {
+                                cancellation.cancel();
+                                mark_writer_failure(&session, transport_generation).await;
+                                break;
+                            }
+                        }
+                    }
+                    None => reader.read(&mut buffer).await,
                 };
-                match read {
-                    Ok(0) => {
-                        let remaining = editing_filter.finish();
-                        if deliver_reader_output(
-                            &session,
-                            &remaining,
-                            output_recorder.as_ref(),
-                            control.as_ref(),
+                match event {
+                    ReaderEvent::Cancelled => break,
+                    ReaderEvent::End => {
+                        let remaining = reader.finish();
+                        // 回写已失败时仍解析剩余普通前缀并发布通知，只不再写坏 writer。
+                        let write_responses = exit_confirmation_deadline.is_none();
+                        let mut confirmation_deadline = exit_confirmation_deadline;
+                        let context = ReaderDeliveryContext {
+                            output_recorder: output_recorder.as_ref(),
+                            control: control.as_ref(),
                             transport_generation,
                             close_wait,
-                        )
-                        .await
-                        .is_err()
+                            editing_invalidated: false,
+                            write_responses,
+                        };
+                        if deliver_reader_batch(&session, &remaining, &[], context)
+                            .await
+                            .is_err()
                         {
-                            cancellation.cancel();
-                            mark_writer_failure(&session, transport_generation).await;
-                            break;
+                            if !ssh_parser_failure_keeps_reader(&session, transport_generation)
+                                .await
+                            {
+                                cancellation.cancel();
+                                mark_writer_failure(&session, transport_generation).await;
+                                break;
+                            }
+                            // 只在首次写失败时建立确认 deadline，不重复延长。
+                            confirmation_deadline.get_or_insert(Instant::now() + close_wait);
                         }
+                        // EOF 已确认读端结束：即使回写失败也交给 wait_exit 取得 typed 结果，
+                        // 由现有重连门禁决定是否重试，而不是把写失败本身当成断线。
                         if let Some(error) = mark_reader_exit(
                             &session,
                             control.as_ref(),
                             transport_generation,
                             close_wait,
+                            confirmation_deadline,
                         )
                         .await
                         {
@@ -1607,18 +1639,22 @@ impl SessionManager {
                         }
                         break;
                     }
-                    Err(error) => {
-                        let remaining = editing_filter.finish();
-                        if deliver_reader_output(
-                            &session,
-                            &remaining,
-                            output_recorder.as_ref(),
-                            control.as_ref(),
+                    ReaderEvent::Failed(error) => {
+                        let remaining = reader.finish();
+                        let write_responses = exit_confirmation_deadline.is_none();
+                        let context = ReaderDeliveryContext {
+                            output_recorder: output_recorder.as_ref(),
+                            control: control.as_ref(),
                             transport_generation,
                             close_wait,
-                        )
-                        .await
-                        .is_err()
+                            editing_invalidated: false,
+                            write_responses,
+                        };
+                        if deliver_reader_batch(&session, &remaining, &[], context)
+                            .await
+                            .is_err()
+                            && !ssh_parser_failure_keeps_reader(&session, transport_generation)
+                                .await
                         {
                             cancellation.cancel();
                             mark_writer_failure(&session, transport_generation).await;
@@ -1627,54 +1663,42 @@ impl SessionManager {
                         mark_reader_failure(&session, transport_generation, error).await;
                         break;
                     }
-                    Ok(read) => {
-                        let filtered = editing_filter.advance(&buffer[..read]);
-                        if filtered.overflowed {
-                            editing_runtime::invalidate(&session, transport_generation);
-                        }
-                        let mut offset = 0;
-                        let mut failed = false;
-                        for frame in filtered.frames {
-                            if deliver_reader_output(
-                                &session,
-                                &filtered.visible[offset..frame.visible_offset],
-                                output_recorder.as_ref(),
-                                control.as_ref(),
-                                transport_generation,
-                                close_wait,
-                            )
-                            .await
-                            .is_err()
+                    ReaderEvent::Data(filtered) => {
+                        // 回写失败后继续按原顺序解析、记录日志、推进帧与发布通知，
+                        // 但不再向已经失败的 writer 重试，避免背压挂住或误判断线。
+                        let write_responses = exit_confirmation_deadline.is_none();
+                        let editing_invalidated = filtered.overflowed
+                            && editing_runtime::invalidate(&session, transport_generation);
+                        let context = ReaderDeliveryContext {
+                            output_recorder: output_recorder.as_ref(),
+                            control: control.as_ref(),
+                            transport_generation,
+                            close_wait,
+                            editing_invalidated,
+                            write_responses,
+                        };
+                        if deliver_reader_batch(
+                            &session,
+                            &filtered.visible,
+                            &filtered.frames,
+                            context,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if !ssh_parser_failure_keeps_reader(&session, transport_generation)
+                                .await
                             {
-                                failed = true;
+                                cancellation.cancel();
+                                mark_writer_failure(&session, transport_generation).await;
                                 break;
                             }
-                            editing_runtime::accept_frame(
-                                &session,
-                                transport_generation,
-                                &frame.payload,
-                            )
-                            .await;
-                            offset = frame.visible_offset;
-                        }
-                        if !failed
-                            && deliver_reader_output(
-                                &session,
-                                &filtered.visible[offset..],
-                                output_recorder.as_ref(),
-                                control.as_ref(),
-                                transport_generation,
-                                close_wait,
-                            )
-                            .await
-                            .is_err()
-                        {
-                            failed = true;
-                        }
-                        if failed {
-                            cancellation.cancel();
-                            mark_writer_failure(&session, transport_generation).await;
-                            break;
+                            // 只登记首个失败时刻；确认窗口到期后仍按原失败路径收口。
+                            if exit_confirmation_deadline.is_none() {
+                                // 停止合批但保留私有帧过滤，保证定时读取不会丢弃跨 await 暂存的字节。
+                                reader.disable_coalescing();
+                                exit_confirmation_deadline = Some(Instant::now() + close_wait);
+                            }
                         }
                     }
                 }
@@ -2282,6 +2306,7 @@ impl SessionManager {
         *session.shell_dialect.write().await = transport.shell_dialect;
         *session.process_id.write().await = transport.process_id;
         *session.shell_integration_enabled.write().await = transport.shell_integration_enabled;
+        let coalesce_cursor = conpty_output_coalescer::enabled(&previous.target, &transport);
         let new_control = Arc::clone(&transport.control);
         let transport_generation = session
             .transport_generation
@@ -2371,6 +2396,7 @@ impl SessionManager {
             cancellation,
             new_control,
             transport_generation,
+            coalesce_cursor,
         );
         *session.reader_task.lock().await = Some(reader_task);
         pending.disarm();
@@ -2379,19 +2405,119 @@ impl SessionManager {
     }
 }
 
-/// 仅把已经剥离私有帧的可见字节送入日志、终端解析器及其响应路径。
-///
-/// @author kongweiguang
-async fn deliver_reader_output(
-    session: &ManagedSession,
-    bytes: &[u8],
-    output_recorder: Option<&Arc<dyn SessionOutputRecorder>>,
-    control: &dyn SessionTransportControl,
+/// 一个批次内累积的可见输出结果；transport 写入、关闭与变更发布都延迟到批次末尾。
+#[derive(Default)]
+struct ReaderBatchDelivery {
+    writes: Vec<Vec<u8>>,
+    close_requested: bool,
+    title_changed: bool,
+    /// 任一片段产生了 shell/转录事件；这类批次不能只靠 Title 通知消费者。
+    had_events: bool,
+}
+
+/// 批次交付所需的 transport 上下文；_reader 侧状态与 output_recorder 仍由调用方持有。
+#[derive(Clone, Copy)]
+struct ReaderDeliveryContext<'a> {
+    output_recorder: Option<&'a Arc<dyn SessionOutputRecorder>>,
+    control: &'a dyn SessionTransportControl,
     transport_generation: u64,
     close_wait: Duration,
+    editing_invalidated: bool,
+    /// 回写失败后仍交付输出，但不再向坏 writer 重试 PTY 响应。
+    write_responses: bool,
+}
+
+/// 交付一个 reader 批次的可见输出与私有帧：同一状态守护内保持 VT 与帧认证的原始顺序，
+/// 批次末尾只发布一次变更，释放状态后才写 PTY 响应，隐藏/恢复之间的中间重绘不会对外可见。
+///
+/// `write_responses` 为 false 时仍完成解析、日志、帧生命周期和通知，只跳过已失败 writer 的
+/// parser 响应，保证 SSH 断线确认窗口内不丢失输出也不重复撞坏 transport。
+///
+/// @author kongweiguang
+async fn deliver_reader_batch(
+    session: &ManagedSession,
+    visible: &[u8],
+    frames: &[kerminal_terminal::shell_editing::ShellEditingFrame],
+    context: ReaderDeliveryContext<'_>,
 ) -> AppResult<()> {
+    let mut delivery = ReaderBatchDelivery::default();
+    let mut delivered = false;
+    let mut accepted = false;
+    {
+        let mut state = session.state.lock().await;
+        let mut offset = 0;
+        for frame in frames {
+            // 帧偏移来自同一过滤结果，防御性截断避免异常偏移越界后重复处理尾部字节。
+            let boundary = frame.visible_offset.min(visible.len());
+            delivered |= deliver_visible_segment(
+                session,
+                &mut state,
+                &visible[offset..boundary],
+                context.output_recorder,
+                context.transport_generation,
+                &mut delivery,
+            )
+            .await;
+            accepted |= editing_runtime::accept_frame_locked(
+                session,
+                &state,
+                context.transport_generation,
+                &frame.payload,
+            )
+            .await;
+            offset = boundary;
+        }
+        delivered |= deliver_visible_segment(
+            session,
+            &mut state,
+            &visible[offset..],
+            context.output_recorder,
+            context.transport_generation,
+            &mut delivery,
+        )
+        .await;
+        if delivered || accepted || context.editing_invalidated {
+            // 编辑接受/失效或任一解析事件都可能改变可见状态，不能用 Title 覆盖；只有
+            // 纯标题变化的批次保留既有 Title 语义，其余仍按 Output 唤醒消费者。
+            let output_change = accepted || context.editing_invalidated || delivery.had_events;
+            session.changes.send_replace(SessionChange {
+                revision: state.engine.revision(),
+                kind: if delivery.title_changed && !output_change {
+                    SessionChangeKind::Title
+                } else {
+                    SessionChangeKind::Output
+                },
+            });
+        }
+    }
+    if context.write_responses {
+        write_parser_responses(session, delivery.writes).await?;
+    }
+    if delivery.close_requested
+        && let Err(error) = context
+            .control
+            .close_until(Instant::now() + context.close_wait)
+            .await
+    {
+        tracing::warn!(error = %error, "terminal parser close request failed");
+    }
+    Ok(())
+}
+
+/// 在批次已持有的会话状态锁内处理一个可见片段；只登记 PTY 响应和关闭请求，
+/// transport 写入留到批次结束后，避免持锁等待 I/O。
+///
+/// @author kongweiguang
+async fn deliver_visible_segment(
+    session: &ManagedSession,
+    state: &mut SessionState,
+    bytes: &[u8],
+    output_recorder: Option<&Arc<dyn SessionOutputRecorder>>,
+    transport_generation: u64,
+    delivery: &mut ReaderBatchDelivery,
+) -> bool {
     if bytes.is_empty() {
-        return Ok(());
+        return false;
     }
     let sequence = session
         .output_sequence
@@ -2406,47 +2532,33 @@ async fn deliver_reader_output(
         tracing::warn!(session_id = %session.session_id, first_missing_sequence, ?reason,
             "terminal session log stopped at bounded output queue boundary");
     }
-    let (output, diagnostic) = {
-        let mut state = session.state.lock().await;
-        let diagnostic = if resize_diagnostics_enabled()
-            && matches!(&state.info.target, SessionTarget::Ssh(_))
-            && claim_resize_reader_diagnostic_chunk(&session.resize_diagnostic_reader_budget)
-        {
-            Some(ResizeReaderDiagnosticContext {
-                session_sequence: session.resize_diagnostic_session_sequence,
-                transport_generation,
-                resize_generation: session.resize_diagnostic_generation.load(Ordering::Acquire),
-                reader_sequence: sequence,
-                chunk_bytes: bytes.len() as u64,
-            })
-        } else {
-            None
-        };
-        let before = diagnostic.map(|_| (state.engine.size(), state.engine.revision()));
-        let output = state.engine.process_output(bytes);
-        let after = diagnostic.map(|_| (state.engine.size(), state.engine.revision()));
-        apply_terminal_output_events(session, &output.events).await;
-        session.changes.send_replace(SessionChange {
-            revision: state.engine.revision(),
-            kind: if output.title_changed.is_some() {
-                SessionChangeKind::Title
-            } else {
-                SessionChangeKind::Output
-            },
-        });
-        (output, diagnostic.zip(before).zip(after))
+    let diagnostic = if resize_diagnostics_enabled()
+        && matches!(&state.info.target, SessionTarget::Ssh(_))
+        && claim_resize_reader_diagnostic_chunk(&session.resize_diagnostic_reader_budget)
+    {
+        Some(ResizeReaderDiagnosticContext {
+            session_sequence: session.resize_diagnostic_session_sequence,
+            transport_generation,
+            resize_generation: session.resize_diagnostic_generation.load(Ordering::Acquire),
+            reader_sequence: sequence,
+            chunk_bytes: bytes.len() as u64,
+        })
+    } else {
+        None
     };
-    if let Some(((context, before), after)) = diagnostic {
+    let before = diagnostic.map(|_| (state.engine.size(), state.engine.revision()));
+    let output = state.engine.process_output(bytes);
+    let after = diagnostic.map(|_| (state.engine.size(), state.engine.revision()));
+    apply_terminal_output_events(session, &output.events).await;
+    if let Some(((context, before), after)) = diagnostic.zip(before).zip(after) {
         log_resize_reader_diagnostic(context, 20, before.0, before.1);
         log_resize_reader_diagnostic(context, 21, after.0, after.1);
     }
-    write_parser_responses(session, output.pty_writes).await?;
-    if output.close_requested
-        && let Err(error) = control.close_until(Instant::now() + close_wait).await
-    {
-        tracing::warn!(error = %error, "terminal parser close request failed");
-    }
-    Ok(())
+    delivery.title_changed |= output.title_changed.is_some();
+    delivery.had_events |= !output.events.is_empty();
+    delivery.close_requested |= output.close_requested;
+    delivery.writes.extend(output.pty_writes);
+    true
 }
 
 #[async_trait]
@@ -3162,8 +3274,8 @@ impl SessionService for SessionManager {
 
     /// 在相同 session 与 shell generation 锁内跳到绝对历史位置，防止失效 UI 绑定改写新视口。
     ///
-    /// offset 由 engine 按当前 history 上限裁剪；快照读取不再写回 viewport，因而该命令是
-    /// 唯一绝对定位入口，并可与增量 scroll 请求共用同一可见 owner/lifecycle 契约。
+    /// offset 由 engine 按当前 history 上限裁剪。键盘输入在写 PTY 前会请求回到底部；
+    /// 仅在位置真正变化时通知订阅者，避免旧画面和真实回显争用同一个快照通道。
     ///
     /// @author kongweiguang
     async fn scroll_ui_to_offset(&self, binding: UiSessionBinding, offset: usize) -> AppResult<()> {
@@ -3174,11 +3286,15 @@ impl SessionService for SessionManager {
             return Err(AppError::conflict("可见终端跳转目标或 generation 已失效"));
         }
 
+        let previous_revision = state.engine.revision();
         state.engine.scroll_to_offset(offset);
-        session.changes.send_replace(SessionChange {
-            revision: state.engine.revision(),
-            kind: SessionChangeKind::Output,
-        });
+        let revision = state.engine.revision();
+        if revision != previous_revision {
+            session.changes.send_replace(SessionChange {
+                revision,
+                kind: SessionChangeKind::Output,
+            });
+        }
         Ok(())
     }
 
@@ -6592,8 +6708,10 @@ async fn mark_reader_exit(
     control: &dyn SessionTransportControl,
     transport_generation: u64,
     close_wait: Duration,
+    confirmation_deadline: Option<Instant>,
 ) -> Option<AppError> {
-    let fallback_deadline = Instant::now() + close_wait;
+    // 回写失败后的确认窗口沿用首次失败建立的绝对 deadline，writer 收尾不能延长总预算。
+    let fallback_deadline = confirmation_deadline.unwrap_or_else(|| Instant::now() + close_wait);
     let mut failure = None;
     match tokio::time::timeout_at(fallback_deadline, control.observe_child_exit()).await {
         Ok(Ok(Some(status))) => {
@@ -6634,7 +6752,13 @@ async fn mark_reader_exit(
     let observed_status = match tokio::time::timeout_at(deadline, control.wait_exit()).await {
         Ok(Ok(status)) => Some(status),
         Ok(Err(error)) => {
-            failure.get_or_insert(error);
+            // 回写已失败时 writer shutdown 错误先记录；wait_exit 的 typed 断线必须覆盖它，
+            // 否则自动重连门禁会把这次真实断线误判为普通写失败。
+            if confirmation_deadline.is_some() && error.is_retryable_remote_disconnect() {
+                failure = Some(error);
+            } else {
+                failure.get_or_insert(error);
+            }
             None
         }
         Err(_) => {
@@ -6736,6 +6860,30 @@ async fn mark_reader_failure(
     tracing::debug!(error = %error, "terminal reader failed");
 }
 
+/// parser response 写失败本身不足以证明连接已断；只让已识别 SSH 当前代的读泵继续确认。
+///
+/// 退役中的旧代、已换代、非 SSH 目标和已离开 Running 的会话仍走原立即失败路径，
+/// 不把任意 I/O 错误当成可重试的远端断线。
+///
+/// @author kongweiguang
+async fn ssh_parser_failure_keeps_reader(
+    session: &ManagedSession,
+    transport_generation: u64,
+) -> bool {
+    if session.transport_generation.load(Ordering::Acquire) != transport_generation {
+        return false;
+    }
+    {
+        let retirement = session.retiring_transport_generation.lock().await;
+        if *retirement == Some(transport_generation) {
+            return false;
+        }
+    }
+    let state = session.state.lock().await;
+    matches!(state.info.target, SessionTarget::Ssh(_))
+        && state.info.lifecycle == SessionLifecycle::Running
+}
+
 /// parser response 写失败只影响当前 transport；旧 generation 在退役门禁中不得污染 Starting owner。
 ///
 /// @author kongweiguang
@@ -6788,5 +6936,13 @@ fn engine_error(error: TerminalEngineError) -> AppError {
 mod resize_diagnostic_tests;
 
 #[cfg(test)]
+#[path = "../tests/unit/conpty_output_coalescer.rs"]
+mod conpty_output_coalescer_tests;
+
+#[cfg(test)]
 #[path = "../tests/unit/managed_shell_encoding.rs"]
 mod managed_shell_encoding_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/session_reader_batch.rs"]
+mod session_reader_batch_tests;

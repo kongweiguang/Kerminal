@@ -64,6 +64,95 @@ fn wheel_mouse(column: u16, row: u16) -> TerminalInputEvent {
     })
 }
 
+/// 让队列测试能独立构造真实键盘文本和需要保留独立回执的提交文本。
+///
+/// @author kongweiguang
+fn text_work(binding: &UiSessionBinding, text: &str, plain: bool) -> SessionWork {
+    let mut work = UiInputWork::new(
+        UiTerminalInputRequest {
+            binding: binding.clone(),
+            expected_context: None,
+            projection: UiInputProjection::Invalidates,
+            event: TerminalInputEvent::Text(text.into()),
+        },
+        None,
+    );
+    work.plain_text_origin = plain;
+    SessionWork::UiInput(Box::new(work))
+}
+
+/// 批次只取已在队列内、同代的连续普通文本，不能跨过 Enter 或独立 IME 提交。
+///
+/// @author kongweiguang
+#[test]
+fn plain_text_batch_preserves_fifo_and_input_boundaries() {
+    for (text, plain, generation_change) in
+        [("\r", true, false), ("c", false, false), ("c", true, true)]
+    {
+        let mut queue = SessionCommandQueues::with_limits(limits(1));
+        let session = SessionId::new();
+        let binding = ui_binding(session.clone());
+        let mut boundary = binding.clone();
+        boundary.session_generation += u64::from(generation_change);
+        for work in [
+            text_work(&binding, "a", true),
+            text_work(&binding, " ", true),
+            text_work(&boundary, text, plain),
+            text_work(&binding, "z", true),
+        ] {
+            queue.enqueue(session.clone(), work).unwrap();
+        }
+        let SessionWork::UiInput(first) = queue.take_ready().unwrap().work else {
+            panic!("expected a text input");
+        };
+        let batch = queue.take_plain_text_following(&first).unwrap();
+        assert_eq!(batch.following.len(), 1);
+        assert_eq!(
+            batch.following[0].request.event,
+            TerminalInputEvent::Text(" ".into())
+        );
+        assert!(queue.take_ready().is_none());
+        assert!(queue.complete(&session));
+        let next = queue.take_ready().unwrap();
+        assert_eq!(next.work, text_work(&boundary, text, plain));
+        let SessionWork::UiInput(next) = next.work else {
+            unreachable!()
+        };
+        if !generation_change {
+            assert!(queue.take_plain_text_following(&next).is_none());
+        }
+    }
+}
+
+/// 取消与启动竞争时保留已开始项，其余批内字符和待发送项只计入一次撤销结果。
+///
+/// @author kongweiguang
+#[test]
+fn plain_text_batch_is_bounded_and_close_stops_remaining_writes() {
+    let mut queue = SessionCommandQueues::default();
+    let session = SessionId::new();
+    let binding = ui_binding(session.clone());
+    for _ in 0..35 {
+        queue
+            .enqueue(session.clone(), text_work(&binding, "x", true))
+            .unwrap();
+    }
+    let SessionWork::UiInput(first) = queue.take_ready().unwrap().work else {
+        panic!("expected a text input");
+    };
+    let batch = queue.take_plain_text_following(&first).unwrap();
+    assert_eq!(batch.following.len(), 31);
+    assert!(batch.dispatch.begin_next());
+    let cancelled = queue.cancel_pending(&session);
+    assert_eq!(cancelled.commands, 34);
+    assert_eq!(cancelled.input_events, 34);
+    assert_eq!(cancelled.input_bytes, 34);
+    assert!(!batch.dispatch.begin_next());
+    assert_eq!(queue.cancel_pending(&session).commands, 0);
+    assert!(queue.complete(&session));
+    assert!(queue.is_idle(&session));
+}
+
 /// 同会话输入保持 FIFO，释放并发名额后按 ready 队列公平服务更早等待的 lane。
 /// 两个会话可先并行运行；满额时阻塞，完成后逐项核对调度身份、文本和队列字节预算。
 ///

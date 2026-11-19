@@ -2479,7 +2479,7 @@ fn handle_mouse_move(
     );
 }
 
-/// 高刷显示器上也只保留一条动画链；每帧重新读 Root 的当前快照，不捕获旧 viewport rows。
+/// 下一帧回调自身会唤醒帧源；由实际快照或选区变化驱动重绘，避免等待 ACK 时刷新整窗。
 ///
 /// @author kongweiguang
 fn schedule_selection_autoscroll(
@@ -2488,13 +2488,12 @@ fn schedule_selection_autoscroll(
     token: TerminalSelectionGestureToken,
     window: &mut Window,
 ) {
-    window.request_animation_frame();
     window.on_next_frame(move |window, app| {
         run_selection_autoscroll_frame(view, tools, token, window, app);
     });
 }
 
-/// 每条边缘滚动都等匹配请求 ACK 与最小快照 revision 后才映射端点；失焦、超时、release 或 owner 失效会终止该链。
+/// 等待匹配的滚动回执和快照后再映射端点，避免使用旧视口；迟到回调只能结算或取消自己的手势。
 ///
 /// @author kongweiguang
 fn run_selection_autoscroll_frame(
@@ -2506,7 +2505,7 @@ fn run_selection_autoscroll_frame(
 ) {
     if !window.is_window_active() {
         tools.update(app, |tools, tools_cx| {
-            tools.cancel_canvas_selection_gesture(tools_cx)
+            tools.cancel_canvas_selection_gesture_if(token.gesture_id(), tools_cx);
         });
         return;
     }

@@ -357,6 +357,7 @@ pub struct HostNavigation {
     /// 为保留现有导航渲染，主机列表使用无环境变量的私有投影；不包含模板。
     profile_rows: Vec<VersionedProfile>,
     default_profile_name: Option<gpui_kit::SharedString>,
+    default_profile_task: Option<Task<()>>,
     groups: Vec<HostGroup>,
     group_revision: Option<ConfigRevision>,
     selected_host: Option<HostId>,
@@ -400,10 +401,11 @@ struct NavigationFeedback {
 impl EventEmitter<HostNavigationEvent> for HostNavigation {}
 
 impl HostNavigation {
-    /// 装配同一主机目录用例与共享执行器；首次加载设置前默认紧凑，避免侧栏短暂撑开。
+    /// 首轮读取前装配模板用例，避免先加载主机再为默认终端名称排队重读整个目录。
     /// @author kongweiguang
     pub fn new(
         hosts: HostManagementService,
+        profiles: Option<ProfileService>,
         executor: ApplicationTaskExecutor,
         recovery: ConfigurationRecoveryState,
         window: &mut Window,
@@ -429,7 +431,7 @@ impl HostNavigation {
         });
         let mut navigation = Self {
             hosts,
-            profiles: None,
+            profiles,
             executor,
             recovery,
             density: InterfaceDensity::Compact,
@@ -440,6 +442,7 @@ impl HostNavigation {
             plugin_rows: Vec::new(),
             profile_rows: Vec::new(),
             default_profile_name: None,
+            default_profile_task: None,
             groups: Vec::new(),
             group_revision: None,
             selected_host: None,
@@ -482,14 +485,6 @@ impl HostNavigation {
             input.set_placeholder(crate::locale::text("搜索", "Search"), window, cx);
         });
         cx.notify();
-    }
-
-    /// 接入模板用例供默认终端显示名称；左栏主机只来自独立主机目录。
-    /// @author kongweiguang
-    pub fn with_profiles(mut self, profiles: ProfileService, cx: &mut Context<Self>) -> Self {
-        self.profiles = Some(profiles);
-        self.reload(cx);
-        self
     }
 
     /// Root 在设置快照变更后同步密度；叶子自行完成布局换算，避免把持久化值复制到主题全局。
@@ -581,7 +576,7 @@ impl HostNavigation {
             })
     }
 
-    /// 读取主机与分组作为同一 UI 快照；失败保留旧数据并提供显式重试。
+    /// 从一次目录读取生成各类主机条目，再与分组一起更新，避免重复扫描或显示不完整的树。
     /// @author kongweiguang
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if self.loading {
@@ -589,23 +584,18 @@ impl HostNavigation {
             return;
         }
         self.loading = true;
+        self.default_profile_task = None;
+        self.default_profile_name = None;
         self.status_dismissed = false;
         let generation = self.catalog_generation;
         let hosts = self.hosts.clone();
-        let profiles = self.profiles.clone();
         let executor = self.executor.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
                 .run(move |_| async move {
-                    let rows = hosts.list_hosts().await?;
-                    let plugin_hosts = hosts.list_plugin_hosts().await?;
-                    let local_hosts = hosts.list_local_hosts().await?;
+                    let catalog = hosts.list_catalog().await?;
                     let groups = hosts.load_groups().await?;
-                    let profiles = match profiles {
-                        Some(profiles) => profiles.list_profiles().await?,
-                        None => Vec::new(),
-                    };
-                    Ok((rows, plugin_hosts, local_hosts, groups, profiles))
+                    Ok((catalog, groups))
                 })
                 .await;
             cx.update(|app| {
@@ -616,14 +606,14 @@ impl HostNavigation {
                             navigation.reload_pending = true;
                         } else {
                             match result {
-                                Ok((rows, plugin_hosts, local_hosts, groups, profiles)) => {
-                                    navigation.rows = rows;
-                                    navigation.plugin_rows = plugin_hosts;
+                                Ok((catalog, groups)) => {
+                                    navigation.rows = catalog.hosts;
+                                    navigation.plugin_rows = catalog.plugin_hosts;
                                     navigation.reconcile_groups(groups.groups);
                                     navigation.group_revision = groups.revision;
-                                    navigation.default_profile_name =
-                                        unique_default_profile_name(&profiles);
-                                    navigation.profile_rows = local_hosts
+                                    navigation.status = None;
+                                    navigation.profile_rows = catalog
+                                        .local_hosts
                                         .into_iter()
                                         .map(|host| {
                                             super::local_hosts::local_host_projection(
@@ -652,8 +642,10 @@ impl HostNavigation {
                                     ) {
                                         navigation.selected_profile = None;
                                     }
-                                    navigation.status = None;
                                     navigation.finish_host_move_readback();
+                                    if !navigation.reload_pending {
+                                        navigation.load_default_profile_name(cx);
+                                    }
                                 }
                                 Err(error) => navigation.status = Some(load_error_message(&error)),
                             }
@@ -668,6 +660,32 @@ impl HostNavigation {
         })
         .detach();
         cx.notify();
+    }
+
+    /// 主机树先发布；默认模板只用于新标签标题，失败时使用通用标题并保留诊断。
+    /// 新一轮刷新取消旧标题任务，关闭侧栏实体时也不会保留该任务。
+    /// @author kongweiguang
+    fn load_default_profile_name(&mut self, cx: &mut Context<Self>) {
+        let Some(profiles) = self.profiles.clone() else {
+            return;
+        };
+        let executor = self.executor.clone();
+        self.default_profile_task = Some(cx.spawn(async move |this, cx| {
+            let result = executor
+                .run(move |_| async move { profiles.list_profiles().await })
+                .await;
+            match result {
+                Ok(profiles) => {
+                    let _ = this.update(cx, |navigation, cx| {
+                        navigation.default_profile_name = unique_default_profile_name(&profiles);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(code = ?error.public_code(), "默认终端模板名称读取失败")
+                }
+            }
+        }));
     }
 
     /// 仅当前代次完整读取成功后结算移动；未知写入按实际位置反馈，不能伪装成普通成功。
@@ -2251,27 +2269,11 @@ impl Render for HostNavigation {
                 &self.search_tree_scroll_handle
             });
 
-        if self.loading
-            && self.rows.is_empty()
-            && self.plugin_rows.is_empty()
-            && self.profile_rows.is_empty()
-        {
-            host_tree = host_tree.child(
-                div()
-                    .w_full()
-                    .p_4()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .text_size(theme.text_sm)
-                    .text_color(theme.muted)
-                    .child(IconName::LoaderCircle)
-                    .child(crate::locale::text("正在读取主机目录…", "Loading hosts…")),
-            );
-        } else if self.rows.is_empty()
-            && self.plugin_rows.is_empty()
-            && self.profile_rows.is_empty()
+        // 分组状态随首份目录一同初始化；空目录也是可继续展示的有效快照。
+        let has_cached_catalog = self.group_state_initialized;
+        let waiting_for_first_catalog = self.loading && !has_cached_catalog;
+        if !self.loading
+            && !has_cached_catalog
             && let Some(status) = self.status.clone()
         {
             host_tree = host_tree.child(
@@ -2291,7 +2293,8 @@ impl Render for HostNavigation {
                             })),
                     ),
             );
-        } else if filtered.is_empty()
+        } else if !waiting_for_first_catalog
+            && filtered.is_empty()
             && filtered_plugins.is_empty()
             && filtered_profiles.is_empty()
             && !has_visible_saved_group
@@ -2304,7 +2307,7 @@ impl Render for HostNavigation {
                 self.recovery.mode == ConfigurationMode::ReadOnlyRecovery,
                 theme,
             ));
-        } else {
+        } else if !waiting_for_first_catalog {
             host_tree = render_tree_groups(
                 self,
                 (&filtered, &filtered_profiles, &filtered_plugins),
@@ -2317,8 +2320,6 @@ impl Render for HostNavigation {
         }
         content = content.child(host_tree.test_support());
 
-        let has_cached_catalog =
-            !self.rows.is_empty() || !self.plugin_rows.is_empty() || !self.profile_rows.is_empty();
         let floating_feedback = self.feedback.as_ref().map_or_else(
             || {
                 (has_cached_catalog && !self.status_dismissed)
@@ -2845,6 +2846,7 @@ fn host_primary_action_label(protocol: RemoteProtocol) -> gpui_kit::SharedString
 /// 搜索框取得按钮组以外的全部宽度；窄图标槽位保留控件高度，避免搜索被三枚方形按钮挤压。
 /// 刷新沿用同一异步加载门禁，按钮组只在相邻动作间保留小间距。
 /// 搜索悬停与普通工具动作使用中性色，强调色保留给真实焦点或选中状态。
+/// 清除按钮放在输入框内部，复用输入变更事件恢复目录，并把焦点交回输入框以便继续搜索。
 /// @author kongweiguang
 fn render_navigation_header(
     navigation: &mut HostNavigation,
@@ -2891,7 +2893,25 @@ fn render_navigation_header(
                 .min_w(px(0.))
                 .px_0()
                 .aria_label(crate::locale::text("搜索主机", "Search hosts"))
-                .prefix(div().text_color(theme.subtle).child(IconName::Search)),
+                .prefix(div().text_color(theme.subtle).child(IconName::Search))
+                .when(!navigation.search.is_empty(), |input| {
+                    let label = crate::locale::text("清除搜索", "Clear search");
+                    let search_input = navigation.search_input.clone();
+                    input.suffix(
+                        Button::new("host-navigation-clear-search")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .accessibility_label(label.clone())
+                            .tooltip(label)
+                            .on_click(move |_, window, cx| {
+                                search_input.update(cx, |input, cx| {
+                                    input.clean(window, cx);
+                                    input.focus(window, cx);
+                                });
+                            }),
+                    )
+                }),
         );
     let actions = div()
         .w(px(metrics.action_width * 3. + 4.))

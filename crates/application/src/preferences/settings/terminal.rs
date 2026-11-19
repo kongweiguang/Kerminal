@@ -338,6 +338,13 @@ pub struct TerminalSettings {
     pub show_command_block_rail: bool,
     pub show_tab_numbers: bool,
     pub confirm_close_tab: bool,
+    /// 右侧栏 Agent 的终端写入是否进入可见终端；关闭后只允许显式 headless 会话。
+    ///
+    /// 默认保持旧行为（可见终端），避免升级后改变既有交互；路由判定仍由 MCP
+    /// 在每次请求时读取已提交设置，不额外缓存或要求重启。
+    ///
+    /// @author kongweiguang
+    pub agent_commands_in_terminal: bool,
     pub inline_suggestion: TerminalInlineSuggestionSettings,
     pub keyword_highlights: TerminalKeywordHighlightSettings,
     pub scrollback: u32,
@@ -365,6 +372,7 @@ impl Default for TerminalSettings {
             show_command_block_rail: true,
             show_tab_numbers: false,
             confirm_close_tab: true,
+            agent_commands_in_terminal: true,
             inline_suggestion: TerminalInlineSuggestionSettings::default(),
             keyword_highlights: TerminalKeywordHighlightSettings::default(),
             scrollback: 5000,

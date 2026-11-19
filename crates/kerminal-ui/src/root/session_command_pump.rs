@@ -33,6 +33,7 @@ struct UiInputAcknowledgement {
     command_line_ticket: Option<command_line_projection::CommandLineInputTicket>,
     command_submitted: bool,
     shell_editing_receipt: Option<ShellEditingSnapshot>,
+    has_later_batch_input: bool,
 }
 
 /// 准入拒绝或失败回执只抑制同一 session 的同一尺寸；改变布局后允许新尝试，不建立重绘重试循环。
@@ -396,6 +397,9 @@ impl RootView {
 
     /// 只用真实 FIFO ACK 推进建议和命令行投影；后续 CAS work 各自单次装箱并按 ACK 串行入队。
     /// 焦点报告只刷新真实上下文，不把无编辑语义的通知交给正文/建议编辑器。
+    /// 批内前序 ACK 先推进投影，建议探测只在最新 ACK 后考虑启动，以免读取中间状态。
+    ///
+    /// @author kongweiguang
     fn complete_ui_input_ack(
         &mut self,
         acknowledgement: UiInputAcknowledgement,
@@ -408,6 +412,7 @@ impl RootView {
             command_line_ticket,
             command_submitted,
             shell_editing_receipt,
+            has_later_batch_input,
         } = acknowledgement;
         if context.session_id != request.binding.session_id
             || context.owner != request.binding.owner
@@ -563,7 +568,7 @@ impl RootView {
             return;
         }
 
-        if self.is_active_suggestion_binding(&request.binding) {
+        if !has_later_batch_input && self.is_active_suggestion_binding(&request.binding) {
             if self
                 .session_commands
                 .has_pending_edit_input(&request.binding.session_id)
@@ -576,6 +581,114 @@ impl RootView {
                 self.request_suggestion_snapshot(request.binding.clone(), mode, false, cx);
             }
         }
+    }
+
+    /// 同一次后台任务按原 writer 逐项发送已经排队的字符，以免每个字符都往返 GPUI 才能派发下一项。
+    /// 仍先核对精确绑定再按序处理真实回执。关闭时只有已经取得派发资格的一项可以继续。
+    /// 批次直接交接已收集的输入，保留逐项回执所需的上下文。
+    ///
+    /// @author kongweiguang
+    fn dispatch_plain_text_batch(
+        &mut self,
+        first: session_queue::UiInputWork,
+        batch: session_queue::PlainTextBatch,
+        cx: &mut Context<Self>,
+    ) {
+        let binding = first.request.binding.clone();
+        let items = std::iter::once(first)
+            .chain(batch.following)
+            .collect::<Vec<_>>();
+        let requests = items
+            .iter()
+            .map(|work| work.request.clone())
+            .collect::<Vec<_>>();
+        let executor = self.services.executor.clone();
+        let sessions = self.services.sessions.clone();
+        let dispatch = batch.dispatch.clone();
+        let close_gate = batch.dispatch;
+        cx.spawn(async move |this, cx| {
+            let results = executor
+                .run(move |cancellation| async move {
+                    let mut results = Vec::with_capacity(requests.len());
+                    for request in requests {
+                        if cancellation.is_cancelled() || !dispatch.begin_next() {
+                            break;
+                        }
+                        let result = match sessions
+                            .scroll_ui_to_offset(request.binding.clone(), 0)
+                            .await
+                        {
+                            Ok(()) => sessions.write_ui_input(request).await,
+                            Err(error) => Err(error),
+                        };
+                        results.push(result);
+                    }
+                    Ok(results)
+                })
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                let current = !close_gate.is_stopped()
+                    && root.session_command_owner(&binding.session_id).as_ref()
+                        == Some(&binding.owner)
+                    && root
+                        .pane_input_handlers
+                        .get(&binding.session_id)
+                        .is_some_and(|registration| registration.binding == binding);
+                if current {
+                    let (mut receipts, executor_error) = match results {
+                        Ok(receipts) => (receipts.into_iter(), None),
+                        Err(error) => (Vec::new().into_iter(), Some(error)),
+                    };
+                    let mut items = items.into_iter().peekable();
+                    while let Some(work) = items.next() {
+                        let receipt = receipts.next().or_else(|| executor_error.clone().map(Err));
+                        match receipt {
+                            Some(Ok(context)) => root.complete_ui_input_ack(
+                                UiInputAcknowledgement {
+                                    request: work.request,
+                                    context,
+                                    acceptance: None,
+                                    command_line_ticket: work.command_line_ticket,
+                                    command_submitted: false,
+                                    shell_editing_receipt: None,
+                                    has_later_batch_input: items.peek().is_some(),
+                                },
+                                cx,
+                            ),
+                            failure => {
+                                if let Some(ticket) = work.command_line_ticket.as_ref() {
+                                    root.command_line_projection.apply_failure(ticket);
+                                }
+                                if let Some(Err(error)) = failure {
+                                    root.status = Some(error.public_message().to_owned().into());
+                                }
+                                if root.is_active_suggestion_binding(&binding) {
+                                    root.terminal_command_suggestions.clear();
+                                    root.suggestion_menu_binding = None;
+                                    root.sync_suggestion_menu(cx);
+                                }
+                            }
+                        }
+                    }
+                    // 批内的快照可能早于末次回底。收尾补读一次，确保中间视口不会成为最终画面。
+                    if invalidate_workspace_snapshot_for_scroll(root, &binding)
+                        && let SessionOwner::Ui { tab_id, pane_id } = &binding.owner
+                        && root
+                            .workspace_runtime
+                            .snapshot_session_is_current(pane_id, &binding.session_id)
+                    {
+                        root.request_workspace_pane_snapshot(tab_id.clone(), pane_id.clone(), cx);
+                    }
+                }
+                root.session_commands.complete(&binding.session_id);
+                if current {
+                    root.start_pending_suggestion_snapshot(cx);
+                }
+                root.start_session_command_pump(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 已确认追加才后台记录排序反馈；目标失配或存储故障不改变终端输入和回执。
@@ -714,6 +827,15 @@ impl RootView {
                 self.session_commands.complete(&ready.session_id);
                 continue;
             };
+            if let session_queue::SessionWork::UiInput(work) = &ready.work
+                && let Some(batch) = self.session_commands.take_plain_text_following(work)
+            {
+                invalidate_workspace_snapshot_for_scroll(self, &work.request.binding);
+                if let session_queue::SessionWork::UiInput(work) = ready.work {
+                    self.dispatch_plain_text_batch(*work, batch, cx);
+                    continue;
+                }
+            }
             let receipt = Some(receipt);
             let session_input_binding =
                 receipt.as_ref().and_then(|receipt| receipt.binding.clone());
@@ -1240,6 +1362,7 @@ impl RootView {
                                         command_line_ticket: ticket,
                                         command_submitted,
                                         shell_editing_receipt,
+                                        has_later_batch_input: false,
                                     },
                                     cx,
                                 );

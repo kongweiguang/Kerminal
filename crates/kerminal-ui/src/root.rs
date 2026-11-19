@@ -53,7 +53,7 @@ pub use self::right_rail_acceptance::RightRailAcceptanceShellSnapshot;
 #[cfg(feature = "right-rail-acceptance")]
 pub use self::settings_acceptance::SettingsAcceptanceState;
 #[cfg(feature = "right-rail-acceptance")]
-pub use self::suggestions_acceptance::SuggestionsAcceptanceState;
+pub use self::suggestions_acceptance::{AcceptanceImeEvent, SuggestionsAcceptanceState};
 mod history;
 #[cfg(feature = "right-rail-acceptance")]
 mod right_rail_acceptance_agent;
@@ -3661,8 +3661,8 @@ impl RootView {
             let recovery = configuration_recovery.clone();
             let configuration_changes = services.configuration_changes.clone();
             cx.new(|cx| {
-                let navigation = HostNavigation::new(hosts, executor, recovery, window, cx)
-                    .with_profiles(profiles, cx);
+                let navigation =
+                    HostNavigation::new(hosts, Some(profiles), executor, recovery, window, cx);
                 match configuration_changes {
                     Some(changes) => navigation.with_configuration_changes(changes),
                     None => navigation,
@@ -3830,6 +3830,7 @@ impl RootView {
                 }
                 if let crate::features::terminal_tools::TerminalToolsEvent::CloseSearch {
                     session_id,
+                    ..
                 } = event
                     && root.agent_terminal_session_id.as_ref() == Some(session_id)
                     && root.agent_terminal_lifecycle == Some(SessionLifecycle::Running)
@@ -3996,6 +3997,8 @@ impl RootView {
                 }
                 root.sync_plugin_content_visibility(cx);
                 if !window.is_window_active() {
+                    // 松键可能到达别的窗口，失活后不能用旧记录消费新的快捷键或重复键。
+                    root.clear_keybinding_chord();
                     // 应用失活时提前停止组件拥有的拖动与边缘滚动，GPUI 不会替应用清理 active_drag。
                     root.cancel_workbench_drag(window, cx);
                 }
@@ -6223,13 +6226,6 @@ impl RootView {
             return;
         }
         self.observe_keybinding_focus(window, cx);
-        if self.focus_handle.is_focused(window)
-            && let Some(binding) = self.logical_focused_terminal_view_binding(cx)
-            && !self.pane_input_handlers.contains_key(&binding.session_id)
-            && self.handle_terminal_history_key_down(binding, event, window, cx)
-        {
-            return;
-        }
         let contexts = window.context_stack();
         let is_modal = terminal_input_modal_blocked(
             window.has_active_prompt()
@@ -6251,6 +6247,16 @@ impl RootView {
                     .is_create_target_picker_open(),
             self.quick_open_modal_open,
         );
+        // 只读历史借用工作台焦点；上层模态仍应优先，已处理的按键也不能再进入祖先派发。
+        if !is_modal
+            && self.focus_handle.is_focused(window)
+            && let Some(binding) = self.logical_focused_terminal_view_binding(cx)
+            && !self.pane_input_handlers.contains_key(&binding.session_id)
+            && self.handle_terminal_history_key_down(binding, event, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         let focus_scope = keybinding_focus::classify_focus_scope(&contexts, is_modal);
         let ime_composing = focus_scope == keybindings::KeybindingFocusScope::Terminal
             && self.pane_input_handlers.values().any(|registration| {
@@ -7224,6 +7230,15 @@ impl Render for RootView {
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(|root, event, window, cx| {
                         root.handle_workbench_key_down(event, window, cx);
+                    }))
+                    .on_key_up(cx.listener(|root, event: &KeyUpEvent, _, cx| {
+                        // 只读历史没有 pane 输入实体，释放由工作台收尾；活动终端已在子级处理。
+                        if root
+                            .keybinding_runtime
+                            .release_terminal_shortcut_key(&event.keystroke)
+                        {
+                            cx.stop_propagation();
+                        }
                     }))
                     .child(workbench),
             );

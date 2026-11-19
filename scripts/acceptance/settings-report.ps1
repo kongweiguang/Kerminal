@@ -426,6 +426,7 @@ function Add-InteractionGallery {
             [pscustomobject]@{ File = 'settings-functional-keyword-list-scroll.png'; Label = '长规则列表滚动' },
             [pscustomobject]@{ File = 'settings-functional-keyword-filter.png'; Label = '规则搜索过滤' },
             [pscustomobject]@{ File = 'settings-functional-keyword-limit-footer.png'; Label = '规则上限与保存区' },
+            [pscustomobject]@{ File = 'settings-functional-terminal-assistant-routing.png'; Label = '右栏助手执行位置开关' },
             [pscustomobject]@{ File = 'settings-functional-terminal-theme.png'; Label = '终端主题与实时色盘' },
             [pscustomobject]@{ File = 'settings-functional-terminal-font.png'; Label = '系统字体搜索' },
             [pscustomobject]@{ File = 'settings-functional-terminal-font-size.png'; Label = '字号步进与边界' },
@@ -633,7 +634,7 @@ function Add-ReportChecks {
 
         $terminalChecks = Get-JsonProperty $Report 'terminalChecks'
         if ($null -eq $terminalChecks) { $terminalChecks = @() }
-        $terminalActions = @('terminal-theme-and-live-palette', 'terminal-system-font-search', 'terminal-font-size-step-and-bounds', 'terminal-line-height-step-and-bounds')
+        $terminalActions = @('terminal-assistant-command-routing', 'terminal-theme-and-live-palette', 'terminal-system-font-search', 'terminal-font-size-step-and-bounds', 'terminal-line-height-step-and-bounds')
         foreach ($action in $terminalActions) {
             $check = Find-ReportRecord -Records $terminalChecks -PropertyName 'action' -ExpectedValue $action
             $passed = Get-JsonProperty $check 'passed'

@@ -33,6 +33,8 @@
 
 `cursorStyle` 可为 `block`、`bar` 或 `underline`，`cursorBlink` 控制默认光标闪烁。`rightClickBehavior` 可为 `none`、`paste` 或 `menu`；`selectionCopy`、`showTabNumbers`、`confirmCloseTab` 和 `autoReconnect` 分别控制选中复制、标签序号、关闭确认和自动重连。`macOptionIsMeta` 只用于 macOS。旧 `showCommandBlockRail` 字段保留兼容，设置界面不再提供该选项。
 
+`[terminal].agentCommandsInTerminal` 是布尔值，默认 `true`。设置界面位于「终端 → 操作与连接」。开启时右栏助手可通过自己的 Kerminal MCP 会话向可见终端写入，Shell 的命令回显和输出会出现在对应标签页。关闭后，该会话的命令改用后台 SSH 或显式创建的后台终端。保存后，后续 MCP 调用读取新值；此设置只作用于右栏助手的 Kerminal 执行路径。
+
 `[terminal.inlineSuggestion]` 复用既有命令提示设置。`enabled` 默认 `true`；`presentation` 可为 `off`、`inline`、`inlineAndMenu`，默认 `inlineAndMenu`。关闭总开关会同步为 `off`，选择 `off` 也会关闭总开关。`acceptKey` 为 `rightArrow`（默认）或 `disabled`；`partialAccept` 默认 `true`，控制 Alt+右方向键的分段接受。`menuShortcut` 保留 `ctrlSpace`；Ctrl+Space 和 Alt+/ 均可主动打开候选菜单。`tabOpensMenu` 默认 `false`，只有显式启用时才将 Tab 用于候选菜单。菜单 Enter 和点击只补全，不执行命令。启用设置不代表当前 Shell 已提供可信编辑状态；不支持或集成失败的会话保留普通终端输入。
 
 `[terminal.inlineSuggestion.providers]` 的 `history`、`remotePath`、`remoteCommand`、`git`、`spec` 均默认 `true`。这些是来源开关，不保存候选或命令正文。`remoteRefresh` 为 `safe`（默认）或 `off`；`remoteProbeEnabled` 默认 `true`，与 `remoteRefresh` 的关闭状态保持一致。远端探测开关只控制远端来源，不能用来禁用本地命令历史。`auditRetentionDays` 默认 `30`，`feedbackRetentionDays` 默认 `365`，均限制在 1–3650 天；历史与接受反馈继续使用应用管理的数据库，不创建第二份历史文件。
@@ -57,7 +59,9 @@
 
 `binding` 是通用回退键位；Windows 的 `windowsBinding` 和 macOS 的 `macBinding` 为空时回退到 `binding`。`linuxBinding` 缺省时沿用旧 Linux 行为：先使用 `windowsBinding`，该字段为空时再回退到 `binding`；写成空字符串则显式禁用 Linux 绑定。每个动作在每个平台只有一个有效绑定。
 
-内置 `terminal.paste` 默认只作用于终端：Windows 为 `Ctrl+V`，Linux 为 `Ctrl+Shift+V`，macOS 为 `Cmd+V`。它的通用 `binding` 刻意留空；这样用户清空一个平台的覆盖值时，不会意外继承其他平台的键位。一次性旧格式迁移只会为已有的非空快捷键列表补入缺失的退出和粘贴动作；已有行及其空绑定保持不变，明确的 `keybindings = []` 也保持为空。补入粘贴动作时，若已有行占用了某个平台的默认粘贴键，只清空新粘贴行对应平台的冲突绑定。正常读取和保存不会恢复缺失动作。
+内置 `terminal.paste` 默认只作用于终端：Windows 为 `Ctrl+V`，Linux 为 `Ctrl+Shift+V`，macOS 为 `Cmd+V`。它的通用 `binding` 刻意留空；这样用户清空一个平台的覆盖值时，不会意外继承其他平台的键位。一次性旧格式迁移只会为已有的非空快捷键列表补入缺失的退出和粘贴动作；已有行及其空绑定保持不变，明确的 `keybindings = []` 也保持为空。补入粘贴动作时，若已有行占用了某个平台的默认粘贴键，只清空新粘贴行对应平台的冲突绑定。正常读取和保存不会恢复缺失动作。设置页的「恢复缺失动作」可显式补回缺少的内置行，已有自定义、空绑定和未知动作行会保留。
+
+设置页录制时保留 Tab 和 Shift+Tab 的焦点导航。macOS 的 Cmd+C，以及各平台的 Ctrl+C、Ctrl+Shift+C 由终端复制/中断优先消费，不可绑定到 `terminal` 作用域；其它作用域中使用这些键会提示终端焦点下的优先级。Windows/Linux 的 Ctrl+Insert 是未配置时的默认复制手势，但可以绑定到 `terminal` 作用域：有匹配配置（包括多段序列）时先执行配置动作，没有匹配时才复制当前选择。各平台按生效键位（含回退）校验。
 
 <!-- example:settings -->
 ```toml
@@ -85,6 +89,7 @@ cursorStyle = "block"
 cursorBlink = true
 colorScheme = "kerminal"
 selectionCopy = false
+agentCommandsInTerminal = true
 
 [mcp]
 bindMode = "loopback"

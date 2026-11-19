@@ -4,10 +4,15 @@
 
 use std::collections::BTreeMap;
 
+use gpui_kit::Keystroke;
+
 use crate::keybindings::{
-    CompiledKeybindings, KeybindingDiagnosticKind, KeybindingPlatform as RuntimeKeybindingPlatform,
+    CompiledKeybindings, KeybindingAction, KeybindingDiagnosticKind,
+    KeybindingPlatform as RuntimeKeybindingPlatform,
 };
-use kerminal_application::preferences::{KeybindingPreference, ProfileDraft, SettingsSnapshot};
+use kerminal_application::preferences::{
+    KeybindingPreference, KeybindingScope, ProfileDraft, SettingsSnapshot,
+};
 
 /// 快捷键平台选项；Linux 复用旧配置中的 Windows/Linux 字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +37,15 @@ pub struct SettingsIssue {
 }
 
 impl SettingsIssue {
-    /// 未知 action 是兼容性提示，不能阻止保存其它设置或丢弃未来版本字段。
+    /// 未知 action 和终端内被优先消费的组合只做兼容性提示，不能阻止保存其它设置。
     ///
     /// @author kongweiguang
     pub const fn blocks_save(&self) -> bool {
-        !matches!(self.kind, SettingsIssueKind::UnknownKeybindingAction)
+        !matches!(
+            self.kind,
+            SettingsIssueKind::UnknownKeybindingAction
+                | SettingsIssueKind::TerminalReservedKeybinding
+        )
     }
 }
 
@@ -61,6 +70,8 @@ pub enum SettingsIssueKind {
     KeybindingCollision,
     /// 当前版本不执行该 action，但保留原配置以兼容未来版本。
     UnknownKeybindingAction,
+    /// 终端作用域的组合已被复制/中断抢先消费；其它界面仍可能触发，因此只提示。
+    TerminalReservedKeybinding,
     /// 两条配置使用重复 action ID，保存无法无歧义映射。
     DuplicateAction,
     /// 关键词规则字段违反长度、唯一性或主题颜色约束。
@@ -142,6 +153,166 @@ pub(super) fn binding_is_customized(
         }
         KeyboardPlatform::Linux => binding.linux_binding != default.linux_binding,
     }
+}
+
+/// 组合键在录制和保存校验中的拒绝原因；分开原因才能区分“永远不可执行”与仅被终端抢先消费。
+///
+/// @author kongweiguang
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::features::preferences) enum ShortcutProblem {
+    /// 只有修饰键，缺少可执行主键。
+    ModifierOnly,
+    /// 终端复制或中断会在配置 keymap 前消费该组合。
+    TerminalReserved,
+    /// 纯字符或 Shift 字符会被文本输入优先接收。
+    PlainCharacter,
+}
+
+impl ShortcutProblem {
+    /// 录制控件和保存校验共用文案，避免同一规则出现两种说法。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn message(self) -> String {
+        match self {
+            Self::ModifierOnly => {
+                validation_text("请在修饰键后添加按键。", "Add a key after the modifiers.")
+            }
+            Self::TerminalReserved => validation_text(
+                "此按键已由终端复制或中断使用。",
+                "This key is reserved for terminal copy or interrupt.",
+            ),
+            Self::PlainCharacter => validation_text(
+                "字符按键需要搭配 Ctrl、Alt 或系统键。",
+                "Use Ctrl, Alt, or the system key with a character.",
+            ),
+        }
+    }
+
+    /// 终端作用域的动作在终端内无法触发，必须修正；其它作用域仍可在非终端界面派发，只提示。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn blocks_save(self, scope: KeybindingScope) -> bool {
+        match self {
+            Self::TerminalReserved => scope == KeybindingScope::Terminal,
+            Self::ModifierOnly | Self::PlainCharacter => true,
+        }
+    }
+}
+
+/// 纯修饰键没有可执行主键，不能成为绑定；录制时保留状态等待下一次按键。
+///
+/// @author kongweiguang
+fn is_modifier_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ctrl"
+            | "control"
+            | "shift"
+            | "alt"
+            | "cmd"
+            | "win"
+            | "super"
+            | "fn"
+            | "platform"
+            | "function"
+    )
+}
+
+/// 预览和录制阶段都允许 Tab/Shift+Tab 走焦点系统，避免录制控件吞掉键盘导航。
+///
+/// @author kongweiguang
+pub(in crate::features::preferences) fn is_focus_navigation_stroke(stroke: &Keystroke) -> bool {
+    let modifiers = stroke.modifiers;
+    stroke.key.eq_ignore_ascii_case("tab")
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && !modifiers.function
+}
+
+/// 运行态会把纯字符及 Shift 字符留给文本输入，因此不能接受无法执行的绑定。
+///
+/// @author kongweiguang
+fn is_plain_character_stroke(stroke: &Keystroke) -> bool {
+    let modifiers = stroke.modifiers;
+    !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && !modifiers.function
+        && stroke.key.chars().count() == 1
+}
+
+/// 复制和中断在终端 keymap 前处理，按录制的目标平台拒绝实际不可达的绑定。
+/// Ctrl+Insert 只是未配置时的默认复制手势，配置命中时会先执行用户动作，因此不再保留。
+///
+/// @author kongweiguang
+fn is_terminal_reserved_stroke(stroke: &Keystroke, platform: RuntimeKeybindingPlatform) -> bool {
+    use RuntimeKeybindingPlatform::Mac;
+    let modifiers = stroke.modifiers;
+    if modifiers.alt || modifiers.function {
+        return false;
+    }
+    let key = stroke.key.to_ascii_lowercase();
+    key == "c"
+        && ((modifiers.control && !modifiers.platform)
+            || (platform == Mac && modifiers.platform && !modifiers.control && !modifiers.shift))
+}
+
+/// 单次按键的原因判断只维护一份，录制、恢复默认和保存校验都复用它。
+///
+/// @author kongweiguang
+pub(in crate::features::preferences) fn shortcut_stroke_problem(
+    stroke: &Keystroke,
+    platform: RuntimeKeybindingPlatform,
+) -> Option<ShortcutProblem> {
+    if is_modifier_key(&stroke.key.to_ascii_lowercase()) {
+        return Some(ShortcutProblem::ModifierOnly);
+    }
+    if is_terminal_reserved_stroke(stroke, platform) {
+        return Some(ShortcutProblem::TerminalReserved);
+    }
+    if is_plain_character_stroke(stroke) {
+        return Some(ShortcutProblem::PlainCharacter);
+    }
+    None
+}
+
+/// 多段序列逐段检查；解析失败交给 GPUI 编译诊断，不在这里伪造第二条格式错误。
+///
+/// @author kongweiguang
+pub(in crate::features::preferences) fn shortcut_sequence_problem(
+    value: &str,
+    platform: RuntimeKeybindingPlatform,
+) -> Option<ShortcutProblem> {
+    let normalized = crate::keybindings::normalize_legacy_binding(value);
+    for part in normalized.split_whitespace() {
+        let Ok(stroke) = Keystroke::parse(part) else {
+            continue;
+        };
+        if let Some(problem) = shortcut_stroke_problem(&stroke, platform) {
+            return Some(problem);
+        }
+    }
+    None
+}
+
+/// 恢复缺失动作只补齐默认目录中不存在的 action，已有行（含自定义和未知 action）保持原样。
+///
+/// 这是用户显式触发的操作；正常读取和保存仍按契约不自动补行。
+///
+/// @author kongweiguang
+pub(super) fn missing_default_keybindings(
+    existing: &[KeybindingPreference],
+) -> Vec<KeybindingPreference> {
+    let existing_actions = existing
+        .iter()
+        .map(|binding| binding.action.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    SettingsSnapshot::default()
+        .keybindings
+        .into_iter()
+        .filter(|binding| !existing_actions.contains(binding.action.as_str()))
+        .collect()
 }
 
 /// 校验完整 typed snapshot；快捷键使用运行时同一 GPUI parser，保留未知 action 警告。
@@ -263,6 +434,11 @@ pub fn validate_settings(draft: &SettingsDraft, platform: KeyboardPlatform) -> V
         }
     }
 
+    let runtime_platform = match platform {
+        KeyboardPlatform::Windows => RuntimeKeybindingPlatform::Windows,
+        KeyboardPlatform::Linux => RuntimeKeybindingPlatform::Linux,
+        KeyboardPlatform::Mac => RuntimeKeybindingPlatform::Mac,
+    };
     let mut seen_actions = BTreeMap::<&str, usize>::new();
     for keybinding in &draft.keybindings {
         *seen_actions.entry(&keybinding.action).or_default() += 1;
@@ -287,6 +463,51 @@ pub fn validate_settings(draft: &SettingsDraft, platform: KeyboardPlatform) -> V
                 .to_string(),
             });
         }
+        // 未知 action 已有保留提示，不再重复判断不可达组合，避免同一行出现两条误导信息。
+        if KeybindingAction::from_id(&keybinding.action).is_none() {
+            continue;
+        }
+        // 保存校验必须和录制使用同一平台的有效值，否则 Linux 回退字段会漏诊。
+        let effective = binding_for_platform(keybinding, platform);
+        if let Some(problem) = shortcut_sequence_problem(&effective, runtime_platform) {
+            let blocking = problem.blocks_save(keybinding.scope);
+            let (zh_cn, en_us) = if blocking {
+                (
+                    format!(
+                        "动作 {} 的绑定 {} 在当前平台不可用：{}",
+                        keybinding.action,
+                        effective,
+                        problem.message()
+                    ),
+                    format!(
+                        "Binding '{}' for action '{}' is unavailable on this platform: {}",
+                        effective,
+                        keybinding.action,
+                        problem.message()
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "动作 {} 的绑定 {} 在终端内会被复制或中断优先消费，其它界面仍可使用。",
+                        keybinding.action, effective
+                    ),
+                    format!(
+                        "Binding '{}' for action '{}' is consumed by terminal copy or interrupt inside the terminal; it still works elsewhere.",
+                        effective, keybinding.action
+                    ),
+                )
+            };
+            issues.push(SettingsIssue {
+                kind: if blocking {
+                    SettingsIssueKind::InvalidKeybinding
+                } else {
+                    SettingsIssueKind::TerminalReservedKeybinding
+                },
+                actions: vec![keybinding.action.clone()],
+                message: validation_text(&zh_cn, &en_us).to_string(),
+            });
+        }
     }
     for (action, count) in seen_actions {
         if count > 1 {
@@ -300,11 +521,6 @@ pub fn validate_settings(draft: &SettingsDraft, platform: KeyboardPlatform) -> V
             });
         }
     }
-    let runtime_platform = match platform {
-        KeyboardPlatform::Windows => RuntimeKeybindingPlatform::Windows,
-        KeyboardPlatform::Linux => RuntimeKeybindingPlatform::Linux,
-        KeyboardPlatform::Mac => RuntimeKeybindingPlatform::Mac,
-    };
     let compiled = CompiledKeybindings::compile(&draft.keybindings, runtime_platform);
     for diagnostic in compiled.diagnostics() {
         let (kind, zh_cn, en_us) = match diagnostic.kind {

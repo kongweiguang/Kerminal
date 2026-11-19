@@ -200,14 +200,13 @@ impl McpRuntimeController {
                 } else {
                     None
                 };
-                McpServer::start_authorized(
-                    &self.runtime,
-                    self.services.clone(),
-                    config,
-                    token,
-                    reserved,
-                )
-                .await
+                // 每次 listener 启动都沿用 controller 的唯一设置仓储；Agent 命令路由
+                // 在请求时读取已提交值，不因启停或重启产生第二份快照。
+                let mut services = self.services.clone();
+                if services.preferences.is_none() {
+                    services.preferences = self.preferences.clone();
+                }
+                McpServer::start_authorized(&self.runtime, services, config, token, reserved).await
             }
             .await;
             let server = match server_result {

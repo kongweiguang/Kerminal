@@ -16,11 +16,11 @@ use kerminal_application::{
     connections::{
         HostConnectionRepository,
         management::{
-            HostAuthenticationMode, HostCredentialReferenceCoverage, HostDocumentRevision,
-            HostDraft, HostGroup, HostGroupDeletionReceipt, HostGroupDraft, HostGroupSnapshot,
-            HostManagementRepository, HostSftpOptions, HostTerminalOptions, ManagedHost,
-            ManagedJumpHost, RdpDisplayOptions, host_note_is_valid, is_reserved_serial_host_tag,
-            normalize_host_note,
+            HostAuthenticationMode, HostCatalog, HostCredentialReferenceCoverage,
+            HostDocumentRevision, HostDraft, HostGroup, HostGroupDeletionReceipt, HostGroupDraft,
+            HostGroupSnapshot, HostManagementRepository, HostSftpOptions, HostTerminalOptions,
+            ManagedHost, ManagedJumpHost, RdpDisplayOptions, host_note_is_valid,
+            is_reserved_serial_host_tag, normalize_host_note,
         },
     },
     platform::external_launch::{ExternalTargetIdentity, SavedExternalTargetLookup},
@@ -334,15 +334,47 @@ impl HostConfigurationRepository {
         })
     }
 
-    /// 仅枚举文件名，内容必须经 ConfigurationRepository 与恢复门禁读取。
-    async fn host_ids(&self) -> AppResult<Vec<HostId>> {
-        let directory = self.root.join("hosts");
-        let ids = task::spawn_blocking(move || enumerate_host_ids(&directory))
+    /// 在一个阻塞任务和一次共享锁内枚举并读取全部主机原始文档。
+    ///
+    /// 逐文件调用 `read` 会重复获取跨进程 `StorageLock`，每次都要发布 owner 元数据、
+    /// 同步目录并复核清理。把枚举和原始字节读取放在同一锁域可减少开销，并在协作
+    /// 写入之间取得一致视图。校验和解码留在锁外，避免占用写入通道做 TOML 解析。
+    ///
+    /// @author kongweiguang
+    async fn host_document_snapshot(&self) -> AppResult<Vec<(HostId, ConfigDocument)>> {
+        let repository = self.clone();
+        task::spawn_blocking(move || repository.host_document_snapshot_locked())
             .await
             .map_err(|source| {
                 AppError::infrastructure_with_source("主机目录扫描任务意外终止", source)
-            })??;
-        Ok(ids)
+            })?
+    }
+
+    /// 锁内只收集原始文档；任一文件缺失或读取失败仍按原语义显式报冲突。
+    ///
+    /// 空目录也必须先通过事务门禁：此时没有单文件读取可以顺带检查 journal，
+    /// 不能把并发的未完成分组事务误报成空列表。门禁只在快照开始时执行一次；
+    /// 协作写入受同一把锁约束，锁内不会再创建事务，逐文件重查无法覆盖不遵守锁的
+    /// 外部写入（它们也可能在最后一次检查后出现）。外部编辑仍由逐文档 validator
+    /// 和 revision 校验暴露。
+    ///
+    /// @author kongweiguang
+    fn host_document_snapshot_locked(&self) -> AppResult<Vec<(HostId, ConfigDocument)>> {
+        let storage = self.store.storage_coordinator();
+        let lock = storage.lock().map_err(|source| {
+            AppError::infrastructure_with_source("无法锁定主机配置目录", source)
+        })?;
+        self.store.ensure_host_documents_readable_locked(&lock)?;
+        let ids = enumerate_host_ids(&self.root.join("hosts"))?;
+        let mut documents = Vec::with_capacity(ids.len());
+        for id in ids {
+            let document = self
+                .store
+                .read_host_document_in_snapshot_locked(&lock, id.as_str())?
+                .ok_or_else(|| AppError::conflict("主机目录在读取期间发生变化，请刷新后重试"))?;
+            documents.push((id, document));
+        }
+        Ok(documents)
     }
 
     /// 编辑 TOML 前读取现有文档，并验证调用方提交的精确 CAS revision。
@@ -382,14 +414,14 @@ impl HostManagementRepository for HostConfigurationRepository {
     }
 
     /// 完整返回所有普通 schema v3 主机；任一条目损坏都整体失败，避免误报为缺失。
+    ///
+    /// 原始文档在同一次锁内批量取得，解码仍在锁外逐条执行，保持原有错误与分类语义。
+    ///
+    /// @author kongweiguang
     async fn list_hosts(&self) -> AppResult<Vec<ManagedHost>> {
-        let mut hosts = Vec::new();
-        for id in self.host_ids().await? {
-            let path = ConfigDocumentPath::Host(id.as_str().to_owned());
-            let document =
-                self.configuration.read(path).await?.ok_or_else(|| {
-                    AppError::conflict("主机目录在读取期间发生变化，请刷新后重试")
-                })?;
+        let snapshot = self.host_document_snapshot().await?;
+        let mut hosts = Vec::with_capacity(snapshot.len());
+        for (id, document) in snapshot {
             self.store
                 .validate_host_document(id.as_str(), &document.source)?;
             if Self::document_is_local(&document)? {
@@ -401,6 +433,34 @@ impl HostManagementRepository for HostConfigurationRepository {
             }
         }
         Ok(hosts)
+    }
+
+    /// 侧栏一次加载共用目录的远程、扩展与本地投影。
+    ///
+    /// 与三次独立列表不同，这里每个文档只读取一次，校验与解析只发生一轮，再按原有
+    /// 协议分类写入对应列表；不再让三类列表各自完整扫描同一目录三次。排序和失败
+    /// 语义由应用层沿用原方法，仓储不改变可见顺序。
+    ///
+    /// @author kongweiguang
+    async fn list_catalog(&self) -> AppResult<HostCatalog> {
+        let snapshot = self.host_document_snapshot().await?;
+        let mut catalog = HostCatalog::default();
+        for (id, document) in snapshot {
+            self.store
+                .validate_host_document(id.as_str(), &document.source)?;
+            if Self::document_is_local(&document)? {
+                catalog
+                    .local_hosts
+                    .push(Self::decode_local_host(document, &id)?);
+            } else if Self::document_is_plugin(&document)? {
+                catalog
+                    .plugin_hosts
+                    .push(self.decode_plugin_host(document, &id)?);
+            } else {
+                catalog.hosts.push(Self::decode_host(document, &id)?);
+            }
+        }
+        Ok(catalog)
     }
 
     /// 按稳定 ID 读取主机，文件路径推导留在基础设施边界。

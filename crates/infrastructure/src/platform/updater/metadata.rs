@@ -31,7 +31,7 @@ const METADATA_CHECK_DEADLINE: Duration = Duration::from_secs(3);
 /// 限制重定向次数，并拒绝从 HTTPS feed 跳转到不安全地址。
 const MAX_METADATA_REDIRECTS: usize = 10;
 
-/// 按 SDK 当前 target 规则逐个读取 endpoint，并生成后续由 SDK 安装的 Update。
+/// 按 SDK 当前 target 规则读取 endpoint，并区分检查超时与普通源错误，让界面能提示可重试原因。
 pub(super) async fn check(
     settings: &UpdaterSettings,
     cancellation: CancellationToken,
@@ -64,7 +64,7 @@ pub(super) async fn check(
             return Err(AppError::cancelled("检查更新已取消"));
         }
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
-            return Err(AppError::infrastructure("检查更新超过总时限"));
+            return Err(AppError::timeout("检查更新"));
         }
 
         let release = match response {
@@ -88,7 +88,7 @@ pub(super) async fn check(
     }
     match last_error {
         Some(error) => Err(error),
-        None => Err(AppError::infrastructure("检查更新超过总时限")),
+        None => Err(AppError::timeout("检查更新")),
     }
 }
 

@@ -1,6 +1,7 @@
 // @author kongweiguang
 
 use super::*;
+use crate::features::terminal_tools::TerminalToolsView;
 use kerminal_application::sessions::UiSessionBinding;
 use kerminal_domain::identity::{PaneId, TabId};
 use kerminal_domain::sessions::{SessionOwner, TerminalSize};
@@ -357,6 +358,62 @@ fn same_cell_continuous_output_refreshes_projection_without_repeating_stable_fra
     let reflowed = fixture_selection_viewport(3, 31, 6, "output$");
     assert!(drag.update(point, cell, 0, &reflowed).is_some());
     assert!(drag.update(point, cell, 0, &reflowed).is_none());
+}
+
+/// 指针在同一帧来回跨过边缘时，保留原回调的预约，避免一个手势积累多条滚动链。
+#[gpui_kit::test]
+fn selection_autoscroll_keeps_one_callback_until_it_finishes(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let binding = fixture_binding(fixture_session(), 21);
+    let session = binding.session_id.clone();
+    let (tools, visual) =
+        cx.add_window_view(move |window, cx| TerminalToolsView::new(Some(session), window, cx));
+    visual.update(|_, app| {
+        tools.update(app, |tools, cx| {
+            let point = TerminalPoint {
+                line: 120,
+                column: 4,
+            };
+            let cell = ViewportCell { row: 0, column: 4 };
+            let viewport = fixture_selection_viewport(0, 120, 1, "hello");
+            let token = tools
+                .begin_canvas_selection_gesture(
+                    binding,
+                    point,
+                    cell,
+                    TerminalSelectionKind::Character,
+                    1,
+                    viewport.clone(),
+                    false,
+                    false,
+                    cx,
+                )
+                .expect("当前终端应接受拖选");
+            assert!(tools.update_canvas_selection_gesture(
+                &token,
+                point,
+                cell,
+                -1,
+                viewport.clone(),
+                cx
+            ));
+            assert!(tools.begin_canvas_autoscroll_schedule(&token));
+            assert!(tools.update_canvas_selection_gesture(
+                &token,
+                point,
+                cell,
+                0,
+                viewport.clone(),
+                cx
+            ));
+            assert!(tools.update_canvas_selection_gesture(&token, point, cell, -1, viewport, cx));
+            assert!(!tools.begin_canvas_autoscroll_schedule(&token));
+            tools.finish_canvas_autoscroll_schedule(&token);
+            assert!(tools.begin_canvas_autoscroll_schedule(&token));
+            assert!(tools.cancel_canvas_selection_gesture_if(token.gesture_id(), cx));
+            assert!(!tools.begin_canvas_autoscroll_schedule(&token));
+        });
+    });
 }
 
 /// 验证滚动 ACK 必须匹配手势的完整 owner/generation，并保留最新指针 cell 供确认后映射。

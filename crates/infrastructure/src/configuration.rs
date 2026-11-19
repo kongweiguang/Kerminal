@@ -330,6 +330,22 @@ impl ConfigurationStore {
         self.read_document_unlocked(ConfigDocumentPath::Host(host_id.to_owned()))
     }
 
+    /// 调用方已在本锁域开始时完成事务门禁时，读取主机原始文档不再逐文件重查 journal。
+    ///
+    /// 协作写入必须持有同一存储锁，锁内的快照不会看到中途新建的事务；不遵守锁的
+    /// 外部写入同样可能在最后一次检查之后出现，逐文件重查并不能提供额外保证。
+    /// 因此批量列表只在快照开始时检查一次，既保留未完成事务的整体拒绝语义，也避免
+    /// 每份文件重复做两次 journal 元数据探测。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn read_host_document_in_snapshot_locked(
+        &self,
+        _lock: &StorageLock<'_>,
+        host_id: &str,
+    ) -> AppResult<Option<ConfigDocument>> {
+        self.read_document_unlocked(ConfigDocumentPath::Host(host_id.to_owned()))
+    }
+
     /// 空主机目录也必须检查配置事务，不能把未完成事务误认为不存在引用。
     ///
     /// @author kongweiguang

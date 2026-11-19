@@ -90,15 +90,14 @@ impl HostConfigurationRepository {
 
     /// 同一目录中任何损坏条目都必须显式失败，不能把损坏远程主机伪装成空列表。
     ///
+    /// 与远程列表共用一次锁内快照：本地投影只做锁外筛选，避免每份文档重复获取
+    /// 跨进程存储锁，同时保留远程/插件条目的原有校验顺序。
+    ///
     /// @author kongweiguang
     pub(super) async fn list_local_host_records(&self) -> AppResult<Vec<ManagedLocalHost>> {
-        let mut hosts = Vec::new();
-        for id in self.host_ids().await? {
-            let document = self
-                .configuration
-                .read(ConfigDocumentPath::Host(id.as_str().to_owned()))
-                .await?
-                .ok_or_else(|| AppError::conflict("主机目录在读取期间发生变化，请刷新后重试"))?;
+        let snapshot = self.host_document_snapshot().await?;
+        let mut hosts = Vec::with_capacity(snapshot.len());
+        for (id, document) in snapshot {
             self.store
                 .validate_host_document(id.as_str(), &document.source)?;
             if Self::document_is_local(&document)? {

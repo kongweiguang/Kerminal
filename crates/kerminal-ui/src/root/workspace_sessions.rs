@@ -588,6 +588,13 @@ impl RootView {
             Ok(None) => return,
             Err(_) => return,
         };
+        // 在 spawn 前冻结确认水位：本次读取启动后若又有选择 ACK，结果不得撤销那条更新的确认。
+        let selection_target = super::terminal_tools_runtime::selection_reconcile_target(
+            self,
+            self.workspace_tools.get(&session_id),
+            &session_id,
+            cx,
+        );
         #[cfg(feature = "acceptance-metrics")]
         crate::acceptance_metrics::terminal_echo_probe_registry().record_phase_for_session(
             binding.session_id.as_str(),
@@ -632,6 +639,7 @@ impl RootView {
                                     || current.grid_epoch != snapshot.grid_epoch
                             })
                         });
+                    let snapshot_has_selection = snapshot.selection.is_some();
                     let accepted = root
                         .workspace_runtime
                         .accept_snapshot(&pane_id, &session_id, token, snapshot)
@@ -653,6 +661,15 @@ impl RootView {
                         .finish_snapshot_request(&pane_id, &session_id, token, accepted, true)
                         .unwrap_or(false);
                     if accepted {
+                        let binding_is_current =
+                            root.terminal_view_bindings.get(&session_id) == Some(&callback_binding);
+                        super::terminal_tools_runtime::reconcile_confirmed_selection_after_snapshot(
+                            root,
+                            selection_target.as_ref(),
+                            binding_is_current,
+                            snapshot_has_selection,
+                            cx,
+                        );
                         root.refresh_workspace_views(cx);
                         if changes_grid_topology {
                             root.refresh_open_terminal_search_for_view_revision(&session_id, cx);

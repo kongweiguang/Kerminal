@@ -39,12 +39,7 @@ impl HostManagementService {
     /// @author kongweiguang
     pub async fn list_local_hosts(&self) -> AppResult<Vec<ManagedLocalHost>> {
         let mut hosts = self.repository.list_local_hosts().await?;
-        hosts.sort_by(|left, right| {
-            left.sort_order
-                .cmp(&right.sort_order)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-        });
+        super::sort_local_hosts(&mut hosts);
         Ok(hosts)
     }
 

@@ -48,6 +48,13 @@ const CONFIG_GUIDE_REVISION_13_SHA256: &str =
     "cc45a78fadb32f0f7d6fb8e482177f22df55b78f9baa2c54a2265583cfab4444";
 const CONFIG_GUIDE_REVISION_14_SHA256: &str =
     "6b3128c7addb0b5a98b2789f705f382b6376f70055cc5b16251290bd2f168b44";
+// Beta 2–5 与 Beta 6–7 使用同一个修订号，但发布了两份不同的受管正文。
+const CONFIG_GUIDE_REVISION_15_SHA256: [&str; 2] = [
+    "f357e3d52c87494e0bde5b81dc80c0c69d0be639c952bfafa58946d06504c2cc",
+    "f397ed6f6c036e19ce076453dafb65281ac8aaa5212f04e291cc06c254f71ae2",
+];
+const CONFIG_GUIDE_REVISION_16_SHA256: &str =
+    "a755873e67effd28d81ad1ba8a17b70cd83f271c4df97e8dcf6510f28964b84e";
 const LEGACY_TAURI_CONFIG_GUIDE_SHA256: &str =
     "e70de091c515a0a143cd04f379a4274fbe18f810a411a6ca273277bc743220ad";
 
@@ -1307,8 +1314,12 @@ fn outdated_guide_revision(contents: &[u8]) -> Option<u32> {
         {
             return None;
         }
-        return (known_previous_guide_digest(revision) == Some(digest.as_str()))
-            .then_some(revision);
+        return (if revision == 15 {
+            CONFIG_GUIDE_REVISION_15_SHA256.contains(&digest.as_str())
+        } else {
+            known_previous_guide_digest(revision) == Some(digest.as_str())
+        })
+        .then_some(revision);
     }
 
     let source = std::str::from_utf8(contents).ok()?;
@@ -1316,6 +1327,10 @@ fn outdated_guide_revision(contents: &[u8]) -> Option<u32> {
     if digest == configuration::config_guide_digest(kerminal_application::preferences::CONFIG_GUIDE)
     {
         None
+    } else if digest == CONFIG_GUIDE_REVISION_16_SHA256 {
+        Some(16)
+    } else if CONFIG_GUIDE_REVISION_15_SHA256.contains(&digest.as_str()) {
+        Some(15)
     } else if digest == CONFIG_GUIDE_REVISION_14_SHA256 {
         Some(14)
     } else if digest == CONFIG_GUIDE_REVISION_13_SHA256 {
@@ -1375,6 +1390,7 @@ fn known_previous_guide_digest(revision: u32) -> Option<&'static str> {
         12 => Some(CONFIG_GUIDE_REVISION_12_SHA256),
         13 => Some(CONFIG_GUIDE_REVISION_13_SHA256),
         14 => Some(CONFIG_GUIDE_REVISION_14_SHA256),
+        16 => Some(CONFIG_GUIDE_REVISION_16_SHA256),
         _ => None,
     }
 }

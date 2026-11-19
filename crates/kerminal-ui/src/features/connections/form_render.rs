@@ -4218,8 +4218,8 @@ fn note_card(message: impl Into<gpui_kit::SharedString>, theme: ThemeTokens) -> 
         .child(message.into())
 }
 
-/// 同时表达凭据状态且单独绑定清除按钮的焦点行；独立身份避免同页多个秘密槽共用 reveal 状态。
-/// 点击回调遵守 Kit 的 App 级事件契约，不读取 vault。
+/// 只在已有凭据可管理时显示状态和按钮，避免空白表单反复显示无操作价值的提示。
+/// 标记清除后仍保留原行与按钮，让用户保存前可以撤销，并区分待清除和实际未保存。
 /// @author kongweiguang
 fn credential_status(
     scope: &EditorFieldScope,
@@ -4230,20 +4230,21 @@ fn credential_status(
     label: impl Into<gpui_kit::SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement {
+    if !exists {
+        return div().hidden();
+    }
     let label = label.into();
-    let mut status =
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(div().flex_1().text_xs().child(if exists && !clearing {
-                crate::locale::text("已关联加密凭据", "Encrypted credential linked")
-            } else {
-                crate::locale::text("未保存凭据", "No saved credential")
-            }));
-    if exists {
-        status = status.child(
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(div().flex_1().text_xs().child(if clearing {
+            crate::locale::text("保存后清除", "Clears on save")
+        } else {
+            crate::locale::text("已关联加密凭据", "Encrypted credential linked")
+        }))
+        .child(
             scope.wrap(
                 identity,
                 Button::new(format!("connections-clear-{label}"))
@@ -4262,7 +4263,5 @@ fn credential_status(
                     .disabled(disabled)
                     .on_click(on_click),
             ),
-        );
-    }
-    status
+        )
 }

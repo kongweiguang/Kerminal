@@ -185,6 +185,135 @@ fn confirmed_selection_survives_ack_until_snapshot_reconciles_it() {
     assert!(!runtime.selection_may_be_present(&owner));
 }
 
+/// 在途快照只能撤销启动时看到的旧确认；请求启动后到达的新 ACK 必须保留，直到更新的帧收敛。
+///
+/// @author kongweiguang
+#[test]
+fn stale_snapshot_cannot_clear_newer_confirmed_selection() {
+    let mut runtime = TerminalToolsRuntime::default();
+    let owner = owner(18, 2);
+    runtime.set_confirmed_selection_present(&owner, true);
+    let stale_watermark = runtime
+        .confirmed_selection_watermark(&owner)
+        .expect("confirmed selection exposes its watermark");
+
+    // 模拟请求启动后又完成一次真实选择 ACK：水位推进，旧帧的 None 不能撤销它。
+    runtime.set_confirmed_selection_present(&owner, true);
+    assert!(!runtime.clear_confirmed_selection_if_unchanged(&owner, Some(stale_watermark)));
+    assert!(runtime.selection_may_be_present(&owner));
+
+    let fresh_watermark = runtime
+        .confirmed_selection_watermark(&owner)
+        .expect("new acknowledgement owns a new watermark");
+    assert_ne!(stale_watermark, fresh_watermark);
+    assert!(runtime.clear_confirmed_selection_if_unchanged(&owner, Some(fresh_watermark)));
+    assert!(!runtime.selection_may_be_present(&owner));
+}
+
+/// 无水位的快照（请求启动时没有确认）不能撤销之后才到达的 ACK；撤销只作用于同一 owner。
+///
+/// @author kongweiguang
+#[test]
+fn snapshot_reconcile_is_scoped_to_unchanged_owner_watermark() {
+    let mut runtime = TerminalToolsRuntime::default();
+    let first = owner(19, 1);
+    let second = owner(20, 1);
+
+    // 请求启动时 first 尚无标记，之后才 ACK：None 水位必须保持不动。
+    runtime.set_confirmed_selection_present(&first, true);
+    assert!(!runtime.clear_confirmed_selection_if_unchanged(&first, None));
+    assert!(runtime.selection_may_be_present(&first));
+
+    // 同会话的另一个 owner 有独立水位，快照撤销不能串到它。
+    let first_watermark = runtime.confirmed_selection_watermark(&first);
+    runtime.set_confirmed_selection_present(&second, true);
+    assert!(runtime.clear_confirmed_selection_if_unchanged(&first, first_watermark));
+    assert!(!runtime.selection_may_be_present(&first));
+    assert!(runtime.selection_may_be_present(&second));
+}
+
+/// 快照撤销已确认标记时，仍在途的选择请求继续阻止 Ctrl+C 变成中断。
+///
+/// @author kongweiguang
+#[test]
+fn pending_selection_keeps_interrupt_guard_after_snapshot_clear() {
+    let mut runtime = TerminalToolsRuntime::default();
+    let owner = owner(21, 3);
+    runtime.set_confirmed_selection_present(&owner, true);
+    let watermark = runtime.confirmed_selection_watermark(&owner);
+    let request = runtime
+        .begin(
+            owner.clone(),
+            TerminalToolsRequestKind::Selection,
+            None,
+            TerminalToolsRequestPolicy::ReplaceCancellable,
+        )
+        .expect("selection begins");
+
+    assert!(runtime.clear_confirmed_selection_if_unchanged(&owner, watermark));
+    assert!(!runtime.confirmed_selection_present.contains_key(&owner));
+    assert!(runtime.selection_may_be_present(&owner));
+
+    runtime.finish_selection(&request, true);
+    assert!(!runtime.has_pending_selection(&owner));
+    assert!(!runtime.selection_may_be_present(&owner));
+}
+
+/// ACK 终态先写先得：已接受的回执不被后续替换改写，未完成的替换仍以拒绝唤醒等待者。
+///
+/// @author kongweiguang
+#[test]
+fn selection_ack_finish_is_first_write_wins() {
+    let mut runtime = TerminalToolsRuntime::default();
+    let owner = owner(22, 4);
+    let accepted_request = runtime
+        .begin(
+            owner.clone(),
+            TerminalToolsRequestKind::Selection,
+            None,
+            TerminalToolsRequestPolicy::ReplaceCancellable,
+        )
+        .expect("selection begins");
+    let accepted_ack = runtime
+        .selection_ack(&owner)
+        .expect("selection exposes its completion gate");
+    runtime.finish_selection(&accepted_request, true);
+    assert_eq!(accepted_ack.result(), Some(true));
+
+    let _replacement = runtime
+        .begin(
+            owner.clone(),
+            TerminalToolsRequestKind::Selection,
+            None,
+            TerminalToolsRequestPolicy::ReplaceCancellable,
+        )
+        .expect("a later move replaces the accepted request");
+    assert_eq!(accepted_ack.result(), Some(true));
+
+    let pending_request = runtime
+        .begin(
+            owner.clone(),
+            TerminalToolsRequestKind::Selection,
+            None,
+            TerminalToolsRequestPolicy::ReplaceCancellable,
+        )
+        .expect("pending move begins");
+    let pending_ack = runtime
+        .selection_ack(&owner)
+        .expect("pending move owns a completion gate");
+    assert_eq!(pending_ack.result(), None);
+    let _newest = runtime
+        .begin(
+            owner.clone(),
+            TerminalToolsRequestKind::Selection,
+            None,
+            TerminalToolsRequestPolicy::ReplaceCancellable,
+        )
+        .expect("newer move replaces the pending one");
+    assert_eq!(pending_ack.result(), Some(false));
+    assert!(!runtime.is_current(&pending_request));
+}
+
 /// Anchor ACK 与 Move request 分离后保持可用；新手势取消旧 ID，Cancel 只撤销当前 ID。
 #[test]
 fn selection_anchor_ack_is_stable_across_moves_and_scoped_to_gesture() {

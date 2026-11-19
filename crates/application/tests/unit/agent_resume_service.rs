@@ -57,11 +57,11 @@ fn stored_endpoint_context(
     }
 }
 
-/// 运行时只接受当前全局路由；旧 scoped 路由必须先经数据迁移清理。
+/// 运行时接受本会话的 scoped 路由或兼容旧全局路由；其他 scoped ID 仍必须拒绝。
 ///
 /// @author kongweiguang
 #[test]
-fn stored_endpoint_accepts_only_current_global_route() {
+fn stored_endpoint_accepts_matching_scoped_or_legacy_global_route() {
     let session = endpoint_fixture_session();
     let id = session.agent_session_id.as_str();
     let base_endpoint = "http://127.0.0.1:37657/mcp";
@@ -69,13 +69,18 @@ fn stored_endpoint_accepts_only_current_global_route() {
 
     stored_endpoint_context(&session, Some(base_endpoint.to_owned()))
         .validate_for(&session)
-        .expect("current global route should remain readable");
+        .expect("legacy global route should remain readable");
+    stored_endpoint_context(&session, Some(scoped_endpoint.clone()))
+        .validate_for(&session)
+        .expect("matching session-scoped route should be readable");
     assert!(validate_mcp_endpoint(base_endpoint).is_ok());
-    assert!(validate_mcp_endpoint(&scoped_endpoint).is_err());
+    assert!(
+        validate_mcp_endpoint(&scoped_endpoint).is_err(),
+        "configured listener base must not already be scoped"
+    );
 
     let other_id = AgentSessionId::new();
     let rejected = [
-        scoped_endpoint,
         format!("http://127.0.0.1:37657/mcp/agents/{other_id}"),
         "http://127.0.0.1:37657/mcp/extra".to_owned(),
         "http://127.0.0.1:37657/mcp?token=fixture".to_owned(),

@@ -1632,7 +1632,7 @@ async fn ui_scroll_requires_exact_visible_binding_and_generation() {
         .expect("close test session resources");
 }
 
-/// 验证绝对跳转以当前 history 大小为边界，且旧 generation 不能继续改写 viewport。
+/// 验证绝对跳转以当前 history 大小为边界；已在目标位置时不唤醒读者，旧 generation 仍不能改写 viewport。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -1683,6 +1683,32 @@ async fn ui_scroll_to_offset_clamps_and_rejects_stale_binding() {
         .expect("read clamped viewport");
     assert_eq!(clamped.scrollback_offset, clamped.history_size);
 
+    let mut updates = manager
+        .subscribe(session_id.clone())
+        .await
+        .expect("observe viewport updates after the first jump");
+    let cancellation = CancellationToken::new();
+    // 输入会重复请求回到实时底部；先验证真跳转仍通知，再验证重复请求不伪造输出。
+    manager
+        .scroll_ui_to_offset(binding.clone(), 0)
+        .await
+        .expect("return to the live viewport");
+    let returned = tokio::time::timeout(Duration::from_secs(1), updates.recv(&cancellation))
+        .await
+        .expect("the actual viewport change wakes subscribers")
+        .expect("live subscription")
+        .expect("viewport change");
+    manager
+        .scroll_ui_to_offset(binding.clone(), 0)
+        .await
+        .expect("repeated return to the live viewport is valid");
+    assert!(
+        tokio::time::timeout(Duration::ZERO, updates.recv(&cancellation))
+            .await
+            .is_err(),
+        "a redundant jump must not trigger another snapshot"
+    );
+
     let mut stale_binding = binding;
     stale_binding.session_generation = stale_binding.session_generation.wrapping_add(1);
     assert_eq!(
@@ -1697,8 +1723,8 @@ async fn ui_scroll_to_offset_clamps_and_rejects_stale_binding() {
         .render_snapshot(session_id, RenderSnapshotRequest::default())
         .await
         .expect("verify stale jump left viewport unchanged");
-    assert_eq!(unchanged.revision, clamped.revision);
-    assert_eq!(unchanged.scrollback_offset, clamped.scrollback_offset);
+    assert_eq!(unchanged.revision, returned.revision);
+    assert_eq!(unchanged.scrollback_offset, 0);
 
     drop(output);
     manager

@@ -35,10 +35,53 @@ const REVISION_13_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v13.md");
 const REVISION_14_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v14.md");
+const REVISION_15_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v15.md");
+const REVISION_15_BETA7_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v15-beta7.md");
+const REVISION_16_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v16.md");
 const HOST_V2_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v2-serial-migration.toml");
 const HOST_V3_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v3-serial.toml");
+
+/// 使用实际旧正文验证升级，并用重新签署的自定义正文确保修订号不能授权覆盖。
+#[test]
+fn frozen_recent_guides_upgrade_without_overwriting_user_edits() {
+    const { assert!(CONFIG_GUIDE_REVISION > 16) };
+    let root = tempdir().expect("创建隔离配置根");
+    let prefix = configuration::CONFIG_GUIDE_MARKER_PREFIX;
+    let path = "kerminal-config.md";
+    for (revision, body) in [
+        (15, REVISION_15_GUIDE),
+        (15, REVISION_15_BETA7_GUIDE),
+        (16, REVISION_16_GUIDE),
+    ] {
+        let digest = configuration::config_guide_digest(body);
+        let marked = format!("{prefix}{revision} sha256={digest} -->\n{body}");
+        for original in [body, marked.as_str()] {
+            write_fixture(root.path(), path, original);
+            let planned = super::plan_current_config_guide_edit(root.path())
+                .expect("规划当前数据格式的旧指南升级")
+                .expect("冻结指南产生计划");
+            assert_eq!(planned.before.as_deref(), Some(original.as_bytes()));
+            assert_eq!(planned.after, configuration::managed_config_guide());
+        }
+    }
+    let custom = format!("{REVISION_16_GUIDE}\n## User notes\nKeep this.\n");
+    let custom_digest = configuration::config_guide_digest(&custom);
+    write_fixture(
+        root.path(),
+        path,
+        &format!("{prefix}16 sha256={custom_digest} -->\n{custom}"),
+    );
+    assert!(
+        super::plan_current_config_guide_edit(root.path())
+            .expect("检查重签的自定义指南")
+            .is_none()
+    );
+}
 
 /// 旧迁移样本没有扩展目录，统一经过与生产相同的规划入口验证。
 ///

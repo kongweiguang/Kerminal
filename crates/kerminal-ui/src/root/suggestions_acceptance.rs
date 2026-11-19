@@ -1,8 +1,8 @@
-//! 命令提示原生验收只读取生产 Root，不改变输入、候选或会话绑定。
+//! 隔离原生验收观察生产 Root，并允许向已验证身份的测试 pane 注入输入法回调。
 //!
 //! @author kongweiguang
 
-use gpui_kit::{Bounds, Context, ElementId, Pixels, Window};
+use gpui_kit::{Bounds, Context, ElementId, EntityInputHandler, Pixels, Window};
 use kerminal_application::sessions::{TerminalCommandContext, UiSessionBinding};
 use kerminal_domain::{
     identity::HostId,
@@ -12,6 +12,13 @@ use kerminal_domain::{
 use super::{RootView, TerminalTargetRequest, command_suggestions::TerminalSuggestionQueryState};
 
 const SSH_FIXTURE_HOST_ID: &str = "suggestions-ssh-fixture";
+
+/// 以平台回调为边界区分预编辑、提交和取消，避免验收直接写入 PTY。
+pub enum AcceptanceImeEvent<'a> {
+    Mark(&'a str),
+    Commit(&'a str),
+    Cancel,
+}
 
 /// 单帧状态只包含本地验收所需证据，正文不从渲染内容逆向推断。
 pub struct SuggestionsAcceptanceState {
@@ -172,6 +179,46 @@ impl RootView {
             cursor_y: cursor.y.as_f32(),
             cell_width: cell_width.as_f32(),
             line_height: self.terminal_metrics.line_height,
+        })
+    }
+
+    /// 复用实际注册的输入处理器，以验证组合期间的键位分流、焦点约束和 PTY 写入。
+    pub fn suggestions_acceptance_ime(
+        &self,
+        binding: &UiSessionBinding,
+        event: AcceptanceImeEvent<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let SessionOwner::Ui { pane_id, .. } = &binding.owner else {
+            return false;
+        };
+        if !self.pane_input_binding_is_focused(binding, window, cx)
+            || !is_acceptance_target(
+                self.workspace_runtime
+                    .pane(pane_id)
+                    .and_then(|pane| pane.target.as_ref()),
+            )
+        {
+            return false;
+        }
+        let Some(handler) = self.pane_input_handlers.get(&binding.session_id) else {
+            return false;
+        };
+        handler.entity.update(cx, |handler, cx| match event {
+            AcceptanceImeEvent::Mark(text) => {
+                let end = text.encode_utf16().count();
+                handler.replace_and_mark_text_in_range(None, text, Some(end..end), window, cx);
+                handler.is_composing()
+            }
+            AcceptanceImeEvent::Commit(text) => {
+                handler.replace_text_in_range(None, text, window, cx);
+                !handler.is_composing()
+            }
+            AcceptanceImeEvent::Cancel => {
+                handler.unmark_text(window, cx);
+                !handler.is_composing()
+            }
         })
     }
 

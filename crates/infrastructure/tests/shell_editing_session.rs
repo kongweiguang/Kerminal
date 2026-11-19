@@ -8,7 +8,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,25 +20,29 @@ use kerminal_application::sessions::{
     CreateSessionRequest, PlainTextSnapshotRequest, SessionService, SessionTransport,
     SessionTransportControl, SessionTransportFactory, SessionTransportOpenError,
     ShellEditingAvailability, ShellEditingSnapshot, ShellEditingUnavailableReason,
-    TerminalCommandAvailability, TerminalCommandUnavailableReason, UiInputProjection,
-    UiSessionBinding, UiTerminalInputRequest,
+    TerminalCommandAvailability, TerminalCommandUnavailableReason, TerminalResizeCapability,
+    UiInputProjection, UiSessionBinding, UiTerminalInputRequest,
 };
 use kerminal_domain::connections::RemoteShellDialect;
-use kerminal_domain::identity::{PaneId, SessionId, TabId};
+use kerminal_domain::identity::{HostId, PaneId, SessionId, TabId};
 use kerminal_domain::sessions::{
-    LocalSessionTarget, SessionExitStatus, SessionOwner, SessionTarget, TerminalSize,
+    LocalSessionTarget, SessionExitStatus, SessionOwner, SessionTarget, SshSessionTarget,
+    TerminalSize,
 };
 use kerminal_infrastructure::sessions::{SessionManager, SessionRuntimeConfig};
 use kerminal_terminal::input::{
     InputModifiers, KeyPhase, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
 };
 use kerminal_terminal::shell_editing::{MAX_SHELL_EDITING_FRAME_BYTES, SHELL_EDITING_FRAME_PREFIX};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, WriteHalf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
+};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 const PROBE: &[u8] = b"\x1b[24;8~";
+const HIDE_AND_QUERY: &[u8] = b"\x1b[?25l\x1b[6n";
 
 #[derive(Default)]
 struct Recorder(StdMutex<Vec<u8>>);
@@ -75,6 +79,31 @@ impl SessionOutputRecorder for Recorder {
 struct Factory {
     peer: Mutex<Option<DuplexStream>>,
     suffix_gate: Option<Arc<SuffixGate>>,
+    /// 启用 Windows ConPTY 能力，仅用于验证 reader 合批与私有帧过滤的真实接线。
+    conpty: bool,
+    ssh_powershell: bool,
+    write_gate: Option<Arc<WriteGate>>,
+}
+
+/// 让 reader 在 transport 写上产生确定性背压，用来区分“批次已处理完”和“只处理了首段”。
+#[derive(Default)]
+struct WriteGate {
+    blocked: AtomicBool,
+    hide_read: Notify,
+    waiting: Notify,
+    waker: StdMutex<Option<Waker>>,
+}
+
+impl WriteGate {
+    /// 解除背压并唤醒被挂起的 writer，避免测试结束时留下阻塞的 reader task。
+    ///
+    /// @author kongweiguang
+    fn release(&self) {
+        self.blocked.store(false, Ordering::Release);
+        if let Some(waker) = self.waker.lock().expect("gate waker").take() {
+            waker.wake();
+        }
+    }
 }
 
 /// 只阻塞被测后缀，探测帧仍走真实 writer，避免通过人为抢锁模拟不可能的时序。
@@ -87,9 +116,36 @@ struct SuffixGate {
     waiting: Notify,
 }
 
+struct ObservedReader {
+    inner: ReadHalf<DuplexStream>,
+    gate: Option<Arc<WriteGate>>,
+}
+
+impl AsyncRead for ObservedReader {
+    /// 通知首段确实已读取，让测试在发送恢复段前建立底层分片边界。
+    ///
+    /// @author kongweiguang
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let offset = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if matches!(result, Poll::Ready(Ok(())))
+            && let Some(gate) = &self.gate
+            && &buffer.filled()[offset..] == HIDE_AND_QUERY
+        {
+            gate.hide_read.notify_one();
+        }
+        result
+    }
+}
+
 struct GatedWriter {
     inner: WriteHalf<DuplexStream>,
     suffix_gate: Option<Arc<SuffixGate>>,
+    write_gate: Option<Arc<WriteGate>>,
 }
 
 impl AsyncWrite for GatedWriter {
@@ -101,6 +157,14 @@ impl AsyncWrite for GatedWriter {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(gate) = &self.write_gate
+            && gate.blocked.load(Ordering::Acquire)
+        {
+            // 先保存 waker 再通知测试，确保测试解除背压时一定能重新调度 writer。
+            *gate.waker.lock().expect("gate waker") = Some(cx.waker().clone());
+            gate.waiting.notify_one();
+            return Poll::Pending;
+        }
         if let Some(gate) = self.suffix_gate.clone() {
             if gate.blocked.load(Ordering::Acquire) && (bytes == b"tus" || bytes == b"us") {
                 if bytes == b"tus" && gate.write_prefix.load(Ordering::Acquire) {
@@ -156,21 +220,73 @@ impl SessionTransportFactory for Factory {
         let (peer, server) = tokio::io::duplex(65536);
         *self.peer.lock().await = Some(peer);
         let (reader, writer) = tokio::io::split(server);
+        let reader = ObservedReader {
+            inner: reader,
+            gate: self.write_gate.clone(),
+        };
         let writer = GatedWriter {
             inner: writer,
             suffix_gate: self.suffix_gate.clone(),
+            write_gate: self.write_gate.clone(),
         };
-        Ok(SessionTransport::new(reader, writer, Control)
-            .with_shell_dialect(RemoteShellDialect::Posix)
+        let transport = if self.conpty {
+            SessionTransport::new(reader, writer, ConPtyControl)
+        } else {
+            SessionTransport::new(reader, writer, Control)
+        };
+        Ok(transport
+            .with_shell_dialect(if self.ssh_powershell {
+                RemoteShellDialect::PowerShell
+            } else {
+                RemoteShellDialect::Posix
+            })
             .with_shell_integration_enabled(true)
             .with_shell_editing_nonce(Some(NONCE.to_owned())))
     }
 }
 
+/// 声明 Windows ConPTY 能力，使真实 reader 走本地合批路径；其余行为与通用控制一致。
+struct ConPtyControl;
+
 struct Control;
 
 #[async_trait]
 impl SessionTransportControl for Control {
+    /// 测试 transport 的尺寸不依赖原生窗口。
+    ///
+    /// @author kongweiguang
+    async fn resize(&self, _: TerminalSize) -> AppResult<()> {
+        Ok(())
+    }
+
+    /// 测试控制器不持有 duplex 对端；测试先释放对端，manager 才能确认 reader 已退出。
+    ///
+    /// @author kongweiguang
+    async fn close_until(&self, _: tokio::time::Instant) -> AppResult<()> {
+        Ok(())
+    }
+
+    /// 返回确定退出状态，不把快照成功当成命令执行。
+    ///
+    /// @author kongweiguang
+    async fn wait_exit(&self) -> AppResult<SessionExitStatus> {
+        Ok(SessionExitStatus {
+            code: Some(0),
+            signal: None,
+            success: true,
+        })
+    }
+}
+
+#[async_trait]
+impl SessionTransportControl for ConPtyControl {
+    /// 声明本地 ConPTY 合批能力，让 reader 实际走“隐藏后等待重绘”的路径。
+    ///
+    /// @author kongweiguang
+    fn terminal_resize_capability(&self) -> TerminalResizeCapability {
+        TerminalResizeCapability::WindowsConPty
+    }
+
     /// 测试 transport 的尺寸不依赖原生窗口。
     ///
     /// @author kongweiguang
@@ -220,13 +336,56 @@ async fn setup_with_suffix_gate(
     UiSessionBinding,
     DuplexStream,
 ) {
-    let factory = Arc::new(Factory {
-        suffix_gate,
-        ..Factory::default()
-    });
+    setup_with(
+        Factory {
+            suffix_gate,
+            ..Factory::default()
+        },
+        7,
+    )
+    .await
+}
+
+/// 以 ConPTY 能力和一次性 writer 背压创建真实会话，用于验证 reader 合批的端到端接线。
+///
+/// @author kongweiguang
+async fn setup_redraw_transport(
+    ssh_powershell: bool,
+    write_gate: Arc<WriteGate>,
+) -> (
+    Arc<SessionManager>,
+    Arc<Recorder>,
+    UiSessionBinding,
+    DuplexStream,
+) {
+    setup_with(
+        Factory {
+            conpty: !ssh_powershell,
+            ssh_powershell,
+            write_gate: Some(write_gate),
+            ..Factory::default()
+        },
+        4096,
+    )
+    .await
+}
+
+/// 共用会话创建与握手；调用方只决定 transport 能力、背压与单次读取上限。
+///
+/// @author kongweiguang
+async fn setup_with(
+    factory: Factory,
+    read_chunk_bytes: usize,
+) -> (
+    Arc<SessionManager>,
+    Arc<Recorder>,
+    UiSessionBinding,
+    DuplexStream,
+) {
+    let factory = Arc::new(factory);
     let recorder = Arc::new(Recorder::default());
     let config = SessionRuntimeConfig {
-        read_chunk_bytes: 7,
+        read_chunk_bytes,
         ..SessionRuntimeConfig::default()
     };
     let manager = Arc::new(
@@ -239,12 +398,20 @@ async fn setup_with_suffix_gate(
     };
     let info = manager
         .create(CreateSessionRequest {
-            target: SessionTarget::Local(LocalSessionTarget {
-                program: OsString::from("test-shell"),
-                args: Vec::new(),
-                working_directory: None,
-                environment: BTreeMap::new(),
-            }),
+            target: if factory.ssh_powershell {
+                SessionTarget::Ssh(SshSessionTarget {
+                    host_id: HostId::new(),
+                    working_directory: None,
+                    command: None,
+                })
+            } else {
+                SessionTarget::Local(LocalSessionTarget {
+                    program: OsString::from("test-shell"),
+                    args: Vec::new(),
+                    working_directory: None,
+                    environment: BTreeMap::new(),
+                })
+            },
             owner: owner.clone(),
             size: TerminalSize::new(80, 24, 0, 0).expect("size"),
             initial_palette: None,
@@ -393,6 +560,75 @@ async fn private_frames_are_filtered_and_append_is_confirmed_once() {
         assert!(!output.contains("/private/path"));
         assert!(!output.contains(NONCE));
     }
+    drop(peer);
+    manager.close(binding.session_id).await.expect("close");
+}
+
+/// 真实 ConPTY 合批路径下，隐藏与重绘之间的私有帧不能把首段单独发布：
+/// writer 背压时最终快照必须已经包含重绘文本，私有帧不进入日志或可见文本。
+///
+/// 旧接线会在首段交付后立刻发布并等待 writer；这里在背压点读取快照即可确定性地识别。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn conpty_batch_publishes_redraw_only_after_private_frame() {
+    verify_redraw_transport(false).await;
+}
+
+/// 即使远端将同一 PowerShell 重绘拆成 SSH 消息，也只发布最终快照。
+#[tokio::test]
+async fn ssh_powershell_batch_publishes_redraw_only_after_private_frame() {
+    verify_redraw_transport(true).await;
+}
+
+/// 用同一个交付断言验证两个启用合批的生产入口，避免仅测试策略常量。
+async fn verify_redraw_transport(ssh_powershell: bool) {
+    let gate = Arc::new(WriteGate::default());
+    let (manager, recorder, binding, mut peer) =
+        setup_redraw_transport(ssh_powershell, Arc::clone(&gate)).await;
+    gate.blocked.store(true, Ordering::Release);
+    // 首段携带光标查询以制造响应背压，私有帧、重绘和恢复光标随后到达。
+    peer.write_all(HIDE_AND_QUERY).await.expect("hide");
+    tokio::time::timeout(Duration::from_secs(2), gate.hide_read.notified())
+        .await
+        .expect("first transport read");
+    let mut redraw = frame(NONCE, "ignored", 0);
+    redraw.extend_from_slice(b"\r\nrestored\x1b[?25h");
+    peer.write_all(&redraw).await.expect("frame and redraw");
+    tokio::time::timeout(Duration::from_secs(2), gate.waiting.notified())
+        .await
+        .expect("writer backpressure");
+
+    let text = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.plaintext_snapshot(
+            binding.session_id.clone(),
+            PlainTextSnapshotRequest::default(),
+        ),
+    )
+    .await
+    .expect("writer backpressure must not hold the snapshot lock")
+    .expect("snapshot")
+    .text;
+    assert!(
+        text.contains("restored"),
+        "the whole batch must be processed before transport writes; visible text: {text:?}"
+    );
+    let recorded =
+        String::from_utf8(recorder.0.lock().expect("recorder lock").clone()).expect("utf8");
+    assert!(recorded.contains("restored"));
+    assert!(!recorded.contains(NONCE));
+
+    gate.release();
+    let mut response = [0_u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut response))
+        .await
+        .expect("cpr response timeout")
+        .expect("cpr response");
+    assert!(
+        read > 0,
+        "the pending parser response must still be written"
+    );
     drop(peer);
     manager.close(binding.session_id).await.expect("close");
 }

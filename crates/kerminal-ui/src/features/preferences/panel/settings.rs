@@ -356,6 +356,32 @@ impl PreferencesPanel {
         }
     }
 
+    /// 显式补齐默认目录里缺失的动作；已有自定义和未知行原样保留，正常读取仍不自动补行。
+    ///
+    /// 写入复用设置草稿的 CAS 与自动保存，不另建配置通道；已有空绑定或显式禁用的行
+    /// 按 action 判定为“已存在”，不会被恢复默认值覆盖。
+    ///
+    /// @author kongweiguang
+    pub(in crate::features::preferences) fn restore_missing_shortcuts(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_controls_locked() {
+            return;
+        }
+        let Some(missing) = self
+            .settings
+            .as_ref()
+            .map(|draft| validation::missing_default_keybindings(&draft.value().keybindings))
+        else {
+            return;
+        };
+        if missing.is_empty() {
+            return;
+        }
+        self.edit_settings(|settings| settings.keybindings.extend(missing), cx);
+    }
+
     /// 来源保存复用设置草稿的 CAS 与权威回读，不另建配置写入通道。
     ///
     /// URL 先用默认快照单独校验；URL 已在基线时只做权威回读，不因其它字段的临时
@@ -932,7 +958,9 @@ fn shortcut_binding_error(
     field: ShortcutBindingField,
     effective: &str,
 ) -> Option<String> {
-    if let Some(message) = super::shortcut_capture::shortcut_sequence_issue(effective) {
+    if let Some(message) =
+        super::shortcut_capture::shortcut_sequence_issue(effective, field.platform())
+    {
         return Some(message);
     }
     let compiled = crate::keybindings::CompiledKeybindings::compile(keybindings, field.platform());

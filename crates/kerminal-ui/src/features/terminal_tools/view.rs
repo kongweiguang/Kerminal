@@ -63,6 +63,7 @@ pub enum TerminalToolsEvent {
     },
     CloseSearch {
         session_id: SessionId,
+        via_escape: bool,
     },
     SetSelection {
         session_id: SessionId,
@@ -258,14 +259,20 @@ impl TerminalToolsView {
                 cx.emit(TerminalToolsEvent::ClearSearch { session_id });
                 cx.notify();
             }
-            TerminalSearchEvent::Close { session_id } => {
+            TerminalSearchEvent::Close {
+                session_id,
+                via_escape,
+            } => {
                 if view.session_id.as_ref() != Some(&session_id) {
                     return;
                 }
                 view.active_search_request_id = view.active_search_request_id.wrapping_add(1);
                 view.search_visible = false;
                 view.clear_search_result();
-                cx.emit(TerminalToolsEvent::CloseSearch { session_id });
+                cx.emit(TerminalToolsEvent::CloseSearch {
+                    session_id,
+                    via_escape,
+                });
                 cx.notify();
             }
         });
@@ -1053,7 +1060,7 @@ impl TerminalToolsView {
         Some(token)
     }
 
-    /// 仅接受同一 binding/代次的指针更新；变化时将绝对 endpoint 与映射它的当前 viewport 一起发出。
+    /// 仅接受当前手势的指针和视口，已排队的边缘滚动由帧回调自行收尾，避免快速穿越边缘时重复排队。
     ///
     /// @author kongweiguang
     pub(crate) fn update_canvas_selection_gesture(
@@ -1084,9 +1091,6 @@ impl TerminalToolsView {
                 expected_revision: None,
                 viewport: Some(viewport),
             });
-        }
-        if edge_direction == 0 {
-            self.selection_autoscroll_scheduled = None;
         }
         true
     }
@@ -1547,7 +1551,10 @@ impl TerminalToolsView {
             search.dismiss_local(window, cx);
         });
         if let Some(session_id) = self.session_id.clone() {
-            cx.emit(TerminalToolsEvent::CloseSearch { session_id });
+            cx.emit(TerminalToolsEvent::CloseSearch {
+                session_id,
+                via_escape: false,
+            });
         }
         cx.notify();
     }

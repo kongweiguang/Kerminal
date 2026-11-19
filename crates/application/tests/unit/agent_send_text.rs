@@ -29,6 +29,7 @@ use std::{
     },
 };
 use tokio_util::sync::CancellationToken;
+use toml_edit::DocumentMut;
 
 use crate::{
     AppError, AppResult, PreferencesService, PublicErrorCode,
@@ -162,6 +163,44 @@ impl MemoryAgentWorkspace {
                     revision: AgentWorkspaceRevision::Sha256("legacy-endpoint".to_owned()),
                 },
             );
+    }
+
+    /// 播种普通受管文本（如 Codex 配置），让恢复刷新能在隔离内存中读取旧地址。
+    ///
+    /// @author kongweiguang
+    fn seed_text_document(
+        &self,
+        id: &AgentSessionId,
+        kind: AgentWorkspaceDocumentKind,
+        contents: String,
+    ) {
+        self.state
+            .lock()
+            .expect("Agent workspace test mutex should not be poisoned")
+            .context_documents
+            .insert(
+                (id.as_str().to_owned(), kind),
+                crate::agents::AgentWorkspaceDocumentSnapshot {
+                    contents: Some(contents),
+                    revision: AgentWorkspaceRevision::Sha256("seeded-text".to_owned()),
+                },
+            );
+    }
+
+    /// 回读受管文本，验证恢复前刷新实际提交了新 endpoint 且没有触碰 Session/Provider。
+    ///
+    /// @author kongweiguang
+    fn text_document(
+        &self,
+        id: &AgentSessionId,
+        kind: AgentWorkspaceDocumentKind,
+    ) -> Option<String> {
+        self.state
+            .lock()
+            .expect("Agent workspace test mutex should not be poisoned")
+            .context_documents
+            .get(&(id.as_str().to_owned(), kind))
+            .and_then(|snapshot| snapshot.contents.clone())
     }
 
     /// 返回 fake 实际保存的 endpoint 正文，验证 stop 清理写入了 None 终态。
@@ -700,7 +739,19 @@ impl AgentWorkspaceRepository for MemoryAgentWorkspace {
             .state
             .lock()
             .expect("Agent workspace test mutex should not be poisoned");
-        let behavior = std::mem::replace(&mut state.next_commit, CommitBehavior::Accept);
+        // 恢复前的运行时文档刷新不是 checkpoint 事务，不应消费为 commit 预备的
+        // CAS/ACK 行为；只有含 Session/Provider 的整批写入才代表提交边界。
+        let is_checkpoint_transaction = documents.iter().any(|document| {
+            matches!(
+                document.kind,
+                AgentWorkspaceDocumentKind::Session | AgentWorkspaceDocumentKind::Provider
+            )
+        });
+        let behavior = if is_checkpoint_transaction {
+            std::mem::replace(&mut state.next_commit, CommitBehavior::Accept)
+        } else {
+            CommitBehavior::Accept
+        };
         match behavior {
             CommitBehavior::ConflictWithoutCommit => {
                 Err(AppError::conflict("simulated workspace CAS conflict"))
@@ -796,11 +847,9 @@ fn apply_documents(
                     },
                 );
             }
-            (
-                kind @ (AgentWorkspaceDocumentKind::TargetBindingContext
-                | AgentWorkspaceDocumentKind::TerminalSnapshotContext),
-                AgentWorkspaceDocumentContent::Text(contents),
-            ) if include_provider => {
+            (kind, AgentWorkspaceDocumentContent::Text(contents)) if include_provider => {
+                // 所有受管文本（说明、provider MCP 配置、目标/快照 context）走同一快照表，
+                // 恢复回归才能直接核对 provider 原生配置是否已更新。
                 state.context_documents.insert(
                     (agent_session_id.to_owned(), *kind),
                     crate::agents::AgentWorkspaceDocumentSnapshot {
@@ -819,11 +868,12 @@ fn apply_documents(
     receipts
 }
 
-/// 从统一目标上下文读取当前全局地址；停止后 listener 不再可用，因此回读受管文件确认清理。
+/// 目标上下文刷新会把兼容读取到的全局地址重建为 scoped 路径；停止后 listener
+/// 不再可用，因此回读受管文件确认 endpoint 被清空。
 ///
 /// @author kongweiguang
 #[tokio::test]
-async fn current_global_endpoint_is_readable_and_stop_sync_clears_it() {
+async fn current_endpoint_context_is_refreshed_to_scoped_path_and_stop_sync_clears_it() {
     let agent_session_id = AgentSessionId::new();
     let session = active_agent(agent_session_id.clone(), AgentSessionStatus::Active);
     let endpoint = "http://127.0.0.1:37657/mcp".to_owned();
@@ -862,14 +912,15 @@ async fn current_global_endpoint_is_readable_and_stop_sync_clears_it() {
     let before = service
         .target_context(agent_session_id.clone(), 1024, CancellationToken::new())
         .await
-        .expect("current global endpoint should be queryable");
+        .expect("current endpoint should be queryable");
+    let scoped_endpoint = format!("{endpoint}/agents/{}", agent_session_id.as_str());
     assert_eq!(
         before
             .record
             .mcp_endpoint
             .as_ref()
             .and_then(|context| context.endpoint.as_deref()),
-        Some(endpoint.as_str())
+        Some(scoped_endpoint.as_str())
     );
 
     service
@@ -883,6 +934,89 @@ async fn current_global_endpoint_is_readable_and_stop_sync_clears_it() {
     let saved: serde_json::Value =
         serde_json::from_str(&saved).expect("committed context should be valid JSON");
     assert!(saved["endpoint"].is_null());
+}
+
+/// 恢复前必须刷新旧全局地址/旧端口的运行时文档，同时不改写 Session/Provider，
+/// 让 checkpoint 的 CAS 基线和用户配置内容都保持有效。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn resume_refreshes_legacy_runtime_documents_before_cli_start() {
+    let agent_session_id = AgentSessionId::new();
+    let session = active_agent(agent_session_id.clone(), AgentSessionStatus::Stale);
+    let workspace = Arc::new(MemoryAgentWorkspace::new(
+        session,
+        codex_provider_session(),
+        CommitBehavior::Accept,
+    ));
+    let old_endpoint = "http://127.0.0.1:3000/mcp";
+    let new_endpoint = "http://127.0.0.1:40137/mcp";
+    workspace.seed_text_document(
+        &agent_session_id,
+        AgentWorkspaceDocumentKind::CodexConfig,
+        format!("# user comment stays\n[mcp_servers.kerminal]\nurl = \"{old_endpoint}\"\n"),
+    );
+    let old_context = serde_json::json!({
+        "schemaVersion": 1,
+        "agentSessionId": agent_session_id.as_str(),
+        "endpoint": old_endpoint,
+        "transport": "streamable-http",
+        "toolsOnly": true,
+        "generatedAt": "2026-10-19T00:00:00Z"
+    });
+    workspace.seed_mcp_endpoint_context(
+        &agent_session_id,
+        serde_json::to_string(&old_context).expect("legacy endpoint context should serialize"),
+    );
+    let sessions = Arc::new(MemorySessions::new(
+        Vec::new(),
+        TEST_SESSION_GENERATION,
+        false,
+    ));
+    let service = agent_service(workspace.clone(), sessions.clone());
+    *service.endpoint.write().await = Some(new_endpoint.to_owned());
+
+    let resumed = service
+        .resume(agent_session_id.clone(), CancellationToken::new())
+        .await
+        .expect("resume should refresh runtime docs and start the fake CLI");
+    assert_eq!(resumed.session.status, AgentSessionStatus::Active);
+    assert_eq!(sessions.create_count(), 1);
+
+    let expected = format!("{new_endpoint}/agents/{}", agent_session_id.as_str());
+    let codex = workspace
+        .text_document(&agent_session_id, AgentWorkspaceDocumentKind::CodexConfig)
+        .expect("resume must rewrite provider MCP config");
+    let codex = codex
+        .parse::<DocumentMut>()
+        .expect("refreshed Codex config remains valid TOML");
+    assert_eq!(
+        codex["mcp_servers"]["kerminal"]["url"].as_str(),
+        Some(expected.as_str())
+    );
+    assert!(
+        codex.to_string().contains("# user comment stays"),
+        "runtime refresh must preserve user content"
+    );
+    assert!(
+        !codex.to_string().contains(old_endpoint),
+        "old global endpoint must not survive resume"
+    );
+
+    let context = workspace
+        .mcp_endpoint_context(&agent_session_id)
+        .expect("resume must rewrite endpoint context");
+    let context: serde_json::Value =
+        serde_json::from_str(&context).expect("refreshed endpoint context is valid JSON");
+    assert_eq!(context["endpoint"].as_str(), Some(expected.as_str()));
+
+    let instructions = workspace
+        .text_document(
+            &agent_session_id,
+            AgentWorkspaceDocumentKind::AgentInstructions,
+        )
+        .expect("resume must rewrite managed instructions");
+    assert!(instructions.contains(&expected));
 }
 
 /// 恢复结果未决时上下文不得回写，旧身份头仍给出迁移诊断并保留原文。

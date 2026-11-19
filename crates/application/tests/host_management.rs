@@ -1644,3 +1644,23 @@ fn plugin_gating_defaults_to_all_available_without_registry() {
     }
     assert!(service.plugin_host_enabled(&plugin_host("kerminal", "host.sftp")));
 }
+
+/// 新目录入口的默认实现保持旧三次列表语义，内存仓储和第三方适配器无需改代码。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn default_catalog_falls_back_to_existing_lists() {
+    let service = HostManagementService::new(Arc::new(MemoryHosts::new(
+        password_host(),
+        SaveDisposition::Commit,
+    )));
+
+    let catalog = service.list_catalog().await.expect("默认目录回退");
+    assert_eq!(
+        catalog.hosts,
+        service.list_hosts().await.expect("远程列表"),
+        "默认目录必须返回同一远程投影"
+    );
+    assert!(catalog.plugin_hosts.is_empty(), "未实现的扩展列表保持为空");
+    assert!(catalog.local_hosts.is_empty(), "未实现的本地列表保持为空");
+}

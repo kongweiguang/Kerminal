@@ -19,10 +19,9 @@ use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AppError, AppResult, ManagedSession, PendingTerminalInputWrite, SessionChange,
-    SessionChangeKind, SessionState, ShellInputOrigin, ShellIntegrationState,
-    UnwrittenSuggestionRecovery, finish_terminal_input_write_with_recovery, mark_shell_input,
-    write_input_bytes_locked,
+    AppError, AppResult, ManagedSession, PendingTerminalInputWrite, SessionState, ShellInputOrigin,
+    ShellIntegrationState, UnwrittenSuggestionRecovery, finish_terminal_input_write_with_recovery,
+    mark_shell_input, write_input_bytes_locked,
 };
 
 const PROBE: &[u8] = b"\x1b[24;8~";
@@ -208,25 +207,38 @@ pub(super) async fn availability(
 
 /// 过滤器超限说明本连接上的消息边界已不再可信，不能继续读取或追加。
 ///
+/// 返回是否真的让当前代的编辑态失效，调用方据此把批次通知归为 Output，
+/// 即使同一批次里还包含标题变化也不能只发 Title。
+///
 /// @author kongweiguang
-pub(super) fn invalidate(session: &ManagedSession, generation: u64) {
+pub(super) fn invalidate(session: &ManagedSession, generation: u64) -> bool {
     let mut editing = session
         .shell_editing
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if editing.generation == generation {
         editing.invalidate(ShellEditingUnavailableReason::SessionChanged);
+        true
+    } else {
+        false
     }
 }
 
 /// 在处理相邻可见输出之间接收帧，以原始 PTY 顺序复核 nonce、prompt 和输入版本。
 ///
+/// 调用方持有一个批次的会话状态守护，并在处理完可见输出和帧后统一发布变更；这里只返回
+/// 编辑态是否变化，避免在隐藏/恢复之间单独唤醒 UI 暴露中间重绘。
+///
 /// @author kongweiguang
-pub(super) async fn accept_frame(session: &ManagedSession, generation: u64, payload: &[u8]) {
+pub(super) async fn accept_frame_locked(
+    session: &ManagedSession,
+    state: &SessionState,
+    generation: u64,
+    payload: &[u8],
+) -> bool {
     let Some(message) = parse_editing_message(payload) else {
-        return;
+        return false;
     };
-    let state = session.state.lock().await;
     let shell_state = session.shell_integration.lock().await;
     let mut editing = session
         .shell_editing
@@ -235,9 +247,9 @@ pub(super) async fn accept_frame(session: &ManagedSession, generation: u64, payl
     if editing.generation != generation
         || session.transport_generation.load(Ordering::Acquire) != generation
     {
-        return;
+        return false;
     }
-    let changed = match message {
+    match message {
         EditingMessage::Hello {
             nonce,
             shell,
@@ -267,15 +279,15 @@ pub(super) async fn accept_frame(session: &ManagedSession, generation: u64, payl
             prediction_visible,
         } => {
             let Some(pending) = editing.take_authenticated_probe(&nonce, shell, &version) else {
-                return;
+                return false;
             };
             let Some(reply) = pending.reply else {
-                return;
+                return false;
             };
-            if !eligible(&state, &shell_state, &pending.binding)
+            if !eligible(state, &shell_state, &pending.binding)
                 || pending.context != context_version(&shell_state)
             {
-                return;
+                return false;
             }
             editing.revision = editing.revision.wrapping_add(1);
             let snapshot = ShellEditingSnapshot {
@@ -298,26 +310,19 @@ pub(super) async fn accept_frame(session: &ManagedSession, generation: u64, payl
             version,
         } => {
             let Some(pending) = editing.take_authenticated_probe(&nonce, shell, &version) else {
-                return;
+                return false;
             };
             let Some(reply) = pending.reply else {
-                return;
+                return false;
             };
-            if !eligible(&state, &shell_state, &pending.binding)
+            if !eligible(state, &shell_state, &pending.binding)
                 || pending.context != context_version(&shell_state)
             {
-                return;
+                return false;
             }
             let _ = reply.send(Err(AppError::invalid(SHELL_EDITING_INPUT_TOO_LONG_CONTEXT)));
             true
         }
-    };
-    drop(editing);
-    if changed {
-        session.changes.send_replace(SessionChange {
-            revision: state.engine.revision(),
-            kind: SessionChangeKind::Output,
-        });
     }
 }
 
