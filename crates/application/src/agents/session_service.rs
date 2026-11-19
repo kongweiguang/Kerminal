@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     future::Future,
     path::Path,
@@ -285,33 +285,38 @@ impl AgentSessionService {
     }
 
     /// 只更新正在运行的 Active Agent workspace；归档、stale 及自定义 AGENTS 文件均不触碰。
+    /// 终端列表已经是存活事实来源，明确 ID 的读取不允许被历史会话全表枚举的损坏记录阻塞。
     async fn sync_live_agent_endpoints(
         &self,
         endpoint: Option<&str>,
         cancellation: &CancellationToken,
     ) -> AppResult<()> {
-        let sessions = self
-            .await_cancellable(cancellation, |token| self.workspace.list_sessions(token))
-            .await?;
         let terminals = self.sessions.list(SessionFilter::default()).await?;
         let live_agent_ids = terminals
             .iter()
             .filter(|terminal| terminal.lifecycle == SessionLifecycle::Running)
             .filter_map(|terminal| match &terminal.owner {
-                SessionOwner::Agent { agent_session_id } => {
-                    Some(agent_session_id.as_str().to_owned())
-                }
+                SessionOwner::Agent { agent_session_id } => Some(agent_session_id.clone()),
                 _ => None,
             })
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         let mut first_error = None;
 
-        for snapshot in sessions.into_iter().filter(|snapshot| {
-            snapshot.session.status == AgentSessionStatus::Active
-                && live_agent_ids.contains(snapshot.session.agent_session_id.as_str())
-        }) {
+        for id in live_agent_ids {
             self.ensure_request_active(cancellation, "Agent MCP endpoint update was cancelled")?;
-            let id = snapshot.session.agent_session_id.clone();
+            let snapshot = self
+                .await_cancellable(cancellation, |token| {
+                    self.workspace.read_session(id.clone(), token)
+                })
+                .await;
+            let snapshot = match snapshot {
+                Ok(snapshot) if snapshot.session.status == AgentSessionStatus::Active => snapshot,
+                Ok(_) => continue,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
             let document = self
                 .await_cancellable(cancellation, |token| {
                     self.workspace.read_document(
@@ -404,6 +409,26 @@ impl AgentSessionService {
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown.cancel();
+    }
+
+    /// 桌面组合根只让 SessionManager 批量关闭终端；此处仅等待 Agent 用例退出操作门。
+    /// 若同时让本服务按会话关闭 Agent 终端，会与批量关闭竞态并产生虚假 NotFound。
+    ///
+    /// @author kongweiguang
+    pub async fn wait_for_shutdown_operations_until(&self, deadline: Instant) -> AppResult<()> {
+        self.begin_shutdown();
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _gate = timeout_at(deadline, self.operation_gate.lock())
+            .await
+            .map_err(|error| {
+                AppError::infrastructure_with_source("Agent shutdown deadline elapsed", error)
+            })?;
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Ok(())
     }
 
     /// 使用独立便捷预算关闭 Agent CLI；桌面退出应调用共享绝对 deadline 版本。

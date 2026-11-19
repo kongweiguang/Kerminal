@@ -832,13 +832,17 @@ impl DesktopComposition {
         self.mcp_runtime.snapshot()
     }
 
-    /// 先停 MCP、连接探测 worker 与 Agent endpoint，再用同一 deadline 收尾并保留失败 owner。
+    /// 先停 MCP 并清除 Agent endpoint，再用同一 deadline 等待后台用例和终端回收。
+    /// 桌面退出只由 SessionManager 批量关闭终端，避免 Agent 与全局终端收尾争抢同一会话。
     ///
     /// @author kongweiguang
     pub async fn shutdown_until(&mut self, deadline: Instant) -> AppResult<()> {
         // 插件 actor 依赖共享执行器；先给其同一截止时间关闭，再关闭 executor intake。
-        if let Some(plugins) = self.external_plugins.as_mut() {
-            plugins.shutdown_until(deadline.into_std()).await?;
+        if let Some(plugins) = self.external_plugins.as_mut()
+            && let Err(error) = plugins.shutdown_until(deadline.into_std()).await
+        {
+            log_shutdown_failure("plugins", &error);
+            return Err(error);
         }
         self.settings_refresh_cancellation.cancel();
         self.mcp_runtime.begin_shutdown();
@@ -846,9 +850,11 @@ impl DesktopComposition {
             notification_bridge.begin_shutdown();
         }
         let mut failures = Vec::new();
-        if let Err(error) = self.task_executor.begin_shutdown() {
-            failures.push(error);
-        }
+        record_shutdown_result(
+            &mut failures,
+            "task_executor",
+            self.task_executor.begin_shutdown(),
+        );
         self.operations.begin_shutdown(deadline);
 
         // Agent endpoint clear 使用 Agent operation gate，必须在 Agent intake 关闭前完成。
@@ -858,9 +864,9 @@ impl DesktopComposition {
             }),
             self.connection_probe_backend.shutdown_until(deadline),
         );
-        append_failure(&mut failures, connection_probe_result);
-        if let Err(error) = mcp_result {
-            failures.push(error);
+        record_shutdown_result(&mut failures, "connection_probe", connection_probe_result);
+        if mcp_result.is_err() {
+            record_shutdown_result(&mut failures, "mcp", mcp_result);
             return Err(AppError::infrastructure_with_source(
                 "MCP 运行时尚未完成退出，保留 Agent endpoint 清理能力以供重试",
                 ShutdownFailures(failures),
@@ -878,7 +884,7 @@ impl DesktopComposition {
             ssh_result,
             (task_executor_result, session_result, rdp_result),
         ) = tokio::join!(
-            self.agent_manager.shutdown_until(deadline),
+            self.agent_manager.wait_for_shutdown_operations_until(deadline),
             self.operations.shutdown_until(deadline),
             stop_notification_bridge(&mut self.notification_bridge, deadline),
             self.transfers.shutdown_until(deadline),
@@ -896,26 +902,31 @@ impl DesktopComposition {
                 shutdown_rdp(&self.rdp_platform, deadline),
             ),
         );
-        append_failure(&mut failures, agent_result);
-        append_failure(&mut failures, operations_result);
-        append_failure(&mut failures, notification_result);
-        append_failure(&mut failures, transfer_result);
-        append_failure(&mut failures, watcher_result);
-        append_failure(&mut failures, suggestion_result);
-        append_failure(&mut failures, git_sync_result);
-        append_failure(&mut failures, ssh_result);
-        append_failure(&mut failures, task_executor_result);
-        append_failure(&mut failures, session_result);
-        append_failure(&mut failures, rdp_result);
-        append_failure(
-            &mut failures,
-            self.session_logs.shutdown_until(deadline.into_std()).await,
-        );
+        for (resource, result) in [
+            ("agent", agent_result),
+            ("operations", operations_result),
+            ("notifications", notification_result),
+            ("transfer", transfer_result),
+            ("configuration_watcher", watcher_result),
+            ("command_suggestions", suggestion_result),
+            ("git_sync", git_sync_result),
+            ("ssh", ssh_result),
+            ("task_executor", task_executor_result),
+            ("terminal_sessions", session_result),
+            ("rdp", rdp_result),
+            (
+                "session_logs",
+                self.session_logs.shutdown_until(deadline.into_std()).await,
+            ),
+        ] {
+            record_shutdown_result(&mut failures, resource, result);
+        }
 
         // 只在所有外部目标消费者都已退出后清除暂存密码，失败时保留仍需重试的 owner。
         if failures.is_empty() {
-            append_failure(
+            record_shutdown_result(
                 &mut failures,
+                "temporary_targets",
                 self.external_launch
                     .clear_temporary_targets_on_shutdown()
                     .await,
@@ -1353,6 +1364,27 @@ where
     mcp_shutdown.await?;
     begin_agent_shutdown();
     Ok(())
+}
+
+/// 收尾失败时保留原始错误，同时留下可用于定位的固定资源名。
+fn record_shutdown_result(
+    failures: &mut Vec<AppError>,
+    resource: &'static str,
+    result: AppResult<()>,
+) {
+    if let Err(error) = &result {
+        log_shutdown_failure(resource, error);
+    }
+    append_failure(failures, result);
+}
+
+/// 诊断只公开产品定义的资源名和错误码，避免写入路径、会话身份或底层错误正文。
+fn log_shutdown_failure(resource: &'static str, error: &AppError) {
+    tracing::warn!(
+        event = "HOST_RESOURCE_STOP_FAILED",
+        shutdown_resource = resource,
+        code = error.public_code().as_str(),
+    );
 }
 
 /// 记录一个子系统错误并继续关闭其余资源，避免首个失败跳过后续清理。

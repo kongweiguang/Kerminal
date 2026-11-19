@@ -57,6 +57,7 @@ const SAFE_EVENTS: &[&str] = &[
     "HOST_COMPOSITION_STOP_BEGIN",
     "HOST_COMPOSITION_STOP_COMPLETE",
     "HOST_COMPOSITION_STOP_FAILED",
+    "HOST_RESOURCE_STOP_FAILED",
     "HOST_LISTENER_STOP_BEGIN",
     "HOST_LISTENER_STOP_COMPLETE",
     "HOST_LISTENER_STOP_FAILED",
@@ -233,6 +234,25 @@ pub fn initialize(config_root: &Path) -> Result<DesktopLogGuard, Box<dyn Error +
     Ok(DesktopLogGuard { worker })
 }
 
+const SAFE_SHUTDOWN_RESOURCES: &[&str] = &[
+    "plugins",
+    "connection_probe",
+    "mcp",
+    "agent",
+    "operations",
+    "notifications",
+    "transfer",
+    "configuration_watcher",
+    "command_suggestions",
+    "git_sync",
+    "ssh",
+    "task_executor",
+    "terminal_sessions",
+    "rdp",
+    "session_logs",
+    "temporary_targets",
+];
+
 /// 将有限事件码、稳定错误码和数值诊断写入日志，其它值统一脱敏。
 struct RedactedFields;
 
@@ -266,6 +286,7 @@ impl Visit for RedactedFieldVisitor<'_> {
         let safe_value = match field.name() {
             "event" if SAFE_EVENTS.contains(&value) => value,
             "code" if SAFE_ERROR_CODES.contains(&value) => value,
+            "shutdown_resource" if SAFE_SHUTDOWN_RESOURCES.contains(&value) => value,
             "task_source" if is_rust_source_basename(value) => value,
             _ => "<redacted>",
         };

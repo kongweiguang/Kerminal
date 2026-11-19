@@ -43,6 +43,7 @@ fn host_shutdown_events_survive_without_dynamic_error_text() {
         "HOST_COMPOSITION_STOP_BEGIN",
         "HOST_COMPOSITION_STOP_COMPLETE",
         "HOST_COMPOSITION_STOP_FAILED",
+        "HOST_RESOURCE_STOP_FAILED",
         "HOST_LISTENER_STOP_BEGIN",
         "HOST_LISTENER_STOP_COMPLETE",
         "HOST_LISTENER_STOP_FAILED",
@@ -52,11 +53,16 @@ fn host_shutdown_events_survive_without_dynamic_error_text() {
             tracing::warn!(
                 event,
                 code = "timeout",
+                shutdown_resource = "terminal_sessions",
                 message = "synthetic private cleanup detail"
             );
         }
+        tracing::warn!(shutdown_resource = "private-resource-name");
     });
     let output = String::from_utf8(output.lock().expect("log buffer").clone()).expect("UTF-8 logs");
+    assert!(output.contains("shutdown_resource=terminal_sessions"));
+    assert!(output.contains("shutdown_resource=<redacted>"));
+    assert!(!output.contains("private-resource-name"));
     for event in events {
         assert!(
             output.contains(&format!("event={event}")),

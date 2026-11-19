@@ -96,6 +96,9 @@ struct WorkspaceState {
     cancel_caller_after_prepare: Option<CancellationToken>,
     fail_next_checkpoint_read: bool,
     cancel_next_session_read: bool,
+    fail_session_enumeration: bool,
+    fail_session_read_ids: BTreeMap<String, usize>,
+    endpoint_write_counts: BTreeMap<String, usize>,
 }
 
 /// 使用受控内存快照模拟一个 Agent workspace 的读取与一次不确定提交。
@@ -144,6 +147,9 @@ impl MemoryAgentWorkspace {
                 cancel_caller_after_prepare: None,
                 fail_next_checkpoint_read: false,
                 cancel_next_session_read: false,
+                fail_session_enumeration: false,
+                fail_session_read_ids: BTreeMap::new(),
+                endpoint_write_counts: BTreeMap::new(),
             }),
         }
     }
@@ -338,6 +344,42 @@ impl MemoryAgentWorkspace {
         );
     }
 
+    /// 注入持久会话全表枚举的损坏历史，验证 endpoint 同步不再为此读取无关目录。
+    ///
+    /// @author kongweiguang
+    fn fail_session_enumeration(&self) {
+        self.state
+            .lock()
+            .expect("Agent workspace test mutex should not be poisoned")
+            .fail_session_enumeration = true;
+    }
+
+    /// 指定准确 ID 的若干次读取失败，用于模拟仍被终端持有的 live workspace 损坏。
+    ///
+    /// @author kongweiguang
+    fn fail_session_reads(&self, id: &AgentSessionId, times: usize) {
+        self.state
+            .lock()
+            .expect("Agent workspace test mutex should not be poisoned")
+            .fail_session_read_ids
+            .insert(id.as_str().to_owned(), times);
+    }
+
+    /// 返回 endpoint context 的提交次数，用于确认失败 owner 不连累其他活动会话。
+    ///
+    /// @author kongweiguang
+    fn endpoint_write_count(&self, id: &AgentSessionId) -> usize {
+        let state = self
+            .state
+            .lock()
+            .expect("Agent workspace test mutex should not be poisoned");
+        state
+            .endpoint_write_counts
+            .get(id.as_str())
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// 改变隔离仓储里的会话状态并推进 revision，验证非 Active 会话在真实 snapshot 写入门禁前被拒绝。
     /// 只服务于本文件的失败分支，不模拟 provider 或恢复材料的变化。
     ///
@@ -410,9 +452,18 @@ impl AgentWorkspaceRepository for MemoryAgentWorkspace {
                 "simulated post-commit readback cancellation",
             ));
         }
+        let key = agent_session_id.as_str();
+        if let Some(remaining) = state.fail_session_read_ids.get_mut(key) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(AppError::configuration_corrupt(
+                    "simulated live Agent workspace failure",
+                ));
+            }
+        }
         state
             .sessions
-            .get(agent_session_id.as_str())
+            .get(key)
             .cloned()
             .ok_or_else(|| AppError::not_found("Agent fixture session not found"))
     }
@@ -426,6 +477,11 @@ impl AgentWorkspaceRepository for MemoryAgentWorkspace {
             .state
             .lock()
             .expect("Agent workspace test mutex should not be poisoned");
+        if state.fail_session_enumeration {
+            return Err(AppError::configuration_corrupt(
+                "simulated corrupt historical Agent session",
+            ));
+        }
         Ok(state.sessions.values().cloned().collect())
     }
 
@@ -846,6 +902,10 @@ fn apply_documents(
                         revision: revision.clone(),
                     },
                 );
+                *state
+                    .endpoint_write_counts
+                    .entry(agent_session_id.to_owned())
+                    .or_default() += 1;
             }
             (kind, AgentWorkspaceDocumentContent::Text(contents)) if include_provider => {
                 // 所有受管文本（说明、provider MCP 配置、目标/快照 context）走同一快照表，
@@ -866,6 +926,134 @@ fn apply_documents(
         });
     }
     receipts
+}
+
+/// 历史目录中的一条损坏记录不能让关闭时的 endpoint 清理永远卡在同步阶段。
+/// 终端列表已经给出当前 owner，服务必须绕开全表枚举并仍真实清空活动会话。
+#[tokio::test]
+async fn stop_sync_ignores_corrupt_historical_session_enumeration() {
+    let agent_session_id = AgentSessionId::new();
+    let workspace = Arc::new(MemoryAgentWorkspace::new(
+        active_agent(agent_session_id.clone(), AgentSessionStatus::Active),
+        codex_provider_session(),
+        CommitBehavior::Accept,
+    ));
+    workspace.seed_mcp_endpoint_context(
+        &agent_session_id,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "agentSessionId": agent_session_id.as_str(),
+            "endpoint": null,
+            "transport": "streamable-http",
+            "toolsOnly": true,
+            "generatedAt": "2026-10-19T00:00:00Z"
+        })
+        .to_string(),
+    );
+    workspace.fail_session_enumeration();
+    let sessions = Arc::new(MemorySessions::new(
+        vec![terminal_info(
+            SessionId::new(),
+            SessionOwner::Agent {
+                agent_session_id: agent_session_id.clone(),
+            },
+            kerminal_domain::sessions::SessionLifecycle::Running,
+        )],
+        TEST_SESSION_GENERATION,
+        false,
+    ));
+    let service = agent_service(workspace.clone(), sessions);
+    *service.endpoint.write().await = Some(TEST_AGENT_ENDPOINT.to_owned());
+
+    service
+        .configure_mcp_endpoint(None, CancellationToken::new())
+        .await
+        .expect("corrupt history must not block shutdown endpoint clearing");
+
+    let saved = workspace
+        .mcp_endpoint_context(&agent_session_id)
+        .expect("live workspace must still be updated");
+    let saved: serde_json::Value =
+        serde_json::from_str(&saved).expect("committed context should be valid JSON");
+    assert!(saved["endpoint"].is_null());
+}
+
+/// 真正由运行中终端持有的 workspace 读取失败仍是错误，但不能连累其他 live owner。
+#[tokio::test]
+async fn stop_sync_reports_live_workspace_failure_without_blocking_other_owners() {
+    let failed_id = AgentSessionId::new();
+    let healthy_id = AgentSessionId::new();
+    let workspace = Arc::new(MemoryAgentWorkspace::new(
+        active_agent(failed_id.clone(), AgentSessionStatus::Active),
+        codex_provider_session(),
+        CommitBehavior::Accept,
+    ));
+    workspace.insert_history_session(
+        active_agent(healthy_id.clone(), AgentSessionStatus::Active),
+        codex_provider_session(),
+    );
+    workspace.seed_mcp_endpoint_context(
+        &failed_id,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "agentSessionId": failed_id.as_str(),
+            "endpoint": null,
+            "transport": "streamable-http",
+            "toolsOnly": true,
+            "generatedAt": "2026-10-19T00:00:00Z"
+        })
+        .to_string(),
+    );
+    workspace.seed_mcp_endpoint_context(
+        &healthy_id,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "agentSessionId": healthy_id.as_str(),
+            "endpoint": null,
+            "transport": "streamable-http",
+            "toolsOnly": true,
+            "generatedAt": "2026-10-19T00:00:00Z"
+        })
+        .to_string(),
+    );
+    workspace.fail_session_reads(&failed_id, 1);
+    let sessions = Arc::new(MemorySessions::new(
+        vec![
+            terminal_info(
+                SessionId::new(),
+                SessionOwner::Agent {
+                    agent_session_id: failed_id.clone(),
+                },
+                kerminal_domain::sessions::SessionLifecycle::Running,
+            ),
+            terminal_info(
+                SessionId::new(),
+                SessionOwner::Agent {
+                    agent_session_id: healthy_id.clone(),
+                },
+                kerminal_domain::sessions::SessionLifecycle::Running,
+            ),
+        ],
+        TEST_SESSION_GENERATION,
+        false,
+    ));
+    let service = agent_service(workspace.clone(), sessions);
+    *service.endpoint.write().await = Some(TEST_AGENT_ENDPOINT.to_owned());
+
+    assert!(
+        service
+            .configure_mcp_endpoint(None, CancellationToken::new())
+            .await
+            .is_err(),
+        "failure touching a genuinely live workspace must remain visible"
+    );
+    let healthy = workspace
+        .mcp_endpoint_context(&healthy_id)
+        .expect("unrelated live owner should still be updated");
+    let healthy: serde_json::Value =
+        serde_json::from_str(&healthy).expect("committed context should be valid JSON");
+    assert!(healthy["endpoint"].is_null());
+    assert_eq!(workspace.endpoint_write_count(&failed_id), 0);
 }
 
 /// 目标上下文刷新会把兼容读取到的全局地址重建为 scoped 路径；停止后 listener
