@@ -2846,7 +2846,7 @@ fn host_primary_action_label(protocol: RemoteProtocol) -> gpui_kit::SharedString
 /// 搜索框取得按钮组以外的全部宽度；窄图标槽位保留控件高度，避免搜索被三枚方形按钮挤压。
 /// 刷新沿用同一异步加载门禁，按钮组只在相邻动作间保留小间距。
 /// 搜索悬停与普通工具动作使用中性色，强调色保留给真实焦点或选中状态。
-/// 清除按钮放在输入框内部，复用输入变更事件恢复目录，并把焦点交回输入框以便继续搜索。
+/// 搜索外框统一控制两侧留白，避免输入组件为后缀叠加右侧内边距；清除后焦点回到输入框。
 /// @author kongweiguang
 fn render_navigation_header(
     navigation: &mut HostNavigation,
@@ -2859,11 +2859,13 @@ fn render_navigation_header(
     let all_collapsed = all_groups_are_collapsed(&group_ids, navigation.active_collapsed_groups());
     let search = div()
         .id("host-navigation-search-frame")
+        .test_support()
         .flex_1()
         .min_w(px(0.))
         .h(px(metrics.control_height))
         .flex()
         .items_center()
+        .gap_1()
         .px_2()
         .rounded_lg()
         .border_1()
@@ -2889,30 +2891,36 @@ fn render_navigation_header(
         .child(
             Input::new(&navigation.search_input)
                 .appearance(false)
-                .w_full()
-                .min_w(px(0.))
+                .flex_1()
+                .min_w_0()
                 .px_0()
                 .aria_label(crate::locale::text("搜索主机", "Search hosts"))
-                .prefix(div().text_color(theme.subtle).child(IconName::Search))
-                .when(!navigation.search.is_empty(), |input| {
-                    let label = crate::locale::text("清除搜索", "Clear search");
-                    let search_input = navigation.search_input.clone();
-                    input.suffix(
-                        Button::new("host-navigation-clear-search")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .accessibility_label(label.clone())
-                            .tooltip(label)
-                            .on_click(move |_, window, cx| {
-                                search_input.update(cx, |input, cx| {
-                                    input.clean(window, cx);
-                                    input.focus(window, cx);
-                                });
-                            }),
-                    )
-                }),
-        );
+                .prefix(
+                    div()
+                        .id("host-navigation-search-icon")
+                        .test_support()
+                        .text_color(theme.subtle)
+                        .child(IconName::Search),
+                ),
+        )
+        .when(!navigation.search.is_empty(), |frame| {
+            let label = crate::locale::text("清除搜索", "Clear search");
+            let search_input = navigation.search_input.clone();
+            frame.child(
+                Button::new("host-navigation-clear-search")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .accessibility_label(label.clone())
+                    .tooltip(label)
+                    .on_click(move |_, window, cx| {
+                        search_input.update(cx, |input, cx| {
+                            input.clean(window, cx);
+                            input.focus(window, cx);
+                        });
+                    }),
+            )
+        });
     let actions = div()
         .w(px(metrics.action_width * 3. + 4.))
         .flex_shrink_0()

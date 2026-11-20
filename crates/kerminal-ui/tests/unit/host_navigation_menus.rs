@@ -275,7 +275,7 @@ fn click_menu_item(visual: &mut VisualTestContext, label: &str) {
     draw(visual);
 }
 
-/// 从真实点击验证输入和目录一起复位，防止只清空文本而遗留筛选或丢失焦点。
+/// 验证两侧图标共用外框留白，避免清除按钮内缩；真实点击还须恢复目录与输入焦点。
 /// @author kongweiguang
 #[gpui_kit::test]
 fn clear_search_restores_directory_and_focus(app: &mut TestAppContext) {
@@ -311,10 +311,17 @@ fn clear_search_restores_directory_and_focus(app: &mut TestAppContext) {
     let target = visual.update(|window, app| {
         assert_eq!(navigation.read(app).search, "unmatched");
         assert!(gpui_kit::base::test_support::find(window, &[], &selector).is_none());
-        clear_button(window)
-            .expect("有搜索内容时可清除")
-            .bounds()
-            .center()
+        let frame =
+            gpui_kit::base::test_support::find(window, &[], &"host-navigation-search-frame".into())
+                .expect("搜索外框应存在")
+                .bounds();
+        let icon =
+            gpui_kit::base::test_support::find(window, &[], &"host-navigation-search-icon".into())
+                .expect("搜索图标应存在")
+                .bounds();
+        let clear = clear_button(window).expect("有搜索内容时可清除").bounds();
+        assert_eq!(icon.left() - frame.left(), frame.right() - clear.right());
+        clear.center()
     });
     visual.simulate_click(target, Default::default());
     draw(visual);
