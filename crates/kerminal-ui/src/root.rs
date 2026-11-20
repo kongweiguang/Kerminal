@@ -7397,7 +7397,9 @@ fn input_modifiers(modifiers: gpui_kit::Modifiers) -> InputModifiers {
     }
 }
 
-/// 将 GPUI 键名转换成平台无关键标识；未知按键留给输入法文本通道。
+/// 用同一键身份处理按下和释放，避免字母 `f` 被吞掉或将未知系统键伪装成字符。
+///
+/// @author kongweiguang
 fn terminal_key(key: &str) -> Option<TerminalKey> {
     let normalized = key.to_ascii_lowercase();
     Some(match normalized.as_str() {
@@ -7416,7 +7418,13 @@ fn terminal_key(key: &str) -> Option<TerminalKey> {
         "pageup" => TerminalKey::PageUp,
         "pagedown" => TerminalKey::PageDown,
         "space" => TerminalKey::Character(' '),
-        name if name.starts_with('f') => TerminalKey::Function(name[1..].parse().ok()?),
+        name if name.len() > 1 && name.starts_with('f') => {
+            let number = name[1..].parse().ok()?;
+            if !(1..=35).contains(&number) {
+                return None;
+            }
+            TerminalKey::Function(number)
+        }
         _ => {
             let mut characters = normalized.chars();
             let character = characters.next()?;

@@ -206,7 +206,26 @@ fn platform_preferred_terminal_text(event: &KeyDownEvent) -> Option<&str> {
         .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
 }
 
-/// 尊重平台标记的字符输入优先级，避免 AltGr 或 IME 按键被用户快捷键误消费。
+/// 让活动终端和只读历史使用同一键身份，防止把系统键名的首字母误发成控制字节。
+///
+/// @author kongweiguang
+fn terminal_key_down_event(
+    event: &KeyDownEvent,
+    modifiers: InputModifiers,
+) -> Option<TerminalKeyEvent> {
+    terminal_key(&event.keystroke.key).map(|key| TerminalKeyEvent {
+        key,
+        phase: if event.is_held {
+            KeyPhase::Repeat
+        } else {
+            KeyPhase::Press
+        },
+        modifiers,
+    })
+}
+
+/// 先保留平台字符输入和用户键位的优先级，再补足 Windows/Linux 的标准粘贴手势。
+/// 活动终端和只读历史共用解析结果，由各自的粘贴处理决定是否可写。
 ///
 /// @author kongweiguang
 fn resolve_terminal_shortcut(
@@ -222,13 +241,44 @@ fn resolve_terminal_shortcut(
     if event.is_held && runtime.is_terminal_shortcut_repeat(&event.keystroke) {
         return keybindings::KeybindingDispatch::Pending;
     }
-    runtime.dispatch(
+    let dispatch = runtime.dispatch(
         &event.keystroke,
         keybindings::KeybindingFocusScope::Terminal,
         ime_composing,
         false,
         event.is_held,
-    )
+    );
+    if dispatch == keybindings::KeybindingDispatch::Unhandled && is_standard_terminal_paste(event) {
+        return keybindings::KeybindingDispatch::Action(KeybindingAction::TerminalPaste);
+    }
+    dispatch
+}
+
+/// 兼容常用终端粘贴手势，使用精确的物理修饰键避免误抢 TUI 组合键，且只认首次按下。
+///
+/// @author kongweiguang
+fn is_standard_terminal_paste(event: &KeyDownEvent) -> bool {
+    if event.is_held {
+        return false;
+    }
+    let key = &event.keystroke.key;
+    let modifiers = event.keystroke.modifiers;
+    let shift_insert = cfg!(any(target_os = "windows", target_os = "linux"))
+        && key.eq_ignore_ascii_case("insert")
+        && modifiers
+            == (Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            });
+    let windows_ctrl_shift_v = cfg!(target_os = "windows")
+        && key.eq_ignore_ascii_case("v")
+        && modifiers
+            == (Modifiers {
+                control: true,
+                shift: true,
+                ..Modifiers::default()
+            });
+    shift_insert || windows_ctrl_shift_v
 }
 
 /// 复用已聚焦 pane 的固定 binding 和输入队列投递剪贴板内容，不另建异步输入通道。
@@ -392,22 +442,7 @@ impl RootView {
             return;
         }
         let modifiers = self.terminal_input_modifiers(event.keystroke.modifiers);
-        let terminal_event = terminal_key(&event.keystroke.key)
-            .or_else(|| {
-                (modifiers.control || modifiers.alt)
-                    .then(|| event.keystroke.key.chars().next())
-                    .flatten()
-                    .map(TerminalKey::Character)
-            })
-            .map(|key| TerminalKeyEvent {
-                key,
-                phase: if event.is_held {
-                    KeyPhase::Repeat
-                } else {
-                    KeyPhase::Press
-                },
-                modifiers,
-            });
+        let terminal_event = terminal_key_down_event(event, modifiers);
 
         let (modes, page_rows, snapshot_has_selection) = self
             .snapshot_for_session(&binding.session_id)
@@ -806,22 +841,7 @@ impl RootView {
         let has_selection =
             snapshot.selection.is_some() || active_gesture || selection_update_pending;
         let modifiers = self.terminal_input_modifiers(event.keystroke.modifiers);
-        let terminal_event = terminal_key(&event.keystroke.key)
-            .or_else(|| {
-                (modifiers.control || modifiers.alt)
-                    .then(|| event.keystroke.key.chars().next())
-                    .flatten()
-                    .map(TerminalKey::Character)
-            })
-            .map(|key| TerminalKeyEvent {
-                key,
-                phase: if event.is_held {
-                    KeyPhase::Repeat
-                } else {
-                    KeyPhase::Press
-                },
-                modifiers,
-            });
+        let terminal_event = terminal_key_down_event(event, modifiers);
 
         if terminal_event
             .is_some_and(|key| key.key == TerminalKey::Escape && key.phase == KeyPhase::Press)
@@ -863,10 +883,13 @@ impl RootView {
                 terminal_clipboard_shortcut(key.key, event, has_selection, false)
             })
         {
-            if event.is_held && action != TerminalClipboardAction::Interrupt {
+            // 历史没有可发送的中断事件，长按复制或中断都不应重复操作或刷新提示。
+            if event.is_held {
                 self.keybinding_runtime.clear_pending();
                 return true;
             }
+            self.keybinding_runtime
+                .remember_terminal_shortcut_key(&event.keystroke);
             match action {
                 TerminalClipboardAction::CopySelection => {
                     // 与 live pane 相同：显式复制手势始终消费；没有选择时选择工具返回 None，

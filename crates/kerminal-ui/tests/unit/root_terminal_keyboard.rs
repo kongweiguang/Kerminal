@@ -12,8 +12,9 @@ use super::{
     KeyPhase, TerminalClipboardAction, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
     TerminalModes, TerminalViewportScroll, consumed_terminal_shortcut_repeat, encode_input,
     platform_preferred_terminal_text, resolve_ctrl_insert_override, resolve_terminal_shortcut,
-    terminal_clipboard_action_for_platform, terminal_clipboard_shortcut, terminal_key_input,
-    terminal_key_release_input, viewport_scroll_action, viewport_scroll_action_for_keys,
+    terminal_clipboard_action_for_platform, terminal_clipboard_shortcut, terminal_key,
+    terminal_key_down_event, terminal_key_input, terminal_key_release_input,
+    viewport_scroll_action, viewport_scroll_action_for_keys,
 };
 
 /// 右栏终端的复制、搜索和粘贴仍归原会话，中央布局动作只有中央 pane 可承接。
@@ -62,7 +63,7 @@ fn configured_paste_replaces_the_previous_terminal_shortcut() {
         "cmd-v"
     } else if cfg!(target_os = "windows") {
         paste.windows_binding = "Ctrl+Shift+F12".to_owned();
-        "ctrl-shift-v"
+        "ctrl-v"
     } else {
         paste.linux_binding = Some("Ctrl+Shift+F12".to_owned());
         "ctrl-shift-v"
@@ -466,6 +467,242 @@ fn key_down(text: &str) -> KeyDownEvent {
         keystroke: Keystroke::parse(text).unwrap(),
         is_held: false,
         prefer_character_input: false,
+    }
+}
+
+/// 字母 f 的按下、重复和释放必须使用同一键身份，避免 Kitty 应用收到不完整的事件。
+///
+/// @author kongweiguang
+#[test]
+fn letter_f_keeps_its_keyboard_identity_in_all_phases() {
+    let modes = TerminalModes {
+        kitty_keyboard_flags: 0b01010,
+        ..TerminalModes::default()
+    };
+    let modifiers = InputModifiers::default();
+    let mut event = key_down("f");
+    for (held, expected) in [(false, b"\x1b[102;1:1u"), (true, b"\x1b[102;1:2u")] {
+        event.is_held = held;
+        let key = terminal_key_down_event(&event, modifiers).unwrap();
+        let input = terminal_key_input(key, modes, None).unwrap();
+        assert_eq!(
+            encode_input(&input, modes).as_deref(),
+            Some(expected.as_slice())
+        );
+    }
+    let key = terminal_key(&event.keystroke.key).unwrap();
+    let release = terminal_key_release_input(key, modifiers, modes).unwrap();
+    assert_eq!(
+        encode_input(&release, modes).as_deref(),
+        Some(b"\x1b[102;1:3u".as_slice())
+    );
+    assert_eq!(terminal_key("f1"), Some(TerminalKey::Function(1)));
+    assert_eq!(terminal_key("F35"), Some(TerminalKey::Function(35)));
+    for unsupported in ["f0", "f36", "f256", "fn"] {
+        assert_eq!(terminal_key(unsupported), None, "{unsupported}");
+    }
+}
+
+/// 系统键必须有明确映射，避免 Ctrl+Menu 等组合误发回车或其他控制字节。
+///
+/// @author kongweiguang
+#[test]
+fn modified_named_keys_do_not_fall_back_to_their_first_character() {
+    for key in ["ctrl-menu", "alt-back", "ctrl-alt-forward"] {
+        let event = key_down(key);
+        let modifiers = super::super::input_modifiers(event.keystroke.modifiers);
+        assert_eq!(terminal_key_down_event(&event, modifiers), None, "{key}");
+    }
+    let event = key_down("ctrl-f");
+    let modifiers = super::super::input_modifiers(event.keystroke.modifiers);
+    let input = TerminalInputEvent::Key(terminal_key_down_event(&event, modifiers).unwrap());
+    assert_eq!(
+        encode_input(&input, TerminalModes::default()),
+        Some(vec![0x06])
+    );
+}
+
+/// Windows 的兼容手势在空配置下仍可用，同时服从精确修饰键和用户组合键的优先级。
+///
+/// @author kongweiguang
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_ctrl_shift_v_is_an_exact_paste_fallback() {
+    use super::keybindings::{KeybindingDispatch, RootKeybindingRuntime};
+    use crate::keybindings::KeybindingAction;
+
+    let mut runtime = RootKeybindingRuntime::default();
+    let event = key_down("ctrl-shift-v");
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, false),
+        KeybindingDispatch::Action(KeybindingAction::TerminalPaste)
+    );
+    let mut held = event.clone();
+    held.is_held = true;
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &held, false),
+        KeybindingDispatch::Unhandled
+    );
+    for key in ["ctrl-v", "shift-v", "ctrl-alt-shift-v", "cmd-ctrl-shift-v"] {
+        assert_eq!(
+            resolve_terminal_shortcut(&mut runtime, &key_down(key), false),
+            KeybindingDispatch::Unhandled,
+            "{key}"
+        );
+    }
+
+    let mut settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let search = settings
+        .keybindings
+        .iter_mut()
+        .find(|binding| binding.action == "terminal.search")
+        .unwrap();
+    search.windows_binding = "Ctrl+Shift+V Ctrl+K".to_owned();
+    runtime.update(&settings.keybindings);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, false),
+        KeybindingDispatch::Pending
+    );
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &key_down("ctrl-k"), false),
+        KeybindingDispatch::Action(KeybindingAction::TerminalSearch)
+    );
+}
+
+/// 默认粘贴键和标准手势应并存，既覆盖新设置也覆盖未保存粘贴动作的旧配置。
+///
+/// @author kongweiguang
+#[test]
+fn shift_insert_pastes_alongside_the_configured_default() {
+    use super::keybindings::{KeybindingDispatch, RootKeybindingRuntime};
+    use crate::keybindings::KeybindingAction;
+
+    let settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let mut runtime = RootKeybindingRuntime::default();
+    runtime.update(&settings.keybindings);
+    let default_paste = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else if cfg!(target_os = "windows") {
+        "ctrl-v"
+    } else {
+        "ctrl-shift-v"
+    };
+    let paste = KeybindingDispatch::Action(KeybindingAction::TerminalPaste);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &key_down(default_paste), false),
+        paste
+    );
+    let shift_insert = key_down("shift-insert");
+    let expected = if cfg!(any(target_os = "windows", target_os = "linux")) {
+        paste
+    } else {
+        KeybindingDispatch::Unhandled
+    };
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &shift_insert, false),
+        expected
+    );
+    runtime.update(&[]);
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &shift_insert, false),
+        expected
+    );
+}
+
+/// 额外修饰键、平台字符输入与未归属快捷键的重复事件继续走原来的输入路径。
+///
+/// @author kongweiguang
+#[test]
+fn shift_insert_paste_requires_an_exact_initial_stroke() {
+    use super::keybindings::{KeybindingDispatch, RootKeybindingRuntime};
+
+    let mut runtime = RootKeybindingRuntime::default();
+    for key in ["insert", "ctrl-shift-insert", "alt-shift-insert"] {
+        assert_eq!(
+            resolve_terminal_shortcut(&mut runtime, &key_down(key), false),
+            KeybindingDispatch::Unhandled,
+            "{key} must retain its terminal routing"
+        );
+    }
+    let event = key_down("shift-insert");
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &event, true),
+        KeybindingDispatch::Unhandled
+    );
+    for modifiers in [
+        Modifiers {
+            platform: true,
+            ..event.keystroke.modifiers
+        },
+        Modifiers {
+            function: true,
+            ..event.keystroke.modifiers
+        },
+    ] {
+        let mut changed = event.clone();
+        changed.keystroke.modifiers = modifiers;
+        assert_eq!(
+            resolve_terminal_shortcut(&mut runtime, &changed, false),
+            KeybindingDispatch::Unhandled
+        );
+    }
+    let mut preferred = event.clone();
+    preferred.prefer_character_input = true;
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &preferred, false),
+        KeybindingDispatch::Unhandled
+    );
+    let mut held = event;
+    held.is_held = true;
+    assert_eq!(
+        resolve_terminal_shortcut(&mut runtime, &held, false),
+        KeybindingDispatch::Unhandled
+    );
+}
+
+/// 自定义动作及组合序列优先，避免升级后已有 Shift+Insert 键位变成意外粘贴。
+///
+/// @author kongweiguang
+#[test]
+fn configured_shortcuts_take_priority_over_shift_insert_paste() {
+    use super::keybindings::{KeybindingDispatch, RootKeybindingRuntime};
+    use crate::keybindings::KeybindingAction;
+
+    let mut settings = kerminal_application::preferences::SettingsSnapshot::default();
+    let shift_insert = key_down("shift-insert");
+    let ctrl_k = key_down("ctrl-k");
+    let mut runtime = RootKeybindingRuntime::default();
+    for sequence in ["Shift+Insert", "Shift+Insert Ctrl+K", "Ctrl+K Shift+Insert"] {
+        let search = settings
+            .keybindings
+            .iter_mut()
+            .find(|binding| binding.action == "terminal.search")
+            .unwrap();
+        search.windows_binding = sequence.to_owned();
+        search.mac_binding = sequence.to_owned();
+        search.linux_binding = Some(sequence.to_owned());
+        runtime.update(&settings.keybindings);
+        let last = match sequence {
+            "Shift+Insert Ctrl+K" => {
+                assert_eq!(
+                    resolve_terminal_shortcut(&mut runtime, &shift_insert, false),
+                    KeybindingDispatch::Pending
+                );
+                &ctrl_k
+            }
+            "Ctrl+K Shift+Insert" => {
+                assert_eq!(
+                    resolve_terminal_shortcut(&mut runtime, &ctrl_k, false),
+                    KeybindingDispatch::Pending
+                );
+                &shift_insert
+            }
+            _ => &shift_insert,
+        };
+        assert_eq!(
+            resolve_terminal_shortcut(&mut runtime, last, false),
+            KeybindingDispatch::Action(KeybindingAction::TerminalSearch)
+        );
     }
 }
 

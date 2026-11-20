@@ -29,7 +29,7 @@ fn key(key: TerminalKey, modifiers: InputModifiers, phase: KeyPhase) -> Terminal
     })
 }
 
-/// Disambiguation 只提升歧义字符，避免把导航键映射成错误的 CSI-u PUA 码。
+/// 消歧模式仍使用功能键的指定 CSI 格式，并为冲突的字符组合提供独立编码。
 /// @author kongweiguang
 #[test]
 fn disambiguation_keeps_canonical_navigation_and_function_sequences() {
@@ -49,7 +49,7 @@ fn disambiguation_keeps_canonical_navigation_and_function_sequences() {
             ),
             modes(1)
         ),
-        Some(b"\x1bOP".to_vec())
+        Some(b"\x1b[P".to_vec())
     );
     assert_eq!(
         encode_input(
@@ -101,7 +101,7 @@ fn disambiguation_keeps_canonical_navigation_and_function_sequences() {
     );
 }
 
-/// Event-type 编码把 :1/:2/:3 放在 modifier 字段后，也覆盖 Escape 的非文本事件。
+/// 验证方向键的默认按下与显式重复、释放能被区分，同时覆盖 Escape 和 Ctrl 字母。
 /// @author kongweiguang
 #[test]
 fn event_types_are_reported_for_navigation_and_modified_text_keys() {
@@ -111,7 +111,7 @@ fn event_types_are_reported_for_navigation_and_modified_text_keys() {
             &key(TerminalKey::Up, InputModifiers::default(), KeyPhase::Press),
             modes(event_flags)
         ),
-        Some(b"\x1b[1;1:1A".to_vec())
+        Some(b"\x1b[A".to_vec())
     );
     assert_eq!(
         encode_input(
@@ -158,17 +158,61 @@ fn event_types_are_reported_for_navigation_and_modified_text_keys() {
     );
 }
 
-/// 全键模式使用 Kitty keycode；无事件字段时省略默认 modifier=1，文本仅随 flag 16 发送。
+/// Kitty 的导航键即使全键报告也保留独立 CSI 格式，避免客户端误解键身份。
 /// @author kongweiguang
 #[test]
-fn report_all_uses_kitty_codes_and_does_not_leak_raw_text() {
+fn kitty_navigation_keeps_dedicated_sequences_across_enhancements() {
+    for (terminal_key, press, release) in [
+        (TerminalKey::Left, "D", "1;5:3D"),
+        (TerminalKey::Right, "C", "1;5:3C"),
+        (TerminalKey::Up, "A", "1;5:3A"),
+        (TerminalKey::Down, "B", "1;5:3B"),
+        (TerminalKey::Home, "H", "1;5:3H"),
+        (TerminalKey::End, "F", "1;5:3F"),
+        (TerminalKey::Insert, "2~", "2;5:3~"),
+        (TerminalKey::Delete, "3~", "3;5:3~"),
+        (TerminalKey::PageUp, "5~", "5;5:3~"),
+        (TerminalKey::PageDown, "6~", "6;5:3~"),
+    ] {
+        let pressed = key(terminal_key, InputModifiers::default(), KeyPhase::Press);
+        for flags in [0b00001, 0b00010, 0b01000, 0b01010] {
+            let modes = TerminalModes {
+                application_cursor: true,
+                ..modes(flags)
+            };
+            assert_eq!(
+                encode_input(&pressed, modes),
+                Some(format!("\x1b[{press}").into_bytes()),
+                "{terminal_key:?}, flags {flags:05b}"
+            );
+        }
+        let released = key(
+            terminal_key,
+            InputModifiers {
+                control: true,
+                ..InputModifiers::default()
+            },
+            KeyPhase::Release,
+        );
+        assert_eq!(encode_input(&released, modes(0b01000)), None);
+        assert_eq!(
+            encode_input(&released, modes(0b01010)),
+            Some(format!("\x1b[{release}").into_bytes())
+        );
+    }
+}
+
+/// 全键模式仍按键类型选择专用序列或 CSI-u，并避免额外抄送原始文本。
+/// @author kongweiguang
+#[test]
+fn report_all_uses_dedicated_key_formats_without_leaking_raw_text() {
     let all_with_types = 0b01000 | 0b00010;
     assert_eq!(
         encode_input(
             &key(TerminalKey::Up, InputModifiers::default(), KeyPhase::Press),
             modes(all_with_types)
         ),
-        Some(b"\x1b[57352;1:1u".to_vec())
+        Some(b"\x1b[A".to_vec())
     );
     assert_eq!(
         encode_input(
@@ -179,7 +223,7 @@ fn report_all_uses_kitty_codes_and_does_not_leak_raw_text() {
             ),
             modes(all_with_types)
         ),
-        Some(b"\x1b[57364;1:1u".to_vec())
+        Some(b"\x1b[P".to_vec())
     );
     assert_eq!(
         encode_input(
@@ -531,5 +575,383 @@ fn text_input_keeps_raw_bytes_independent_of_bracketed_paste_mode() {
             }
         ),
         Some(text.as_bytes().to_vec())
+    );
+}
+
+/// Kitty legacy Ctrl 表把 `[ \ ]` 与数字键映射到同一组 VT 控制字节。
+///
+/// 这些标点不在字母区间内，必须显式映射，否则会以可打印字符发送；
+/// 同时确认 Ctrl+Shift 的歧义编码仍走 CSI-u，不会被 VT 字节覆盖。
+/// @author kongweiguang
+#[test]
+fn legacy_ctrl_brackets_map_to_vt_control_bytes() {
+    for (character, expected) in [
+        ('[', 0x1b),
+        ('\\', 0x1c),
+        (']', 0x1d),
+        ('^', 0x1e),
+        ('_', 0x1f),
+        ('/', 0x1f),
+        ('4', 0x1c),
+        ('5', 0x1d),
+    ] {
+        assert_eq!(
+            encode_input(
+                &key(
+                    TerminalKey::Character(character),
+                    InputModifiers {
+                        control: true,
+                        ..InputModifiers::default()
+                    },
+                    KeyPhase::Press,
+                ),
+                TerminalModes::default(),
+            ),
+            Some(vec![expected]),
+            "Ctrl+{character:?} must use the VT control byte"
+        );
+    }
+    assert_eq!(
+        encode_input(
+            &key(
+                TerminalKey::Character('['),
+                InputModifiers {
+                    shift: true,
+                    control: true,
+                    ..InputModifiers::default()
+                },
+                KeyPhase::Press,
+            ),
+            TerminalModes::default(),
+        ),
+        Some(b"\x1b[91;6u".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &key(
+                TerminalKey::Character(']'),
+                InputModifiers {
+                    alt: true,
+                    control: true,
+                    ..InputModifiers::default()
+                },
+                KeyPhase::Press,
+            ),
+            TerminalModes::default(),
+        ),
+        Some(vec![0x1b, 0x1d])
+    );
+}
+
+/// DECCKM 只改变未修饰 Home/End 的终结形式；组合键保持 CSI 以便应用区分。
+///
+/// 方向键继续沿用原有 SS3 行为，Insert/PageUp 等 tilde 键不受该模式影响。
+/// @author kongweiguang
+#[test]
+fn application_cursor_home_end_use_ss3_only_without_modifiers() {
+    let application = TerminalModes {
+        application_cursor: true,
+        ..TerminalModes::default()
+    };
+    let plain = |terminal_key| key(terminal_key, InputModifiers::default(), KeyPhase::Press);
+
+    assert_eq!(
+        encode_input(&plain(TerminalKey::Home), TerminalModes::default()),
+        Some(b"\x1b[H".to_vec())
+    );
+    assert_eq!(
+        encode_input(&plain(TerminalKey::End), TerminalModes::default()),
+        Some(b"\x1b[F".to_vec())
+    );
+    assert_eq!(
+        encode_input(&plain(TerminalKey::Home), application),
+        Some(b"\x1bOH".to_vec())
+    );
+    assert_eq!(
+        encode_input(&plain(TerminalKey::End), application),
+        Some(b"\x1bOF".to_vec())
+    );
+
+    let shift = InputModifiers {
+        shift: true,
+        ..InputModifiers::default()
+    };
+    let control = InputModifiers {
+        control: true,
+        ..InputModifiers::default()
+    };
+    assert_eq!(
+        encode_input(&key(TerminalKey::Home, shift, KeyPhase::Press), application),
+        Some(b"\x1b[1;2H".to_vec())
+    );
+    assert_eq!(
+        encode_input(&key(TerminalKey::End, shift, KeyPhase::Press), application),
+        Some(b"\x1b[1;2F".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &key(TerminalKey::Home, control, KeyPhase::Press),
+            application
+        ),
+        Some(b"\x1b[1;5H".to_vec())
+    );
+
+    assert_eq!(
+        encode_input(&plain(TerminalKey::Up), application),
+        Some(b"\x1bOA".to_vec())
+    );
+    assert_eq!(
+        encode_input(&plain(TerminalKey::Insert), application),
+        Some(b"\x1b[2~".to_vec())
+    );
+    assert_eq!(
+        encode_input(&plain(TerminalKey::PageUp), application),
+        Some(b"\x1b[5~".to_vec())
+    );
+}
+
+/// Kitty progressive 模式用 CSI 13~ 代替会被误认成光标位置报告的 F3 序列。
+///
+/// 全键模式同样遵循 F3 的专用格式，旧模式保留应用依赖的 SS3 R。
+/// @author kongweiguang
+#[test]
+fn kitty_f3_avoids_cursor_position_report_in_progressive_modes() {
+    let f3 = |modifiers: InputModifiers, phase| key(TerminalKey::Function(3), modifiers, phase);
+    let control = InputModifiers {
+        control: true,
+        ..InputModifiers::default()
+    };
+    let shift = InputModifiers {
+        shift: true,
+        ..InputModifiers::default()
+    };
+
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Press),
+            TerminalModes::default()
+        ),
+        Some(b"\x1bOR".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Release),
+            TerminalModes::default()
+        ),
+        None
+    );
+
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Press),
+            modes(0b0001)
+        ),
+        Some(b"\x1b[13~".to_vec())
+    );
+    assert_eq!(
+        encode_input(&f3(shift, KeyPhase::Press), modes(0b0001)),
+        Some(b"\x1b[13;2~".to_vec())
+    );
+
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Press),
+            modes(0b0010)
+        ),
+        Some(b"\x1b[13~".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Repeat),
+            modes(0b0010)
+        ),
+        Some(b"\x1b[13;1:2~".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Release),
+            modes(0b0010)
+        ),
+        Some(b"\x1b[13;1:3~".to_vec())
+    );
+    assert_eq!(
+        encode_input(&f3(control, KeyPhase::Press), modes(0b0011)),
+        Some(b"\x1b[13;5~".to_vec())
+    );
+    assert_eq!(
+        encode_input(&f3(control, KeyPhase::Release), modes(0b0011)),
+        Some(b"\x1b[13;5:3~".to_vec())
+    );
+
+    for (number, final_byte) in [(1u8, b'P'), (2, b'Q'), (4, b'S')] {
+        assert_eq!(
+            encode_input(
+                &key(
+                    TerminalKey::Function(number),
+                    InputModifiers::default(),
+                    KeyPhase::Press
+                ),
+                modes(0b0010)
+            ),
+            Some(format!("\x1b[{}", char::from(final_byte)).into_bytes())
+        );
+    }
+
+    assert_eq!(
+        encode_input(
+            &f3(InputModifiers::default(), KeyPhase::Press),
+            modes(0b01000)
+        ),
+        Some(b"\x1b[13~".to_vec())
+    );
+    assert_eq!(
+        encode_input(&f3(control, KeyPhase::Release), modes(0b01010)),
+        Some(b"\x1b[13;5:3~".to_vec())
+    );
+}
+
+/// 非全键模式下保留重置终端所需的输入语义，连带修饰键也不报告这些键的释放。
+/// @author kongweiguang
+#[test]
+fn tab_enter_and_backspace_release_require_report_all_keys_flag() {
+    for (terminal_key, code) in [(TerminalKey::Enter, 13), (TerminalKey::Backspace, 127)] {
+        let release = key(terminal_key, InputModifiers::default(), KeyPhase::Release);
+        assert_eq!(encode_input(&release, modes(0b0010)), None);
+        assert_eq!(
+            encode_input(&release, modes(0b1010)),
+            Some(format!("\x1b[{code};1:3u").into_bytes())
+        );
+    }
+    let ctrl = InputModifiers {
+        control: true,
+        ..InputModifiers::default()
+    };
+    let super_key = InputModifiers {
+        super_key: true,
+        ..InputModifiers::default()
+    };
+
+    assert_eq!(
+        encode_input(&key(TerminalKey::Tab, ctrl, KeyPhase::Press), modes(0b0010)),
+        Some(b"\x1b[9;5:1u".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &key(TerminalKey::Tab, ctrl, KeyPhase::Release),
+            modes(0b0010)
+        ),
+        None
+    );
+    assert_eq!(
+        encode_input(
+            &key(TerminalKey::Tab, super_key, KeyPhase::Release),
+            modes(0b0010)
+        ),
+        None
+    );
+    assert_eq!(
+        encode_input(
+            &key(
+                TerminalKey::BackTab,
+                InputModifiers {
+                    shift: true,
+                    control: true,
+                    ..InputModifiers::default()
+                },
+                KeyPhase::Release,
+            ),
+            modes(0b0010)
+        ),
+        None
+    );
+    assert_eq!(
+        encode_input(
+            &key(TerminalKey::Tab, InputModifiers::default(), KeyPhase::Press),
+            modes(0b0010)
+        ),
+        Some(b"\t".to_vec())
+    );
+
+    assert_eq!(
+        encode_input(
+            &key(TerminalKey::Tab, ctrl, KeyPhase::Release),
+            modes(0b1010)
+        ),
+        Some(b"\x1b[9;5:3u".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &key(
+                TerminalKey::Tab,
+                InputModifiers::default(),
+                KeyPhase::Release
+            ),
+            modes(0b1010)
+        ),
+        Some(b"\x1b[9;1:3u".to_vec())
+    );
+}
+
+/// disambiguate 模式按 Kitty 功能键表把 F13–F35 提升为 PUA 码，传统 CSI 25~ 只留给 legacy。
+///
+/// 增强标志组合不应改变功能键身份，F12 仍保留规范的 tilde 编号。
+/// @author kongweiguang
+#[test]
+fn disambiguation_promotes_f13_and_above_to_kitty_pua_codes() {
+    let shift = InputModifiers {
+        shift: true,
+        ..InputModifiers::default()
+    };
+
+    for (number, legacy, pua) in [
+        (13u8, b"\x1b[25~".as_slice(), 57376u32),
+        (20, b"\x1b[34~".as_slice(), 57383),
+        (21, b"\x1b[57384u".as_slice(), 57384),
+    ] {
+        let press = key(
+            TerminalKey::Function(number),
+            InputModifiers::default(),
+            KeyPhase::Press,
+        );
+        assert_eq!(
+            encode_input(&press, TerminalModes::default()),
+            Some(legacy.to_vec())
+        );
+        for flags in [0b00001, 0b00010, 0b01000, 0b01010] {
+            assert_eq!(
+                encode_input(&press, modes(flags)),
+                Some(format!("\x1b[{pua}u").into_bytes())
+            );
+        }
+    }
+
+    assert_eq!(
+        encode_input(
+            &key(TerminalKey::Function(13), shift, KeyPhase::Press),
+            modes(0b0001)
+        ),
+        Some(b"\x1b[57376;2u".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &key(
+                TerminalKey::Function(12),
+                InputModifiers::default(),
+                KeyPhase::Press
+            ),
+            modes(0b0001)
+        ),
+        Some(b"\x1b[24~".to_vec())
+    );
+    assert_eq!(
+        encode_input(
+            &key(
+                TerminalKey::Function(12),
+                InputModifiers::default(),
+                KeyPhase::Press
+            ),
+            modes(0b0010)
+        ),
+        Some(b"\x1b[24~".to_vec())
     );
 }

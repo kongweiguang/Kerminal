@@ -267,57 +267,29 @@ fn encode_kitty_key(
         return None;
     }
 
+    if report_all || disambiguate || report_types {
+        let event_type =
+            (report_types && event.phase != KeyPhase::Press).then(|| phase_code(event.phase));
+        if let Some(sequence) = kitty_functional_sequence(event.key, modifier, event_type) {
+            return Some(sequence);
+        }
+    }
+
     if !report_all {
-        if matches!(event.key, TerminalKey::Escape) && !disambiguate && !report_types {
+        let encode = match event.key {
+            TerminalKey::Escape => disambiguate || report_types,
+            TerminalKey::Character(_) => {
+                disambiguate && character_needs_disambiguation(event, modifiers)
+            }
+            // 即使 Ctrl+Tab 的按下需要消歧，非全键模式也不发送 release。
+            TerminalKey::Tab | TerminalKey::BackTab => {
+                event.phase != KeyPhase::Release && (modifiers.control || modifiers.super_key)
+            }
+            _ => false,
+        };
+        if !encode {
             return None;
         }
-        if matches!(event.key, TerminalKey::Enter | TerminalKey::Backspace) {
-            return None;
-        }
-        if matches!(event.key, TerminalKey::Tab | TerminalKey::BackTab)
-            && !modifiers.control
-            && !modifiers.super_key
-        {
-            return None;
-        }
-        if matches!(event.key, TerminalKey::Character(_))
-            && !(disambiguate && character_needs_disambiguation(event, modifiers))
-        {
-            return None;
-        }
-        if is_functional_key(event.key)
-            && !report_types
-            && event.phase == KeyPhase::Press
-            && !has_non_legacy_function_encoding(event.key)
-        {
-            return None;
-        }
-        let modified_tab = matches!(event.key, TerminalKey::Tab | TerminalKey::BackTab)
-            && (modifiers.control || modifiers.super_key);
-        if !is_functional_key(event.key)
-            && !matches!(event.key, TerminalKey::Character(_) | TerminalKey::Escape)
-            && !modified_tab
-        {
-            return None;
-        }
-    }
-
-    if matches!(event.key, TerminalKey::Enter | TerminalKey::Backspace) && !report_all {
-        return None;
-    }
-    if matches!(event.key, TerminalKey::Tab | TerminalKey::BackTab)
-        && !report_all
-        && !modifiers.control
-        && !modifiers.super_key
-    {
-        return None;
-    }
-
-    if is_functional_key(event.key) && !report_all {
-        if report_types {
-            return kitty_functional_sequence(event, modifiers, flags);
-        }
-        return None;
     }
 
     let key_code = kitty_key_code(event.key)?;
@@ -445,12 +417,12 @@ fn encode_legacy_key(
         TerminalKey::Down => Some(cursor_sequence(b'B', modes.application_cursor, modifier)),
         TerminalKey::Right => Some(cursor_sequence(b'C', modes.application_cursor, modifier)),
         TerminalKey::Left => Some(cursor_sequence(b'D', modes.application_cursor, modifier)),
-        TerminalKey::Home => Some(tilde_or_cursor_sequence(b'H', None, modifier)),
-        TerminalKey::End => Some(tilde_or_cursor_sequence(b'F', None, modifier)),
-        TerminalKey::Insert => Some(tilde_or_cursor_sequence(b'~', Some(2), modifier)),
-        TerminalKey::Delete => Some(tilde_or_cursor_sequence(b'~', Some(3), modifier)),
-        TerminalKey::PageUp => Some(tilde_or_cursor_sequence(b'~', Some(5), modifier)),
-        TerminalKey::PageDown => Some(tilde_or_cursor_sequence(b'~', Some(6), modifier)),
+        TerminalKey::Home => Some(cursor_sequence(b'H', modes.application_cursor, modifier)),
+        TerminalKey::End => Some(cursor_sequence(b'F', modes.application_cursor, modifier)),
+        TerminalKey::Insert => Some(tilde_sequence(2, modifier)),
+        TerminalKey::Delete => Some(tilde_sequence(3, modifier)),
+        TerminalKey::PageUp => Some(tilde_sequence(5, modifier)),
+        TerminalKey::PageDown => Some(tilde_sequence(6, modifier)),
         TerminalKey::Function(number) => function_key_sequence(number, modifier),
     }
 }
@@ -479,69 +451,42 @@ fn character_needs_disambiguation(event: TerminalKeyEvent, modifiers: InputModif
         )
 }
 
-/// 标记已经有传统控制序列的非文本键，避免 Kitty CSI-u 错把它们当 Unicode PUA。
-///
-/// @author kongweiguang
-fn is_functional_key(key: TerminalKey) -> bool {
-    matches!(
-        key,
-        TerminalKey::Up
-            | TerminalKey::Down
-            | TerminalKey::Right
-            | TerminalKey::Left
-            | TerminalKey::Home
-            | TerminalKey::End
-            | TerminalKey::Insert
-            | TerminalKey::Delete
-            | TerminalKey::PageUp
-            | TerminalKey::PageDown
-            | TerminalKey::Function(_)
-    )
-}
-
-/// Kitty legacy 模式没有 F13 以上键序列时，使用协议定义的 PUA 码点继续报告。
-///
-/// @author kongweiguang
-fn has_non_legacy_function_encoding(key: TerminalKey) -> bool {
-    matches!(key, TerminalKey::Function(21..=35))
-}
-
-/// 将导航键和功能键按 Kitty event type 扩展为 CSI 序列，不误用 CSI-u PUA 键码。
+/// 对齐 Kitty `key_encoding.c` 的功能键表与默认参数省略规则，包含全键模式。
+/// F3 固定用 `13~`，避免与光标位置报告冲突，F13 起才使用 PUA 编号。
 ///
 /// @author kongweiguang
 fn kitty_functional_sequence(
-    event: TerminalKeyEvent,
-    modifiers: InputModifiers,
-    flags: u8,
+    key: TerminalKey,
+    modifier: u8,
+    event_type: Option<u8>,
 ) -> Option<Vec<u8>> {
-    let modifier = modifiers.protocol_value();
-    let event_type = (flags & 0b10 != 0).then(|| phase_code(event.phase));
-    let suffix = event_type.map_or_else(String::new, |kind| format!(":{kind}"));
-    let sequence = match event.key {
-        TerminalKey::Up => format!("\x1b[1;{modifier}{suffix}A"),
-        TerminalKey::Down => format!("\x1b[1;{modifier}{suffix}B"),
-        TerminalKey::Right => format!("\x1b[1;{modifier}{suffix}C"),
-        TerminalKey::Left => format!("\x1b[1;{modifier}{suffix}D"),
-        TerminalKey::Home => format!("\x1b[1;{modifier}{suffix}H"),
-        TerminalKey::End => format!("\x1b[1;{modifier}{suffix}F"),
-        TerminalKey::Insert => format!("\x1b[2;{modifier}{suffix}~"),
-        TerminalKey::Delete => format!("\x1b[3;{modifier}{suffix}~"),
-        TerminalKey::PageUp => format!("\x1b[5;{modifier}{suffix}~"),
-        TerminalKey::PageDown => format!("\x1b[6;{modifier}{suffix}~"),
-        TerminalKey::Function(number @ 1..=4) => {
-            format!("\x1b[1;{modifier}{suffix}{}", char::from(b'P' + number - 1))
-        }
-        TerminalKey::Function(number @ 5..=12) => {
-            let code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
-            format!("\x1b[{code};{modifier}{suffix}~")
-        }
-        TerminalKey::Function(number @ 13..=35) => {
-            let code = 57363 + u32::from(number);
-            return Some(kitty_csi_u(&code.to_string(), modifier, event_type, None));
-        }
+    let (number, final_byte) = match key {
+        TerminalKey::Up => (1, b'A'),
+        TerminalKey::Down => (1, b'B'),
+        TerminalKey::Right => (1, b'C'),
+        TerminalKey::Left => (1, b'D'),
+        TerminalKey::Home => (1, b'H'),
+        TerminalKey::End => (1, b'F'),
+        TerminalKey::Insert => (2, b'~'),
+        TerminalKey::Delete => (3, b'~'),
+        TerminalKey::PageUp => (5, b'~'),
+        TerminalKey::PageDown => (6, b'~'),
+        TerminalKey::Function(number @ (1 | 2 | 4)) => (1, b'P' + number - 1),
+        TerminalKey::Function(3) => (13, b'~'),
+        TerminalKey::Function(number @ 5..=12) => (
+            u32::from(FUNCTION_TILDE_CODES[usize::from(number - 5)]),
+            b'~',
+        ),
+        TerminalKey::Function(number @ 13..=35) => (57363 + u32::from(number), b'u'),
         _ => return None,
     };
-    Some(sequence.into_bytes())
+    let final_char = char::from(final_byte);
+    Some(match event_type {
+        Some(phase) => format!("\x1b[{number};{modifier}:{phase}{final_char}").into_bytes(),
+        None if modifier != 1 => format!("\x1b[{number};{modifier}{final_char}").into_bytes(),
+        None if number == 1 => vec![0x1b, b'[', final_byte],
+        None => format!("\x1b[{number}{final_char}").into_bytes(),
+    })
 }
 
 /// 根据当前 flag 组合构造规范 CSI-u；仅在需要后续字段时显式保留默认 modifier=1。
@@ -622,33 +567,21 @@ const fn phase_code(phase: KeyPhase) -> u8 {
     }
 }
 
-/// 将 Kitty 的全键 keycode 与协议要求的渐进式 CSI/SS3 功能键输入分开维护。
+/// 只取普通 CSI-u 键码，导航和功能键保留各自的协议终止符。
 ///
 /// @author kongweiguang
 fn kitty_key_code(key: TerminalKey) -> Option<u32> {
     Some(match key {
         TerminalKey::Character(character) => character as u32,
         TerminalKey::Enter => 13,
-        TerminalKey::Tab => 9,
+        TerminalKey::Tab | TerminalKey::BackTab => 9,
         TerminalKey::Backspace => 127,
         TerminalKey::Escape => 27,
-        TerminalKey::BackTab => 9,
-        TerminalKey::Up => 57352,
-        TerminalKey::Down => 57353,
-        TerminalKey::Right => 57354,
-        TerminalKey::Left => 57355,
-        TerminalKey::Insert => 57348,
-        TerminalKey::Delete => 57349,
-        TerminalKey::PageUp => 57350,
-        TerminalKey::PageDown => 57351,
-        TerminalKey::Home => 57356,
-        TerminalKey::End => 57357,
-        TerminalKey::Function(number @ 1..=35) => 57363 + u32::from(number),
-        TerminalKey::Function(_) => return None,
+        _ => return None,
     })
 }
 
-/// 生成方向键序列，并按 application-cursor 与 xterm 修饰键模式选择格式。
+/// 方向键和 Home/End 共用 DECCKM；带修饰键时保留 xterm 的 CSI 1;m，供应用区分组合键。
 ///
 /// @author kongweiguang
 fn cursor_sequence(final_byte: u8, application_cursor: bool, modifier: u8) -> Vec<u8> {
@@ -662,19 +595,23 @@ fn cursor_sequence(final_byte: u8, application_cursor: bool, modifier: u8) -> Ve
     }
 }
 
-/// 编码 Home/End 与 tilde 类编辑键。
+/// 编码 Insert/Delete/PageUp/PageDown 的 tilde 序列。
+///
+/// 编号由键位固定，修饰键只追加 1-based 掩码；它们不受 DECCKM 影响。
 ///
 /// @author kongweiguang
-fn tilde_or_cursor_sequence(final_byte: u8, number: Option<u8>, modifier: u8) -> Vec<u8> {
-    match number {
-        Some(number) if modifier == 1 => format!("\x1b[{number}~").into_bytes(),
-        Some(number) => format!("\x1b[{number};{modifier}~").into_bytes(),
-        None if modifier == 1 => vec![0x1b, b'[', final_byte],
-        None => format!("\x1b[1;{modifier}{}", char::from(final_byte)).into_bytes(),
+fn tilde_sequence(number: u8, modifier: u8) -> Vec<u8> {
+    if modifier == 1 {
+        format!("\x1b[{number}~").into_bytes()
+    } else {
+        format!("\x1b[{number};{modifier}~").into_bytes()
     }
 }
 
-/// 编码 F1 至 F20 的常见 legacy 序列，并用 Kitty PUA 承载 F21 至 F35。
+// Kitty 和 legacy 对 F5–F12 使用相同编号，避免两条编码路径各自维护。
+const FUNCTION_TILDE_CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+
+/// 保留旧应用依赖的 SS3 和 tilde 序列，F21–F35 无传统编号时使用 Kitty 码点。
 ///
 /// @author kongweiguang
 fn function_key_sequence(number: u8, modifier: u8) -> Option<Vec<u8>> {
@@ -684,22 +621,11 @@ fn function_key_sequence(number: u8, modifier: u8) -> Option<Vec<u8>> {
         3 if modifier == 1 => b"\x1bOR".to_vec(),
         4 if modifier == 1 => b"\x1bOS".to_vec(),
         1..=4 => format!("\x1b[1;{modifier}{}", char::from(b'P' + number - 1)).into_bytes(),
-        5..=12 => {
-            let code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
-            if modifier == 1 {
-                format!("\x1b[{code}~").into_bytes()
-            } else {
-                format!("\x1b[{code};{modifier}~").into_bytes()
-            }
-        }
-        13..=20 => {
-            let code = [25, 26, 28, 29, 31, 32, 33, 34][usize::from(number - 13)];
-            if modifier == 1 {
-                format!("\x1b[{code}~").into_bytes()
-            } else {
-                format!("\x1b[{code};{modifier}~").into_bytes()
-            }
-        }
+        5..=12 => tilde_sequence(FUNCTION_TILDE_CODES[usize::from(number - 5)], modifier),
+        13..=20 => tilde_sequence(
+            [25, 26, 28, 29, 31, 32, 33, 34][usize::from(number - 13)],
+            modifier,
+        ),
         21..=35 => kitty_csi_u(
             &(57363 + u32::from(number)).to_string(),
             modifier,
@@ -713,15 +639,18 @@ fn function_key_sequence(number: u8, modifier: u8) -> Option<Vec<u8>> {
 
 /// 把可被传统终端表达的 Ctrl+ASCII 组合映射到 VT 控制字节。
 ///
+/// 字母由连续区间覆盖；方括号与反斜杠必须显式列出，否则会落到可打印 ASCII
+/// 回退分支，向应用发送字面字符而不是 VT 控制码。
+///
 /// @author kongweiguang
 fn control_character(character: char) -> Option<u8> {
     let value = character.to_ascii_lowercase();
     Some(match value {
         'a'..='z' => value as u8 - b'a' + 1,
         ' ' | '@' | '2' => 0,
-        '3' => 0x1b,
-        '4' => 0x1c,
-        '5' => 0x1d,
+        '3' | '[' => 0x1b,
+        '4' | '\\' => 0x1c,
+        '5' | ']' => 0x1d,
         '6' | '^' | '~' => 0x1e,
         '7' | '/' | '_' => 0x1f,
         '8' | '?' => 0x7f,
