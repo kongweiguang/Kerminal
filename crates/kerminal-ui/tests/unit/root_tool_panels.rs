@@ -1495,6 +1495,160 @@ fn commands_unit_gates_snippet_content_entry() {
     assert!(commands_content_enabled(&gating_registry(&[])));
 }
 
+/// 在真实工作区画布分发键盘事件，验证按下、长按、松开都遵守同一会话的粘贴归属。
+///
+/// @author kongweiguang
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[gpui_kit::test]
+fn standard_paste_gestures_dispatch_once_to_the_focused_terminal(app: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui_kit::{ClipboardItem, KeyDownEvent, KeyUpEvent, Keystroke};
+    use kerminal_terminal::{
+        TerminalEngine, TerminalLimits,
+        input::{KeyPhase, TerminalInputEvent, TerminalKey},
+        snapshot::RenderSnapshotRequest,
+    };
+
+    use crate::root::pane_input::PaneTerminalInputEvent;
+
+    let (runtime, root, visual) =
+        crate::root::external_auth::tests::host_file_workspace_fixture(app, |services| services);
+    visual.simulate_resize(size(px(1020.), px(720.)));
+    settle_split_fixture(&runtime, visual);
+
+    let tab = TabId::new();
+    let pane = PaneId::new();
+    let session = SessionId::new();
+    let binding = split_binding(session.clone(), tab.clone(), pane.clone(), 1);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let payload = "剪贴板\nsecond line";
+    let _subscription = visual.update(|window, app| {
+        window.activate_window();
+        app.write_to_clipboard(ClipboardItem::new_string(payload.to_owned()));
+        let input = root.update(app, |root, cx| {
+            let mut controller = WorkspaceController::from_missing().unwrap();
+            controller
+                .synchronize_snapshot(WorkspaceSessionSnapshot {
+                    active_tab_id: Some(tab.clone()),
+                    focused_pane_id: Some(pane.clone()),
+                    selected_machine_id: Some("local".to_owned()),
+                    terminal_tabs: vec![WorkspaceSessionTab::Terminal {
+                        id: tab.clone(),
+                        tab_group_id: None,
+                        title: "shell".to_owned(),
+                        machine_id: "local".to_owned(),
+                        layout: TerminalLayoutNode::pane(pane.clone()),
+                    }],
+                    terminal_panes: vec![split_workspace_pane(pane.clone())],
+                    pinned_containers: Vec::new(),
+                    tab_groups: BTreeMap::new(),
+                })
+                .unwrap();
+            root.workspace_runtime =
+                WorkspaceRuntime::from_snapshot(controller.snapshot()).unwrap();
+            root.workspace_controller = Some(controller);
+            root.workspace_load_pending = false;
+            root.center_panel = CenterPanel::Terminal;
+            let size = TerminalSize::default();
+            root.workspace_runtime
+                .install_session(&pane, session.clone(), split_session_target(), size)
+                .unwrap();
+            let mut engine =
+                TerminalEngine::new(session.clone(), size, TerminalLimits::default()).unwrap();
+            let mut snapshot = engine.render_snapshot(RenderSnapshotRequest::default());
+            // 全键与事件类型一起开启，才能发现粘贴键泄漏的 Insert 或普通字母 v 释放。
+            snapshot.modes.kitty_keyboard_flags = 0b01011;
+            snapshot.modes.bracketed_paste = true;
+            assert!(
+                root.workspace_runtime
+                    .accept_initial_snapshot(&pane, &session, snapshot)
+                    .unwrap()
+            );
+            root.install_pane_input_handler(
+                binding.clone(),
+                split_command_context(&binding),
+                window,
+                cx,
+            );
+            let input = root.pane_input_handlers[&session].entity.clone();
+            window.focus(&input.read(cx).focus_handle(), cx);
+            root.refresh_workspace_views(cx);
+            input
+        });
+        window.draw(app).clear(app);
+        app.subscribe(&input, move |_, event: &PaneTerminalInputEvent, _| {
+            if !matches!(event.event, TerminalInputEvent::Focus(_)) {
+                observed
+                    .borrow_mut()
+                    .push((event.binding.clone(), event.event.clone()));
+            }
+        })
+    });
+
+    for (gesture, main_key) in [
+        ("shift-insert", "insert"),
+        #[cfg(target_os = "windows")]
+        ("ctrl-shift-v", "v"),
+    ] {
+        events.borrow_mut().clear();
+        let released_modifiers = Keystroke::parse(main_key).unwrap();
+        visual.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse(gesture).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        visual.simulate_event(KeyDownEvent {
+            keystroke: released_modifiers.clone(),
+            is_held: true,
+            prefer_character_input: false,
+        });
+        visual.simulate_event(KeyUpEvent {
+            keystroke: released_modifiers,
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[(
+                binding.clone(),
+                TerminalInputEvent::Paste(payload.to_owned())
+            )],
+            "{gesture}"
+        );
+    }
+
+    visual.simulate_event(KeyDownEvent {
+        keystroke: Keystroke::parse("insert").unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [_, (target, TerminalInputEvent::Key(event))]
+            if target == &binding && event.key == TerminalKey::Insert && event.phase == KeyPhase::Press
+    ));
+
+    // 直接调用只读路由，检查 Ctrl 先松时长按 C 不会把复制反馈换成重连提示。
+    visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            let copy = KeyDownEvent {
+                keystroke: Keystroke::parse("ctrl-shift-c").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            };
+            assert!(root.handle_terminal_history_key_down(binding.clone(), &copy, window, cx));
+            let copy_status = root.status.clone();
+            let held = KeyDownEvent {
+                keystroke: Keystroke::parse("c").unwrap(),
+                is_held: true,
+                prefer_character_input: false,
+            };
+            assert!(root.handle_terminal_history_key_down(binding.clone(), &held, window, cx));
+            assert_eq!(root.status, copy_status);
+        });
+    });
+}
+
 /// 经真实 Root 的 `handle_workspace_render_event` 激活分屏 pane，且不预置投影或改动
 /// effect 调度；事件返回后、deferred effect 排空前手动绘制恰好一帧，检查首个元素树中的
 /// Logs 目标、保留插件实体和渲染上下文。成功路径要求 B 已提交、A 不可挂载、实体不重建，

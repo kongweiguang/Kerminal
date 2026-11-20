@@ -21,6 +21,7 @@ use gpui_kit::{
         ActiveTheme as _, Icon,
         button::{Button as KitButton, ButtonVariants as _},
         checkbox::Checkbox as KitCheckbox,
+        group_box::{GroupBox, GroupBoxVariants as _},
         input::{Editor, Input, Textarea},
         menu::{DropdownMenu as _, PopupMenuItem},
         progress::Progress as KitProgress,
@@ -30,7 +31,7 @@ use gpui_kit::{
     },
     container_query, div, fill, point,
     prelude::*,
-    px, size, white,
+    px, rems, size, white,
 };
 use kerminal_application::external_contributions::PreparedPlugin;
 use kerminal_plugin_protocol::{
@@ -275,7 +276,8 @@ impl NativeRenderer {
         }
     }
 
-    /// 当前结构严格对应冻结节点树；插件文本只作为内容，不解释为 HTML。
+    /// 节点位置沿用冻结树的索引，使条件隐藏不会改变其余控件的身份或草稿。
+    /// 布局只采用宿主主题与已知样式，插件文本不解释为 HTML。
     pub(super) fn render_node(
         &mut self,
         node: &NativeNode,
@@ -305,6 +307,7 @@ impl NativeRenderer {
             | Row { children, .. }
             | Toolbar { children, .. } => {
                 let horizontal = matches!(&node.kind, Row { .. } | Toolbar { .. });
+                let header = horizontal && has_appearance(node, "header");
                 let gap = match &node.kind {
                     Stack { gap, .. }
                     | Section { gap, .. }
@@ -316,28 +319,66 @@ impl NativeRenderer {
                     .flex()
                     .when(!horizontal, |d| d.flex_col())
                     .when(horizontal, |d| d.items_center())
+                    .when(header, |d| d.flex_wrap())
+                    .min_w_0()
                     .w_full();
                 box_ = match gap.unwrap_or(Gap::Md) {
                     Gap::Sm => box_.gap_1(),
                     Gap::Md => box_.gap_2(),
                     Gap::Lg => box_.gap_4(),
                 };
-                if let Section { title, .. } = &node.kind {
-                    box_ = box_.child(div().font_medium().child(self.projection.text(title)));
+                let section_title = match &node.kind {
+                    Section { title, .. } => Some(self.projection.text(title)),
+                    _ => None,
+                };
+                let grouped = section_title.is_some() && has_appearance(node, "grouped");
+                if let Some(title) = section_title.as_ref().filter(|_| !grouped) {
+                    box_ = box_.child(div().font_medium().child(title.clone()));
                 }
                 for (index, child) in children.iter().enumerate() {
-                    box_ =
-                        box_.child(self.render_node(child, format!("{path}.{index}"), window, cx));
+                    if !self.projection.is_visible(child) {
+                        continue;
+                    }
+                    let content = self.render_node(child, format!("{path}.{index}"), window, cx);
+                    box_ = if header && index == 0 {
+                        // 标题优先占用剩余空间；狭窄面板把动作换行，避免裁掉标题或按钮。
+                        box_.child(div().flex_1().min_w(rems(7.)).max_w_full().child(content))
+                    } else {
+                        box_.child(content)
+                    };
                 }
-                box_.into_any_element()
+                if let Some(title) = section_title.filter(|_| grouped) {
+                    GroupBox::new()
+                        .id(format!("external-group-{path}"))
+                        .fill()
+                        .title(div().text_sm().font_medium().child(title))
+                        .child(box_)
+                        .into_any_element()
+                } else {
+                    box_.into_any_element()
+                }
             }
-            Scroll { child, .. } => div()
-                .id(format!("external-scroll-{path}"))
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(self.render_node(child, format!("{path}.0"), window, cx))
-                .into_any_element(),
+            Scroll { child, .. } => {
+                let content = self.render_node(child, format!("{path}.0"), window, cx);
+                div()
+                    .id(format!("external-scroll-{path}"))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(if has_appearance(node, "inset") {
+                        // 滚动条贴面板边缘；内容限宽，避免右栏放大后表单和按钮相距过远。
+                        div()
+                            .flex()
+                            .justify_center()
+                            .px_4()
+                            .py_5()
+                            .child(div().w_full().min_w_0().max_w(rems(36.)).child(content))
+                            .into_any_element()
+                    } else {
+                        content
+                    })
+                    .into_any_element()
+            }
             Tabs { tabs, .. } => {
                 let selected = self
                     .active_tabs
@@ -383,7 +424,12 @@ impl NativeRenderer {
                     Tone::Danger => cx.theme().danger,
                 };
                 div()
+                    .min_w_0()
                     .text_color(color)
+                    .when(has_appearance(node, "title"), |d| {
+                        d.text_xl().font_semibold()
+                    })
+                    .when(has_appearance(node, "caption"), |d| d.text_sm())
                     .child(self.projection.text(text))
                     .into_any_element()
             }
@@ -586,10 +632,20 @@ impl NativeRenderer {
                 icon,
                 variant,
                 busy,
-                ..
+                extensions,
             } => {
                 let key = node.id.clone().unwrap_or(path.clone());
                 let action = action.clone();
+                // 可编辑草稿即时更新入口；Sidecar 仍负责实际目录和地址校验。
+                let missing_text = extensions
+                    .get("x-kerminal-requires-text")
+                    .and_then(Value::as_str)
+                    .and_then(|binding| binding.strip_prefix('$'))
+                    .is_some_and(|binding| {
+                        self.field_value(binding)
+                            .and_then(Value::as_str)
+                            .is_none_or(str::is_empty)
+                    });
                 let busy = busy
                     .as_deref()
                     .and_then(|path| self.field_value(path))
@@ -615,7 +671,8 @@ impl NativeRenderer {
                     .when_some(resolved_icon, |button, icon| button.icon(icon))
                     .loading(busy)
                     .disabled(
-                        busy || !self.field_errors.is_empty()
+                        busy || missing_text
+                            || !self.field_errors.is_empty()
                             || self.secret_write_pending()
                             || !matches!(self.status, OpenStatus::Ready),
                     )
@@ -711,7 +768,7 @@ impl NativeRenderer {
         }
     }
 
-    /// 字段外壳统一显示标签、远端冲突和校验错误，输入实体保持原位。
+    /// 视觉标签与输入的可访问名称共用文案；路径选择按钮不与长路径争抢宽度。
     fn render_field(
         &self,
         path: &str,
@@ -721,8 +778,9 @@ impl NativeRenderer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut field = div().flex().flex_col().gap_1().w_full();
-        if let Some(label) = label {
-            field = field.child(div().text_sm().child(self.projection.text(label)));
+        let label = label.map(|text| self.projection.text(text));
+        if let Some(label) = &label {
+            field = field.child(div().text_sm().child(label.clone()));
         }
         if let Some(control) = self.fields.get(path) {
             field = match control {
@@ -732,11 +790,12 @@ impl NativeRenderer {
                     secret_write,
                     ..
                 } => {
-                    let mut row = div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(Input::new(state).w_full());
+                    let mut row = div().flex().items_center().gap_2().child(
+                        Input::new(state)
+                            .flex_1()
+                            .min_w_0()
+                            .when_some(label.clone(), |input, label| input.aria_label(label)),
+                    );
                     if *secret {
                         let pending = secret_write
                             .as_ref()
@@ -757,7 +816,8 @@ impl NativeRenderer {
                         let mode = *mode;
                         row = row.child(
                             KitButton::new(format!("external-path-{path}"))
-                                .label(crate::locale::text("选择", "Browse"))
+                                .label(crate::locale::text("选择…", "Browse…"))
+                                .flex_shrink_0()
                                 .on_click(cx.listener(move |renderer, _, _, cx| {
                                     renderer.choose_path(bind.clone(), mode, cx)
                                 })),
@@ -873,6 +933,25 @@ impl NativeRenderer {
             }
         }
     }
+}
+
+/// 只识别宿主提供的外观名称，旧包和未知扩展继续使用默认布局。
+fn has_appearance(node: &NativeNode, appearance: &str) -> bool {
+    use NativeNodeKind::*;
+    let extensions = match &node.kind {
+        Scroll { extensions, .. }
+        | Row { extensions, .. }
+        | Toolbar { extensions, .. }
+        | Section { extensions, .. }
+        | Text { extensions, .. }
+        | Badge { extensions, .. }
+        | Notice { extensions, .. } => extensions,
+        _ => return false,
+    };
+    extensions
+        .get("x-kerminal-appearance")
+        .and_then(Value::as_str)
+        == Some(appearance)
 }
 
 /// 打开/保存/仅目录三种模式到平台选择参数的唯一映射；保存走独立的新路径对话框。

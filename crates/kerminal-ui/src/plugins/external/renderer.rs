@@ -128,7 +128,9 @@ use gpui_kit::{
 use kerminal_application::{
     AppError, AppResult,
     executor::ApplicationTaskExecutor,
-    plugin_ports::{PluginViewIdentity, PluginViewSavedState, PreparedPlugin},
+    plugin_ports::{
+        PluginViewIdentity, PluginViewSavedState, PreparedPlugin, plugin_business_error,
+    },
 };
 use kerminal_domain::plugins::PluginRuntimeState;
 use kerminal_plugin_protocol::native::NativeView;
@@ -139,7 +141,7 @@ use super::{
     collections::NativeCollection,
     inputs::FieldControl,
     runtime::{AsyncViewRuntime, RuntimeEvent, RuntimeReply, RuntimeRequest, RuntimeSubscription},
-    state::ActionTicket,
+    state::{ActionTicket, BindingPath},
     view::NativeViewProjection,
 };
 use crate::plugins::content::{ContentInstanceIdentity, ContentStateChanged};
@@ -974,7 +976,7 @@ impl NativeRenderer {
         .detach();
     }
 
-    /// 动作快照绑定当前实例和进程代次；等待秘密写入回执后才能提交引用。
+    /// 动作快照绑定当前实例和进程代次；合法重试开始后，旧错误不再覆盖本次结果。
     pub(super) fn action(
         &mut self,
         node: String,
@@ -999,6 +1001,7 @@ impl NativeRenderer {
         let Ok(ticket) = self.projection.state_mut().begin_action(&node) else {
             return;
         };
+        self.error = None;
         let generation = self.process_generation;
         let request = RuntimeRequest {
             identity: self.identity.clone(),
@@ -1058,9 +1061,31 @@ impl NativeRenderer {
                 }
             }
             Ok(_) => {}
-            Err(error) => self.error = Some(error.public_message().to_owned()),
+            Err(error) => {
+                self.error = (!self.action_error_is_inline(&error, window, cx))
+                    .then(|| error.public_message().to_owned());
+            }
         }
         cx.notify();
+    }
+
+    /// 业务回执和内联提示一致时只显示一次。使用应用缓存消除界面订阅与回执的调度差异。
+    fn action_error_is_inline(
+        &mut self,
+        error: &AppError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(path) = inline_action_error_path(&self.projection.view().root) else {
+            return false;
+        };
+        if plugin_business_error(error).is_none() || !self.resync() {
+            return false;
+        }
+        self.sync_controls(window, cx);
+        self.sync_collections(cx);
+        let inline = self.projection.state().remote_value(&path);
+        matches_inline_action_error(inline, error)
     }
 
     /// 快照由异步应用服务缓存；同步工作区保存只读取确认过的结果。
@@ -1096,6 +1121,23 @@ impl NativeRenderer {
         })
         .detach();
     }
+}
+
+/// 只接受根滚动区显式声明的绑定，避免改变已有面板的错误展示。
+fn inline_action_error_path(root: &NativeNode) -> Option<BindingPath> {
+    let kerminal_plugin_protocol::native::NativeNodeKind::Scroll { extensions, .. } = &root.kind
+    else {
+        return None;
+    };
+    let binding = extensions.get("x-kerminal-action-error")?.as_str()?;
+    BindingPath::parse(binding.strip_prefix('$')?).ok()
+}
+
+/// 只认当前业务回执中的文案，旧内联字段不能盖住权限、超时等宿主错误。
+fn matches_inline_action_error(inline: Option<&Value>, error: &AppError) -> bool {
+    plugin_business_error(error).is_some_and(|business| {
+        !business.message().is_empty() && inline.and_then(Value::as_str) == Some(business.message())
+    })
 }
 
 impl Drop for NativeRenderer {

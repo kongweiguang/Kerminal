@@ -4421,6 +4421,51 @@ fn narrow_toolbar_keeps_search_and_update_all_reachable(app: &mut TestAppContext
     );
 }
 
+/// 用真实滚轮事件核对宽窄两种布局，防止滚动条轨道跟随行内容移动。
+#[gpui_kit::test]
+fn extension_list_scrollbar_stays_at_viewport_edge(app: &mut TestAppContext) {
+    let (runtime, page, visual) = page_fixture(
+        app,
+        Arc::new(FakeStore::new(PluginStoreState::default(), Vec::new())),
+        Arc::new(FakeCatalog::default()),
+    );
+    let snapshot = catalog_snapshot(
+        (0..30)
+            .map(|index| catalog_plugin(&format!("acme.extension-{index}")))
+            .collect(),
+    );
+    visual.update(|_, app| {
+        page.update(app, |page, cx| {
+            page.catalog = Some(snapshot);
+            page.state = Some(PluginStoreState::default());
+            cx.notify();
+        });
+    });
+
+    for width in [900., 400.] {
+        visual.simulate_resize(size(px(width), px(600.)));
+        visual.update(|_, app| {
+            page.update(app, |page, cx| {
+                page.list_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+                cx.notify();
+            });
+        });
+        pump(&runtime, visual);
+        let viewport = visual.update(|_, app| page.read(app).list_scroll.bounds());
+        assert!(viewport.size.height > px(0.));
+        assert_eq!(visual.debug_bounds("scrollbar-overlay"), Some(viewport));
+
+        visual.simulate_event(gpui_kit::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-240.))),
+            ..Default::default()
+        });
+        pump(&runtime, visual);
+        assert!(visual.update(|_, app| page.read(app).list_scroll.offset().y) < px(0.));
+        assert_eq!(visual.debug_bounds("scrollbar-overlay"), Some(viewport));
+    }
+}
+
 /// 内置组标题是唯一折叠入口；箭头槽与行内容共用同一左 inset，搜索只临时展开。
 #[gpui_kit::test]
 fn builtin_group_header_toggles_collapse_and_aligns_arrow(app: &mut TestAppContext) {

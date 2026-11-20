@@ -111,7 +111,7 @@ impl PluginProcessSpec {
 }
 
 impl PluginProcess {
-    /// 配置白名单环境后启动受管进程，所有权在任何握手等待之前交还监督器。
+    /// 白名单保留运行时依赖的系统路径与必要用户变量；启动即登记所有权，避免握手失败遗留进程。
     pub(crate) async fn spawn(
         spec: &PluginProcessSpec,
         generation: u64,
@@ -136,6 +136,11 @@ impl PluginProcess {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
+        }
+        // Winsock 用 SystemRoot 展开系统网络提供程序路径。只补这一项，维持子进程环境隔离。
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
         }
         command
             .env("KERMINAL_PLUGIN_ID", spec.id.as_str())

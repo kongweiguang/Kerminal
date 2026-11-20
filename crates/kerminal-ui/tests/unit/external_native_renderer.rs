@@ -7,6 +7,39 @@ use kerminal_plugin_protocol::runtime::{ViewFetchSort, ViewSortDirection};
 
 use super::{CollectionQuery, collection_cache_key};
 
+/// 只有与当前业务回执一致的内联内容才能代替宿主反馈。
+#[test]
+fn inline_action_error_must_match_current_business_reply() {
+    use kerminal_application::{AppError, plugin_ports::PluginBusinessError};
+    use serde_json::json;
+
+    use super::{inline_action_error_path, matches_inline_action_error};
+
+    let root = serde_json::from_value(json!({
+        "type": "scroll",
+        "child": { "type": "text", "text": "$feedback.error" },
+        "x-kerminal-action-error": "$feedback.error"
+    }))
+    .expect("valid scroll");
+    let path = inline_action_error_path(&root).expect("explicit error binding");
+    assert_eq!(path.segments(), &["feedback", "error"]);
+    let inline = json!("请选择有效的共享目录");
+    let business = AppError::infrastructure_with_source(
+        "插件请求失败",
+        PluginBusinessError::new(-32103, "请选择有效的共享目录").expect("business code"),
+    );
+    assert!(matches_inline_action_error(Some(&inline), &business));
+    assert!(!matches_inline_action_error(
+        Some(&json!("旧提示")),
+        &business
+    ));
+    assert!(!matches_inline_action_error(None, &business));
+    assert!(!matches_inline_action_error(
+        Some(&inline),
+        &AppError::unsupported("插件权限不足")
+    ));
+}
+
 /// 父节点、排序列和方向都属于查询身份，比较规则必须与相等判断一致。
 #[test]
 fn collection_queries_keep_parent_and_sort_as_separate_keys() {

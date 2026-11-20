@@ -39,6 +39,21 @@ use kerminal_domain::plugins::{
 };
 use std::collections::BTreeSet;
 
+/// 将滚动条叠层固定在视口边缘，避免 GPUI 把它和内容一起平移。
+/// 保留原滚动容器及句柄，让键盘定位仍使用直接子元素的索引。
+///
+/// @author kongweiguang
+fn extension_scroll_viewport(content: impl IntoElement, scroll: &ScrollHandle) -> gpui_kit::Div {
+    div()
+        .relative()
+        .flex_1()
+        .min_w(px(0.))
+        .min_h(px(0.))
+        .flex()
+        .child(content)
+        .vertical_scrollbar(scroll)
+}
+
 impl Render for ExtensionsPage {
     /// 页头与单张主从卡片共同承担设置页的既有留白，卡片内部各自滚动。
     /// 确认交给窗口级 Kit Dialog，页面不再自行绘制遮罩或手写焦点陷阱。
@@ -748,7 +763,6 @@ impl ExtensionsPage {
             .min_h(px(0.))
             .overflow_y_scroll()
             .track_scroll(&self.list_scroll)
-            .vertical_scrollbar(&self.list_scroll)
             .track_focus(&self.list_focus)
             .on_key_down(cx.listener(Self::handle_list_key))
             .p_2()
@@ -778,7 +792,7 @@ impl ExtensionsPage {
         if entries.is_empty() {
             list = list.child(self.empty_state(theme, cx));
         }
-        list.into_any_element()
+        extension_scroll_viewport(list, &self.list_scroll).into_any_element()
     }
 
     /// 空态按搜索、分类与两条来源的加载/失败状态区分；失败不铺错误条，
@@ -938,7 +952,6 @@ impl ExtensionsPage {
             .min_h(px(0.))
             .overflow_y_scroll()
             .track_scroll(&self.detail_scroll)
-            .vertical_scrollbar(&self.detail_scroll)
             .px_4()
             .pb_4()
             .flex()
@@ -1612,7 +1625,10 @@ impl ExtensionsPage {
                 );
             return detail.into_any_element();
         }
-        detail.child(fixed).child(scroll).into_any_element()
+        detail
+            .child(fixed)
+            .child(extension_scroll_viewport(scroll, &self.detail_scroll))
+            .into_any_element()
     }
 
     /// 对象级反馈只在反馈来源与当前详情完全一致时出现；内置与同 ID 外部记录
@@ -1759,6 +1775,7 @@ impl ExtensionsPage {
     }
 
     /// 使用窗口级 Kit Dialog 呈现确认：焦点、Escape 和关闭后的焦点恢复由 Kit 统一负责。
+    /// 正文使用 Kit 的滚动视口，使长确认清单的轨道与底部操作区各自固定。
     pub(super) fn present_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.active {
             self.confirmation = None;
@@ -1782,12 +1799,10 @@ impl ExtensionsPage {
         let ok_operation = model.action.clone();
         let confirm_operation = model.action.clone();
         let danger = model.danger;
-        let body_scroll = ScrollHandle::new();
         window.open_dialog(cx, move |dialog, window, app| {
             // 弹层可能跨主题切换存活；每次重建都按当次窗口与 App 取语义色，
             // 避免跟随系统切换后仍沿用打开瞬间的旧 panel 色。
             let theme = ThemeTokens::current(window, app).for_settings();
-            let body_scroll = body_scroll.clone();
             let ok_owner = ok_owner.clone();
             let cancel_owner = cancel_owner.clone();
             let dismiss_owner = dismiss_owner.clone();
@@ -1814,9 +1829,6 @@ impl ExtensionsPage {
                     div()
                         .id("extensions-confirmation-body")
                         .max_h(window.viewport_size().height * 0.55)
-                        .overflow_y_scroll()
-                        .track_scroll(&body_scroll)
-                        .vertical_scrollbar(&body_scroll)
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -1907,7 +1919,8 @@ impl ExtensionsPage {
                                 model.full_access,
                                 theme,
                             ))
-                        }),
+                        })
+                        .overflow_y_scrollbar(),
                 )
                 .footer(
                     div()
