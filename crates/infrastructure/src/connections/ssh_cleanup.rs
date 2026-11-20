@@ -300,6 +300,10 @@ impl PendingRusshCleanup {
             .cloned()
             .collect();
         for handshake in handshakes {
+            // 已被其他 owner 确认结束的握手不需要剩余预算，与前面的 session 路径一致。
+            if handshake.is_complete() {
+                continue;
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(
                     first_error.unwrap_or_else(|| AppError::timeout("SSH cleanup deadline"))
@@ -320,7 +324,9 @@ impl PendingRusshCleanup {
                 first_error.unwrap_or_else(|| AppError::timeout("SSH cleanup remains pending"))
             );
         }
-        first_error.map_or(Ok(()), Err)
+        // 剩余 owner 为空说明过程中记录的错误都对应已 join 的任务；具体错误已在产生
+        // 处保留脱敏诊断，不能再用已关闭资源阻塞退出、插件重启或更新安装。
+        Ok(())
     }
 }
 
@@ -545,28 +551,45 @@ impl PendingHandshakeCleanup {
     }
 
     /// 收尾遗弃的握手，并在同一 deadline 内关闭迟到成功的 session。
+    ///
+    /// 握手 task 已在本次 join 中结束时不会留下 session 或 socket；其失败只说明本次
+    /// 连接没有建立。若继续把它当作待清理资源，桌面退出、插件重启和更新安装会被
+    /// 已关闭任务的重放错误挡住；只有仍在运行、未 join 的握手才保留超时错误重试。
+    ///
+    /// @author kongweiguang
     async fn close_until(&self, deadline: tokio::time::Instant) -> AppResult<()> {
-        match self.session_until(deadline).await? {
-            Some(session) => {
-                if session.disconnected.load(Ordering::Acquire) {
-                    self.complete.store(true, Ordering::Release);
+        let session = match self.session_until(deadline).await {
+            Ok(session) => session,
+            Err(error) => {
+                if self.is_complete() {
+                    tracing::warn!(
+                        code = error.public_code().as_str(),
+                        "SSH handshake task ended with an error after join; no session remains"
+                    );
                     return Ok(());
                 }
-                let graceful_deadline = deadline.checked_sub(CLEANUP_GRACE).unwrap_or(deadline);
-                let result = super::disconnect_one_session_until(
-                    &session,
-                    "Kerminal abandoned SSH handshake",
-                    graceful_deadline,
-                    deadline,
-                )
-                .await;
-                if session.disconnected.load(Ordering::Acquire) {
-                    self.complete.store(true, Ordering::Release);
-                }
-                result
+                return Err(error);
             }
-            None => Ok(()),
+        };
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if session.disconnected.load(Ordering::Acquire) {
+            self.complete.store(true, Ordering::Release);
+            return Ok(());
         }
+        let graceful_deadline = deadline.checked_sub(CLEANUP_GRACE).unwrap_or(deadline);
+        let result = super::disconnect_one_session_until(
+            &session,
+            "Kerminal abandoned SSH handshake",
+            graceful_deadline,
+            deadline,
+        )
+        .await;
+        if session.disconnected.load(Ordering::Acquire) {
+            self.complete.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// 保留 handler 记录的内部决策错误（例如公钥无法序列化），其余 KEX/网络失败一律

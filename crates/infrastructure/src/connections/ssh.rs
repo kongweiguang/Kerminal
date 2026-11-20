@@ -1852,7 +1852,7 @@ async fn disconnect_sessions(
 }
 
 /// 先请求 SSH disconnect 并 join；已被 owner 取消的 socket 只重试 join，不向失效队列重发。
-/// 远端传输错误只有在 Handle 已实际完成且错误证明连接已终止后才算关闭成功；普通错误仍保留给 retry。
+/// 只有截止时间前仍未 join 的 Handle 才继续持有 transport；连接结束后的错误只作诊断。
 ///
 /// @author kongweiguang
 async fn disconnect_one_session_until(
@@ -1907,46 +1907,60 @@ async fn disconnect_one_session_until(
         Ok(exit) => Some(exit),
         Err(_) => {
             session.transport_cancel.cancel();
-            match tokio::time::timeout_at(
+            tokio::time::timeout_at(
                 hard_deadline,
                 std::future::poll_fn(|context| Pin::new(&mut *handle).poll(context)),
             )
             .await
-            {
-                Ok(exit) => Some(exit),
-                Err(_) => {
-                    first_error
-                        .get_or_insert_with(|| AppError::timeout("SSH session task shutdown"));
-                    None
-                }
-            }
+            .ok()
         }
     };
 
-    if let Some(exit) = exit {
+    if exit.is_some() {
         // 只在 Handle Future 真正完成后置位，避免重试时重复 poll 已完成的 oneshot receiver。
         session.disconnected.store(true, Ordering::Release);
-        match exit {
-            Ok(()) => {
-                // Handle 正常完成是关闭 ACK；先前仅为 disconnect send 记录的错误已无资源可对应。
-                first_error = None;
-            }
-            Err(error)
-                if is_expected_local_disconnect(
-                    session.disconnect_requested.load(Ordering::Acquire),
-                    session.transport_cancel.is_cancelled(),
-                    &error,
-                ) || is_confirmed_remote_transport_end(&error) =>
-            {
-                // 本地 typed cancel 或已完成的远端 transport end 均不能留下虚假的待关闭状态。
-                first_error = None;
-            }
-            Err(error) => {
-                first_error.get_or_insert_with(|| russh_error("SSH session task failed", error));
-            }
-        }
     }
-    first_error.map_or(Ok(()), Err)
+    session_cleanup_result(
+        exit,
+        session.disconnect_requested.load(Ordering::Acquire),
+        session.transport_cancel.is_cancelled(),
+        first_error,
+    )
+}
+
+/// 只有未在截止时间内 join 的会话才仍持有 socket 与 russh task。
+///
+/// Handle Future 完成即证明会话任务与底层 transport 已经结束，此时无论 join 返回
+/// 什么错误都不存在可继续清理的资源；若仍把它报告为失败，插件重启或更新安装会
+/// 因为“已关闭资源”被假失败挡住并让用户手动重试。已 join 的异常只保留脱敏诊断。
+///
+/// @author kongweiguang
+fn session_cleanup_result(
+    exit: Option<Result<(), russh::Error>>,
+    disconnect_requested: bool,
+    transport_cancelled: bool,
+    first_error: Option<AppError>,
+) -> AppResult<()> {
+    let Some(exit) = exit else {
+        return Err(first_error.unwrap_or_else(|| AppError::timeout("SSH session task shutdown")));
+    };
+    if let Some(error) = first_error {
+        tracing::debug!(
+            code = error.public_code().as_str(),
+            "SSH disconnect request failed before the session task finished"
+        );
+    }
+    if let Err(error) = exit
+        && !is_expected_local_disconnect(disconnect_requested, transport_cancelled, &error)
+        && !is_confirmed_remote_transport_end(&error)
+    {
+        let diagnostic = russh_error("SSH session task failed", error);
+        tracing::warn!(
+            code = diagnostic.public_code().as_str(),
+            "SSH session task ended with an error after join; transport resources are released"
+        );
+    }
+    Ok(())
 }
 
 /// 只分类 Handle join 后的终止结果；调用方不得用它豁免仍运行的 task、channel writer 或非终止 IO 错误。

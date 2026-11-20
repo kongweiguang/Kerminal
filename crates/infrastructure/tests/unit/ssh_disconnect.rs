@@ -4,8 +4,9 @@
 
 use super::{
     CancellablePeerStream, is_confirmed_remote_transport_end, is_expected_local_disconnect,
-    local_ssh_transport_cancelled_error,
+    local_ssh_transport_cancelled_error, session_cleanup_result,
 };
+use kerminal_application::{AppError, PublicErrorCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -103,4 +104,41 @@ async fn cancelled_peer_stream_preserves_owned_source_in_every_io_operation() {
             &russh::Error::IO(error)
         ));
     }
+}
+
+/// Handle Future 完成即会话 task 与 transport 已释放；join 错误只保留诊断，
+/// 不能再作为剩余资源阻塞桌面退出、插件重启和更新安装。
+///
+/// @author kongweiguang
+#[test]
+fn joined_session_errors_do_not_remain_pending_cleanup_resources() {
+    let request_error = AppError::infrastructure("SSH session disconnect request failed");
+    for exit in [
+        Ok(()),
+        Err(russh::Error::Disconnect),
+        Err(russh::Error::SendError),
+        Err(russh::Error::RequestDenied),
+        Err(russh::Error::IO(std::io::Error::other("writer stopped"))),
+    ] {
+        let result = session_cleanup_result(Some(exit), true, false, Some(request_error.clone()));
+        assert!(
+            result.is_ok(),
+            "a completed Handle Future leaves no transport resource to retry"
+        );
+    }
+}
+
+/// 截止时间前未 join 的 Handle 仍可能持有 socket，必须保留原错误供同一 owner 重试。
+///
+/// @author kongweiguang
+#[test]
+fn unjoined_session_keeps_the_residual_cleanup_error() {
+    let request_error = AppError::infrastructure("SSH session disconnect request failed");
+    let error = session_cleanup_result(None, true, false, Some(request_error))
+        .expect_err("an unjoined handle still owns the transport task");
+    assert_eq!(error.public_code(), PublicErrorCode::Infrastructure);
+
+    let timeout = session_cleanup_result(None, false, true, None)
+        .expect_err("an unjoined handle without a prior error must time out");
+    assert_eq!(timeout.public_code(), PublicErrorCode::Timeout);
 }
