@@ -5,11 +5,13 @@
 use gpui_kit::{KeyDownEvent, Keystroke, Modifiers};
 use kerminal_terminal::input::InputModifiers;
 
+// Ctrl+Insert 的覆盖优先级只在非 macOS 测试中断言，导入沿用同一平台条件。
+#[cfg(not(target_os = "macos"))]
+use super::ctrl_insert_override_wins;
 use super::{
     KeyPhase, TerminalClipboardAction, TerminalInputEvent, TerminalKey, TerminalKeyEvent,
-    TerminalModes, TerminalViewportScroll, consumed_terminal_shortcut_repeat,
-    ctrl_insert_override_wins, encode_input, platform_preferred_terminal_text,
-    resolve_ctrl_insert_override, resolve_terminal_shortcut,
+    TerminalModes, TerminalViewportScroll, consumed_terminal_shortcut_repeat, encode_input,
+    platform_preferred_terminal_text, resolve_ctrl_insert_override, resolve_terminal_shortcut,
     terminal_clipboard_action_for_platform, terminal_clipboard_shortcut, terminal_key_input,
     terminal_key_release_input, viewport_scroll_action, viewport_scroll_action_for_keys,
 };
