@@ -3842,25 +3842,27 @@ fn catalog_source_unknown_mismatch_fails_visibly(app: &mut TestAppContext) {
     );
 }
 
-/// 构造 application 校验接受、但 UI 表单校验会阻塞的 Windows 快捷键冲突。
+/// 让同一份外部设置在每个平台都触发 UI 保存校验，避免宿主快捷键差异绕过冲突分支。
 ///
-/// 外部配置可能由旧版本或手工编辑写入同一组合；UI 仍要阻止再次保存。
-/// 用默认目录里的两个已知动作，避免测试复制一份快捷键契约。
+/// 从默认动作复制生效字段，保留 Linux 跟随 Windows 配置的语义。
 ///
 /// @author kongweiguang
 fn make_ui_blocked_shortcut_collision(settings: &mut SettingsSnapshot) {
-    let open_binding = settings
+    let open = settings
         .keybindings
         .iter()
         .find(|binding| binding.action == "settings.open")
-        .map(|binding| binding.windows_binding.clone())
+        .cloned()
         .expect("默认设置必须包含 settings.open");
     let search = settings
         .keybindings
         .iter_mut()
         .find(|binding| binding.action == "terminal.search")
         .expect("默认设置必须包含 terminal.search");
-    search.windows_binding = open_binding;
+    search.binding = open.binding;
+    search.windows_binding = open.windows_binding;
+    search.mac_binding = open.mac_binding;
+    search.linux_binding = open.linux_binding;
 }
 
 /// 冲突恢复续写被 UI 校验拒绝时，来源必须显式失败而不是永久 saving。
