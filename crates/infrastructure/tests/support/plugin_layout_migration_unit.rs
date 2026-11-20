@@ -337,6 +337,101 @@ fn empty_schema_one_store_becomes_current() {
     );
 }
 
+/// 0.4 产品会在插件根下写入 `catalog-cache/official.json`；真实安装根没有插件状态
+/// 或已是 schema 2 时都必须放行，缓存原文不能因预检被改写。
+#[test]
+fn product_catalog_cache_is_accepted_in_fresh_and_current_roots() {
+    let fixture = tempfile::tempdir().expect("隔离数据根");
+    let root = fixture.path().join("root");
+    let plugins = root.join(PLUGINS_DIRECTORY);
+    let cache = plugins
+        .join(layout::CATALOG_CACHE_DIRECTORY)
+        .join("official.json");
+    fs::create_dir_all(cache.parent().expect("缓存父目录")).expect("创建目录缓存");
+    let cache_bytes =
+        br#"{"raw":"{\"schema\":1,\"source_id\":\"official\",\"sequence\":1,\"plugins\":[]}","fetched_at":1}"#;
+    fs::write(&cache, cache_bytes).expect("写入目录缓存");
+
+    // 首次启动可能只创建缓存目录，还没有任何插件状态。
+    let fresh = inspect(&root).expect("无状态分类");
+    assert!(fresh.blockers.is_empty(), "{:?}", fresh.blockers);
+    assert_eq!(fresh.class, PluginLayoutClass::Fresh);
+    assert_eq!(fresh.readiness(), PluginLayoutReadiness::Fresh);
+    assert!(!fresh.requires_migration());
+
+    fs::write(
+        plugins.join(STATE_FILE),
+        r#"{"schema":2,"revision":1,"plugins":{},"pending":[],"failures":{}}"#,
+    )
+    .expect("写入 schema 2 状态");
+    let current = inspect(&root).expect("当前状态分类");
+    assert!(current.blockers.is_empty(), "{:?}", current.blockers);
+    assert_eq!(current.class, PluginLayoutClass::Current);
+    assert_eq!(current.readiness(), PluginLayoutReadiness::Current);
+    assert_eq!(fs::read(&cache).expect("缓存保留"), cache_bytes);
+}
+
+/// schema 1 根里已经出现目录缓存时，迁移只搬旧包和状态，缓存目录原样保留。
+#[test]
+fn schema_one_migration_preserves_catalog_cache() {
+    let (_temp, root) = fixture_root("empty");
+    let plugins = root.join(PLUGINS_DIRECTORY);
+    let cache = plugins
+        .join(layout::CATALOG_CACHE_DIRECTORY)
+        .join("official.json");
+    fs::create_dir_all(cache.parent().expect("缓存父目录")).expect("创建目录缓存");
+    fs::write(&cache, b"product cache").expect("写入缓存");
+
+    let inspection = inspect(&root).expect("迁移前分类");
+    assert!(inspection.blockers.is_empty(), "{:?}", inspection.blockers);
+    assert_eq!(inspection.class, PluginLayoutClass::Schema1Empty);
+    let report = migrate_locked(&root).expect("带缓存的旧根迁移");
+    assert_eq!(report.outcome, PluginLayoutOutcome::Migrated);
+    assert_eq!(read_state(&plugins).schema, CURRENT_STATE_SCHEMA);
+    assert_eq!(fs::read(&cache).expect("缓存保留"), b"product cache");
+}
+
+/// 缓存目录被同名文件、链接或重解析点替换时仍属于未知材料，必须阻断并保留原文。
+#[test]
+fn unsafe_catalog_cache_entry_blocks_and_preserves_original() {
+    let fixture = tempfile::tempdir().expect("隔离数据根");
+    let root = fixture.path().join("root");
+    let plugins = root.join(PLUGINS_DIRECTORY);
+    fs::create_dir_all(&plugins).expect("插件目录");
+    let cache = plugins.join(layout::CATALOG_CACHE_DIRECTORY);
+    fs::write(&cache, b"not a cache directory").expect("同名文件");
+
+    let fresh = inspect(&root).expect("无状态分类");
+    assert_eq!(fresh.class, PluginLayoutClass::Recovery);
+    assert_eq!(fresh.readiness(), PluginLayoutReadiness::Blocked);
+    assert!(
+        fresh
+            .blockers
+            .contains(&DataMigrationBlocker::PluginLayoutUnsupportedMaterial),
+        "{:?}",
+        fresh.blockers
+    );
+
+    fs::write(
+        plugins.join(STATE_FILE),
+        r#"{"schema":2,"revision":1,"plugins":{},"pending":[],"failures":{}}"#,
+    )
+    .expect("写入 schema 2 状态");
+    let current = inspect(&root).expect("当前状态分类");
+    assert_eq!(current.readiness(), PluginLayoutReadiness::Blocked);
+    assert!(
+        current
+            .blockers
+            .contains(&DataMigrationBlocker::PluginLayoutUnsupportedMaterial),
+        "{:?}",
+        current.blockers
+    );
+    assert_eq!(
+        fs::read(&cache).expect("原文保留"),
+        b"not a cache directory"
+    );
+}
+
 /// 损坏、未来 schema、残留 staging 与未知材料只能只读阻断，原文不能被覆盖。
 #[test]
 fn unknown_or_residual_material_blocks_without_modifying_originals() {

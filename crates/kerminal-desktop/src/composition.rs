@@ -884,7 +884,8 @@ impl DesktopComposition {
             ssh_result,
             (task_executor_result, session_result, rdp_result),
         ) = tokio::join!(
-            self.agent_manager.wait_for_shutdown_operations_until(deadline),
+            self.agent_manager
+                .wait_for_shutdown_operations_until(deadline),
             self.operations.shutdown_until(deadline),
             stop_notification_bridge(&mut self.notification_bridge, deadline),
             self.transfers.shutdown_until(deadline),

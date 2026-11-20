@@ -20,7 +20,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::storage::{AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file};
+use crate::{
+    plugins::layout,
+    storage::{AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file},
+};
 
 /// 官方地址使用固定缓存名，保证升级后仍能读到旧签名缓存。
 const OFFICIAL_CACHE_FILE: &str = "official.json";
@@ -493,9 +496,10 @@ fn valid_source_id(value: &str) -> bool {
 }
 
 /// 每级缓存目录拒绝链接和 Windows 重解析点，防止写入逃离配置根。
+/// 目录名取自共享布局常量，避免迁移预检与缓存写入对同一产品目录使用不同拼写。
 fn cache_directory(root: &Path, create: bool) -> AppResult<PathBuf> {
     let mut path = root.to_path_buf();
-    for name in ["plugins", "catalog-cache"] {
+    for name in [layout::PLUGINS_DIRECTORY, layout::CATALOG_CACHE_DIRECTORY] {
         path.push(name);
         if create {
             match fs::create_dir(&path) {

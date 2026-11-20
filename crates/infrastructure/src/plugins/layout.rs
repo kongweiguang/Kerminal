@@ -20,6 +20,9 @@ use crate::storage::{AtomicCommitError, CommitMode, commit_staged_file};
 pub const PLUGINS_DIRECTORY: &str = "plugins";
 pub const DATA_DIRECTORY: &str = "data";
 pub const LOGS_DIRECTORY: &str = "logs";
+/// 目录客户端把下载缓存放在插件根下；它不是插件材料，但迁移预检必须与读取端
+/// 共用同一个目录名，否则产品自建缓存会被误判成未知外部材料。
+pub const CATALOG_CACHE_DIRECTORY: &str = "catalog-cache";
 pub const STAGING_DIRECTORY: &str = ".staging";
 pub const INCOMING_DIRECTORY: &str = "_incoming";
 pub const BACKUP_DIRECTORY: &str = ".backup";

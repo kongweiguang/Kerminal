@@ -329,15 +329,30 @@ pub fn inspect(root: &Path) -> AppResult<PluginLayoutInspection> {
                     None,
                 ));
             }
-            // 只有迁移控制目录、没有状态和插件材料时仍视为 fresh；其他内容一律保留。
-            if entries.len() == 1 && entries[0].0 == MIGRATION_DIRECTORY {
-                return Ok(inspection(
-                    PluginLayoutClass::Fresh,
-                    Vec::new(),
-                    Vec::new(),
-                    false,
-                    None,
-                ));
+            // 0.4 的目录客户端在首次刷新时就可能建好缓存目录，而插件状态要到第一次
+            // 安装或启用才写出；只有迁移控制目录和产品缓存目录时仍应视为 fresh。
+            // 缓存被替换成文件、链接或重解析点时仍按未知材料阻断，绝不顺着它读写。
+            let mut only_control_directories = true;
+            let mut unsafe_catalog_cache = false;
+            for (name, metadata) in &entries {
+                match name.as_str() {
+                    MIGRATION_DIRECTORY => {}
+                    layout::CATALOG_CACHE_DIRECTORY => {
+                        unsafe_catalog_cache |= !catalog_cache_is_safe(metadata);
+                    }
+                    _ => only_control_directories = false,
+                }
+            }
+            if only_control_directories {
+                let (class, blockers) = if unsafe_catalog_cache {
+                    (
+                        PluginLayoutClass::Recovery,
+                        vec![DataMigrationBlocker::PluginLayoutUnsupportedMaterial],
+                    )
+                } else {
+                    (PluginLayoutClass::Fresh, Vec::new())
+                };
+                return Ok(inspection(class, blockers, Vec::new(), false, None));
             }
             Ok(inspection(
                 PluginLayoutClass::Recovery,
@@ -633,6 +648,18 @@ fn staging_material_is_owned(staging: &Path, state: &PluginStoreState) -> AppRes
     Ok(true)
 }
 
+/// 目录缓存是产品自建控制目录，不是插件材料；预检只确认目录本身安全。
+///
+/// 缓存正文由目录客户端在读取时逐文件限制大小并拒绝链接，因此迁移不需要遍历或
+/// 解析它，避免一次网络缓存（包括中断留下的临时文件）把正常升级挡在恢复界面。
+/// 但目录本身若是指向配置根之外的链接或 Windows 重解析点，必须继续阻断，否则
+/// 后续缓存写入会越过数据根。
+///
+/// @author kongweiguang
+fn catalog_cache_is_safe(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && layout::safe_metadata(metadata)
+}
+
 /// 当前 schema 2 只接受已知布局材料；未知文件、孤立 staging/backup 或恢复记录阻断。
 fn classify_current(
     plugins: &Path,
@@ -656,6 +683,13 @@ fn classify_current(
         match name.as_str() {
             DATA_DIRECTORY | LOGS_DIRECTORY => {
                 if !safe_dir {
+                    blockers.push(DataMigrationBlocker::PluginLayoutUnsupportedMaterial);
+                }
+            }
+            // 0.4 起目录客户端会在插件根下建立缓存；正文由客户端读取时逐文件校验，
+            // 预检只确认它本身是安全普通目录，避免任意缓存内容被当成插件材料阻断升级。
+            layout::CATALOG_CACHE_DIRECTORY => {
+                if !catalog_cache_is_safe(metadata) {
                     blockers.push(DataMigrationBlocker::PluginLayoutUnsupportedMaterial);
                 }
             }
@@ -738,6 +772,13 @@ fn classify_legacy(
             }
             DATA_DIRECTORY | LOGS_DIRECTORY => {
                 if !safe_dir {
+                    blockers.push(DataMigrationBlocker::PluginLayoutUnsupportedMaterial);
+                }
+            }
+            // schema 1 根同样可能已经产生目录缓存；它是产品控制目录而不是旧插件材料，
+            // 迁移只移走 packages/state，缓存保留原处即可，不能因此进入残留阻断。
+            layout::CATALOG_CACHE_DIRECTORY => {
+                if !catalog_cache_is_safe(metadata) {
                     blockers.push(DataMigrationBlocker::PluginLayoutUnsupportedMaterial);
                 }
             }

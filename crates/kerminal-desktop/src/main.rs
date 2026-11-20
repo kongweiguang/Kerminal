@@ -509,8 +509,9 @@ fn run_application(
                     #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
                     host_list_acceptance)
             })
+            // 当前格式也会进入完整性检查，不能从预检报错推断存在历史版本迁移。
             .map_err(|error| io::Error::other(format!(
-                "Kerminal 数据迁移未完成：{}。请运行安装包内 migration 脚本做只读预检并保留恢复材料。",
+                "Kerminal 无法确认用户数据可安全打开：{}。请运行安装包内 migration 脚本做只读预检并保留恢复材料。",
                 error.public_message()
             )))?
         }
