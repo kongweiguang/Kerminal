@@ -1587,11 +1587,8 @@ fn standard_paste_gestures_dispatch_once_to_the_focused_terminal(app: &mut TestA
         })
     });
 
-    for (gesture, main_key) in [
-        ("shift-insert", "insert"),
-        #[cfg(target_os = "windows")]
-        ("ctrl-shift-v", "v"),
-    ] {
+    // 每种手势复用同一断言，避免条件编译让 Linux 只剩单元素循环。
+    let mut assert_paste_gesture = |gesture: &str, main_key: &str| {
         events.borrow_mut().clear();
         let released_modifiers = Keystroke::parse(main_key).unwrap();
         visual.simulate_event(KeyDownEvent {
@@ -1615,7 +1612,10 @@ fn standard_paste_gestures_dispatch_once_to_the_focused_terminal(app: &mut TestA
             )],
             "{gesture}"
         );
-    }
+    };
+    assert_paste_gesture("shift-insert", "insert");
+    #[cfg(target_os = "windows")]
+    assert_paste_gesture("ctrl-shift-v", "v");
 
     visual.simulate_event(KeyDownEvent {
         keystroke: Keystroke::parse("insert").unwrap(),
