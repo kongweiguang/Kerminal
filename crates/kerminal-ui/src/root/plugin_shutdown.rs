@@ -124,7 +124,7 @@ fn finalize_plugin_closes(contents: &mut ContentHost, tools: &mut PluginTools) -
 }
 
 impl RootView {
-    /// 提交收尾后拒绝新资源；各异步关闭共用原截止时间并分别提交回执。
+    /// 提交收尾后拒绝新资源；保留原意图让窗口在插件回执前也能显示正确的操作。
     ///
     /// @author kongweiguang
     pub(super) fn begin_content_shutdown(
@@ -138,6 +138,7 @@ impl RootView {
         self.plugin_commands.cancel();
         self.host_shutdown_requested = true;
         self.pending_quit_intent = None;
+        self.quit_ready_intent = Some(intent.clone());
         let (jobs, first_error) =
             begin_plugin_closes(&mut self.content_host, &mut self.plugin_tools, deadline, cx);
         if jobs.is_empty() {

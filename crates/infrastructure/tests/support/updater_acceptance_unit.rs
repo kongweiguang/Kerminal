@@ -270,7 +270,7 @@ async fn linux_appimage_install_child() {
             .is_file()
     );
 }
-/// Windows 父测在隔离子进程中验证 SDK 会退出宿主并且退出发生在 executor 收尾之后。
+/// 在隔离子进程检查旧宿主退出及实际安装参数，避免只因 PowerShell 启动就认为更新会重启。
 #[cfg(windows)]
 #[test]
 fn windows_sdk_installer_exit_is_contained_in_child_process() {
@@ -302,13 +302,18 @@ fn windows_sdk_installer_exit_is_contained_in_child_process() {
         b"executor-shutdown"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !install_started_marker.exists() {
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        install_started_marker.exists(),
-        "SDK did not start the inert test installer"
-    );
+    let args = loop {
+        match std::fs::read_to_string(&install_started_marker) {
+            Ok(args) => break args,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("SDK did not record the inert installer's arguments: {error}"),
+        }
+    };
+    assert_eq!(args.lines().collect::<Vec<_>>(), ["/P", "/R"]);
 }
 
 /// 子进程只在父测设置隔离路径后运行，并在 SDK exit 前确认任务入口已关闭且队列已收尾。
@@ -388,7 +393,18 @@ fn compile_noop_windows_installer(root: &std::path::Path) -> PathBuf {
     let binary = root.join("inert_installer.exe");
     std::fs::write(
         &source,
-        "fn main() { if let Ok(path) = std::env::var(\"KERMINAL_TEST_UPDATER_INSTALLER_MARKER\") { let _ = std::fs::write(path, b\"started\"); } }",
+        r#"// @author kongweiguang
+// 先写同目录临时文件，避免父测读到尚未写完的安装参数。
+fn main() -> std::io::Result<()> {
+    let path = std::path::PathBuf::from(
+        std::env::var_os("KERMINAL_TEST_UPDATER_INSTALLER_MARKER").expect("test receipt path"),
+    );
+    let staged = path.with_extension("tmp");
+    let args = std::env::args().skip(1).collect::<Vec<_>>().join("\n");
+    std::fs::write(&staged, args)?;
+    std::fs::rename(staged, path)
+}
+"#,
     )
     .expect("write inert installer source");
     let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());

@@ -6,9 +6,9 @@ use gpui_kit::SharedString;
 use kerminal_application::{platform::window_state::ClosePolicy, updates::DownloadedUpdateId};
 
 use super::{
-    RootHostLifecycle, UpdateInstallRequest, can_retry_exit, host_shutdown_presentation,
-    quit_preparation_is_running, retryable_update_request, window_close_policy,
-    workspace_quit_preparation_failure, workspace_quit_preparation_in_flight,
+    QuitIntent, RootHostLifecycle, UpdateInstallRequest, can_retry_exit,
+    host_shutdown_presentation, quit_preparation_is_running, retryable_update_request,
+    window_close_policy, workspace_quit_preparation_failure, workspace_quit_preparation_in_flight,
 };
 
 /// Stopping 也包含 CAS 准备阶段，未派发收尾前不得遮住确认弹层或取消后恢复的工作台。
@@ -17,7 +17,7 @@ use super::{
 #[test]
 fn preparing_or_cancelled_quit_keeps_the_normal_workbench() {
     for lifecycle in [RootHostLifecycle::Running, RootHostLifecycle::Stopping] {
-        assert!(host_shutdown_presentation(false, lifecycle, None, 0).is_none());
+        assert!(host_shutdown_presentation(false, lifecycle, None, None).is_none());
     }
     assert_eq!(
         window_close_policy(false, true, false),
@@ -29,24 +29,78 @@ fn preparing_or_cancelled_quit_keeps_the_normal_workbench() {
     );
 }
 
-/// 原错不取自普通 status；重试期间继续显示它，但只有失败终态才开放下一次退出请求。
+/// 扩展重启失败后保留原操作，重试开始后不再展示旧错误或接收重复提交。
 ///
 /// @author kongweiguang
 #[test]
-fn host_failure_survives_retry_and_waiting_does_not_enable_another_retry() {
+fn extension_restart_failure_offers_the_original_operation_until_retry_starts() {
     let failure = SharedString::from("固定宿主收尾失败样本");
-    let failed = host_shutdown_presentation(true, RootHostLifecycle::StopFailed, Some(&failure), 0)
-        .expect("committed failure must stay visible");
-    assert_eq!(failed.message, failure);
-    assert_eq!(failed.managed_tasks, 0);
-    assert!(!failed.cleanup_note.is_empty());
+    let intent = Some(&QuitIntent::RestartForExtensions);
+    let failed =
+        host_shutdown_presentation(true, RootHostLifecycle::StopFailed, intent, Some(&failure))
+            .expect("committed failure must stay visible");
+    assert_eq!(failed.detail.as_ref(), Some(&failure));
+    assert!(failed.retry_restart);
     assert!(failed.retry_exit);
 
-    let retrying = host_shutdown_presentation(true, RootHostLifecycle::Stopping, Some(&failure), 3)
-        .expect("an accepted retry must keep the stopping projection");
-    assert_eq!(retrying.message, failure);
-    assert_eq!(retrying.managed_tasks, 3);
-    assert!(!retrying.retry_exit, "do not enqueue a parallel retry");
+    let retrying =
+        host_shutdown_presentation(true, RootHostLifecycle::Stopping, intent, Some(&failure))
+            .expect("an accepted retry must keep the stopping projection");
+    assert_ne!(retrying.title, failed.title);
+    assert!(retrying.detail.is_none());
+    assert!(!retrying.retry_restart);
+    assert!(!retrying.retry_exit);
+
+    let quit_failed = host_shutdown_presentation(
+        true,
+        RootHostLifecycle::StopFailed,
+        Some(&QuitIntent::Exit),
+        Some(&failure),
+    )
+    .expect("failed quit still has recovery actions");
+    assert!(!quit_failed.retry_restart);
+    assert!(quit_failed.retry_exit);
+}
+
+/// 真实恢复屏必须把重启按钮接回原宿主事件，防止只改按钮文字却仍然执行退出。
+///
+/// @author kongweiguang
+#[gpui_kit::test]
+fn restart_recovery_button_emits_the_original_host_intent(app: &mut gpui_kit::TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui_kit::base::test_support::find;
+
+    let (_runtime, root, visual) =
+        crate::root::external_auth::tests::host_file_workspace_fixture(app, |services| services);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = visual.update(|_, app| {
+        let events = events.clone();
+        app.subscribe(&root, move |_, event: &super::RootViewEvent, _| {
+            events.borrow_mut().push(event.clone());
+        })
+    });
+    let center = visual.update(|window, app| {
+        root.update(app, |root, cx| {
+            root.fail_content_shutdown(QuitIntent::RestartForExtensions, "测试收尾失败".into(), cx);
+        });
+        window.refresh();
+        window.draw(app).clear(app);
+        find(window, &[], &"host-shutdown-retry-restart".into())
+            .expect("重启失败应显示真实重试按钮")
+            .bounds()
+            .center()
+    });
+    visual.simulate_click(center, Default::default());
+    visual.run_until_parked();
+
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [super::RootViewEvent::QuitReady {
+            intent: QuitIntent::RestartForExtensions,
+            ..
+        }]
+    ));
 }
 
 /// 所有现有失败终态均能显式退出，结果未知仍保持停止投影而非重新使用普通服务。
@@ -62,10 +116,10 @@ fn every_failed_host_terminal_state_can_retry_exit_without_becoming_usable() {
         RootHostLifecycle::ListenerRecoveryFailed,
     ] {
         assert!(can_retry_exit(lifecycle));
-        let projection = host_shutdown_presentation(true, lifecycle, None, 0)
+        let projection = host_shutdown_presentation(true, lifecycle, None, None)
             .expect("failure cannot restore the ordinary workbench");
         assert!(projection.retry_exit);
-        assert!(!projection.message.is_empty());
+        assert!(!projection.title.is_empty());
         assert_eq!(
             window_close_policy(true, true, false),
             ClosePolicy::RequestQuit
@@ -89,7 +143,7 @@ fn every_failed_host_terminal_state_can_retry_exit_without_becoming_usable() {
 /// @author kongweiguang
 #[test]
 fn a_committed_shutdown_never_projects_a_usable_workbench() {
-    let projection = host_shutdown_presentation(true, RootHostLifecycle::Running, None, 0)
+    let projection = host_shutdown_presentation(true, RootHostLifecycle::Running, None, None)
         .expect("the submitted shutdown is the authoritative irreversible boundary");
     assert!(!projection.retry_exit);
     assert_eq!(
@@ -98,17 +152,24 @@ fn a_committed_shutdown_never_projects_a_usable_workbench() {
     );
 }
 
-/// executor intake 关闭只显示受管任务数，不以任务归零代替 host 的会话和 listener 清理回执。
+/// 更新仍在收尾时显示该操作的进度，更新结果未知时也不能冒充仍在等待或允许重放。
 ///
 /// @author kongweiguang
 #[test]
-fn executor_closing_keeps_waiting_for_host_cleanup_even_with_active_tasks() {
-    let projection = host_shutdown_presentation(true, RootHostLifecycle::Stopping, None, 2)
-        .expect("executor closing must immediately replace the live workbench");
-
-    assert_eq!(projection.managed_tasks, 2);
-    assert!(!projection.retry_exit);
-    assert!(!projection.cleanup_note.is_empty());
+fn update_shutdown_progress_is_distinct_from_an_unknown_installation_result() {
+    let intent = QuitIntent::RestartForUpdate {
+        version: "1.2.3".into(),
+    };
+    let pending =
+        host_shutdown_presentation(true, RootHostLifecycle::Stopping, Some(&intent), None)
+            .expect("an accepted update must immediately replace the live workbench");
+    let unknown =
+        host_shutdown_presentation(true, RootHostLifecycle::OutcomeUnknown, Some(&intent), None)
+            .expect("an unknown result must retain the recovery surface");
+    assert_ne!(pending.title, unknown.title);
+    assert!(!pending.retry_exit);
+    assert!(unknown.retry_exit);
+    assert!(!unknown.retry_restart);
 }
 
 /// 更新重试仅保留原确定失败的句柄，未知结果、启动失败和监听恢复失败均不能重放安装。
@@ -214,7 +275,9 @@ fn blocked_workspace_quit_keeps_failure_visible_and_prevents_tray_hide() {
         let failure = workspace_quit_preparation_failure(&result)
             .expect("rejected workspace preparation must remain visible");
         assert!(!failure.is_empty());
-        assert!(host_shutdown_presentation(false, RootHostLifecycle::Running, None, 0).is_none());
+        assert!(
+            host_shutdown_presentation(false, RootHostLifecycle::Running, None, None).is_none()
+        );
         for tray_installed in [false, true] {
             assert_eq!(
                 window_close_policy(false, tray_installed, true),

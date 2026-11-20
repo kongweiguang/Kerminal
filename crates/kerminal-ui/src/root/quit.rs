@@ -6,10 +6,15 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{
     AnyElement, ClickEvent, Context, IntoElement, SharedString, Window,
-    component::{Disableable as _, button::Button},
+    base::StyledExt as _,
+    component::{
+        Disableable as _,
+        button::{Button, ButtonVariants as _},
+        spinner::Spinner,
+    },
     div,
     prelude::*,
-    px,
+    px, rems,
 };
 use kerminal_application::{
     AppError,
@@ -90,10 +95,10 @@ fn workspace_quit_preparation_in_flight(
 
 /// 只投影既有生命周期；收尾请求事实与失败正文不构成第二套业务状态机。
 struct HostShutdownPresentation {
-    message: SharedString,
-    managed_tasks: usize,
-    cleanup_note: SharedString,
+    title: SharedString,
+    detail: Option<SharedString>,
     retry_exit: bool,
+    retry_restart: bool,
 }
 
 /// 已派发的宿主收尾可能部分完成，退出重试必须复用既有路径，不能恢复普通服务。
@@ -125,40 +130,47 @@ fn retryable_update_request(
     })
 }
 
-/// Stopping 在 CAS 准备阶段仍可取消，只有实际派发收尾后才替换工作台，且普通 status 永不参与原错投影。
+/// 以宿主回执判断成功或失败。重试期间收起上次错误，避免将已经开始的操作仍显示为失败。
 ///
 /// @author kongweiguang
 fn host_shutdown_presentation(
     requested: bool,
     lifecycle: RootHostLifecycle,
+    intent: Option<&QuitIntent>,
     failure: Option<&SharedString>,
-    managed_tasks: usize,
 ) -> Option<HostShutdownPresentation> {
+    use crate::locale::text;
+
     if !requested {
         return None;
     }
     let retry_exit = can_retry_exit(lifecycle);
-    let message = failure.cloned().unwrap_or_else(|| {
-        if retry_exit {
-            crate::locale::text(
-                "应用服务已停止或未能完成收尾。请重试退出后重新打开应用。",
-                "Application services have stopped or cleanup is incomplete. Retry quitting, then reopen the application.",
-            )
-        } else {
-            crate::locale::text(
-                "正在收尾应用服务，请等待退出完成。",
-                "Application services are stopping. Please wait for cleanup to finish.",
-            )
+    let title = match (lifecycle, intent) {
+        (RootHostLifecycle::OutcomeUnknown, _) => text("更新结果待确认", "Update result unknown"),
+        (RootHostLifecycle::RestartFailed, _) => {
+            text("Kerminal 未能重启", "Kerminal could not restart")
         }
-    });
+        (_, Some(QuitIntent::RestartForUpdate { .. })) if retry_exit => {
+            text("未能完成更新", "Could not update Kerminal")
+        }
+        (_, Some(QuitIntent::RestartForExtensions)) if retry_exit => {
+            text("Kerminal 未能重启", "Kerminal could not restart")
+        }
+        (_, _) if retry_exit => text("Kerminal 未能退出", "Kerminal could not quit"),
+        (_, Some(QuitIntent::RestartForUpdate { .. })) => {
+            text("正在更新 Kerminal", "Updating Kerminal")
+        }
+        (_, Some(QuitIntent::RestartForExtensions)) => {
+            text("正在重启 Kerminal", "Restarting Kerminal")
+        }
+        _ => text("正在退出 Kerminal", "Quitting Kerminal"),
+    };
     Some(HostShutdownPresentation {
-        message,
-        managed_tasks,
-        cleanup_note: crate::locale::text(
-            "任务归零不代表宿主资源已全部清理；仍需等待宿主确认会话、监听器和服务收尾。",
-            "Zero managed tasks does not prove host resources are fully cleaned; wait for the host to confirm sessions, listeners, and services.",
-        ),
+        title,
+        detail: failure.filter(|_| retry_exit).cloned(),
         retry_exit,
+        retry_restart: lifecycle == RootHostLifecycle::StopFailed
+            && intent == Some(&QuitIntent::RestartForExtensions),
     })
 }
 
@@ -223,6 +235,7 @@ impl RootView {
         let Some(reason) = reason else {
             return false;
         };
+        self.cancel_pending_update_install(cx);
         self.pending_quit_intent = None;
         self.status = Some(reason.into());
         cx.notify();
@@ -314,16 +327,23 @@ impl RootView {
         if self.host_lifecycle != RootHostLifecycle::StopFailed {
             return false;
         }
+        let Some(intent) = self.failed_quit_intent.clone() else {
+            return false;
+        };
         if !self.content_host.scopes().is_empty()
             || !self.plugin_tools.all_instance_contexts().is_empty()
         {
-            let Some(intent) = self.failed_quit_intent.clone() else {
-                return false;
-            };
             self.begin_content_shutdown(intent, Instant::now() + HOST_SHUTDOWN_BUDGET, cx);
             return true;
         }
-        if let Some(update) = self.pending_update_install.clone() {
+        if let QuitIntent::RestartForUpdate { version } = &intent {
+            let Some(update) = self
+                .pending_update_install
+                .clone()
+                .filter(|request| &request.version == version)
+            else {
+                return false;
+            };
             if self.update_install_guard.pending().is_some() {
                 self.finish_quit_after_content_shutdown(
                     QuitIntent::RestartForUpdate {
@@ -345,9 +365,6 @@ impl RootView {
             cx.notify();
             return true;
         }
-        let Some(intent) = self.failed_quit_intent.clone() else {
-            return false;
-        };
         self.pending_quit_intent = Some(intent);
         self.emit_quit_ready(cx);
         true
@@ -451,7 +468,7 @@ impl RootView {
         cx.notify();
     }
 
-    /// 更新意图通过原门禁；实际重试派发时保留收尾事实，不让更新失败窗口重回普通工作台。
+    /// 更新被准备门禁拒绝时将验签包交还面板；只有实际开始收尾的请求才留在宿主恢复流程。
     ///
     /// @author kongweiguang
     pub(super) fn handle_updates_event(
@@ -462,29 +479,30 @@ impl RootView {
     ) {
         match event {
             crate::features::updates::UpdatesEvent::InstallRequested { update_id, version } => {
-                if self.host_lifecycle != RootHostLifecycle::Running {
+                let intent = QuitIntent::RestartForUpdate {
+                    version: version.clone(),
+                };
+                if self.pending_quit_intent.as_ref() == Some(&intent)
+                    && self
+                        .pending_update_install
+                        .as_ref()
+                        .is_some_and(|request| request.update_id == *update_id)
+                {
+                    return;
+                }
+                if !quit_preparation_is_running(self.host_lifecycle, self.host_shutdown_requested)
+                    || self.pending_quit_intent.is_some()
+                {
                     self.updates_panel
                         .update(cx, |panel, cx| panel.cancel_install_guard(*update_id, cx));
                     return;
                 }
                 match self.update_install_guard.begin(*update_id, version.clone()) {
-                    GuardRequestResult::Started => {
+                    GuardRequestResult::Started | GuardRequestResult::AlreadyPending => {
                         self.pending_update_install = self.update_install_guard.pending().cloned();
-                        let _ = self.request_quit(
-                            QuitIntent::RestartForUpdate {
-                                version: version.clone(),
-                            },
-                            cx,
-                        );
-                    }
-                    GuardRequestResult::AlreadyPending => {
-                        // The settings panel may have been waiting on a running save/profile operation.
-                        let _ = self.request_quit(
-                            QuitIntent::RestartForUpdate {
-                                version: version.clone(),
-                            },
-                            cx,
-                        );
+                        if !self.request_quit(intent, cx) && self.pending_quit_intent.is_none() {
+                            self.cancel_pending_update_install(cx);
+                        }
                     }
                     GuardRequestResult::Busy => {
                         self.updates_panel
@@ -508,36 +526,13 @@ impl RootView {
                 }
                 match self.host_lifecycle {
                     RootHostLifecycle::StopFailed => {
-                        if !self.content_host.scopes().is_empty()
-                            || !self.plugin_tools.all_instance_contexts().is_empty()
+                        if self.failed_quit_intent.as_ref()
+                            == Some(&QuitIntent::RestartForUpdate {
+                                version: version.clone(),
+                            })
                         {
-                            self.begin_content_shutdown(
-                                QuitIntent::RestartForUpdate {
-                                    version: version.clone(),
-                                },
-                                Instant::now() + HOST_SHUTDOWN_BUDGET,
-                                cx,
-                            );
-                            return;
+                            self.retry_host_shutdown(cx);
                         }
-                        if self.update_install_guard.pending().is_some() {
-                            self.finish_quit_after_content_shutdown(
-                                QuitIntent::RestartForUpdate {
-                                    version: version.clone(),
-                                },
-                                Instant::now() + HOST_SHUTDOWN_BUDGET,
-                                cx,
-                            );
-                            return;
-                        }
-                        self.host_lifecycle = RootHostLifecycle::Stopping;
-                        self.plugin_commands.cancel();
-                        self.host_shutdown_requested = true;
-                        cx.emit(RootViewEvent::InstallReady {
-                            update_id: *update_id,
-                            version: version.clone(),
-                            deadline: Instant::now() + HOST_SHUTDOWN_BUDGET,
-                        });
                     }
                     RootHostLifecycle::StoppedUpdateFailed => {
                         self.host_lifecycle = RootHostLifecycle::Stopping;
@@ -615,6 +610,7 @@ impl RootView {
             owner_has_pending,
         ) {
             if owner_has_pending && !preferences.read(cx).is_workbench_layout_save_in_flight() {
+                self.cancel_pending_update_install(cx);
                 self.pending_quit_intent = None;
                 self.workbench_layout_save_error = Some(crate::locale::text(
                     "布局尚未保存；请通过状态栏在设置中读回、核对或明确重试后再次退出。",
@@ -785,9 +781,13 @@ impl RootView {
                 ) {
                     self.host_lifecycle = RootHostLifecycle::Running;
                     self.pending_quit_intent = None;
-                    // 真实失败已取消本次退出；Ready/watch 回执不能代替用户重新发起。
+                    // 新布局操作仍可继续等待，真实失败则把已验签的更新包交还面板。
                     if self.workbench_layout_save_error.is_none() {
-                        let _ = self.request_quit(intent, cx);
+                        if !self.request_quit(intent, cx) && self.pending_quit_intent.is_none() {
+                            self.cancel_pending_update_install(cx);
+                        }
+                    } else {
+                        self.cancel_pending_update_install(cx);
                     }
                     cx.notify();
                     return;
@@ -1039,7 +1039,7 @@ impl RootView {
         )
     }
 
-    /// 停止视图不挂载会发起普通任务的子 Entity；原 owner 留在 Root，资源回执仍由原订阅处理。
+    /// 停止视图只展示用户原本选择的操作及可执行的恢复动作；实际资源仍由原 owner 收尾。
     ///
     /// @author kongweiguang
     pub(super) fn render_host_shutdown(
@@ -1047,11 +1047,25 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !self.host_shutdown_requested {
+            return None;
+        }
+        let update_intent =
+            self.pending_update_install
+                .as_ref()
+                .map(|request| QuitIntent::RestartForUpdate {
+                    version: request.version.clone(),
+                });
+        let intent = self
+            .quit_ready_intent
+            .as_ref()
+            .or(self.failed_quit_intent.as_ref())
+            .or(update_intent.as_ref());
         let presentation = host_shutdown_presentation(
             self.host_shutdown_requested,
             self.host_lifecycle,
+            intent,
             self.host_failure_message.as_ref(),
-            self.application_task_snapshot.active_tasks,
         )?;
         if !self.host_shutdown_view_shown {
             window.focus(&self.focus_handle, cx);
@@ -1088,21 +1102,29 @@ impl RootView {
                 .child(title_content)
                 .into_any_element()
         };
-        let retry_exit = presentation.retry_exit;
-        let mut actions = div().flex().gap_3().child(
-            Button::new("host-shutdown-retry-exit")
-                .label(crate::locale::text("重试退出", "Retry quitting"))
-                .tab_stop(true)
-                .disabled(!retry_exit)
-                .loading(!retry_exit)
-                .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
-                    root.request_quit(QuitIntent::Exit, cx);
-                })),
-        );
-        if let Some(request) =
+        let retry_update = if self.host_lifecycle == RootHostLifecycle::StopFailed
+            && !matches!(intent, Some(QuitIntent::RestartForUpdate { .. }))
+        {
+            None
+        } else {
             retryable_update_request(self.host_lifecycle, self.pending_update_install.as_ref())
                 .cloned()
-        {
+        };
+        let has_operation_retry = presentation.retry_restart || retry_update.is_some();
+        let mut actions = div().flex().flex_wrap().gap_2();
+        if presentation.retry_restart {
+            actions = actions.child(
+                Button::new("host-shutdown-retry-restart")
+                    .label(crate::locale::text("重试重启", "Retry restart"))
+                    .tab_stop(true)
+                    .on_click(cx.listener(|root, _: &ClickEvent, _, cx| {
+                        if root.failed_quit_intent == Some(QuitIntent::RestartForExtensions) {
+                            root.retry_host_shutdown(cx);
+                        }
+                    })),
+            );
+        }
+        if let Some(request) = retry_update {
             actions = actions.child(
                 Button::new("host-shutdown-retry-update")
                     .label(crate::locale::text("重试更新", "Retry update"))
@@ -1115,20 +1137,35 @@ impl RootView {
                         {
                             return;
                         }
-                        if root.update_install_guard.pending().is_some() {
-                            root.begin_content_shutdown(
-                                QuitIntent::RestartForUpdate {
+                        if root.host_lifecycle == RootHostLifecycle::StopFailed {
+                            if root.failed_quit_intent.as_ref()
+                                != Some(&QuitIntent::RestartForUpdate {
                                     version: request.version.clone(),
-                                },
-                                Instant::now() + HOST_SHUTDOWN_BUDGET,
-                                cx,
-                            );
-                        } else {
-                            root.updates_panel
-                                .update(cx, |panel, cx| panel.retry_host_install(cx));
+                                })
+                            {
+                                return;
+                            }
+                            if root.update_install_guard.pending().is_some() {
+                                root.retry_host_shutdown(cx);
+                                return;
+                            }
                         }
+                        root.updates_panel
+                            .update(cx, |panel, cx| panel.retry_host_install(cx));
                     })),
             );
+        }
+        if presentation.retry_exit {
+            let exit = Button::new("host-shutdown-retry-exit").on_click(cx.listener(
+                |root, _: &ClickEvent, _, cx| {
+                    root.request_quit(QuitIntent::Exit, cx);
+                },
+            ));
+            actions = actions.child(if has_operation_retry {
+                exit.ghost().label(crate::locale::text("退出", "Quit"))
+            } else {
+                exit.label(crate::locale::text("重试退出", "Retry quitting"))
+            });
         }
         Some(
             div()
@@ -1168,29 +1205,43 @@ impl RootView {
                     div()
                         .id("host-shutdown-notice")
                         .flex_1()
-                        .p_4()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_6()
                         .flex()
-                        .flex_col()
-                        .justify_center()
                         .items_center()
-                        .gap_3()
+                        .justify_center()
                         .child(
                             div()
-                                .text_color(if retry_exit { theme.error } else { theme.muted })
-                                .child(presentation.message),
-                        )
-                        .child(div().text_color(theme.muted).child(format!(
-                            "{}: {}",
-                            crate::locale::text("未返回的受管任务", "Managed tasks still running",),
-                            presentation.managed_tasks,
-                        )))
-                        .child(
-                            div()
-                                .max_w(px(620.))
-                                .text_color(theme.muted)
-                                .child(presentation.cleanup_note),
-                        )
-                        .child(actions),
+                                .w_full()
+                                .max_w(rems(26.))
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when(!presentation.retry_exit, |row| {
+                                            row.child(div().flex_none().child(Spinner::new()))
+                                        })
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .text_lg()
+                                                .font_semibold()
+                                                .child(presentation.title),
+                                        ),
+                                )
+                                .when_some(presentation.detail, |body, detail| {
+                                    body.child(
+                                        div().text_sm().text_color(theme.muted).child(detail),
+                                    )
+                                })
+                                .when(presentation.retry_exit, |body| body.child(actions)),
+                        ),
                 )
                 .into_any_element(),
         )

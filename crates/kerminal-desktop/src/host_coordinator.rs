@@ -759,16 +759,15 @@ fn classify_install_result(result: &UpdateInstallResult) -> UpdateCompletionPath
 }
 
 /// 扩展重启没有安装器代为启动进程；所有平台都须在原截止时间内明确启动当前程序。
-/// 失败保留停止事实交回 Root，不能把关闭资源成功当作重启成功或恢复普通服务。
+/// 失败仅报告启动结果，由 Root 根据原操作提供重试，避免错误说明引导用户退出。
+///
+/// @author kongweiguang
 fn restart_extensions_until(deadline: Instant, options: &PluginStartupOptions) -> AppResult<()> {
     if Instant::now() >= deadline {
         return Err(AppError::timeout("等待扩展变更重启"));
     }
     restart_current_process(options).map_err(|source| {
-        AppError::infrastructure_with_source(
-            "应用服务已停止，但无法启动 Kerminal；请重试退出后手动重新打开",
-            source,
-        )
+        AppError::infrastructure_with_source("应用服务已停止，但未能启动 Kerminal。", source)
     })
 }
 
