@@ -961,6 +961,130 @@ pub fn commit_staged_file(
         .map_err(AtomicCommitError::CommitUnknown)
 }
 
+/// 提交并允许针对 ReplaceFileW 1175 的一次窄重试。
+///
+/// 1175 表示系统替换调用未完成且双方文件名保留；只有 Windows 的 ReplaceExisting 出现
+/// `CommitUnknown` 1175 时才短暂等待，复核 staging 仍是指定字节并让调用方重新确认 CAS，
+/// 然后最多再提交一次。等待后的任何 I/O 失败、取消或复核拒绝都返回首个未知结果，
+/// 由调用方按未知回读，绝不升级为确定未提交或新的成功。
+///
+/// @author kongweiguang
+pub(crate) fn commit_staged_file_with_replace_retry(
+    source: &Path,
+    destination: &Path,
+    mode: CommitMode,
+    expected_staged: &[u8],
+    revalidate: impl FnOnce() -> bool,
+) -> Result<(), AtomicCommitError> {
+    #[cfg(windows)]
+    {
+        commit_staged_file_with_replace_retry_using(
+            source,
+            destination,
+            mode,
+            expected_staged,
+            revalidate,
+            commit_staged_file,
+            wait_for_replace_retry,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (expected_staged, revalidate);
+        commit_staged_file(source, destination, mode)
+    }
+}
+
+/// 把 1175 门禁、等待和二次提交拆成可注入实现，便于用故障注入验证只有一次重试且不改分类。
+///
+/// 顺序固定为：首次提交 -> 识别精确 1175 -> 等待 -> 复核 staging -> 调用方 CAS 复核 -> 二次提交。
+/// 任何前置复核失败都直接返回首个未知错误，不给真实冲突或未确认状态制造覆盖机会。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+fn commit_staged_file_with_replace_retry_using<C, W>(
+    source: &Path,
+    destination: &Path,
+    mode: CommitMode,
+    expected_staged: &[u8],
+    revalidate: impl FnOnce() -> bool,
+    mut commit: C,
+    mut wait: W,
+) -> Result<(), AtomicCommitError>
+where
+    C: FnMut(&Path, &Path, CommitMode) -> Result<(), AtomicCommitError>,
+    W: FnMut(),
+{
+    let first = commit(source, destination, mode);
+    if !is_replace_1175_unknown(&first, mode) {
+        return first;
+    }
+    wait();
+    // 等待可能给外部进程留下改动窗口，必须在二次提交前紧贴复核全部 CAS 输入。
+    if !staging_still_matches(source, expected_staged) || !revalidate() {
+        return first;
+    }
+    // 只有二次提交给出确定成功才升级结果；任何再次失败都保留首个 1175 未知，
+    // 尤其不能把二次提交前的 NotCommitted 当成整体未提交而抹掉首次未知。
+    match commit(source, destination, mode) {
+        Ok(()) => Ok(()),
+        Err(_) => first,
+    }
+}
+
+/// 只把精确的 ReplaceFileW 1175 视为可重试；其他错误码、模式以及确定未提交都保持原分类。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+fn is_replace_1175_unknown(result: &Result<(), AtomicCommitError>, mode: CommitMode) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_REMOVE_REPLACED;
+
+    if mode != CommitMode::ReplaceExisting {
+        return false;
+    }
+    let Err(AtomicCommitError::CommitUnknown(error)) = result else {
+        return false;
+    };
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        == Some(ERROR_UNABLE_TO_REMOVE_REPLACED)
+}
+
+/// 复核 staging 仍是普通文件，且限定读取 expected 长度加一字节以确认内容完全相等。
+///
+/// 先验证普通文件路径约束，再协商式读取：超出 expected 说明文件已被替换或追加，
+/// 不足、读取错误或类型变化都视为无法确认，避免把元数据检查与内容检查之间的变化当成功。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+fn staging_still_matches(source: &Path, expected_staged: &[u8]) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(source) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new().read(true).open(source) else {
+        return false;
+    };
+    let mut staged = Vec::with_capacity(expected_staged.len().saturating_add(1));
+    let mut bounded = file.take(expected_staged.len() as u64 + 1);
+    match bounded.read_to_end(&mut staged) {
+        Ok(_) => staged == expected_staged,
+        Err(_) => false,
+    }
+}
+
+/// 1175 通常来自目标文件的短暂句柄占用；等待小段时间让系统释放句柄，
+/// 但固定上限避免把一次瞬时占用拖成长时间阻塞。
+///
+/// @author kongweiguang
+#[cfg(windows)]
+fn wait_for_replace_retry() {
+    std::thread::sleep(Duration::from_millis(50));
+}
+
 /// 删除已由调用方校验并持锁的普通文件；Unix 父目录同步失败按提交结果未知返回。
 pub(crate) fn remove_file_with_parent_sync(path: &Path) -> Result<(), AtomicCommitError> {
     remove_file_with_parent_sync_using(path, |parent| sync_commit_directories(None, Some(parent)))
@@ -991,6 +1115,10 @@ fn remove_file_with_parent_sync_using(
 #[cfg(test)]
 #[path = "../tests/support/storage_remove_unit.rs"]
 mod remove_file_tests;
+
+#[cfg(all(test, windows))]
+#[path = "../tests/unit/storage_replace_retry.rs"]
+mod replace_retry_tests;
 
 /// 在内容提交前同步 staging；Windows 临时清除只读属性以取得写句柄，并在同步后恢复原 Permissions。
 /// 该标准库调用只存在于 Windows 条件分支，避免对 Unix 权限语义作无关调整。

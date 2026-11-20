@@ -18,7 +18,7 @@ use thiserror::Error;
 use super::layout::{self, LayoutError};
 use crate::storage::{
     AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file,
-    remove_file_with_parent_sync,
+    commit_staged_file_with_replace_retry, remove_file_with_parent_sync,
 };
 
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -277,7 +277,10 @@ impl PluginStore {
         self.publish_and_compare_locked(expected, next, publish)
     }
 
-    /// 锁内提交实现；调用方已持有写锁并通过恢复门禁。
+    /// 目录发布和候选版本只执行一次。Windows 短暂占用状态文件时，只有读回原基线
+    /// 才能在同一恢复记录内重试文件替换，避免覆盖并发写入或重放目录事务。
+    ///
+    /// @author kongweiguang
     fn publish_and_compare_locked(
         &self,
         expected: &PluginStoreSnapshot,
@@ -323,7 +326,13 @@ impl PluginStore {
             mode,
             latest.fingerprint,
             &next,
-            commit_staged_file,
+            |staged, target, mode| {
+                commit_staged_file_with_replace_retry(staged, target, mode, &bytes, || {
+                    self.read_unlocked().is_ok_and(|current| {
+                        current.fingerprint == latest.fingerprint && current.state == latest.state
+                    })
+                })
+            },
         )?;
         Ok(PluginStoreSnapshot {
             state: next,

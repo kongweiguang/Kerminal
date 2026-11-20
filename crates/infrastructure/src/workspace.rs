@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
-use crate::storage::{AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file};
+use crate::storage::{
+    AtomicCommitError, CommitMode, StorageCoordinator, commit_staged_file_with_replace_retry,
+};
 
 const SESSION_RELATIVE_PATH: &str = "workspace/session.json";
 
@@ -107,6 +109,9 @@ impl WorkspaceSessionStore {
             let latest = read_regular_file_following_symlink(&path).map_err(|source| {
                 AppError::infrastructure_with_source("重新读取工作区 session 失败", source)
             })?;
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("工作区写入已在提交前取消"));
+            }
             commit_mode_for_expected(&path, latest.as_deref(), &expected)
         })?;
         Ok(revision_for_bytes(&bytes))
@@ -223,7 +228,7 @@ fn stage_and_commit(
     destination: &Path,
     bytes: &[u8],
     cancellation: &CancellationToken,
-    before_commit: impl FnOnce() -> AppResult<CommitMode>,
+    before_commit: impl Fn() -> AppResult<CommitMode>,
 ) -> AppResult<()> {
     let parent = destination
         .parent()
@@ -268,7 +273,12 @@ fn stage_and_commit(
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("工作区写入已在提交前取消"));
         }
-        commit_staged_file(&temp_path, destination, mode).map_err(|source| match source {
+        commit_staged_file_with_replace_retry(&temp_path, destination, mode, bytes, || {
+            // 复用提交前的同一 CAS 闭包：等待后紧贴提交重新读回并确认目标仍是原 revision；
+            // 读回或复核无法确定时返回 false，让首个未知结果走既有回读恢复。
+            before_commit().is_ok_and(|retried| retried == mode)
+        })
+        .map_err(|source| match source {
             AtomicCommitError::NotCommitted(error)
                 if matches!(
                     error.kind(),
