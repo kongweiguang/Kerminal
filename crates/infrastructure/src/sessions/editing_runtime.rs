@@ -123,6 +123,59 @@ impl EditingRuntime {
     }
 }
 
+/// reader 交付边界使用的轻量门控：只回答当前代是否正在等待 Bash 探测响应。
+///
+/// 探测是在 reader 已经挂起于 `read` 之后才发送的，无法在发送时主动通知读取方；
+/// 因此门控只能在字节到达后短暂查询一次。锁内只比较字段、不 await、不跨 I/O，
+/// 避免 reader 为了合批而持有会话状态锁或与交付路径互相等待。
+///
+/// @author kongweiguang
+pub(super) struct BashProbeGate {
+    editing: Arc<StdMutex<EditingRuntime>>,
+    generation: u64,
+}
+
+impl BashProbeGate {
+    /// 绑定当前 transport 代次；重连替换 EditingRuntime 内容后旧代门控自动判定失效。
+    ///
+    /// @author kongweiguang
+    pub(super) fn new(editing: Arc<StdMutex<EditingRuntime>>, generation: u64) -> Self {
+        Self {
+            editing,
+            generation,
+        }
+    }
+
+    /// 只有已确认 Bash 且恰好有唯一探测在途时才需要合并擦除与恢复重绘；
+    /// 超时后尚未被清理的探测不再算在途，避免 reader 为一个不会到的响应继续等待。
+    /// 其它 Shell 或普通输出保持原有立即交付语义。
+    ///
+    /// @author kongweiguang
+    pub(super) fn in_flight(&self) -> bool {
+        let editing = self
+            .editing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = tokio::time::Instant::now();
+        editing.generation == self.generation
+            && matches!(
+                &editing.status,
+                EditingStatus::Installed {
+                    shell: EditingShell::Bash,
+                    ..
+                }
+            )
+            && editing
+                .pending
+                .as_ref()
+                .is_some_and(|pending| now < pending.deadline)
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/bash_probe_gate_fixture.rs"]
+mod bash_probe_gate_fixture;
+
 /// 输入版本按现有命令生命周期生成，不把无正文探测记成一次用户编辑。
 ///
 /// @author kongweiguang

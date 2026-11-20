@@ -2,7 +2,10 @@
 //!
 //! @author kongweiguang
 
-use super::conpty_output_coalescer::{CURSOR_HOLD_DEADLINE, ReaderEvent, SessionOutputReader};
+use super::conpty_output_coalescer::{
+    BASH_REDRAW_HOLD_DEADLINE, CURSOR_HOLD_DEADLINE, ReaderEvent, SessionOutputReader,
+};
+use super::editing_runtime::BashProbeGate;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -327,6 +330,282 @@ async fn generic_transport_never_holds() {
     match next_event(&mut reader, &mut buffer).await {
         ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), HIDE),
         _ => panic!("generic transport must pass through"),
+    }
+}
+
+/// 真实 WSL Bash 5.1 抓取的探测响应：readline 先擦除提示符行，随后私有快照帧与 PS1 恢复。
+/// 帧正文按 `1;S;nonce;bash;unit;cursor;version;cwd;input;prediction` 组成，便于核对
+/// 即使交给真实解析器也能通过认证字段格式。
+const BASH_ERASE: &[u8] = b"\r\x1b[K";
+const BASH_PROMPT_VISIBLE: &[u8] = b"testuser@host:$ \x1b]133;B\x07a";
+const BASH_SNAPSHOT: &[u8] =
+    b"\x1b]6977;Kerminal;1;S;0123456789abcdef0123456789abcdef;bash;byte;1;5.1.0;/root;a;0\x07";
+
+/// 抓取样本的私有帧正文必须能被真实解析器接受，避免回归夹具退化成无法认证的文本。
+///
+/// @author kongweiguang
+#[test]
+fn captured_bash_snapshot_payload_parses() {
+    use kerminal_terminal::shell_editing::{EditingMessage, parse_editing_message};
+    let prefix = kerminal_terminal::shell_editing::SHELL_EDITING_FRAME_PREFIX;
+    let payload = &BASH_SNAPSHOT[prefix.len()..BASH_SNAPSHOT.len() - 1];
+    assert!(matches!(
+        parse_editing_message(payload),
+        Some(EditingMessage::Snapshot { .. })
+    ));
+}
+
+/// 探测在途时擦除提示符行不能先于恢复重绘发布，否则 SSH 分段交付会闪出空行。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bash_probe_erase_is_published_with_the_prompt_redraw() {
+    let (mut writer, transport) = duplex(4096);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 4096];
+    let event = {
+        let read = reader.read(&mut buffer);
+        tokio::pin!(read);
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "bash erase must wait for the prompt boundary"
+        );
+        let mut redraw = BASH_SNAPSHOT.to_vec();
+        redraw.extend_from_slice(BASH_PROMPT_VISIBLE);
+        writer.write_all(&redraw).await.expect("write redraw");
+        read.await
+    };
+    match event {
+        ReaderEvent::Data(output) => {
+            assert_eq!(output.visible, [BASH_ERASE, BASH_PROMPT_VISIBLE].concat());
+            assert_eq!(output.frames.len(), 1);
+            assert_eq!(output.frames[0].visible_offset, BASH_ERASE.len());
+        }
+        _ => panic!("bash erase and redraw must be one batch"),
+    }
+}
+
+/// transport 把擦除序列拆成 `\r ESC [` 与 `K` 时，第二批仍要从 `K` 开始等待提示符恢复。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bash_erase_split_across_reads_is_still_held() {
+    let (mut writer, transport) = duplex(4096);
+    writer.write_all(b"\r\x1b[").await.expect("write prefix");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 4096];
+    match next_event(&mut reader, &mut buffer).await {
+        ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), b"\r\x1b["),
+        _ => panic!("partial erase prefix must pass through"),
+    }
+    writer.write_all(b"K").await.expect("write erase tail");
+    let event = {
+        let read = reader.read(&mut buffer);
+        tokio::pin!(read);
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "split erase must still wait for the prompt boundary"
+        );
+        writer
+            .write_all(b"$ \x1b]133;B\x07")
+            .await
+            .expect("write prompt boundary");
+        read.await
+    };
+    match event {
+        ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), b"K$ \x1b]133;B\x07"),
+        _ => panic!("erase tail and prompt must be one batch"),
+    }
+}
+
+/// OSC 133 B 本身也可能被拆开，且 ST 结束符等价于 BEL；两者都必须等到完整结束符。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bash_prompt_boundary_split_and_st_terminator_are_held() {
+    let (mut writer, transport) = duplex(4096);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 4096];
+    let event = {
+        let read = reader.read(&mut buffer);
+        tokio::pin!(read);
+        assert!(poll_once(read.as_mut()).await.is_pending());
+        writer
+            .write_all(b"testuser@host:$ \x1b]133;")
+            .await
+            .expect("write partial boundary");
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "partial prompt marker must not close the hold"
+        );
+        writer
+            .write_all(b"B\x1b")
+            .await
+            .expect("write boundary with ST prefix");
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "unfinished ST must not close the hold"
+        );
+        writer
+            .write_all(b"\\a")
+            .await
+            .expect("write ST terminator and echo");
+        read.await
+    };
+    match event {
+        ReaderEvent::Data(output) => assert_eq!(
+            output.visible,
+            [BASH_ERASE, b"testuser@host:$ \x1b]133;B\x1b\\a"].concat()
+        ),
+        _ => panic!("complete ST must close the batch"),
+    }
+}
+
+/// 提示符恢复迟迟不到时必须按绝对截止时间放行擦除，不能挂住普通输出。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bash_probe_hold_releases_at_deadline() {
+    let (mut writer, transport) = duplex(256);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 256];
+    let started = tokio::time::Instant::now();
+    let event = {
+        let read = reader.read(&mut buffer);
+        tokio::pin!(read);
+        assert!(poll_once(read.as_mut()).await.is_pending());
+        tokio::time::sleep(BASH_REDRAW_HOLD_DEADLINE + Duration::from_millis(5)).await;
+        read.await
+    };
+    match event {
+        ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), BASH_ERASE),
+        _ => panic!("deadline must release the held erase"),
+    }
+    assert!(
+        started.elapsed() >= BASH_REDRAW_HOLD_DEADLINE - Duration::from_millis(8),
+        "deadline released too early: {:?}",
+        started.elapsed()
+    );
+}
+
+/// EOF 落在等待提示符恢复期间时，先交付擦除字节再报告结束，不丢失已读输出。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bash_probe_hold_flushes_before_eof() {
+    let (mut writer, transport) = duplex(256);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    drop(writer);
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 256];
+    match next_event(&mut reader, &mut buffer).await {
+        ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), BASH_ERASE),
+        _ => panic!("held erase must be delivered before EOF"),
+    }
+    assert!(matches!(
+        next_event(&mut reader, &mut buffer).await,
+        ReaderEvent::End
+    ));
+}
+
+/// 私有快照正文里出现的 OSC 133 B 片段在过滤后不属于可见字节，不能提前结束等待；
+/// 只有 PS1 真正恢复后交付的标记才算提示符边界。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn prompt_marker_inside_private_frame_does_not_close_the_batch() {
+    let (mut writer, transport) = duplex(4096);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 4096];
+    let event = {
+        let read = reader.read(&mut buffer);
+        tokio::pin!(read);
+        assert!(poll_once(read.as_mut()).await.is_pending());
+        writer
+            .write_all(
+                b"\x1b]6977;Kerminal;1;S;nonce;bash;byte;8;5.1.0;L3RtcA==;YQ==;0\x1b]133;B\x07",
+            )
+            .await
+            .expect("write private frame with boundary text");
+        assert!(
+            poll_once(read.as_mut()).await.is_pending(),
+            "private payload must not close the hold"
+        );
+        writer
+            .write_all(BASH_PROMPT_VISIBLE)
+            .await
+            .expect("write prompt boundary");
+        read.await
+    };
+    match event {
+        ReaderEvent::Data(output) => {
+            assert_eq!(output.visible, [BASH_ERASE, BASH_PROMPT_VISIBLE].concat());
+            assert_eq!(output.frames.len(), 1);
+        }
+        _ => panic!("real prompt boundary must close the batch"),
+    }
+}
+
+/// 已超时但尚未被清理的探测不能再把擦除字节扣在 reader 里，否则会拖慢普通输出。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn expired_probe_does_not_hold_the_erase() {
+    let (mut writer, transport) = duplex(256);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_with_expired_probe_for_test()));
+    let mut buffer = [0_u8; 256];
+    match next_event(&mut reader, &mut buffer).await {
+        ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), BASH_ERASE),
+        _ => panic!("expired probe must not hold ordinary output"),
+    }
+}
+
+/// 没有在途探测时，同样的擦除序列按普通输出立即交付，不受 Bash 合批影响。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn bash_erase_without_probe_passes_through() {
+    let (mut writer, transport) = duplex(256);
+    writer.write_all(BASH_ERASE).await.expect("write erase");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(false)));
+    let mut buffer = [0_u8; 256];
+    match next_event(&mut reader, &mut buffer).await {
+        ReaderEvent::Data(output) => assert_eq!(output.visible.as_slice(), BASH_ERASE),
+        _ => panic!("erase without an in-flight probe must pass through"),
+    }
+}
+
+/// 探测在途时普通输出仍然立即交付，只有已经出现的擦除序列才进入等待。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn ordinary_output_with_pending_probe_is_immediate() {
+    let (mut writer, transport) = duplex(256);
+    writer
+        .write_all(b"ordinary command output")
+        .await
+        .expect("write output");
+    let mut reader = SessionOutputReader::new(Box::pin(transport), CancellationToken::new(), false)
+        .with_bash_probe(Some(BashProbeGate::bash_for_test(true)));
+    let mut buffer = [0_u8; 256];
+    match next_event(&mut reader, &mut buffer).await {
+        ReaderEvent::Data(output) => {
+            assert_eq!(output.visible.as_slice(), b"ordinary command output")
+        }
+        _ => panic!("ordinary output must not wait for the probe"),
     }
 }
 

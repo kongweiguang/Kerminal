@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 const PROBE: &[u8] = b"\x1b[24;8~";
 const HIDE_AND_QUERY: &[u8] = b"\x1b[?25l\x1b[6n";
+const BASH_ERASE_AND_QUERY: &[u8] = b"\r\x1b[K\x1b[6n";
 
 #[derive(Default)]
 struct Recorder(StdMutex<Vec<u8>>);
@@ -82,6 +83,7 @@ struct Factory {
     /// 启用 Windows ConPTY 能力，仅用于验证 reader 合批与私有帧过滤的真实接线。
     conpty: bool,
     ssh_powershell: bool,
+    ssh_bash: bool,
     write_gate: Option<Arc<WriteGate>>,
 }
 
@@ -134,7 +136,7 @@ impl AsyncRead for ObservedReader {
         let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
         if matches!(result, Poll::Ready(Ok(())))
             && let Some(gate) = &self.gate
-            && &buffer.filled()[offset..] == HIDE_AND_QUERY
+            && [HIDE_AND_QUERY, BASH_ERASE_AND_QUERY].contains(&&buffer.filled()[offset..])
         {
             gate.hide_read.notify_one();
         }
@@ -398,7 +400,7 @@ async fn setup_with(
     };
     let info = manager
         .create(CreateSessionRequest {
-            target: if factory.ssh_powershell {
+            target: if factory.ssh_powershell || factory.ssh_bash {
                 SessionTarget::Ssh(SshSessionTarget {
                     host_id: HostId::new(),
                     working_directory: None,
@@ -628,6 +630,75 @@ async fn verify_redraw_transport(ssh_powershell: bool) {
     assert!(
         read > 0,
         "the pending parser response must still be written"
+    );
+    drop(peer);
+    manager.close(binding.session_id).await.expect("close");
+}
+
+/// 让第一段产生终端查询回复来卡住 reader：如果擦除独立发布，背压时快照会只剩空行。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn ssh_bash_probe_keeps_prompt_visible_across_transport_reads() {
+    let gate = Arc::new(WriteGate::default());
+    let (manager, recorder, binding, mut peer) = setup_with(
+        Factory {
+            ssh_bash: true,
+            write_gate: Some(gate.clone()),
+            ..Factory::default()
+        },
+        4096,
+    )
+    .await;
+    let request = {
+        let manager = manager.clone();
+        let binding = binding.clone();
+        tokio::spawn(async move {
+            manager
+                .request_shell_editing_snapshot(binding, CancellationToken::new())
+                .await
+        })
+    };
+    expect_probe(&mut peer).await;
+    gate.blocked.store(true, Ordering::Release);
+    peer.write_all(BASH_ERASE_AND_QUERY).await.expect("erase");
+    tokio::time::timeout(Duration::from_secs(2), gate.hide_read.notified())
+        .await
+        .expect("erase read independently");
+    let mut redraw = frame(NONCE, "a", 1);
+    redraw.extend_from_slice(b"testuser@host:$ \x1b]133;B\x07a");
+    peer.write_all(&redraw).await.expect("frame and redraw");
+    tokio::time::timeout(Duration::from_secs(2), gate.waiting.notified())
+        .await
+        .expect("writer backpressure");
+    let text = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.plaintext_snapshot(
+            binding.session_id.clone(),
+            PlainTextSnapshotRequest::default(),
+        ),
+    )
+    .await
+    .expect("snapshot without waiting on the writer")
+    .expect("snapshot")
+    .text;
+    gate.release();
+    assert!(text.contains("testuser@host:$ a"), "visible text: {text:?}");
+    assert!(
+        !recorder
+            .0
+            .lock()
+            .expect("recorder lock")
+            .windows(NONCE.len())
+            .any(|value| value == NONCE.as_bytes())
+    );
+    assert_eq!(
+        request
+            .await
+            .expect("request join")
+            .expect("editing snapshot")
+            .input,
+        "a"
     );
     drop(peer);
     manager.close(binding.session_id).await.expect("close");

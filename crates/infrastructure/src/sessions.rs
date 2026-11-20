@@ -1566,8 +1566,14 @@ impl SessionManager {
         let manager = self.clone();
         self.runtime.spawn(async move {
             let mut buffer = vec![0_u8; maximum_chunk];
+            // 门控只读当前代 EditingRuntime；重连替换后旧 reader 的克隆会因代次不符自动失效。
+            let bash_probe = editing_runtime::BashProbeGate::new(
+                Arc::clone(&session.shell_editing),
+                transport_generation,
+            );
             let mut reader =
-                SessionOutputReader::new(reader, cancellation.clone(), coalesce_cursor);
+                SessionOutputReader::new(reader, cancellation.clone(), coalesce_cursor)
+                    .with_bash_probe(Some(bash_probe));
             // 回写失败后留给读泵确认真实退出的绝对截止时间；Some 表示不再向坏 writer 交付。
             // 只对已识别的 SSH 当前代启用，避免把任意 I/O 错误猜成可重连的断线。
             let mut exit_confirmation_deadline: Option<Instant> = None;
