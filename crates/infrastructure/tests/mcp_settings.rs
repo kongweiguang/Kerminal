@@ -35,7 +35,7 @@ async fn mcp_vault_token_is_stable_and_encrypted() {
     assert!(!format!("{first:?}").contains(first.secret()));
 }
 
-/// 原文注释与未知字段在 MCP CAS 更新后仍保留，旧浅深字段只在读取投影标记待归并。
+/// 用缺少自动启动字段的真实旧配置验证安全默认值，并确保更新保留原文扩展。
 #[tokio::test]
 async fn settings_preserve_extensions_and_identify_legacy_terminal_theme() {
     let root = tempfile::tempdir().unwrap();
@@ -45,11 +45,13 @@ async fn settings_preserve_extensions_and_identify_legacy_terminal_theme() {
     let preferences = PreferencesService::new(Arc::new(store));
     let loaded = preferences.load_settings().await.unwrap();
     assert!(loaded.settings.terminal.legacy_color_scheme_missing);
+    assert!(!loaded.settings.mcp.auto_start);
     assert_eq!(
         fs::read_to_string(root.path().join("settings.toml")).unwrap(),
         source
     );
     let mut next = loaded.settings;
+    next.mcp.auto_start = true;
     next.terminal.resolve_legacy_terminal_scheme(true);
     next.mcp.bind_mode = McpBindMode::Lan;
     next.mcp.port = 41017;
@@ -59,7 +61,17 @@ async fn settings_preserve_extensions_and_identify_legacy_terminal_theme() {
         .await
         .unwrap();
     assert_eq!(saved.settings.mcp.port, 41017);
+    assert!(
+        preferences
+            .load_settings()
+            .await
+            .unwrap()
+            .settings
+            .mcp
+            .auto_start
+    );
     let result = fs::read_to_string(root.path().join("settings.toml")).unwrap();
+    assert!(result.contains("autoStart = true"));
     assert!(result.contains("# user note"));
     assert!(result.contains("custom = \"keep\""));
     assert!(result.contains("service:kerminal:mcp-token:v1"));

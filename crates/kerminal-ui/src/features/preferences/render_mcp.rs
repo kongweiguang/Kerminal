@@ -63,6 +63,15 @@ impl PreferencesPanel {
             _ => true,
         };
         let current_lan = snapshot.bind_mode == McpBindMode::Lan;
+        // 自动启动偏好只来自权威回读；只有手动启动失败或同步待重试时才提供放弃入口，
+        // 常态下不新增常驻控件，也不把偏好 true 当成 listener 正在运行。
+        let auto_start_abandonable = self.mcp_settings.confirmed_auto_start
+            && !busy
+            && match state {
+                McpRuntimeState::Stopped | McpRuntimeState::Failed => true,
+                McpRuntimeState::Synchronizing => snapshot.endpoint_sync_pending,
+                _ => false,
+            };
         let running_port = snapshot.endpoint.as_deref().and_then(endpoint_port);
         let selected_address = self
             .mcp_settings
@@ -178,34 +187,52 @@ impl PreferencesPanel {
                     ),
             )
             .child(
-                div().flex().items_center().gap_2().child(
-                    Button::new("mcp-settings-toggle")
-                        .compact()
-                        .outline()
-                        .ghost()
-                        .icon(
-                            Icon::new(if running || stopping {
-                                IconName::PowerOff
-                            } else {
-                                IconName::Power
-                            })
-                            .size(theme.metrics.icon_size),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .when(auto_start_abandonable, |row| {
+                        // 启动失败后偏好仍为 true 时，用同一手动停止入口关闭它；
+                        // 该动作不依赖端口草稿或 endpoint，便于端口冲突时恢复。
+                        row.child(
+                            Button::new("mcp-auto-start-disable")
+                                .compact()
+                                .ghost()
+                                .label(crate::locale::text("关闭自动启动", "Turn off auto start"))
+                                .disabled(locked || self.mcp_settings.outcome_unknown)
+                                .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                    panel.disable_mcp_auto_start(cx)
+                                })),
                         )
-                        .label(toggle_label)
-                        .loading(busy)
-                        .disabled(
-                            !toggle_available
-                                || locked
-                                || (!running
-                                    && !stopping
-                                    && (invalid_port
-                                        || self.mcp_settings.conflict
-                                        || self.mcp_settings.outcome_unknown)),
-                        )
-                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                            panel.toggle_mcp_settings(cx)
-                        })),
-                ),
+                    })
+                    .child(
+                        Button::new("mcp-settings-toggle")
+                            .compact()
+                            .outline()
+                            .ghost()
+                            .icon(
+                                Icon::new(if running || stopping {
+                                    IconName::PowerOff
+                                } else {
+                                    IconName::Power
+                                })
+                                .size(theme.metrics.icon_size),
+                            )
+                            .label(toggle_label)
+                            .loading(busy)
+                            .disabled(
+                                !toggle_available
+                                    || locked
+                                    || self.mcp_settings.outcome_unknown
+                                    || (!running
+                                        && !stopping
+                                        && (invalid_port || self.mcp_settings.conflict)),
+                            )
+                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                                panel.toggle_mcp_settings(cx)
+                            })),
+                    ),
             );
 
         let settings = div()

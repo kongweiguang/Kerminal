@@ -43,6 +43,8 @@
 
 `[mcp].bindMode` 是监听范围：`loopback` 为本机，`lan` 为所有 IPv4 网卡；缺省为 `loopback`。`port` 是固定监听端口，缺省为 `37657`，有效范围 1–65535。局域网模式要求 `tokenRef = "service:kerminal:mcp-token:v1"`，对应令牌由应用保存在加密 vault；不要将令牌正文写入普通配置、日志或工作区上下文。配置校验不能创建令牌或启动服务。
 
+`[mcp].autoStart` 是布尔值，默认 `false`。在「设置 → MCP」中启动或停止时会保存此值。为 `true` 时，Kerminal 启动后按保存的端口和范围启动 MCP。应用退出和内置 Agent 按需启动服务时保留此值。自动启动失败后可以在 MCP 设置中重试或关闭自动启动。
+
 `pluginCatalogUrl` 是插件市场目录的 JSON 地址。空字符串表示使用内置官方目录；自定义值必须是合法的 HTTP(S) 绝对地址，允许局域网、回环主机和非默认端口，拒绝 userinfo、fragment 与 0 端口，最长 2048 个字符。目录只读取 JSON，不要求签名文件；在应用设置界面保存后立即切换到新来源并刷新，无需重启；直接编辑 `settings.toml` 时，目录地址在下次启动生效。失败时保留原来源。不同来源的缓存相互隔离，切换来源不会复用另一来源的目录内容；正在进行的旧来源刷新不会写入新来源缓存，也不会把旧来源结果当成新来源展示。
 
 `[workbenchLayout]` 保存稳定的工作台用户意图：`hostSidebarCollapsed` 默认 `false`，`hostSidebarWidth` 默认 `220` 且范围为 `168`–`360`；`dockPanelWidths` 默认空表，右侧 Attached 工具共用 `360` 逻辑像素内容宽度，显式宽度范围为 `130`–`1360`；`bottomPanelHeight` 默认 `240` 且范围为 `180`–`4000`。
@@ -61,7 +63,7 @@
 
 内置 `terminal.paste` 默认只作用于终端：Windows 为 `Ctrl+V`，Linux 为 `Ctrl+Shift+V`，macOS 为 `Cmd+V`。它的通用 `binding` 刻意留空；这样用户清空一个平台的覆盖值时，不会意外继承其他平台的键位。一次性旧格式迁移只会为已有的非空快捷键列表补入缺失的退出和粘贴动作；已有行及其空绑定保持不变，明确的 `keybindings = []` 也保持为空。补入粘贴动作时，若已有行占用了某个平台的默认粘贴键，只清空新粘贴行对应平台的冲突绑定。正常读取和保存不会恢复缺失动作。设置页的「恢复缺失动作」可显式补回缺少的内置行，已有自定义、空绑定和未知动作行会保留。
 
-设置页录制时保留 Tab 和 Shift+Tab 的焦点导航。macOS 的 Cmd+C，以及各平台的 Ctrl+C、Ctrl+Shift+C 由终端复制/中断优先消费，不可绑定到 `terminal` 作用域；其它作用域中使用这些键会提示终端焦点下的优先级。Windows/Linux 的 Ctrl+Insert 是未配置时的默认复制手势，但可以绑定到 `terminal` 作用域：有匹配配置（包括多段序列）时先执行配置动作，没有匹配时才复制当前选择。各平台按生效键位（含回退）校验。
+设置页录制时保留 Tab 和 Shift+Tab 的焦点导航。macOS 的 Cmd+C，以及各平台的 Ctrl+C、Ctrl+Shift+C 由终端复制/中断优先消费，不可绑定到 `terminal` 作用域；其它作用域中使用这些键会提示终端焦点下的优先级。Windows/Linux 的 `Ctrl+Insert`、`Shift+Insert` 和 Windows 的 `Ctrl+Shift+V` 可以绑定到 `terminal` 作用域。有匹配配置（包括多段序列）时优先执行配置动作。没有匹配配置时，`Ctrl+Insert` 复制终端选区，其余上述手势粘贴系统剪贴板。清空 `terminal.paste` 的平台键位仍保留这些标准手势。各平台按生效键位（含回退）校验。
 
 <!-- example:settings -->
 ```toml
@@ -92,6 +94,7 @@ selectionCopy = false
 agentCommandsInTerminal = true
 
 [mcp]
+autoStart = false
 bindMode = "loopback"
 port = 37657
 

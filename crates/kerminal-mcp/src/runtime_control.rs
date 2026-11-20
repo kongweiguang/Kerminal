@@ -96,6 +96,7 @@ impl McpRuntimeController {
                     kerminal_application::preferences::settings::McpBindMode::Loopback
                 },
                 token_ref: None,
+                auto_start: false,
             }),
             config: StdRwLock::new(config),
             preferences: None,
@@ -300,7 +301,13 @@ impl McpRuntimeController {
 
         if !had_server && owner.pending_sync.is_none() {
             let current = self.snapshot();
-            if current.state == McpRuntimeState::Starting {
+            // 只有 owner 中没有可重试的 listener 或 endpoint 同步任务时才走这里；
+            // 存在未收尾资源时继续走下方真实 shutdown/同步路径，不能用状态清理掩盖 owner。
+            // Failed 会清掉旧失败原因，让下一次启动从明确的 Stopped 状态开始。
+            if matches!(
+                current.state,
+                McpRuntimeState::Starting | McpRuntimeState::Failed
+            ) {
                 self.publish(McpRuntimeSnapshot::stopped());
                 return Ok(self.snapshot());
             }

@@ -366,6 +366,8 @@ impl ConnectivityState {
     }
 
     /// 启动共享 MCP listener，按 runtime 实际状态门禁，旧操作结果不能覆盖新状态。
+    /// 用户点击启动必须走持久化手动入口，由 runtime 先落盘自动启动偏好再建 listener，
+    /// 避免界面替 runtime 假设持久化顺序。
     pub(in crate::features::preferences) fn start_mcp(
         &mut self,
         cx: &mut Context<PreferencesPanel>,
@@ -386,6 +388,8 @@ impl ConnectivityState {
             cx.notify();
             return;
         };
+        // 重试同步只恢复现有 listener，不把 Agent 的按需启动变成开机偏好。
+        let retry_sync = self.mcp_snapshot.state == McpRuntimeState::Synchronizing;
         self.begin_mcp_operation(McpOperation::Start, cx);
         let executor = self.executor.clone();
         let generation = self.mcp_generation;
@@ -395,8 +399,15 @@ impl ConnectivityState {
                 .run(move |task_cancellation| {
                     let operation_cancellation = CancellationToken::new();
                     let operation_cancellation_for_start = operation_cancellation.clone();
-                    let operation =
-                        async move { runtime.start(operation_cancellation_for_start).await };
+                    let operation = async move {
+                        if retry_sync {
+                            runtime.start(operation_cancellation_for_start).await
+                        } else {
+                            runtime
+                                .start_manually(operation_cancellation_for_start)
+                                .await
+                        }
+                    };
                     await_operation_with_cooperative_cancellation(
                         operation,
                         operation_cancellation,
@@ -406,9 +417,7 @@ impl ConnectivityState {
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
-                panel
-                    .connectivity
-                    .finish_mcp_operation(generation, result, cx);
+                panel.finish_mcp_toggle(generation, result, !retry_sync, cx);
                 if panel.connectivity.current_mcp_snapshot().state == McpRuntimeState::Running {
                     panel.refresh_mcp_addresses(cx);
                 }
@@ -418,6 +427,7 @@ impl ConnectivityState {
     }
 
     /// 停止共享 listener 时保留原 owner 的有界清理语义，超时后允许再次停止。
+    /// 用户点击停止同样走手动入口：runtime 先落盘关闭自动启动，再收尾 listener。
     pub(in crate::features::preferences) fn stop_mcp(
         &mut self,
         cx: &mut Context<PreferencesPanel>,
@@ -425,9 +435,15 @@ impl ConnectivityState {
         if let Some(runtime) = self.runtime.as_ref() {
             self.mcp_snapshot = runtime.snapshot();
         }
-        if self.mcp_operation.is_some()
-            || (self.mcp_snapshot.endpoint.is_none() && !self.mcp_snapshot.endpoint_sync_pending)
-        {
+        // 启动失败的 Failed 可能没有 endpoint，仍需要允许用户关闭自动启动偏好；
+        // 因此只有既无 owner、也无待同步、且不是失败态时才拒绝停止。
+        let has_stop_target = self.mcp_snapshot.endpoint.is_some()
+            || self.mcp_snapshot.endpoint_sync_pending
+            || matches!(
+                self.mcp_snapshot.state,
+                McpRuntimeState::Stopped | McpRuntimeState::Failed
+            );
+        if self.mcp_operation.is_some() || !has_stop_target {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
@@ -442,14 +458,12 @@ impl ConnectivityState {
             let result = executor
                 .run(move |_| async move {
                     runtime
-                        .stop_until(Instant::now() + Duration::from_secs(5))
+                        .stop_manually_until(Instant::now() + Duration::from_secs(5))
                         .await
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
-                panel
-                    .connectivity
-                    .finish_mcp_operation(generation, result, cx);
+                panel.finish_mcp_toggle(generation, result, true, cx);
             });
         })
         .detach();
@@ -468,14 +482,15 @@ impl ConnectivityState {
     }
 
     /// 仅接受当前操作回执；停止未完成给出本地化恢复动作，底层原因仍由 runtime 快照保留。
-    fn finish_mcp_operation(
+    /// 返回是否接受了本次回执，供调用方只在真实完成时触发权威回读。
+    pub(super) fn finish_mcp_operation(
         &mut self,
         generation: u64,
         result: Result<McpRuntimeSnapshot, AppError>,
         cx: &mut Context<PreferencesPanel>,
-    ) {
+    ) -> bool {
         if generation != self.mcp_generation {
-            return;
+            return false;
         }
         let operation = self.mcp_operation.take();
         let mut start_failure_reason = None;
@@ -566,6 +581,7 @@ impl ConnectivityState {
             .detach();
         }
         cx.notify();
+        true
     }
 
     /// 在途状态禁止复制旧配置；只有剪贴板回读匹配才确认，避免报告未完成的系统写入。

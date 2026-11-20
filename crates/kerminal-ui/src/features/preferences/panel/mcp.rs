@@ -41,6 +41,9 @@ pub(in crate::features::preferences) struct McpSettingsState {
     pub(in crate::features::preferences) addresses_generation: u64,
     pub(in crate::features::preferences) message: Option<String>,
     pub(in crate::features::preferences) is_error: bool,
+    /// runtime 手动启停单独持久化的自动启动偏好；只由权威回读更新，
+    /// 避免设置草稿因脏编辑未安装时，失败后的关闭入口读取过期值。
+    pub(in crate::features::preferences) confirmed_auto_start: bool,
     generation: u64,
     pending: Option<McpSettings>,
 }
@@ -71,6 +74,7 @@ impl McpSettingsState {
             addresses_generation: 0,
             message: None,
             is_error: false,
+            confirmed_auto_start: false,
             generation: 0,
             pending: None,
         }
@@ -98,23 +102,35 @@ impl McpSettingsState {
 
     /// 操作已返回未知结果后，成功的权威回读才能解除门禁；确认未保存时保留输入供显式重试。
     /// 同 revision 的回读也必须处理，否则未落盘的提交会永远停留在“核对结果”。
+    ///
+    /// 只比较监听字段：手动启停会同时改写 auto_start，把它算进“是否保存成功”
+    /// 会让仅偏好变化被误报成监听草稿未保存。
     pub(super) fn reconcile_readback(
         &mut self,
         settings: &McpSettings,
         window: &mut Window,
         cx: &mut Context<PreferencesPanel>,
     ) {
+        // 每次权威回读都更新偏好视图，即使当前脏草稿不会安装；
+        // 这样失败后的关闭入口始终依据磁盘确认值出现或消失。
+        self.confirmed_auto_start = settings.auto_start;
         if !self.outcome_unknown || self.busy {
             return;
         }
         self.outcome_unknown = false;
-        if self.pending.take().as_ref() == Some(settings) {
+        let Some(pending) = self.pending.take() else {
+            // 手动启停只需读回偏好；保留监听草稿且不重放启停。
+            self.message = None;
+            self.is_error = false;
+            return;
+        };
+        if same_listener(&pending, settings) {
             self.edited = false;
             self.message = None;
             self.is_error = false;
             self.sync(settings, window, cx);
         } else {
-            self.conflict = settings != &self.baseline;
+            self.conflict = !same_listener(settings, &self.baseline);
             self.refresh_edit_state(cx);
             if !self.conflict {
                 self.message = Some(
@@ -129,14 +145,23 @@ impl McpSettingsState {
     }
 
     /// 外部重读不得覆盖用户正在编辑的端口；不同基线必须显式恢复后再应用。
-    pub(super) fn sync(
+    ///
+    /// 冲突只看监听字段：手动启停写入的 auto_start 变化不能把正在编辑的草稿
+    /// 误判成外部冲突，但最新偏好仍需进入基线供后续手动启动沿用。
+    pub(in crate::features::preferences) fn sync(
         &mut self,
         settings: &McpSettings,
         window: &mut Window,
         cx: &mut Context<PreferencesPanel>,
     ) {
+        // 安装或重置共用同一权威快照；偏好视图不能落后于实际持久值。
+        self.confirmed_auto_start = settings.auto_start;
         if self.outcome_unknown {
-            if self.pending.as_ref() != Some(settings) {
+            if !self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| same_listener(pending, settings))
+            {
                 self.conflict = true;
                 return;
             }
@@ -147,7 +172,11 @@ impl McpSettingsState {
             self.is_error = false;
         }
         if self.edited {
-            self.conflict = settings != &self.baseline;
+            self.conflict = !same_listener(settings, &self.baseline);
+            if !self.conflict {
+                // 监听字段一致时只同步 auto_start 等持久字段，不覆盖用户输入。
+                self.baseline = settings.clone();
+            }
             return;
         }
         self.baseline = settings.clone();
@@ -158,9 +187,51 @@ impl McpSettingsState {
 }
 
 impl PreferencesPanel {
-    /// 停止只收尾原 owner；启动先提交当前草稿，再由 runtime 读取最新持久配置。
+    /// 手动启停写入未知时先读回偏好，避免未核实就重复尝试；同步重试没有偏好写入。
+    pub(super) fn finish_mcp_toggle(
+        &mut self,
+        generation: u64,
+        result: kerminal_application::AppResult<
+            kerminal_application::mcp_runtime::McpRuntimeSnapshot,
+        >,
+        writes_preference: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let unknown = result.as_ref().is_err_and(|error| {
+            error.public_code() == kerminal_application::PublicErrorCode::OutcomeUnknown
+        });
+        if !self
+            .connectivity
+            .finish_mcp_operation(generation, result, cx)
+            || !writes_preference
+        {
+            return;
+        }
+        if unknown {
+            self.mcp_settings.outcome_unknown = true;
+        }
+        self.spawn_settings_revision_check(cx);
+    }
+
+    /// 启动失败后仍保留自动启动时，用同一手动停止入口取消偏好；
+    /// 失败态可能没有 endpoint 或清理 owner，不能沿用常规停止门禁。
+    /// 监听草稿写入在途或结果未知时先等待核对，避免两笔设置写入互相覆盖。
+    pub(in crate::features::preferences) fn disable_mcp_auto_start(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mcp_settings.busy || self.mcp_settings.outcome_unknown {
+            return;
+        }
+        self.connectivity.stop_mcp(cx);
+    }
+
+    /// 显式启停保存下次启动偏好，有监听草稿时先确认参数以免绑定过时端口。
     pub(in crate::features::preferences) fn toggle_mcp_settings(&mut self, cx: &mut Context<Self>) {
-        if self.mcp_settings.busy || self.connectivity.mcp_operation.is_some() {
+        if self.mcp_settings.busy
+            || self.mcp_settings.outcome_unknown
+            || self.connectivity.mcp_operation.is_some()
+        {
             return;
         }
         match self.connectivity.current_mcp_snapshot().state {
@@ -295,6 +366,9 @@ impl PreferencesPanel {
             bind_mode: self.mcp_settings.bind_mode,
             port,
             token_ref: draft.value().mcp.token_ref.clone(),
+            // 本入口只保存监听参数；auto_start 由手动启停入口持久化，
+            // 这里沿用已确认值，避免回写把 runtime 刚写入的偏好改回去。
+            auto_start: draft.value().mcp.auto_start,
         };
         let mut pending = requested.clone();
         if pending.bind_mode == McpBindMode::Lan && pending.token_ref.is_none() {
@@ -497,4 +571,14 @@ impl PreferencesPanel {
         })
         .detach();
     }
+}
+
+/// 判断两份设置是否指向同一个监听目标。
+///
+/// 手动启停会单独改写 auto_start，若整份比较会让 watcher 把偏好变化
+/// 误当成端口/范围的外部冲突，或把已保存的监听草稿判成未保存。
+fn same_listener(left: &McpSettings, right: &McpSettings) -> bool {
+    left.bind_mode == right.bind_mode
+        && left.port == right.port
+        && left.token_ref == right.token_ref
 }

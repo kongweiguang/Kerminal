@@ -827,9 +827,24 @@ impl DesktopComposition {
         Some(&self.update_service)
     }
 
-    /// 返回共享 MCP runtime 的已发布快照；桌面启动时默认保持 Stopped。
+    /// 返回共享 MCP runtime 的已发布快照；未启用自动启动时，桌面启动保持 Stopped。
     pub fn mcp_runtime_snapshot(&self) -> McpRuntimeSnapshot {
         self.mcp_runtime.snapshot()
+    }
+
+    /// 交给桌面共享执行器恢复监听，使首帧不等待 Agent 工作区 I/O，退出时仍能追踪此任务。
+    ///
+    /// @author kongweiguang
+    pub fn restore_mcp_runtime(
+        &self,
+    ) -> impl std::future::Future<Output = AppResult<McpRuntimeSnapshot>> + use<> {
+        let runtime = self.mcp_runtime.clone();
+        let executor = self.task_executor.clone();
+        async move {
+            executor
+                .run(move |cancellation| async move { runtime.restore_on_startup(cancellation).await })
+                .await
+        }
     }
 
     /// 先停 MCP 并清除 Agent endpoint，再用同一 deadline 等待后台用例和终端回收。

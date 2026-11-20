@@ -41,6 +41,8 @@ const REVISION_15_BETA7_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v15-beta7.md");
 const REVISION_16_GUIDE: &str =
     include_str!("../../../../tests/fixtures/configuration/config-guide-v16.md");
+const REVISION_17_GUIDE: &str =
+    include_str!("../../../../tests/fixtures/configuration/config-guide-v17.md");
 const HOST_V2_SERIAL: &str =
     include_str!("../../../../tests/fixtures/configuration/host-schema-v2-serial-migration.toml");
 const HOST_V3_SERIAL: &str =
@@ -49,7 +51,7 @@ const HOST_V3_SERIAL: &str =
 /// 使用实际旧正文验证升级，并用重新签署的自定义正文确保修订号不能授权覆盖。
 #[test]
 fn frozen_recent_guides_upgrade_without_overwriting_user_edits() {
-    const { assert!(CONFIG_GUIDE_REVISION > 16) };
+    const { assert!(CONFIG_GUIDE_REVISION > 17) };
     let root = tempdir().expect("创建隔离配置根");
     let prefix = configuration::CONFIG_GUIDE_MARKER_PREFIX;
     let path = "kerminal-config.md";
@@ -57,6 +59,7 @@ fn frozen_recent_guides_upgrade_without_overwriting_user_edits() {
         (15, REVISION_15_GUIDE),
         (15, REVISION_15_BETA7_GUIDE),
         (16, REVISION_16_GUIDE),
+        (17, REVISION_17_GUIDE),
     ] {
         let digest = configuration::config_guide_digest(body);
         let marked = format!("{prefix}{revision} sha256={digest} -->\n{body}");
@@ -69,12 +72,12 @@ fn frozen_recent_guides_upgrade_without_overwriting_user_edits() {
             assert_eq!(planned.after, configuration::managed_config_guide());
         }
     }
-    let custom = format!("{REVISION_16_GUIDE}\n## User notes\nKeep this.\n");
+    let custom = format!("{REVISION_17_GUIDE}\n## User notes\nKeep this.\n");
     let custom_digest = configuration::config_guide_digest(&custom);
     write_fixture(
         root.path(),
         path,
-        &format!("{prefix}16 sha256={custom_digest} -->\n{custom}"),
+        &format!("{prefix}17 sha256={custom_digest} -->\n{custom}"),
     );
     assert!(
         super::plan_current_config_guide_edit(root.path())

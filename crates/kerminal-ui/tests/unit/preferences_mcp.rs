@@ -28,6 +28,8 @@ struct RuntimeFixture {
     state: Mutex<RuntimeState>,
     repository: Mutex<Option<super::MemorySettingsRepository>>,
     fail_next_apply: AtomicBool,
+    /// 仅让下一次手动启动在已持久化 auto_start 之后失败，复现端口冲突后仍保留偏好。
+    fail_next_manual_start: AtomicBool,
     unknown_before_apply: AtomicBool,
     unknown_after_apply: AtomicBool,
 }
@@ -45,6 +47,7 @@ impl RuntimeFixture {
         Arc::new(Self {
             repository: Mutex::new(None),
             fail_next_apply: AtomicBool::new(false),
+            fail_next_manual_start: AtomicBool::new(false),
             unknown_before_apply: AtomicBool::new(false),
             unknown_after_apply: AtomicBool::new(false),
             state: Mutex::new(RuntimeState {
@@ -60,6 +63,24 @@ impl RuntimeFixture {
     fn counts(&self) -> (usize, usize) {
         let state = self.state.lock().unwrap();
         (state.starts, state.stops)
+    }
+
+    /// 手动启停的持久化通过真实测试仓储完成，使 UI 测试验证的是磁盘确认值，
+    /// 而不是 fixture 内存里的开关。
+    async fn persist_auto_start(&self, auto_start: bool) -> AppResult<()> {
+        let Some(repository) = self.repository.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let VersionedSettings {
+            mut settings,
+            revision,
+        } = repository.load_settings().await?;
+        if settings.mcp.auto_start == auto_start {
+            return Ok(());
+        }
+        settings.mcp.auto_start = auto_start;
+        repository.save_settings(settings, revision).await?;
+        Ok(())
     }
 }
 
@@ -81,10 +102,27 @@ impl McpRuntimeControl for RuntimeFixture {
         };
         let mut state = self.state.lock().unwrap();
         state.starts += 1;
+        if self.fail_next_manual_start.swap(false, Ordering::SeqCst) {
+            let mut snapshot = McpRuntimeSnapshot::stopped();
+            snapshot.state = McpRuntimeState::Failed;
+            snapshot.failure_reason = Some("fixture port conflict".to_owned());
+            state.snapshot = snapshot;
+            return Err(AppError::infrastructure("fixture MCP start failed"));
+        }
         state.snapshot = running();
         state.snapshot.bind_mode = bind_mode;
         state.snapshot.endpoint = Some(format!("http://127.0.0.1:{port}/mcp"));
         Ok(state.snapshot.clone())
+    }
+
+    /// 手动启动先落盘 auto_start=true 再复用资源启动；启动失败时偏好保留，
+    /// 正是 UI 需要提供“关闭自动启动”的真实前提。
+    async fn start_manually(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<McpRuntimeSnapshot> {
+        self.persist_auto_start(true).await?;
+        self.start(cancellation).await
     }
 
     /// 用真实测试仓储的 CAS 模拟启动前保存，失败时不得触发 start。
@@ -109,7 +147,10 @@ impl McpRuntimeControl for RuntimeFixture {
             .clone()
             .ok_or_else(|| AppError::unsupported("MCP fixture repository missing"))?;
         let mut loaded = repository.load_settings().await?.settings;
+        // 与生产 adapter 一致：监听草稿只改监听参数，启用意图由手动启停单独维护。
+        let auto_start = loaded.mcp.auto_start;
         loaded.mcp = settings;
+        loaded.mcp.auto_start = auto_start;
         let saved = repository.save_settings(loaded, expected_revision).await?;
         if self.unknown_after_apply.swap(false, Ordering::SeqCst) {
             return Err(AppError::outcome_unknown("MCP fixture after save"));
@@ -129,6 +170,13 @@ impl McpRuntimeControl for RuntimeFixture {
         }
         state.snapshot = McpRuntimeSnapshot::stopped();
         Ok(state.snapshot.clone())
+    }
+
+    /// 手动停止先落盘 auto_start=false 再收尾原 owner；失败态没有 endpoint
+    /// 也必须允许关闭偏好，因此不再复用 endpoint 门禁。
+    async fn stop_manually_until(&self, deadline: Instant) -> AppResult<McpRuntimeSnapshot> {
+        self.persist_auto_start(false).await?;
+        self.stop_until(deadline).await
     }
 
     /// fixture 不拥有系统资源；仅复用 trait 的生命周期边界。
@@ -321,7 +369,7 @@ fn shared_start_in_progress_disables_toggle(app: &mut TestAppContext) {
     assert_eq!(control.counts(), (0, 0));
 }
 
-/// endpoint 同步失败必须显示可重试动作，且同步成功前不能复制可能失效的地址。
+/// 重试按需启动的同步只恢复地址可用性，避免悄悄开启下次自动启动。
 #[gpui_kit::test]
 fn retries_endpoint_sync_before_enabling_copy(app: &mut TestAppContext) {
     let mut snapshot = running();
@@ -329,7 +377,8 @@ fn retries_endpoint_sync_before_enabling_copy(app: &mut TestAppContext) {
     snapshot.client_json = None;
     snapshot.endpoint_sync_pending = true;
     let control = RuntimeFixture::new(snapshot, false);
-    let (runtime, _panel, _, visual) = fixture_with_mcp(app, Some(control.clone()));
+    let (runtime, _panel, repository, visual) = fixture_with_mcp(app, Some(control.clone()));
+    *control.repository.lock().unwrap() = Some(repository.clone());
     click(visual, "preferences-nav-mcp");
     click(visual, "mcp-connection-info-toggle");
     assert_eq!(
@@ -340,6 +389,7 @@ fn retries_endpoint_sync_before_enabling_copy(app: &mut TestAppContext) {
     click(visual, "mcp-settings-toggle");
     pump_runtime(&runtime, visual);
     assert_eq!(control.counts(), (1, 0));
+    assert!(!repository.snapshot().0.mcp.auto_start);
     assert!(!control.snapshot().endpoint_sync_pending);
     assert_copy_state(visual, true);
 }
@@ -480,4 +530,115 @@ fn verify_unknown_readback(app: &mut TestAppContext, saved: bool) {
     }
     assert_eq!(control.counts(), (1, 0));
     assert_eq!(repository.snapshot().0.mcp.port, 37661);
+}
+
+/// 真实按钮必须接到持久化手动入口：启动先写 auto_start=true，停止先写 false，
+/// 且设置草稿只通过权威回读采用新偏好。
+#[gpui_kit::test]
+fn manual_toggle_persists_auto_start_through_real_buttons(app: &mut TestAppContext) {
+    let control = RuntimeFixture::new(McpRuntimeSnapshot::stopped(), false);
+    let (runtime, panel, repository, visual) = fixture_with_mcp(app, Some(control.clone()));
+    *control.repository.lock().unwrap() = Some(repository.clone());
+    click(visual, "preferences-nav-mcp");
+    click(visual, "mcp-settings-toggle");
+    for _ in 0..3 {
+        pump_runtime(&runtime, visual);
+    }
+    assert_eq!(control.counts(), (1, 0));
+    assert_eq!(control.snapshot().state, McpRuntimeState::Running);
+    assert!(repository.snapshot().0.mcp.auto_start);
+    assert!(visual.update(|_, app| {
+        panel
+            .read(app)
+            .settings
+            .as_ref()
+            .is_some_and(|draft| draft.value().mcp.auto_start)
+    }));
+
+    click(visual, "mcp-settings-toggle");
+    for _ in 0..3 {
+        pump_runtime(&runtime, visual);
+    }
+    assert_eq!(control.counts(), (1, 1));
+    assert_eq!(control.snapshot().state, McpRuntimeState::Stopped);
+    assert!(!repository.snapshot().0.mcp.auto_start);
+    assert!(visual.update(|_, app| {
+        panel
+            .read(app)
+            .settings
+            .as_ref()
+            .is_some_and(|draft| !draft.value().mcp.auto_start)
+    }));
+}
+
+/// 监听草稿正在编辑时，watcher 只带回 auto_start 变化也不能误报端口/范围冲突；
+/// 偏好仍需进入确认视图，供失败后的关闭入口使用。
+#[gpui_kit::test]
+fn auto_start_only_readback_keeps_listener_draft_without_conflict(app: &mut TestAppContext) {
+    let control = RuntimeFixture::new(McpRuntimeSnapshot::stopped(), false);
+    let (_runtime, panel, _repository, visual) = fixture_with_mcp(app, Some(control));
+    click(visual, "preferences-nav-mcp");
+    click(visual, "mcp-settings-port");
+    visual.simulate_keystrokes("secondary-a backspace");
+    visual.simulate_input("37659");
+    super::draw(visual);
+    assert!(visual.update(|_, app| panel.read(app).mcp_settings.edited));
+
+    let changed = visual.update(|_, app| {
+        let mut settings = panel
+            .read(app)
+            .settings
+            .as_ref()
+            .expect("settings loaded")
+            .value()
+            .mcp
+            .clone();
+        settings.auto_start = true;
+        settings
+    });
+    visual.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.mcp_settings.sync(&changed, window, cx);
+            cx.notify();
+        });
+    });
+    assert!(visual.update(|_, app| panel.read(app).mcp_settings.edited));
+    assert!(!visual.update(|_, app| panel.read(app).mcp_settings.conflict));
+    assert!(visual.update(|_, app| panel.read(app).mcp_settings.confirmed_auto_start));
+}
+
+/// 启动失败后 auto_start 仍为 true 时保留重试入口，并允许在无 endpoint 的
+/// Failed 状态关闭自动启动，避免端口冲突把用户困在反复失败的按钮上。
+#[gpui_kit::test]
+fn failed_manual_start_can_turn_off_auto_start_without_endpoint(app: &mut TestAppContext) {
+    let control = RuntimeFixture::new(McpRuntimeSnapshot::stopped(), false);
+    let (runtime, _panel, repository, visual) = fixture_with_mcp(app, Some(control.clone()));
+    *control.repository.lock().unwrap() = Some(repository.clone());
+    control.fail_next_manual_start.store(true, Ordering::SeqCst);
+    click(visual, "preferences-nav-mcp");
+    click(visual, "mcp-settings-toggle");
+    for _ in 0..3 {
+        pump_runtime(&runtime, visual);
+    }
+    assert_eq!(control.counts(), (1, 0));
+    assert_eq!(control.snapshot().state, McpRuntimeState::Failed);
+    assert!(control.snapshot().endpoint.is_none());
+    assert!(repository.snapshot().0.mcp.auto_start);
+    assert_eq!(
+        observed_element(visual, "mcp-settings-toggle").label(),
+        Some(crate::locale::text("启动", "Start").as_ref())
+    );
+    let disable = observed_element(visual, "mcp-auto-start-disable");
+    assert_eq!(
+        disable.label(),
+        Some(crate::locale::text("关闭自动启动", "Turn off auto start").as_ref())
+    );
+
+    click(visual, "mcp-auto-start-disable");
+    for _ in 0..3 {
+        pump_runtime(&runtime, visual);
+    }
+    assert_eq!(control.counts(), (1, 1));
+    assert_eq!(control.snapshot().state, McpRuntimeState::Stopped);
+    assert!(!repository.snapshot().0.mcp.auto_start);
 }

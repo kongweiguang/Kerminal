@@ -41,6 +41,9 @@ impl McpRuntimeController {
                 "设置已变更，请重新读取后再应用 MCP 配置",
             ));
         }
+        // 启用意图只由手动启停用例维护；监听草稿来自 UI 的 struct 字面量，
+        // 不能让它缺省构造出的 false 覆盖用户已确认的自动启动选择。
+        requested.auto_start = loaded.settings.mcp.auto_start;
         if requested.port == 0 {
             return Err(AppError::invalid("MCP 端口需要在 1 到 65535 之间"));
         }
@@ -54,10 +57,15 @@ impl McpRuntimeController {
             ));
         }
         let previous = if state == McpRuntimeState::Running {
-            self.settings
+            let mut current = self
+                .settings
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+                .clone();
+            // Running 快照里的启用意图可能落后于磁盘（例如运行中改过文件），它不描述
+            // 当前 listener；统一成权威值，避免只改意图就触发一次无意义的监听重启。
+            current.auto_start = requested.auto_start;
+            current
         } else {
             loaded.settings.mcp.clone()
         };
@@ -148,6 +156,50 @@ impl McpRuntimeController {
         self.start_core(CancellationToken::new(), None)
             .await
             .map(|_| ())
+    }
+
+    /// 手动启停的意图必须在触碰 listener 前确认；结果未知只按权威回读核对，
+    /// 不重放写入，避免把另一次并发保存误当成自己的已提交结果。
+    ///
+    /// 有 deadline 时只在真正写盘前检查一次是否还有预算；已经开始原子替换就完整
+    /// 等待结果，不能用 `timeout` 丢弃 future 而留下无法判断的磁盘提交。
+    pub(super) async fn persist_auto_start(
+        &self,
+        auto_start: bool,
+        deadline: Option<Instant>,
+        cancellation: Option<&CancellationToken>,
+    ) -> AppResult<VersionedSettings> {
+        let preferences = self
+            .preferences
+            .as_ref()
+            .ok_or_else(|| AppError::unsupported("MCP 设置服务不可用"))?;
+        let loaded = preferences.load_settings().await?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(AppError::cancelled("MCP start was cancelled"));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(AppError::timeout("MCP configuration operation"));
+        }
+        if loaded.settings.mcp.auto_start == auto_start {
+            return Ok(loaded);
+        }
+        let expected_revision = loaded.revision;
+        let mut next = loaded.settings;
+        next.mcp.auto_start = auto_start;
+        match preferences
+            .save_settings(next.clone(), expected_revision)
+            .await
+        {
+            Ok(saved) => Ok(saved),
+            Err(error) if error.public_code() == PublicErrorCode::OutcomeUnknown => {
+                // 只确认提交的同一份设置，避免采用另一笔编辑改变的端口或监听范围。
+                match preferences.load_settings().await {
+                    Ok(readback) if readback.settings == next => Ok(readback),
+                    Ok(_) | Err(_) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// 结果必须来自当前运行中的 listener，避免复制已经过期的本机网卡地址。

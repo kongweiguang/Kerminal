@@ -22,6 +22,9 @@ pub struct McpSettings {
     pub bind_mode: McpBindMode,
     pub port: u16,
     pub token_ref: Option<String>,
+    /// 用户手动启动/停止时固化的下次启动意图；Agent 按需启动不修改它。
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 impl Default for McpSettings {
@@ -31,6 +34,7 @@ impl Default for McpSettings {
             bind_mode: McpBindMode::Loopback,
             port: 37657,
             token_ref: None,
+            auto_start: false,
         }
     }
 }

@@ -4525,6 +4525,16 @@ impl RootView {
         cx.notify();
     }
 
+    /// MCP 自动恢复完成后刷新已挂载的设置，避免使用者须关闭重开才能看到结果。
+    ///
+    /// @author kongweiguang
+    pub fn refresh_mcp_runtime(&mut self, cx: &mut Context<Self>) {
+        if !self.host_shutdown_requested {
+            self.preferences_panel
+                .update(cx, |panel, cx| panel.refresh_mcp_runtime(cx));
+        }
+    }
+
     /// 把首次启动和单实例转发的 activation 送进同一应用用例，并合并尚未完成的完全相同请求。
     ///
     /// @author kongweiguang

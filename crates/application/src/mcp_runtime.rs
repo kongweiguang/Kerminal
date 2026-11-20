@@ -152,10 +152,38 @@ pub trait McpRuntimeControl: Send + Sync {
     fn snapshot(&self) -> McpRuntimeSnapshot;
 
     /// 确保唯一 listener 启动；取消令牌用于在安全边界请求启动后立即收束。
+    ///
+    /// 这是按需启动入口（例如 Agent 请求），不写入 `autoStart`；用户手动启停使用
+    /// `start_manually`，避免一次按需使用被固化成下次启动行为。
     async fn start(&self, cancellation: CancellationToken) -> AppResult<McpRuntimeSnapshot>;
 
     /// 在调用方统一 deadline 内停止 listener；失败或超时必须保留 handle 供再次尝试。
     async fn stop_until(&self, deadline: Instant) -> AppResult<McpRuntimeSnapshot>;
+
+    /// 桌面启动时按持久化意图恢复一次；实现必须在配置门内只读取一次已验证设置，
+    /// 再以该快照启动，避免读到 `true` 后普通启动又按外部新值重新解释。
+    ///
+    /// 不拥有持久配置的适配器保持当前快照；生产 adapter 覆盖此方法。
+    async fn restore_on_startup(
+        &self,
+        _cancellation: CancellationToken,
+    ) -> AppResult<McpRuntimeSnapshot> {
+        Ok(self.snapshot())
+    }
+
+    /// 用户手动启动：先以 CAS 确认并持久化 `autoStart = true`，再复用已有启动流程。
+    ///
+    /// 启动失败（包括端口占用）仍保留已确认的意图，下一次启动继续尝试；取消只能发生在
+    /// 触碰 listener 之前，已开始的设置提交不会被中途丢弃。
+    async fn start_manually(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<McpRuntimeSnapshot>;
+
+    /// 用户手动停止：先以 CAS 确认并持久化 `autoStart = false`，再在统一 deadline 内收尾。
+    ///
+    /// 未能确认停止意图时不得先关 listener；`Failed` 且没有 listener 时也允许清理失败状态。
+    async fn stop_manually_until(&self, deadline: Instant) -> AppResult<McpRuntimeSnapshot>;
 
     /// 在同一 owner 内应用监听设置并按指定 revision 保存，失败需保留可观察的恢复状态。
     async fn apply_settings(

@@ -390,6 +390,13 @@ impl PreferencesPanel {
         if !loading_documents {
             self.refresh_vault_availability(cx);
         }
+        self.refresh_mcp_runtime(cx);
+    }
+
+    /// 监听可能在首帧之后才恢复；刷新当前快照和网卡，无需重新打开已经显示的设置。
+    ///
+    /// @author kongweiguang
+    pub(crate) fn refresh_mcp_runtime(&mut self, cx: &mut Context<Self>) {
         self.connectivity.refresh_mcp(cx);
         self.refresh_mcp_addresses(cx);
     }

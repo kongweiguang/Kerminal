@@ -640,6 +640,7 @@ fn run_primary_instance(
         }
         return Err(error.into());
     }
+    let mcp_startup = composition.restore_mcp_runtime();
     let mcp_snapshot = composition.mcp_runtime_snapshot();
     let mcp_state_event = match mcp_snapshot.state {
         kerminal_application::mcp_runtime::McpRuntimeState::Unavailable => {
@@ -725,6 +726,7 @@ fn run_primary_instance(
     let ui_result = catch_unwind(AssertUnwindSafe(|| {
         run_native_ui(
             services,
+            mcp_startup,
             #[cfg(target_os = "macos")]
             activation_sender,
             activation_receiver,
@@ -792,6 +794,8 @@ fn first_run_window_bounds(cx: &App) -> Option<WindowBounds> {
 #[allow(clippy::too_many_arguments)]
 fn run_native_ui(
     services: AppServices,
+    mcp_startup: impl Future<Output = AppResult<kerminal_application::mcp_runtime::McpRuntimeSnapshot>>
+    + 'static,
     #[cfg(target_os = "macos")] activation_sender: ActivationQueueSender,
     activation_receiver: mpsc::Receiver<ActivationRequest>,
     host_sender: HostCoordinatorSender,
@@ -880,6 +884,19 @@ fn run_native_ui(
                 cx.quit();
                 return root;
             }
+            // 首帧之后再恢复监听，工作区同步变慢时窗口仍可操作。
+            let mcp_root = root.downgrade();
+            window.on_next_frame(move |_, app| {
+                app.spawn(async move |app| {
+                    if let Err(error) = mcp_startup.await {
+                        tracing::warn!(
+                            event = "MCP_RUNTIME_RESTORE_FAILED",
+                            code = error.public_code().as_str(),
+                        );
+                    }
+                    let _ = mcp_root.update(app, |root, cx| root.refresh_mcp_runtime(cx));
+                }).detach();
+            });
             // 只有真实窗口完成首轮绘制后才提交健康标记；磁盘提交交给共享后台执行器。
             let boot = startup_plugins.clone();
             let executor = services.executor.clone();

@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use kerminal_application::{
     AppError, AppResult, PublicErrorCode,
     mcp_runtime::{McpRuntimeControl, McpRuntimeSnapshot},
+    preferences::settings::McpSettings,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -48,6 +49,69 @@ impl McpRuntimeControl for McpRuntimeController {
         let _configuration = tokio::time::timeout_at(deadline, self.configuration_gate.lock())
             .await
             .map_err(|_| AppError::timeout("MCP configuration operation"))?;
+        self.stop_inner(deadline).await
+    }
+
+    /// 启动恢复在同一配置门内只读一次设置，并用该已验证快照直接启动。
+    ///
+    /// 不能先读 `autoStart` 再调用普通 `start`：两次读取之间外部可能关闭自动启动或
+    /// 改写端口，导致本次启动采用与确认值不同的配置。
+    async fn restore_on_startup(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<McpRuntimeSnapshot> {
+        let _configuration = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AppError::cancelled("MCP restore was cancelled")),
+            guard = self.configuration_gate.lock() => guard,
+        };
+        let Some(preferences) = self.preferences.as_ref() else {
+            return Ok(self.snapshot());
+        };
+        let loaded = preferences.load_settings().await?;
+        if !loaded.settings.mcp.auto_start {
+            return Ok(self.snapshot());
+        }
+        self.start_from_settings(loaded.settings.mcp, cancellation)
+            .await
+    }
+
+    /// 用户手动启动先固化启用意图，再复用同一 owner 的启动流程。
+    ///
+    /// 设置提交一旦真正开始就不再被取消丢弃；端口占用等启动失败只影响本次启动，
+    /// 已确认的 `autoStart` 留给下一次启动或用户显式关闭，避免“本次成功、重启丢失”。
+    async fn start_manually(
+        &self,
+        cancellation: CancellationToken,
+    ) -> AppResult<McpRuntimeSnapshot> {
+        let _configuration = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AppError::cancelled("MCP start was cancelled")),
+            guard = self.configuration_gate.lock() => guard,
+        };
+        self.ensure_available()?;
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("MCP start was cancelled"));
+        }
+        let confirmed = self
+            .persist_auto_start(true, None, Some(&cancellation))
+            .await?;
+        self.start_from_settings(confirmed.settings.mcp, cancellation)
+            .await
+    }
+
+    /// 用户手动停止先确认关闭意图，再收尾同一 owner；未能确认意图时不能先拆 listener。
+    ///
+    /// 收尾失败或超时保留原 handle 供再次尝试，而磁盘上的 `autoStart = false` 已保证
+    /// 下次启动不会重新拉起；`Failed` 且无 listener 时也在这里清空失败状态。
+    async fn stop_manually_until(&self, deadline: Instant) -> AppResult<McpRuntimeSnapshot> {
+        let _configuration = tokio::time::timeout_at(deadline, self.configuration_gate.lock())
+            .await
+            .map_err(|_| AppError::timeout("MCP configuration operation"))?;
+        // 截止时间已耗尽时不要开始一次无法在本轮收尾的磁盘提交；已经开始的提交
+        // 仍会完整等待，不能通过 timeout 丢弃 future 制造“盘上结果未知”。
+        if Instant::now() >= deadline {
+            return Err(AppError::timeout("MCP configuration operation"));
+        }
+        self.persist_auto_start(false, Some(deadline), None).await?;
         self.stop_inner(deadline).await
     }
 
@@ -103,6 +167,21 @@ impl McpRuntimeControl for McpRuntimeController {
 }
 
 impl McpRuntimeController {
+    /// 用配置门内已确认的设置启动，不再回读偏好；手动启动与启动恢复共用这一路径。
+    ///
+    /// 只有没有现存 listener 时才替换启动草稿；运行中的监听地址必须以实际 handle
+    /// 为准，不能因为一次确认动作把快照改到尚未绑定的端口。
+    async fn start_from_settings(
+        &self,
+        settings: McpSettings,
+        cancellation: CancellationToken,
+    ) -> AppResult<McpRuntimeSnapshot> {
+        if self.owner.lock().await.server.is_none() {
+            self.set_config(settings)?;
+        }
+        self.start_core(cancellation, None).await
+    }
+
     /// 启动唯一 listener 并同步 Agent workspace endpoint；失败保留 listener 及重试 owner。
     pub(super) async fn start_core(
         &self,

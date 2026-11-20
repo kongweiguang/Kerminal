@@ -14,7 +14,7 @@ use tokio::{
 
 use super::*;
 
-/// 释放本轮保留端口后验证真实 listener；停止超时必须由用户按钮重试原 owner。
+/// 同时验证持久化启停意图和真实 listener，防止只更新界面或只写配置却报告成功。
 ///
 /// @author kongweiguang
 pub(super) async fn verify(
@@ -48,6 +48,14 @@ pub(super) async fn verify(
         click_selector(cx, window, "mcp-settings-toggle")?;
     }
     let running = wait_for_runtime(cx, window, services, McpRuntimeState::Running).await?;
+    if !load_persisted_settings(services)
+        .await?
+        .settings
+        .mcp
+        .auto_start
+    {
+        return Err(io::Error::other("MCP Start did not save autoStart = true").into());
+    }
     let endpoint = running
         .endpoint
         .ok_or_else(|| io::Error::other("running MCP has no endpoint"))?;
@@ -59,6 +67,16 @@ pub(super) async fn verify(
     let pending = wait_for_runtime(cx, window, services, McpRuntimeState::Stopping).await?;
     if pending.client_json.is_some() || pending.failure_reason.is_none() {
         return Err(io::Error::other("timed-out stop lost its cleanup state").into());
+    }
+    if load_persisted_settings(services)
+        .await?
+        .settings
+        .mcp
+        .auto_start
+    {
+        return Err(
+            io::Error::other("MCP stop must save autoStart before cleanup completes").into(),
+        );
     }
     let label = button(cx, window, "mcp-settings-toggle")?
         .label()
@@ -78,6 +96,14 @@ pub(super) async fn verify(
     drop(barrier);
     click_selector(cx, window, "mcp-settings-toggle")?;
     wait_for_runtime(cx, window, services, McpRuntimeState::Stopped).await?;
+    if load_persisted_settings(services)
+        .await?
+        .settings
+        .mcp
+        .auto_start
+    {
+        return Err(io::Error::other("MCP Stop did not save autoStart = false").into());
+    }
     let mut checks = vec![SettingCheck {
         action: "mcp-timeout-retry-stops-original-owner",
         passed: true,
