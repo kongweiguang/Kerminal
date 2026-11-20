@@ -435,7 +435,8 @@ impl AgentWorkspaceRepository for MemoryAgentWorkspace {
         Ok(())
     }
 
-    /// 只返回指定身份和 revision；一次性读回取消模拟提交 ACK 之后存储读回被中断。
+    /// 按会话身份注入有限次数的读取失败，避免失败样本影响其他活动会话的清理断言。
+    /// 优先处理一次性取消，以模拟提交 ACK 之后存储读回被中断。
     ///
     /// @author kongweiguang
     async fn read_session(
@@ -453,13 +454,13 @@ impl AgentWorkspaceRepository for MemoryAgentWorkspace {
             ));
         }
         let key = agent_session_id.as_str();
-        if let Some(remaining) = state.fail_session_read_ids.get_mut(key) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(AppError::configuration_corrupt(
-                    "simulated live Agent workspace failure",
-                ));
-            }
+        if let Some(remaining) = state.fail_session_read_ids.get_mut(key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(AppError::configuration_corrupt(
+                "simulated live Agent workspace failure",
+            ));
         }
         state
             .sessions
