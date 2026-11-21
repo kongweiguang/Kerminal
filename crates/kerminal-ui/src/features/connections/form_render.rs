@@ -1855,7 +1855,7 @@ fn editor_section_icon(section: HostEditorSection) -> IconName {
     }
 }
 
-/// 将最常修改的主机属性平铺为对齐表单，分组与标签直接可见，认证就近归入属性页。
+/// 常规页统一字段对齐，SSH 认证内部按行预留校验位，避免外层重复预留。
 /// @author kongweiguang
 fn render_properties(
     panel: &ConnectionsPanel,
@@ -1905,11 +1905,13 @@ fn render_properties(
     let has_passphrase = editor.has_target_passphrase();
     match editor.protocol {
         RemoteProtocol::Ssh | RemoteProtocol::Sftp => {
-            fields = fields.child(with_validation_issue(
-                render_ssh_auth(editor, has_target, has_passphrase, disabled, theme, cx),
+            fields = fields.child(render_ssh_auth(
                 editor,
-                HostEditorField::Authentication,
+                has_target,
+                has_passphrase,
+                disabled,
                 theme,
+                cx,
             ));
         }
         RemoteProtocol::Rdp => {
@@ -2811,7 +2813,7 @@ fn render_endpoint(editor: &HostEditor, disabled: bool, theme: ThemeTokens) -> i
     fields
 }
 
-/// 只展示当前认证所需字段，已有凭据由状态行表示，避免字段名随清除操作改变焦点身份。
+/// 认证字段共用表单右缘，每行最多留一个校验位，错误详情仍跟随实际出错的输入。
 /// @author kongweiguang
 fn render_ssh_auth(
     editor: &HostEditor,
@@ -2867,24 +2869,38 @@ fn render_ssh_auth(
             }
             menu
         });
-    let mut section = div().w_full().flex().flex_col().gap_2().child(field(
+    let mode_field = field(
         crate::locale::text("认证", "Authentication"),
         mode_picker,
         theme,
         &field_scope,
-    ));
+    );
+    let mut section = div().w_full().flex().flex_col().gap_2();
     match mode {
-        HostAuthenticationMode::Agent => {}
-        HostAuthenticationMode::Password => {
-            section = section.child(input_field(
-                crate::locale::text("密码", "Password"),
-                password_input(Input::new(&editor.inputs.secret))
-                    .disabled(disabled)
-                    .w_full(),
+        HostAuthenticationMode::Agent => {
+            section = section.child(with_validation_issue(
+                mode_field,
+                editor,
+                HostEditorField::Authentication,
                 theme,
-                &field_scope,
             ));
-            section = section.child(credential_status(
+        }
+        HostAuthenticationMode::Password => {
+            let password_section = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(mode_field)
+                .child(input_field(
+                    crate::locale::text("密码", "Password"),
+                    password_input(Input::new(&editor.inputs.secret))
+                        .disabled(disabled)
+                        .w_full(),
+                    theme,
+                    &field_scope,
+                ));
+            let password_section = password_section.child(credential_status(
                 &field_scope,
                 "target-password-clear",
                 has_credential,
@@ -2901,6 +2917,12 @@ fn render_ssh_auth(
                     panel.reset_connection_probe();
                     cx.notify();
                 }),
+            ));
+            section = section.child(with_validation_issue(
+                password_section,
+                editor,
+                HostEditorField::Authentication,
+                theme,
             ));
         }
         HostAuthenticationMode::PrivateKey => {
@@ -2929,11 +2951,22 @@ fn render_ssh_auth(
                     panel.reset_connection_probe();
                     cx.notify();
                 }));
-            section = section.child(field(
-                crate::locale::text("私钥来源", "Key source"),
-                source,
+            section = section.child(with_validation_issue(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(mode_field)
+                    .child(field(
+                        crate::locale::text("私钥来源", "Key source"),
+                        source,
+                        theme,
+                        &field_scope,
+                    )),
+                editor,
+                HostEditorField::Authentication,
                 theme,
-                &field_scope,
             ));
             section = section.child(match editor.private_key_input_mode {
                 PrivateKeyInputMode::File => with_validation_issue(
@@ -2967,28 +3000,33 @@ fn render_ssh_auth(
                     theme,
                 ),
             });
-            section = section.child(credential_status(
-                &field_scope,
-                "target-private-key-clear",
-                editor.has_target_private_key(),
-                editor.clear_private_key,
-                disabled,
-                crate::locale::text("私钥", "Private key"),
-                cx.listener(|panel, _: &ClickEvent, window, cx| {
-                    if let Some(editor) = panel.editor.as_mut() {
-                        editor.clear_private_key = !editor.clear_private_key;
-                        if editor.clear_private_key {
-                            editor
-                                .inputs
-                                .private_key
-                                .update(cx, |state, cx| state.set_value("", window, cx));
+            let key_tail = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(credential_status(
+                    &field_scope,
+                    "target-private-key-clear",
+                    editor.has_target_private_key(),
+                    editor.clear_private_key,
+                    disabled,
+                    crate::locale::text("私钥", "Private key"),
+                    cx.listener(|panel, _: &ClickEvent, window, cx| {
+                        if let Some(editor) = panel.editor.as_mut() {
+                            editor.clear_private_key = !editor.clear_private_key;
+                            if editor.clear_private_key {
+                                editor
+                                    .inputs
+                                    .private_key
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
+                            }
                         }
-                    }
-                    panel.reset_connection_probe();
-                    cx.notify();
-                }),
-            ));
-            section = section.child(input_field(
+                        panel.reset_connection_probe();
+                        cx.notify();
+                    }),
+                ));
+            let key_tail = key_tail.child(input_field(
                 crate::locale::text("私钥口令", "Key passphrase"),
                 password_input(Input::new(&editor.inputs.passphrase))
                     .disabled(disabled)
@@ -2996,7 +3034,7 @@ fn render_ssh_auth(
                 theme,
                 &field_scope,
             ));
-            section = section.child(credential_status(
+            let key_tail = key_tail.child(credential_status(
                 &field_scope,
                 "target-passphrase-clear",
                 has_passphrase,
@@ -3014,6 +3052,7 @@ fn render_ssh_auth(
                     cx.notify();
                 }),
             ));
+            section = section.child(with_validation_issue(key_tail, editor, None, theme));
         }
     }
     section.into_any_element()
@@ -4081,26 +4120,26 @@ fn render_jump(
     card
 }
 
-/// 错误入口始终预留相同几何，描边叠绘不参与尺寸计算，也不扩大焦点滚动的边界。
+/// 可校验字段与同列的普通字段预留同一状态位，描边不改变布局或焦点滚动边界。
 /// @author kongweiguang
 fn with_validation_issue(
     content: impl IntoElement,
     editor: &HostEditor,
-    field: HostEditorField,
+    field: impl Into<Option<HostEditorField>>,
     theme: ThemeTokens,
 ) -> gpui_kit::AnyElement {
+    let field = field.into();
     let issue = editor
         .validation_issue
         .as_ref()
-        .filter(|issue| issue.field == field);
-    let mut row =
+        .filter(|issue| Some(issue.field) == field);
+    let row =
         div()
-            .id(("connections-validation-field", field as usize))
             .w_full()
             .flex()
             .items_start()
             .gap_1()
-            .when(field == HostEditorField::Username, |row| {
+            .when(field == Some(HostEditorField::Username), |row| {
                 row.debug_selector(|| "connections-editor-username-row".into())
             })
             .child(div().flex_1().min_w_0().relative().child(content).when(
@@ -4120,6 +4159,10 @@ fn with_validation_issue(
         .w(theme.metrics.control_height)
         .h(theme.metrics.control_height)
         .flex_shrink_0();
+    let Some(field) = field else {
+        return row.child(detail_slot).into_any_element();
+    };
+    let mut row = row.id(("connections-validation-field", field as usize));
     if let Some(issue) = issue {
         let detail = issue.message.clone();
         let id = field as usize;

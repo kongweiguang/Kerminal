@@ -60,6 +60,69 @@ fn endpoint_port_aligns_with_general_fields_in_wide_and_compact_editors(app: &mu
     }
 }
 
+/// 私钥文件按钮和粘贴输入应沿常规字段的右缘，错误详情位不能再挤窄一格。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn private_key_inputs_share_the_general_field_right_edge(app: &mut TestAppContext) {
+    use crate::features::connections::form::{
+        HostEditorField, HostEditorValidationIssue, PrivateKeyInputMode,
+    };
+    use gpui_kit::{ElementId, px, size};
+
+    let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    for width in [1360., 800.] {
+        visual.simulate_resize(size(px(width), px(900.)));
+        update_panel(&panel, visual, |panel, window, cx| {
+            panel.begin_create_host(window, cx);
+            panel.set_authentication_mode(HostAuthenticationMode::PrivateKey, window, cx);
+        });
+        visual.update(|window, _| {
+            let name = gpui_kit::base::test_support::find(
+                window,
+                &[],
+                &ElementId::from("connections-editor-name-input"),
+            )
+            .expect("常规页必须渲染名称输入框");
+            let picker = gpui_kit::base::test_support::find(
+                window,
+                &[],
+                &ElementId::from("host-path-picker-PrivateKey"),
+            )
+            .expect("文件来源应显示路径选择按钮");
+            assert_eq!(picker.bounds().right(), name.bounds().right(), "{width}");
+        });
+
+        update_panel(&panel, visual, |panel, window, cx| {
+            let editor = panel.editor.as_mut().unwrap();
+            editor.select_private_key_input_mode(PrivateKeyInputMode::Paste, window, cx);
+            editor.validation_issue = Some(HostEditorValidationIssue {
+                field: HostEditorField::PrivateKey,
+                section: HostEditorSection::Properties,
+                message: "请填写私钥内容。".to_owned(),
+            });
+            cx.notify();
+        });
+        visual.update(|window, app| {
+            let editor = panel.read(app).editor.as_ref().unwrap();
+            let key_right = editor.inputs.private_key.read(app).input_bounds().right();
+            assert_eq!(
+                key_right,
+                editor.inputs.name.read(app).input_bounds().right()
+            );
+            let details = gpui_kit::base::test_support::find(
+                window,
+                &[],
+                &ElementId::from(format!(
+                    "connections-validation-{}-details",
+                    HostEditorField::PrivateKey as usize
+                )),
+            )
+            .expect("私钥错误应保留详情入口");
+            assert!(details.bounds().left() >= key_right);
+        });
+    }
+}
+
 /// 窄窗的分类入口应能通过指针开启、键盘选择，并将焦点交给实际渲染的字段。
 /// @author kongweiguang
 #[gpui_kit::test]
