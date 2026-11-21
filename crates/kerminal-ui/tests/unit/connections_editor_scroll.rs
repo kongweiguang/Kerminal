@@ -53,13 +53,13 @@ fn assert_row_fully_visible(visual: &mut VisualTestContext, row_selector: &'stat
     );
 }
 
-/// 窄窗中 Tab 到屏外用户名后应自动露出字段，Shift+Tab 回到名称也应把视口带回。
+/// 极窄窗使用堆叠标签，Tab 到屏外用户名应露出字段，Shift+Tab 回到名称应带回视口。
 /// @author kongweiguang
 #[gpui_kit::test]
 fn tab_and_shift_tab_reveal_fields_in_a_narrow_editor(app: &mut TestAppContext) {
     let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
     activate_editor_window(visual);
-    visual.simulate_resize(size(px(640.), px(420.)));
+    visual.simulate_resize(size(px(560.), px(420.)));
     draw(visual);
     update_panel(&panel, visual, |panel, window, cx| {
         panel.begin_create_host(window, cx);
@@ -111,13 +111,13 @@ fn tab_and_shift_tab_reveal_fields_in_a_narrow_editor(app: &mut TestAppContext) 
     );
 }
 
-/// 视口已经完整显示用户名时重新取得焦点不应重置用户当前滚动位置。
+/// 极窄窗滚到用户名后重新聚焦可见字段，不应重置用户当前滚动位置。
 /// @author kongweiguang
 #[gpui_kit::test]
 fn focusing_an_already_visible_field_preserves_scroll_position(app: &mut TestAppContext) {
     let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
     activate_editor_window(visual);
-    visual.simulate_resize(size(px(640.), px(420.)));
+    visual.simulate_resize(size(px(560.), px(420.)));
     draw(visual);
     update_panel(&panel, visual, |panel, window, cx| {
         panel.begin_create_host(window, cx);
@@ -156,14 +156,14 @@ fn focusing_an_already_visible_field_preserves_scroll_position(app: &mut TestApp
     assert_row_fully_visible(visual, USERNAME_ROW_SELECTOR);
 }
 
-/// 从真实并发输入 Tab 到紧邻的保留时间按钮，确保非文本控件离开视口时整行也会被带入。
+/// 在堆叠标签的极窄窗中，从并发输入 Tab 到保留时间按钮应把屏外开关整行带入。
 /// 按钮用生产 ElementId 的 keyed FocusHandle 验证 Tab 目标，避免仅凭偏移变化误判焦点路径。
 /// @author kongweiguang
 #[gpui_kit::test]
 fn tab_to_preserve_mtime_toggle_reveals_the_whole_non_text_row(app: &mut TestAppContext) {
     let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
     activate_editor_window(visual);
-    visual.simulate_resize(size(px(640.), px(420.)));
+    visual.simulate_resize(size(px(560.), px(420.)));
     draw(visual);
     update_panel(&panel, visual, |panel, window, cx| {
         panel.begin_create_host(window, cx);

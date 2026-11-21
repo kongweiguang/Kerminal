@@ -15,7 +15,7 @@ fn endpoint_port_aligns_with_general_fields_in_wide_and_compact_editors(app: &mu
     use gpui_kit::{ElementId, px, size};
 
     let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
-    for width in [1360., 800.] {
+    for width in [1360., 800., 520.] {
         visual.simulate_resize(size(px(width), px(800.)));
         for protocol in [
             RemoteProtocol::Ssh,
@@ -58,6 +58,99 @@ fn endpoint_port_aligns_with_general_fields_in_wide_and_compact_editors(app: &mu
             assert_eq!(bounds(visual, "connections-editor-port-input"), port);
         }
     }
+}
+
+/// 窄窗的分类入口应能通过指针开启、键盘选择，并将焦点交给实际渲染的字段。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn compact_section_pickers_support_pointer_and_keyboard(app: &mut TestAppContext) {
+    let (runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    visual.simulate_resize(gpui_kit::size(gpui_kit::px(800.), gpui_kit::px(600.)));
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.create_host_with_protocol(RemoteProtocol::Rdp, window, cx);
+    });
+    let remote_picker = visual
+        .debug_bounds("connections-editor-section-picker")
+        .unwrap();
+    visual.simulate_click(remote_picker.center(), Default::default());
+    draw(visual);
+    visual.simulate_keystrokes("down down enter");
+    draw(visual);
+    visual.update(|_, app| {
+        assert_eq!(
+            panel.read(app).editor.as_ref().unwrap().section,
+            HostEditorSection::Display
+        );
+    });
+
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.activate_local_host_editor(window, cx);
+    });
+    pump_runtime(&runtime, visual);
+    let local_picker = visual
+        .debug_bounds("connections-local-editor-section-picker")
+        .unwrap();
+    assert_eq!(local_picker, remote_picker);
+    visual.simulate_click(local_picker.center(), Default::default());
+    draw(visual);
+    visual.simulate_keystrokes("down down enter");
+    draw(visual);
+    visual.update(|window, app| {
+        let local = panel.read(app).local_hosts.editor.as_ref().unwrap();
+        assert_eq!(local.section, LocalHostEditorSection::Terminal);
+        assert!(local.args.read(app).focus_handle(app).is_focused(window));
+    });
+
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.create_host_with_protocol(RemoteProtocol::Telnet, window, cx);
+    });
+    assert!(
+        visual
+            .debug_bounds("connections-editor-section-heading")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("connections-editor-section-picker")
+            .is_none()
+    );
+}
+
+/// 占位文案来自同一组中性提示，协议切换或语言刷新不能把空凭据误报为已保存。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn new_credential_placeholders_remain_accurate_when_switching_protocols(app: &mut TestAppContext) {
+    let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host(window, cx);
+        for protocol in [
+            RemoteProtocol::Ssh,
+            RemoteProtocol::Sftp,
+            RemoteProtocol::Ssh,
+        ] {
+            panel.set_protocol(protocol, window, cx);
+            panel.add_jump(window, cx);
+            let editor = panel.editor.as_ref().unwrap();
+            editor.refresh_locale(window, cx);
+            assert!(!editor.has_target_credential());
+            for (state, placeholder) in [
+                (
+                    &editor.inputs.secret,
+                    crate::locale::text("输入密码", "Enter password"),
+                ),
+                (
+                    &editor.inputs.proxy_password,
+                    crate::locale::text("输入代理密码", "Enter proxy password"),
+                ),
+                (
+                    &editor.jumps[0].secret,
+                    crate::locale::text("输入跳板密码", "Enter jump host password"),
+                ),
+            ] {
+                assert_eq!(state.read(cx).presentation().placeholder(), &placeholder);
+            }
+        }
+    });
 }
 
 /// 本地两页应和远端共用标题位置，切换分类时首行起点和固定底栏保持稳定。

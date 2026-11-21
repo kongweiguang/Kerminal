@@ -787,7 +787,7 @@ async fn capture_acceptance(
     Ok(())
 }
 
-/// 两种私钥来源由生产入口准备并分别截图；报告明确区分状态装配与真实 Radio 鼠标交互。
+/// 隐藏窗口先绘制拿到真实边界，再按需滚动并重绘；只有实际可见时才记录截图。
 /// @author kongweiguang
 async fn capture_private_key_sources(
     cx: &mut AsyncApp,
@@ -812,6 +812,26 @@ async fn capture_private_key_sources(
             return Err(format!("private-key source {source} did not become active"));
         }
         settle_frame(cx).await;
+        let visible = window
+            .update(cx, |_, window, app| {
+                draw_acceptance_frame(window, app);
+                if state
+                    .read(app)
+                    .reveal_private_key_source(paste, window, app)
+                {
+                    return true;
+                }
+                draw_acceptance_frame(window, app);
+                state
+                    .read(app)
+                    .reveal_private_key_source(paste, window, app)
+            })
+            .map_err(|error| error.to_string())?;
+        if !visible {
+            return Err(format!(
+                "private-key source {source} is outside the editor viewport"
+            ));
+        }
         let capture = save_frame(
             cx,
             window,
@@ -821,7 +841,7 @@ async fn capture_private_key_sources(
             "system",
             "ssh",
             section,
-            "production-method input preparation; private-key source selection",
+            "production-method input preparation; source selection and viewport positioning",
         )?;
         sources.push(PrivateKeySourceRecord {
             source,

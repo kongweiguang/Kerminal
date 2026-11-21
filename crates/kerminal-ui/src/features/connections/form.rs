@@ -542,7 +542,7 @@ impl HostEditor {
         Self::new_with_protocol(host, groups, RemoteProtocol::Ssh, window, cx)
     }
 
-    /// 新建入口可指定默认协议，已保存主机仍以持久协议为准，避免模态调用方复制表单状态机。
+    /// 新建入口使用所选协议，编辑沿用持久协议；密码占位不声称存在已保存凭据。
     ///
     /// @author kongweiguang
     pub(super) fn new_with_protocol(
@@ -831,10 +831,7 @@ impl HostEditor {
             secret: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "输入密码；留空保留已保存密码",
-                    "Password; leave empty to keep the saved password",
-                ),
+                crate::locale::text("输入密码", "Enter password"),
                 "",
                 true,
             ),
@@ -850,10 +847,7 @@ impl HostEditor {
             passphrase: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "私钥口令（可选）；留空保留已保存口令",
-                    "Key passphrase (optional); leave empty to keep the saved passphrase",
-                ),
+                crate::locale::text("私钥口令（可选）", "Key passphrase (optional)"),
                 "",
                 true,
             ),
@@ -891,10 +885,7 @@ impl HostEditor {
             proxy_password: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "代理密码；留空保留已保存密码",
-                    "Proxy password; leave empty to keep the saved password",
-                ),
+                crate::locale::text("输入代理密码", "Enter proxy password"),
                 "",
                 true,
             ),
@@ -994,7 +985,7 @@ impl HostEditor {
         editor
     }
 
-    /// 语言切换只改现存字段的占位文本，不重建输入实体或触碰未保存的用户值。
+    /// 切换语言时就地更新中性的占位文本，保留输入实体与草稿内容。
     /// @author kongweiguang
     pub(super) fn refresh_locale(&self, window: &mut Window, cx: &mut Context<ConnectionsPanel>) {
         let placeholders = [
@@ -1017,10 +1008,7 @@ impl HostEditor {
             ),
             (
                 &self.inputs.secret,
-                crate::locale::text(
-                    "输入密码；留空保留已保存密码",
-                    "Password; leave empty to keep the saved password",
-                ),
+                crate::locale::text("输入密码", "Enter password"),
             ),
             (
                 &self.inputs.key_path,
@@ -1028,10 +1016,7 @@ impl HostEditor {
             ),
             (
                 &self.inputs.passphrase,
-                crate::locale::text(
-                    "私钥口令（可选）；留空保留已保存口令",
-                    "Key passphrase (optional); leave empty to keep the saved passphrase",
-                ),
+                crate::locale::text("私钥口令（可选）", "Key passphrase (optional)"),
             ),
             (
                 &self.inputs.serial_baud,
@@ -1051,10 +1036,7 @@ impl HostEditor {
             ),
             (
                 &self.inputs.proxy_password,
-                crate::locale::text(
-                    "代理密码；留空保留已保存密码",
-                    "Proxy password; leave empty to keep the saved password",
-                ),
+                crate::locale::text("输入代理密码", "Enter proxy password"),
             ),
         ];
         for (input, placeholder) in placeholders {
@@ -1990,7 +1972,7 @@ impl HostEditor {
         true
     }
 
-    /// 为首次进入的协议创建空字段，复用名称/标签句柄，其余字段按协议默认值独立持有。
+    /// 首次切换到其他协议时沿用名称和标签，其余字段从各协议的默认值和空凭据开始。
     /// @author kongweiguang
     fn new_protocol_inputs(
         &self,
@@ -2031,10 +2013,7 @@ impl HostEditor {
             secret: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "输入密码；留空保留已保存密码",
-                    "Password; leave empty to keep the saved password",
-                ),
+                crate::locale::text("输入密码", "Enter password"),
                 "",
                 true,
             ),
@@ -2050,10 +2029,7 @@ impl HostEditor {
             passphrase: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "私钥口令（可选）；留空保留已保存口令",
-                    "Key passphrase (optional); leave empty to keep the saved passphrase",
-                ),
+                crate::locale::text("私钥口令（可选）", "Key passphrase (optional)"),
                 "",
                 true,
             ),
@@ -2088,10 +2064,7 @@ impl HostEditor {
             proxy_password: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "代理密码；留空保留已保存密码",
-                    "Proxy password; leave empty to keep the saved password",
-                ),
+                crate::locale::text("输入代理密码", "Enter proxy password"),
                 "",
                 true,
             ),
@@ -2284,10 +2257,7 @@ impl JumpInputs {
             ),
             (
                 &self.secret,
-                crate::locale::text(
-                    "跳板密码；留空保留",
-                    "Jump host password; leave empty to keep",
-                ),
+                crate::locale::text("输入跳板密码", "Enter jump host password"),
             ),
             (
                 &self.key_path,
@@ -2295,10 +2265,7 @@ impl JumpInputs {
             ),
             (
                 &self.passphrase,
-                crate::locale::text(
-                    "跳板私钥口令；留空保留",
-                    "Jump host key passphrase; leave empty to keep",
-                ),
+                crate::locale::text("私钥口令（可选）", "Key passphrase (optional)"),
             ),
         ];
         for (input, placeholder) in placeholders {
@@ -2306,7 +2273,7 @@ impl JumpInputs {
         }
     }
 
-    /// 由已保存主机快照构造跳板输入，并只回显公开 key path 与认证模式。
+    /// 只回显公开路径与认证模式，密码框用中性占位，已有凭据状态由原引用决定。
     fn from_model(
         jump: &ManagedJumpHost,
         window: &mut Window,
@@ -2353,10 +2320,7 @@ impl JumpInputs {
             secret: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "跳板密码；留空保留",
-                    "Jump host password; leave empty to keep the saved reference",
-                ),
+                crate::locale::text("输入跳板密码", "Enter jump host password"),
                 "",
                 true,
             ),
@@ -2370,10 +2334,7 @@ impl JumpInputs {
             passphrase: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "跳板私钥口令；留空保留",
-                    "Jump host key passphrase; leave empty to keep the saved reference",
-                ),
+                crate::locale::text("私钥口令（可选）", "Key passphrase (optional)"),
                 "",
                 true,
             ),
@@ -2384,7 +2345,7 @@ impl JumpInputs {
         }
     }
 
-    /// 添加一条空白 Agent 跳板，让用户先明确填写网络目标再选择需要的认证方式。
+    /// 新跳板从 Agent 和空凭据开始，认证方式切换时不会显示已有密码的提示。
     pub(super) fn empty(window: &mut Window, cx: &mut Context<ConnectionsPanel>) -> Self {
         Self {
             name: create_input(
@@ -2418,10 +2379,7 @@ impl JumpInputs {
             secret: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "跳板密码；留空保留",
-                    "Jump host password; leave empty to keep the saved reference",
-                ),
+                crate::locale::text("输入跳板密码", "Enter jump host password"),
                 "",
                 true,
             ),
@@ -2435,10 +2393,7 @@ impl JumpInputs {
             passphrase: create_input(
                 window,
                 cx,
-                crate::locale::text(
-                    "跳板私钥口令；留空保留",
-                    "Jump host key passphrase; leave empty to keep the saved reference",
-                ),
+                crate::locale::text("私钥口令（可选）", "Key passphrase (optional)"),
                 "",
                 true,
             ),

@@ -12,6 +12,7 @@ use crate::theme::ThemeTokens;
 const EDITOR_WIDTH_REM: f32 = 54.0;
 const EDITOR_HEIGHT_REM: f32 = 38.0;
 const COMPACT_WINDOW_WIDTH_REM: f32 = 54.0;
+const STACKED_FIELD_WINDOW_WIDTH_REM: f32 = 36.0;
 
 /// 标签轴按 8 个全角字符预留，避免“默认目录（可选）”等中文标签在固定列内折行。
 pub(super) const FORM_FIELD_LABEL_WIDTH_REM: f32 = 8.0;
@@ -91,16 +92,18 @@ impl EditorField {
 }
 
 impl RenderOnce for EditorField {
-    /// 宽窗两列限制输入行长，窄窗标签上置后则让控件用足剩余宽度，避免留下空白列。
+    /// 分类菜单释放侧栏空间后仍保留横排标签，只有窄到容不下地址与端口时才堆叠字段。
     fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let compact = compact_editor(window);
+        let stacked =
+            window.viewport_size().width < window.rem_size() * STACKED_FIELD_WINDOW_WIDTH_REM;
         let label = div()
             .text_sm()
             .text_color(self.theme.muted)
-            .when(!compact, |label| {
+            .when(!stacked, |label| {
                 label.w(rems(FORM_FIELD_LABEL_WIDTH_REM)).flex_shrink_0()
             })
-            .when(!compact && self.multiline, |label| label.pt_2())
+            .when(!stacked && self.multiline, |label| label.pt_2())
             .child(self.label);
         let content = div()
             .flex_1()
@@ -113,12 +116,12 @@ impl RenderOnce for EditorField {
             .w_full()
             .min_w_0()
             .flex()
-            .when(compact, |row| row.flex_col().items_stretch().gap_1())
-            .when(!compact, |row| {
+            .when(stacked, |row| row.flex_col().items_stretch().gap_1())
+            .when(!stacked, |row| {
                 row.gap(rems(FORM_FIELD_GAP_REM)).min_h(rems(2.25))
             })
-            .when(!compact && self.multiline, |row| row.items_start())
-            .when(!compact && !self.multiline, |row| row.items_center())
+            .when(!stacked && self.multiline, |row| row.items_start())
+            .when(!stacked && !self.multiline, |row| row.items_center())
             .child(label)
             .child(content);
         match self.reveal {

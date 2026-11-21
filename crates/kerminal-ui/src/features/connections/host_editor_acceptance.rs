@@ -508,7 +508,7 @@ impl HostEditorAcceptanceState {
         });
     }
 
-    /// 复用生产认证与来源选择入口装配截图，不伪装为原生键盘输入或 Radio 点击。
+    /// 由生产入口切换来源，验收后续用实际输入边界定位截图。
     /// @author kongweiguang
     pub fn prepare_private_key_source(
         &mut self,
@@ -532,6 +532,38 @@ impl HostEditorAcceptanceState {
             cx.notify();
             selected
         })
+    }
+
+    /// 隐藏窗口不会派发原生焦点进入事件，显式滚动到已挂载的来源控件后再验证可见性。
+    /// @author kongweiguang
+    pub fn reveal_private_key_source(
+        &self,
+        paste: bool,
+        window: &mut Window,
+        cx: &gpui_kit::App,
+    ) -> bool {
+        let Some(editor) = self.panel.read(cx).editor.as_ref() else {
+            return false;
+        };
+        let bounds = if paste {
+            editor.inputs.private_key.read(cx).input_bounds()
+        } else {
+            editor.inputs.key_path.read(cx).input_bounds()
+        };
+        let viewport = editor.scroll_handle.bounds();
+        if bounds.size.width <= gpui_kit::px(0.) || bounds.size.height <= gpui_kit::px(0.) {
+            return false;
+        }
+        if bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom() {
+            return true;
+        }
+        let mut offset = editor.scroll_handle.offset();
+        offset.y = (offset.y + viewport.center().y - bounds.center().y)
+            .max(-editor.scroll_handle.max_offset().y)
+            .min(gpui_kit::px(0.));
+        editor.scroll_handle.set_offset(offset);
+        window.refresh();
+        false
     }
 
     /// 只填公开合成字段；代理开关、跳板新增和认证、RDP 模式均由验收的真实鼠标事件改变。

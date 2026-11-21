@@ -44,7 +44,7 @@ const FORM_FIELD_GAP_PX: f32 = 12.0;
 const ENDPOINT_PORT_INPUT_MIN_WIDTH_PX: f32 = 80.0;
 const NETWORK_FIELD_LABEL_WIDTH_PX: f32 = FORM_FIELD_LABEL_WIDTH_REM * 16.0;
 const NETWORK_FIELD_CONTROL_MAX_WIDTH_PX: f32 = 192.0;
-const EDITOR_ACTION_WIDTH_REM: f32 = 10.0;
+const EDITOR_ACTION_WIDTH_REM: f32 = 9.0;
 
 /// 主要底栏动作共享固定宽高，状态文案变化不会推动相邻按钮。
 /// @author kongweiguang
@@ -77,6 +77,24 @@ fn editor_navigation_content(icon: IconName, label: gpui_kit::SharedString) -> i
         .px_2()
         .child(Icon::new(icon).size(px(16.)))
         .child(div().min_w_0().text_ellipsis().child(label))
+}
+
+/// 窄窗分类菜单沿用侧栏的图标与文字轴，只有展开箭头占据右端。
+/// @author kongweiguang
+fn editor_section_picker(
+    id: &'static str,
+    icon: IconName,
+    label: gpui_kit::SharedString,
+    disabled: bool,
+) -> Button {
+    Button::new(id)
+        .debug_selector(move || id.to_owned())
+        .w_full()
+        .outline()
+        .dropdown_caret(true)
+        .accessibility_label(label.clone())
+        .child(editor_navigation_content(icon, label))
+        .disabled(disabled)
 }
 
 /// 端口列至少容纳内联端口标签、字段间距和可读的端口输入；地址列承担剩余伸缩。
@@ -1266,7 +1284,7 @@ fn render_local_host_editor_load(
         .into_any_element()
 }
 
-/// 本地常用字段和多行启动项分开，窄窗通过同一 Kit 菜单选择分类。
+/// 本地启动项保留独立分类，窄窗的标题入口与远端共用同一菜单样式。
 /// @author kongweiguang
 fn local_host_editor_navigation(
     selected: LocalHostEditorSection,
@@ -1288,27 +1306,27 @@ fn local_host_editor_navigation(
             .border_b_1()
             .border_color(theme.border)
             .child(
-                Button::new("connections-local-editor-section-picker")
-                    .w_full()
-                    .secondary()
-                    .dropdown_caret(true)
-                    .disabled(disabled)
-                    .label(local_section_label(selected))
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for section in sections {
-                            let panel_entity = panel_entity.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(local_section_label(section))
-                                    .checked(section == selected)
-                                    .on_click(move |_, window, app| {
-                                        panel_entity.update(app, |panel, cx| {
-                                            panel.select_local_host_section(section, window, cx)
-                                        });
-                                    }),
-                            );
-                        }
-                        menu
-                    }),
+                editor_section_picker(
+                    "connections-local-editor-section-picker",
+                    local_section_icon(selected),
+                    local_section_label(selected),
+                    disabled,
+                )
+                .dropdown_menu(move |mut menu, _, _| {
+                    for section in sections {
+                        let panel_entity = panel_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(local_section_label(section))
+                                .checked(section == selected)
+                                .on_click(move |_, window, app| {
+                                    panel_entity.update(app, |panel, cx| {
+                                        panel.select_local_host_section(section, window, cx)
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }),
             )
             .into_any_element();
     }
@@ -1332,11 +1350,7 @@ fn local_host_editor_navigation(
                 .compact()
                 .accessibility_label(label.clone())
                 .child(editor_navigation_content(
-                    if section == LocalHostEditorSection::Properties {
-                        IconName::Settings2
-                    } else {
-                        IconName::SquareTerminal
-                    },
+                    local_section_icon(section),
                     label,
                 ))
                 .disabled(disabled)
@@ -1360,6 +1374,15 @@ fn local_section_label(section: LocalHostEditorSection) -> gpui_kit::SharedStrin
     match section {
         LocalHostEditorSection::Properties => crate::locale::text("常规", "General"),
         LocalHostEditorSection::Terminal => crate::locale::text("终端", "Terminal"),
+    }
+}
+
+/// 同一分类在侧栏和紧凑菜单入口保持相同图标，便于缩放时辨认位置。
+/// @author kongweiguang
+fn local_section_icon(section: LocalHostEditorSection) -> IconName {
+    match section {
+        LocalHostEditorSection::Properties => IconName::Settings2,
+        LocalHostEditorSection::Terminal => IconName::SquareTerminal,
     }
 }
 
@@ -1624,7 +1647,7 @@ fn render_probe_action(
     )
 }
 
-/// 基础连接字段始终在首屏；协议专属选项只在展开后用紧凑导航切换。
+/// 没有其他分类时保留正文标题，避免窄窗出现只有一个选项的下拉菜单。
 /// @author kongweiguang
 fn render_editor_section(
     panel: &ConnectionsPanel,
@@ -1695,17 +1718,20 @@ fn render_editor_section(
         .flex()
         .flex_col()
         .gap_3()
-        .when(!compact, |section_content| {
-            section_content.child(editor_section_heading(
-                protocol_section_label(editor.protocol, section),
-                theme,
-            ))
-        })
+        .when(
+            !compact || editor.protocol == RemoteProtocol::Telnet,
+            |section_content| {
+                section_content.child(editor_section_heading(
+                    protocol_section_label(editor.protocol, section),
+                    theme,
+                ))
+            },
+        )
         .child(content)
         .into_any_element()
 }
 
-/// 将常用属性和高级协议项放在同一左侧目录，切换只改变当前表单视图。
+/// 常规和高级项共用分类目录，切到紧凑菜单时保留同一标签、图标与选中项。
 /// @author kongweiguang
 fn render_editor_navigation(
     editor: &HostEditor,
@@ -1722,6 +1748,9 @@ fn render_editor_navigation(
         .filter(|section| *section != HostEditorSection::Authentication)
         .collect::<Vec<_>>();
     if compact {
+        if protocol == RemoteProtocol::Telnet {
+            return div().into_any_element();
+        }
         let panel_entity = cx.entity().clone();
         return div()
             .debug_selector(|| "connections-editor-section-heading".to_owned())
@@ -1730,28 +1759,27 @@ fn render_editor_navigation(
             .border_b_1()
             .border_color(theme.border)
             .child(
-                Button::new("connections-editor-section-picker")
-                    .w_full()
-                    .label(protocol_section_label(editor.protocol, selected))
-                    .icon(editor_section_icon(selected))
-                    .dropdown_caret(true)
-                    .secondary()
-                    .disabled(disabled)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for section in sections.iter().copied() {
-                            let panel_entity = panel_entity.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(protocol_section_label(protocol, section))
-                                    .checked(section == selected)
-                                    .on_click(move |_, window, app| {
-                                        panel_entity.update(app, |panel, cx| {
-                                            panel.select_editor_section(section, window, cx);
-                                        });
-                                    }),
-                            );
-                        }
-                        menu
-                    }),
+                editor_section_picker(
+                    "connections-editor-section-picker",
+                    editor_section_icon(selected),
+                    protocol_section_label(editor.protocol, selected),
+                    disabled,
+                )
+                .dropdown_menu(move |mut menu, _, _| {
+                    for section in sections.iter().copied() {
+                        let panel_entity = panel_entity.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(protocol_section_label(protocol, section))
+                                .checked(section == selected)
+                                .on_click(move |_, window, app| {
+                                    panel_entity.update(app, |panel, cx| {
+                                        panel.select_editor_section(section, window, cx);
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }),
             )
             .into_any_element();
     }
@@ -2783,7 +2811,7 @@ fn render_endpoint(editor: &HostEditor, disabled: bool, theme: ThemeTokens) -> i
     fields
 }
 
-/// 认证方式与私钥来源使用明确选择，只展示生效的输入，避免文件和粘贴正文竞争或挤占首屏。
+/// 只展示当前认证所需字段，已有凭据由状态行表示，避免字段名随清除操作改变焦点身份。
 /// @author kongweiguang
 fn render_ssh_auth(
     editor: &HostEditor,
@@ -2849,7 +2877,7 @@ fn render_ssh_auth(
         HostAuthenticationMode::Agent => {}
         HostAuthenticationMode::Password => {
             section = section.child(input_field(
-                crate::locale::text("新密码", "New password"),
+                crate::locale::text("密码", "Password"),
                 password_input(Input::new(&editor.inputs.secret))
                     .disabled(disabled)
                     .w_full(),
@@ -2961,7 +2989,7 @@ fn render_ssh_auth(
                 }),
             ));
             section = section.child(input_field(
-                crate::locale::text("新私钥口令", "New key passphrase"),
+                crate::locale::text("私钥口令", "Key passphrase"),
                 password_input(Input::new(&editor.inputs.passphrase))
                     .disabled(disabled)
                     .w_full(),
@@ -2991,7 +3019,7 @@ fn render_ssh_auth(
     section.into_any_element()
 }
 
-/// RDP 只说明用户需要决定的客户端认证方式，密码保留规则由输入占位说明，避免技术细节和重复长提示。
+/// RDP 只说明可用的客户端认证方式，已有密码可用独立状态与动作管理。
 /// @author kongweiguang
 fn render_rdp_auth(
     editor: &HostEditor,
@@ -3654,7 +3682,7 @@ fn render_proxy_route(
                 &field_scope,
             ))
             .child(input_field(
-                crate::locale::text("新代理密码", "New proxy password"),
+                crate::locale::text("代理密码", "Proxy password"),
                 password_input(Input::new(&editor.inputs.proxy_password))
                     .disabled(disabled)
                     .w_full(),
@@ -3952,7 +3980,7 @@ fn render_jump(
         }
         HostAuthenticationMode::Password => {
             card = card.child(input_field(
-                crate::locale::text("新跳板密码", "New jump host password"),
+                crate::locale::text("跳板密码", "Jump host password"),
                 password_input(Input::new(&jump.secret))
                     .disabled(disabled)
                     .w_full(),
@@ -3998,7 +4026,7 @@ fn render_jump(
                     &field_scope,
                 ))
                 .child(input_field(
-                    crate::locale::text("新私钥口令", "New key passphrase"),
+                    crate::locale::text("私钥口令", "Key passphrase"),
                     password_input(Input::new(&jump.passphrase))
                         .disabled(disabled)
                         .w_full(),
