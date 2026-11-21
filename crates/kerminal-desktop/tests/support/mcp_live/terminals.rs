@@ -2,25 +2,24 @@
 //!
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, ffi::OsString, time::Duration};
+use std::{path::Path, time::Duration};
 
 use kerminal_application::{
-    SessionService,
     agents::{AgentService, CreateAgentSessionRequest},
     preferences::settings::{AgentLauncherSettings, CustomAgentDefinition},
-    sessions::{CreateSessionRequest, SessionFilter},
+    sessions::CreateSessionRequest,
 };
 use kerminal_domain::{
     agents::{AgentSessionScope, AgentTargetBinding, AgentTargetLiveStatus},
-    identity::{PaneId, SessionId, TabId},
-    sessions::{LocalSessionTarget, SessionOwner, SessionTarget, TerminalSize},
+    identity::{HostId, PaneId, TabId},
+    sessions::{SessionOwner, SessionTarget, SshSessionTarget, TerminalSize},
 };
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, ClientInfo},
     transport::StreamableHttpClientTransport,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -107,22 +106,23 @@ async fn wait_output(h: &Harness, id: &str, marker: &str) {
     .expect("real PTY must execute and return the marker");
 }
 
-/// 用明确 UI owner 的真实 PTY 建立 Agent 目标，禁止借用当前窗口或隐式重连。
+/// 用同一 SSH 夹具和明确 UI owner 覆盖用户终端路径，避免后台 PTY 误当作回显通过。
 ///
 /// @author kongweiguang
 async fn scoped_agent_target(h: &Harness, composition: &DesktopComposition, endpoint: &str) {
     let pane_id = PaneId::new();
+    let tab_id = TabId::new();
+    let host_id = HostId::parse("right-rail-fixture").unwrap();
     let session = composition
         .sessions
         .create(CreateSessionRequest {
-            target: SessionTarget::Local(LocalSessionTarget {
-                program: OsString::from("pwsh"),
-                args: vec![OsString::from("-NoLogo"), OsString::from("-NoProfile")],
-                working_directory: Some(h.root.clone()),
-                environment: BTreeMap::new(),
+            target: SessionTarget::Ssh(SshSessionTarget {
+                host_id: host_id.clone(),
+                working_directory: Some(text(&h.fixture, "remoteSftpDirectory").into()),
+                command: None,
             }),
             owner: SessionOwner::Ui {
-                tab_id: TabId::new(),
+                tab_id: tab_id.clone(),
                 pane_id: pane_id.clone(),
             },
             size: TerminalSize::default(),
@@ -130,24 +130,24 @@ async fn scoped_agent_target(h: &Harness, composition: &DesktopComposition, endp
         })
         .await
         .unwrap();
-    let id = session.session_id.as_str();
-    h.call(
-        "terminal.write",
-        json!({"sessionId": id, "data": "Write-Output ('MCP_AGENT_TARGET_' + 'EXECUTED')\r"}),
-    )
-    .await;
-    wait_output(h, id, "MCP_AGENT_TARGET_EXECUTED").await;
-    agent_context(h, composition, endpoint, id).await;
-    h.call("terminal.close", json!({"sessionId": id})).await;
+    let mut binding = AgentTargetBinding::unbound(0);
+    binding.terminal_session_id = Some(session.session_id);
+    binding.tab_id = Some(tab_id);
+    binding.pane_id = Some(pane_id);
+    binding.target_kind = Some("ssh".into());
+    binding.target_ref = Some(host_id.to_string());
+    binding.live_status = AgentTargetLiveStatus::Ready;
+    agent_context(h, composition, endpoint, binding).await;
 }
 
-/// Custom Agent 仅运行本地无收费 CLI 的等待进程，仍经过正式持久化和 session-scoped HTTP 校验。
+/// 从实际生成的端点连入，并在同一客户端验证开关实时生效、命令回读和目标失效。
 async fn agent_context(
     h: &Harness,
     composition: &DesktopComposition,
     endpoint: &str,
-    local_id: &str,
+    binding: AgentTargetBinding,
 ) {
+    let terminal_id = binding.terminal_session_id.as_ref().unwrap().to_string();
     let settings = composition.preferences.load_settings().await.unwrap();
     let mut updated = settings.settings;
     let definition = CustomAgentDefinition::new(
@@ -159,28 +159,12 @@ async fn agent_context(
         selected_agent_key: key,
         custom_agents: vec![definition],
     };
+    updated.terminal.agent_commands_in_terminal = true;
     composition
         .preferences
         .save_settings(updated, settings.revision)
         .await
         .unwrap();
-    let mut binding = AgentTargetBinding::unbound(0);
-    binding.terminal_session_id = Some(SessionId::parse(local_id).unwrap());
-    let target = composition
-        .sessions
-        .list(SessionFilter::default())
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|session| session.session_id.as_str() == local_id)
-        .unwrap();
-    let SessionOwner::Ui { tab_id, pane_id } = target.owner else {
-        panic!("Agent fixture requires an explicit UI owner");
-    };
-    binding.tab_id = Some(tab_id);
-    binding.pane_id = Some(pane_id);
-    binding.target_kind = Some("local".into());
-    binding.live_status = AgentTargetLiveStatus::Ready;
     let agent = composition
         .agent_manager
         .create(
@@ -196,41 +180,111 @@ async fn agent_context(
         .await
         .unwrap();
     let id = agent.session.agent_session_id.as_str();
+    let context_file = Path::new(&agent.session.session_root).join("context/mcp-endpoint.json");
+    let generated: Value = serde_json::from_slice(&std::fs::read(context_file).unwrap()).unwrap();
+    let scoped_endpoint = text(&generated, "endpoint");
+    assert_eq!(generated["agentSessionId"], id);
+    assert_eq!(scoped_endpoint, format!("{endpoint}/agents/{id}"));
     let client = ClientInfo::default()
-        .serve(StreamableHttpClientTransport::from_uri(format!(
-            "{endpoint}/agents/{id}"
-        )))
+        .serve(StreamableHttpClientTransport::from_uri(scoped_endpoint))
         .await
         .unwrap();
     assert_eq!(client.peer().list_all_tools().await.unwrap().len(), 21);
-    let result = client
-        .peer()
-        .call_tool(
-            CallToolRequestParams::new("kerminal.agent.target_context")
-                .with_arguments(json!({"agentSessionId": id}).as_object().unwrap().clone()),
+    let call = async |tool: &'static str, args: Value, expect_error: bool| {
+        let result = timeout(
+            Duration::from_secs(30),
+            client.peer().call_tool(
+                CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone()),
+            ),
         )
         .await
+        .unwrap()
         .unwrap();
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "scoped target context: {:?}",
-        result.structured_content
-    );
-    let value = result.structured_content.unwrap();
+        let value = result.structured_content.unwrap();
+        assert_eq!(
+            result.is_error.unwrap_or(false),
+            expect_error,
+            "{tool}: {value}"
+        );
+        value
+    };
+    let value = call(
+        "kerminal.agent.target_context",
+        json!({"agentSessionId": id}),
+        false,
+    )
+    .await;
     assert_eq!(
         value["data"]["agentSession"]["session"]["agent_session_id"],
         id
     );
-    assert_eq!(value["data"]["terminal"]["session"]["id"], local_id);
-    assert!(
-        text(&value["data"]["terminal"]["snapshot"], "data").contains("MCP_AGENT_TARGET_EXECUTED")
+    assert_eq!(value["data"]["terminal"]["session"]["id"], terminal_id);
+    let generation = value["data"]["targetBinding"]["generation"]
+        .as_u64()
+        .unwrap();
+    let ssh_args = json!({"name": "Right rail fixture", "command": "printf MCP_AGENT_BACKGROUND"});
+    let blocked = call("ssh.command", ssh_args.clone(), true).await;
+    assert_eq!(blocked["data"]["route"], "visible");
+    assert_eq!(blocked["data"]["hostId"], "right-rail-fixture");
+    let visible_write =
+        json!({"bindingGeneration": generation, "data": "printf 'MCP_AGENT_%s\\n' 'VISIBLE'\r"});
+    let written = call("terminal.write", visible_write.clone(), false).await;
+    assert_eq!(
+        written["data"]["bytesWritten"],
+        text(&visible_write, "data").len()
+    );
+    wait_output(h, &terminal_id, "MCP_AGENT_VISIBLE").await;
+    let readback = call(
+        "terminal.snapshot",
+        json!({"sessionId": terminal_id}),
+        false,
+    )
+    .await;
+    assert!(text(&readback["data"]["snapshot"], "data").contains("MCP_AGENT_VISIBLE"));
+
+    let settings = composition.preferences.load_settings().await.unwrap();
+    let mut updated = settings.settings;
+    updated.terminal.agent_commands_in_terminal = false;
+    composition
+        .preferences
+        .save_settings(updated, settings.revision)
+        .await
+        .unwrap();
+    call("terminal.write", visible_write.clone(), true).await;
+    let background = call("ssh.command", ssh_args.clone(), false).await;
+    assert_eq!(background["data"]["output"]["exitCode"], 0);
+    assert_eq!(
+        background["data"]["output"]["stdout"],
+        "MCP_AGENT_BACKGROUND"
+    );
+    let readback = call(
+        "terminal.snapshot",
+        json!({"sessionId": terminal_id}),
+        false,
+    )
+    .await;
+    assert!(!text(&readback["data"]["snapshot"], "data").contains("MCP_AGENT_BACKGROUND"));
+
+    let settings = composition.preferences.load_settings().await.unwrap();
+    let mut updated = settings.settings;
+    updated.terminal.agent_commands_in_terminal = true;
+    composition
+        .preferences
+        .save_settings(updated, settings.revision)
+        .await
+        .unwrap();
+    h.call("terminal.close", json!({"sessionId": terminal_id}))
+        .await;
+    call("terminal.write", visible_write, true).await;
+    assert_eq!(
+        call("ssh.command", ssh_args, true).await["data"]["route"],
+        "visible"
     );
     h.verified
         .lock()
         .await
         .insert("kerminal.agent.target_context".into());
-    println!("live MCP OK: kerminal.agent.target_context");
+    println!("live MCP OK: generated Agent endpoint and bound SSH routing");
     client.cancel().await.unwrap();
     composition
         .agent_manager

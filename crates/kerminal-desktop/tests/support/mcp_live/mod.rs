@@ -5,7 +5,9 @@
 mod core;
 mod terminals;
 
-use std::{collections::BTreeSet, io::Write, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet, io::Write, net::TcpListener, path::PathBuf, sync::Arc, time::Duration,
+};
 
 use rmcp::{
     RoleClient, ServiceExt,
@@ -32,6 +34,7 @@ pub(super) struct Harness {
 
 /// 必须显式 opt-in 并校验隔离 fixture，避免普通 cargo test 连接真实主机或启动业务 CLI。
 /// 只在全部固定目录工具均有真实效果且组合根关停成功后写入回执。
+/// 使用临时回环端口，让验收与正在使用默认端口的桌面实例并行运行。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires KERMINAL_MCP_ACCEPTANCE_MANIFEST and an isolated fixture"]
 async fn all_retained_tools_work_over_live_mcp() {
@@ -69,11 +72,19 @@ async fn all_retained_tools_work_over_live_mcp() {
     .unwrap();
     std::fs::copy(source.join("known_hosts"), root.join("known_hosts")).unwrap();
 
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    std::fs::write(
+        root.join("settings.toml"),
+        format!("schema_version = 1\n\n[mcp]\nbindMode = \"loopback\"\nport = {port}\n"),
+    )
+    .unwrap();
     let composition = Arc::new(
         DesktopComposition::build(Handle::current(), &root)
             .await
             .expect("production composition initializes"),
     );
+    drop(reservation);
     let endpoint = composition
         .mcp_runtime
         .start(CancellationToken::new())
