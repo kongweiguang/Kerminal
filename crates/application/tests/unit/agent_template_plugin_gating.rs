@@ -62,7 +62,7 @@ fn codex_session() -> AgentSession {
     .expect("测试会话应满足领域不变量")
 }
 
-/// None registry 与全启用视图输出必须逐字一致，保证离线装配与测试基线稳定。
+/// 全启用时应先解释绑定终端的路由，再推荐独立的后台 SSH，避免模型把后台当成通用入口。
 ///
 /// @author kongweiguang
 #[test]
@@ -89,25 +89,15 @@ fn absent_registry_matches_full_enablement() {
         assert!(unfiltered.contains(needle), "full template keeps {needle}");
     }
 
-    // 全启用文本必须维持 HEAD 模板的句子顺序：SSH 服务器命令、SFTP 传输、容器/tmux。
-    let historical_runtime_line = "- Run non-interactive server commands with `ssh.command`. For local/remote file transfers use `sftp.transfer.enqueue`, then query `sftp.transfer.list` until completion. Container and tmux commands use `ssh.command`; their former dedicated MCP tools are unavailable.";
-    assert!(
-        unfiltered.contains(historical_runtime_line),
-        "full template keeps the historical runtime sentence order"
-    );
+    let bound_pos = unfiltered
+        .find("use `terminal.write` for commands on the bound terminal")
+        .expect("bound terminal routing is present");
     let server_pos = unfiltered
-        .find("Run non-interactive server commands with `ssh.command`.")
-        .expect("server command segment is present");
-    let transfer_pos = unfiltered
-        .find("For local/remote file transfers use `sftp.transfer.enqueue`")
-        .expect("sftp segment is present");
-    let container_pos = unfiltered
-        .find("Container and tmux commands use `ssh.command`")
-        .expect("container segment is present");
-    assert!(
-        server_pos < transfer_pos && transfer_pos < container_pos,
-        "runtime segments keep the historical order"
-    );
+        .find("Use `ssh.command` for one-shot server commands in background mode or on an explicitly requested different host")
+        .expect("SSH advice respects bound terminal routing");
+    assert!(bound_pos < server_pos);
+    assert!(unfiltered.contains("`bindingGeneration`"));
+    assert!(!unfiltered.contains("Run non-interactive server commands with `ssh.command`."));
 }
 
 /// 关闭 SSH 与 SFTP 时移除对应工具句，终端核心提示与文档结构保持完整。

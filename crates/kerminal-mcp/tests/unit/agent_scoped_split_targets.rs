@@ -40,7 +40,7 @@ use kerminal_domain::{
         AgentProvider, AgentSession, AgentSessionLaunch, AgentSessionScope, AgentSessionStatus,
         AgentTargetBinding, AgentTargetLiveStatus,
     },
-    identity::{AgentSessionId, PaneId, SessionId, TabId},
+    identity::{AgentSessionId, HostId, PaneId, SessionId, TabId},
     preferences::{
         ConfigDocument, ConfigDocumentPath, ConfigRevision, ConfigurationMode,
         ConfigurationRecoveryState,
@@ -908,6 +908,67 @@ async fn routing_fixture() -> RoutingFixture {
     }
 }
 
+/// 同一台服务器的后台执行门禁按 Agent 作用域和设置判定，断线时仍保留原绑定身份。
+///
+/// @author kongweiguang
+#[tokio::test]
+async fn visible_agent_rejects_background_ssh_to_bound_host() {
+    let mut fixture = routing_fixture().await;
+    let bound_host = HostId::parse("bound-host").unwrap();
+    let other_host = HostId::parse("other-host").unwrap();
+    for (status, reference) in [
+        (AgentTargetLiveStatus::Ready, "bound-host"),
+        (AgentTargetLiveStatus::Stale, "ssh:bound-host"),
+    ] {
+        let binding = Arc::get_mut(&mut fixture.agent)
+            .unwrap()
+            .view
+            .session
+            .target
+            .as_mut()
+            .unwrap();
+        binding.live_status = status;
+        binding.target_kind = Some("ssh".to_owned());
+        binding.target_ref = Some(reference.to_owned());
+        let visible = fixture.services(Some(routing_preferences(true)), true);
+        let rejected = crate::ssh_tools::enforce_agent_ssh_routing(
+            &visible,
+            &bound_host,
+            &[],
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("visible routing must reject one-shot SSH to the bound host");
+        let body = rejected.structured_content.unwrap();
+        assert_eq!(body["errorKind"], "conflict");
+        assert_eq!(body["data"]["route"], "visible");
+        assert_eq!(body["data"]["hostId"], bound_host.as_str());
+        assert_eq!(body["data"]["required"], "kerminal.agent.target_context");
+        crate::ssh_tools::enforce_agent_ssh_routing(
+            &visible,
+            &other_host,
+            &[],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("explicit SSH to another host is independent of the binding");
+    }
+
+    for services in [
+        fixture.services(Some(routing_preferences(false)), true),
+        fixture.services(None, false),
+    ] {
+        crate::ssh_tools::enforce_agent_ssh_routing(
+            &services,
+            &bound_host,
+            &[],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("background mode and the global endpoint retain one-shot SSH");
+    }
+}
+
 /// 同 Tab 两个 UI pane 可经 scoped target_context 发现，显式读取次选 pane 不会重绑首选目标。
 ///
 /// 回归覆盖：terminals 中两个 pane 的 tabId/paneId 准确；显式 snapshot 只读取指定 pane；
@@ -1136,7 +1197,7 @@ async fn agent_scoped_context_discovers_split_panes_and_keeps_explicit_targets()
     );
 }
 
-/// 从真实 HTTP 路径注入助手身份，防止后台策略只在手动设置 scope 的单测中生效。
+/// 从真实 HTTP 路径核对助手身份，确保自发现和终端写入都读取相同的会话作用域。
 ///
 /// @author kongweiguang
 #[tokio::test]
@@ -1165,6 +1226,20 @@ async fn scoped_http_write_obeys_background_preference() {
         ))
         .await
         .expect("通过助手专用地址连接 MCP");
+    let guide = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("kerminal.help").with_arguments(args(json!({
+                "topic": "operation",
+                "intent": "ssh-command"
+            }))),
+        )
+        .await
+        .expect("取得 scoped MCP 操作指南");
+    assert_eq!(
+        success_data(&guide)["data"]["workflow"][0]["toolId"],
+        "kerminal.agent.target_context"
+    );
     let result = client
         .peer()
         .call_tool(

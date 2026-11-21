@@ -408,8 +408,8 @@ fn ensure_toml_table<'a>(parent: &'a mut Table, key: &str) -> AppResult<&'a mut 
 
 /// 所有 provider 使用唯一 live 上下文入口与保留的运行态工具；审批仍由 host 决定。
 ///
-/// 模板行按插件启用视图裁剪：SSH、SFTP 与 Agent 单元关闭时，对应句子整体移除，
-/// 终端核心提示保留；保留的句子维持历史模板顺序，全启用时与 HEAD 文本逐字一致。
+/// 先给出绑定终端的执行规则，再说明独立后台工具。按插件启用视图裁剪对应条目，
+/// 避免通用 SSH 建议覆盖当前会话的执行位置。
 ///
 /// @author kongweiguang
 fn agent_instructions_with(
@@ -435,50 +435,25 @@ fn agent_instructions_with(
         format!(
             "- The session endpoint is `{endpoint}`. Use its MCP tools directly; the MCP host owns approval and audit policy."
         ),
-        "- External MCP defaults to background execution. A visible Tab is never required. When a preferred target is stale or missing, report that state and do not substitute another terminal.".to_owned(),
     ]);
-    // SSH 与传输原本共用一段说明；按历史模板顺序分别追加，禁用时整句省略，
-    // 避免裁剪后改变全启用文本的相对顺序。
-    let mut runtime_segments = Vec::new();
+    if agents_enabled {
+        bullets.push(
+            "- Read `nextHints` from the live target context before running commands. In visible mode, use `terminal.write` for commands on the bound terminal, ending `data` with a carriage return (`\\r`). Omit `sessionId` and pass `targetBinding.generation` as `bindingGeneration`. Check completion with `terminal.snapshot` on the same `targetTerminalSessionId`. If the binding is stale or missing, ask the user to confirm the target. Switching Tabs preserves the binding.".to_owned(),
+        );
+    }
     if ssh_enabled {
-        runtime_segments.push("Run non-interactive server commands with `ssh.command`.");
+        bullets.push(
+            "- Use `ssh.command` for one-shot server commands in background mode or on an explicitly requested different host. Apply the same routing to shell commands for containers and tmux.".to_owned(),
+        );
     }
     if sftp_enabled {
-        runtime_segments.push(
-            "For local/remote file transfers use `sftp.transfer.enqueue`, then query `sftp.transfer.list` until completion.",
+        bullets.push(
+            "- For local/remote file transfers use `sftp.transfer.enqueue`, then query `sftp.transfer.list` until completion.".to_owned(),
         );
     }
-    if ssh_enabled {
-        runtime_segments.push(
-            "Container and tmux commands use `ssh.command`; their former dedicated MCP tools are unavailable.",
-        );
-    }
-    if !runtime_segments.is_empty() {
-        bullets.push(format!("- {}", runtime_segments.join(" ")));
-    }
-    // Agent 命令路由由已提交终端设置决定；提示当前模式，避免 provider 继续把可见终端
-    // 当成唯一入口，也避免关闭后仍向用户正在看的终端写入。
-    if agents_enabled {
-        let mut routing_segments = vec![
-            "Read the live `nextHints` from `kerminal.agent.target_context` before sending terminal commands; they state whether this session runs commands in the visible terminal or in background.",
-            "When the hint allows the visible terminal, use `terminal.write` for input meant to be seen and `terminal.snapshot` to read the output.",
-            "When the hint requires background execution, do not write to the preferred visible terminal; call `terminal.create` for local or remote one-shot and interactive work, and keep using its explicit `sessionId`.",
-        ];
-        if ssh_enabled {
-            routing_segments.push("Use `ssh.command` for non-interactive server commands.");
-        }
-        routing_segments.push(
-            "Do not intercept or replace the user's own Agent CLI shell; these rules apply only to Kerminal terminal tools.",
-        );
-        bullets.push(format!("- {}", routing_segments.join(" ")));
-    }
-    let mut terminal_line = "- For a new interactive shell, call `terminal.create`, then use its explicit `sessionId` for read/write and close it after the task.".to_owned();
-    if agents_enabled {
-        terminal_line.push_str(
-            " For target-bound work, refresh `kerminal.agent.target_context` first; ordinary Tab changes do not rebind this session.",
-        );
-    }
-    bullets.push(terminal_line);
+    bullets.push(
+        "- For an independent background shell, call `terminal.create`, use its explicit `sessionId` for reads and writes, and close it after the task.".to_owned(),
+    );
     bullets.push(
         "- Keep custom text outside the managed block below; Kerminal updates only this marked block.".to_owned(),
     );
@@ -507,7 +482,7 @@ fn claude_instructions(endpoint: &str, plugins: Option<&PluginRegistry>) -> Stri
         );
         if ssh_enabled {
             section.push(
-                "- Use `ssh.command` for non-interactive server commands in background routing."
+            "- Use `ssh.command` for one-shot server commands in background mode or on an explicitly requested different host."
                     .to_owned(),
             );
         }

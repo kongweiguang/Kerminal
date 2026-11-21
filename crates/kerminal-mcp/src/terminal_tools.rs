@@ -981,7 +981,7 @@ fn session_target_gate_for(
 
 /// Agent 终端命令的当前路由；与设置页共用同一已提交设置，不建立第二份运行态缓存。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AgentCommandRouting {
+pub(crate) enum AgentCommandRouting {
     /// 写入首选可见终端，保持 0.4 之前的交互。
     Visible,
     /// 只允许显式 headless 会话，避免后台 Agent 改写用户正在看的终端。
@@ -1009,7 +1009,7 @@ async fn stored_agent_command_routing(
     ))
 }
 
-/// 写入路径需要确定的策略；缺失设置仓储时 fail closed。
+/// 执行路径需要确定的策略；缺失设置仓储时不能猜测命令应该在哪执行。
 ///
 /// 生产组合根必须注入 preferences，只有离线 fixture 会缺省。显式 Running MCP
 /// headless 目标在调用本函数前已经放行，因此这里的拒绝不会阻断安全的后台会话；
@@ -1017,7 +1017,7 @@ async fn stored_agent_command_routing(
 /// 仅在失败路径分配完整 MCP 错误响应，保持既有响应结构和提示。
 ///
 /// @author kongweiguang
-async fn require_agent_command_routing(
+pub(crate) async fn require_agent_command_routing(
     services: &McpServices,
 ) -> Result<AgentCommandRouting, Box<CallToolResult>> {
     match stored_agent_command_routing(services).await {
@@ -1137,10 +1137,10 @@ pub(crate) async fn agent_routing_hints(
     match stored_agent_command_routing(services).await {
         Ok(None) => Vec::new(),
         Ok(Some(AgentCommandRouting::Visible)) if has_live_preferred_target => vec![
-            "当前设置为在绑定的主终端 Tab 中执行：对首选终端使用 terminal.write 写入，并用 terminal.snapshot 读取输出；普通切换 Tab 不会重新绑定本会话。".to_owned(),
+            "当前设置为在绑定的主终端 Tab 中执行。用 terminal.write 提交命令（data 末尾带回车，省略 sessionId，把 targetBinding.generation 传为 bindingGeneration），再用 terminal.snapshot 读取原 targetTerminalSessionId 的输出并确认完成。普通切换 Tab 保留原绑定。".to_owned(),
         ],
         Ok(Some(AgentCommandRouting::Visible)) => vec![
-            "可见终端模式已开启，但当前没有可用的首选终端。请让用户确认目标，或在已确认的后台目标执行；不要自动选择其他标签页。".to_owned(),
+            "可见终端模式已开启，当前没有可用的首选终端。请让用户确认目标后再执行绑定终端的命令。".to_owned(),
         ],
         Ok(Some(AgentCommandRouting::Background)) => {
             let ssh_hint = if ssh_available {

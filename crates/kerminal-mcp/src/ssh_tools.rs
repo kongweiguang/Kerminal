@@ -25,7 +25,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     McpServices,
-    terminal_tools::{failure, parse_args, success, units_gate},
+    terminal_tools::{
+        AgentCommandRouting, failure, failure_with_data, parse_args, require_agent_command_routing,
+        success, units_gate,
+    },
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -155,7 +158,7 @@ pub(crate) async fn dispatch(
 }
 
 /// 合并入口仍保留合取 selector 与 hostId 优先规则，旧 hostId 请求无需迁移参数。
-/// 输入与目标分开建模，避免归并命令参数时改变候选范围或复制主机认证引用。
+/// 先固定主机身份，再应用右栏执行位置设置，使各类 selector 共享同一条路由规则。
 ///
 /// @author kongweiguang
 pub(crate) async fn command(
@@ -234,6 +237,11 @@ pub(crate) async fn command(
     ) {
         return result;
     }
+    if let Err(result) =
+        enforce_agent_ssh_routing(services, &resolved.id, &hosts, cancel.clone()).await
+    {
+        return *result;
+    }
     execute(
         services,
         SshCommandTarget {
@@ -251,6 +259,57 @@ pub(crate) async fn command(
         cancel,
     )
     .await
+}
+
+/// 可见模式下，按持久绑定标识拦住发往同一主机的后台执行，断开连接期间也保留这条规则。
+/// SSH exec 与交互 Shell 的环境和回执不同，拒绝后由调用方选择显式的终端输入工具。
+/// 已迁移的绑定仍可能保存带协议前缀的稳定引用，存在同名主机时优先认领完整 ID。
+///
+/// @author kongweiguang
+pub(crate) async fn enforce_agent_ssh_routing(
+    services: &McpServices,
+    host_id: &HostId,
+    hosts: &[ManagedHost],
+    cancel: CancellationToken,
+) -> Result<(), Box<CallToolResult>> {
+    let Some(agent_id) = &services.agent_scope else {
+        return Ok(());
+    };
+    if require_agent_command_routing(services).await? == AgentCommandRouting::Background {
+        return Ok(());
+    }
+    let agent = services
+        .agent_service()
+        .map_err(|error| Box::new(failure(error)))?
+        .get(agent_id.clone(), cancel)
+        .await
+        .map_err(|error| Box::new(failure(error)))?;
+    let Some(target_ref) = agent
+        .session
+        .target
+        .filter(|binding| binding.target_kind.as_deref() == Some("ssh"))
+        .and_then(|binding| binding.target_ref)
+    else {
+        return Ok(());
+    };
+    let bound_host = target_ref == host_id.as_str()
+        || (target_ref.strip_prefix("ssh:") == Some(host_id.as_str())
+            && !hosts.iter().any(|host| host.id.as_str() == target_ref));
+    if !bound_host {
+        return Ok(());
+    }
+    Err(Box::new(failure_with_data(
+        AppError::conflict(
+            "当前设置要求在绑定的终端显示助手命令，本次后台 SSH 未执行。请先调用 kerminal.agent.target_context 核对绑定，再使用 terminal.write 和 terminal.snapshot。",
+        ),
+        json!({
+            "setting": "terminal.agentCommandsInTerminal",
+            "route": "visible",
+            "hostId": host_id.as_str(),
+            "agentSessionId": agent_id.as_str(),
+            "required": "kerminal.agent.target_context"
+        }),
+    )))
 }
 
 impl HostSelector {

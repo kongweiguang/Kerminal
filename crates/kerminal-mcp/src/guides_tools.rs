@@ -200,7 +200,9 @@ fn intent_has_primary_tool(intent: &str, available: &[&str]) -> bool {
     }
 }
 
-/// 概览只描述当前 endpoint 的固定可调用集合，避免把已移除入口呈现为可启用工具。
+/// 概览从当前 endpoint 的目录选择首呼，右栏助手先读取绑定，外部调用方保留独立执行入口。
+///
+/// @author kongweiguang
 fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     if !arguments.is_empty() {
         return failure(AppError::invalid("tool arguments"));
@@ -244,9 +246,13 @@ fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallTo
             })
         })
         .collect::<Vec<_>>();
-    // 推荐首呼同样受启用视图约束；禁用 SSH 后不能再把 ssh.command 当作通用入口。
     let mut recommended_first_calls = vec!["kerminal.help", "kerminal.runtime_snapshot"];
-    if unit_enabled(services, capabilities::SSH_UNIT) {
+    if catalog
+        .iter()
+        .any(|tool| tool["toolId"] == "kerminal.agent.target_context")
+    {
+        recommended_first_calls.insert(0, "kerminal.agent.target_context");
+    } else if unit_enabled(services, capabilities::SSH_UNIT) {
         recommended_first_calls.push("ssh.command");
     }
     recommended_first_calls.push("terminal.create");
@@ -273,7 +279,7 @@ fn capabilities(services: &McpServices, arguments: Map<String, Value>) -> CallTo
                     "scope": "global",
                     "preferredTarget": "targetBinding",
                     "externalMcpDefault": external_mcp_default,
-                    "visiblePtyFirst": "内置 Agent 通过 target_context 的 nextHints 确认执行方式。设置开启时，targetBinding 是首选可见终端。关闭时，请使用后台 SSH 命令或显式创建后台 PTY。",
+                    "visiblePtyFirst": "内置 Agent 先通过 target_context 的 nextHints 确认执行方式。设置开启时，绑定主机的命令通过 terminal.write 写入同一终端。设置关闭时，可使用后台 SSH 或显式创建后台 PTY。",
                     "otherTerminals": "读取 terminal.list 不会切换 UI Tab；指定目标失效时不回退。",
                     "headlessFallback": "创建后台 PTY 后，使用其明确 sessionId 执行 snapshot、write 和 close。",
                     "backgroundFallback": "后台失败不自动改为向可见终端写入。",
@@ -631,7 +637,9 @@ fn tool_help(services: &McpServices, arguments: Map<String, Value>) -> CallToolR
     )
 }
 
-/// 将任务意图归一成当前可用工具序列，已移除的运维入口改为显式 SSH 命令。
+/// 将任务意图归一成可用工具序列，右栏助手先查询终端路由，避免把 SSH 当作固定路径。
+///
+/// @author kongweiguang
 fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> CallToolResult {
     let args = match crate::terminal_tools::parse_args::<OperationGuideArgs>(arguments) {
         Ok(args) => args,
@@ -680,6 +688,13 @@ fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> Cal
             .copied()
             .collect();
     }
+    let resolve_agent_route = available.contains(&"ssh.command")
+        && catalog
+            .iter()
+            .any(|tool| tool["toolId"] == "kerminal.agent.target_context");
+    if resolve_agent_route {
+        available.insert(0, "kerminal.agent.target_context");
+    }
     let calls = intent_calls(intent);
     let missing = calls
         .iter()
@@ -695,7 +710,9 @@ fn operation_guide(services: &McpServices, arguments: Map<String, Value>) -> Cal
         .cloned()
         .collect::<Vec<_>>();
     // 安全边界中的替代路径同样不能推荐已关闭的 SSH；本地终端说明始终保留。
-    let server_operations = if unit_enabled(services, capabilities::SSH_UNIT) {
+    let server_operations = if resolve_agent_route {
+        "On an Agent endpoint, follow the live target context hints. In visible mode use terminal.write for the bound host. Use ssh.command in background mode or on an explicitly requested different host."
+    } else if unit_enabled(services, capabilities::SSH_UNIT) {
         "Use ssh.command for server-side container, tmux, system and file commands. Local shell tasks use terminal.create with an explicit sessionId."
     } else {
         "Local shell tasks use terminal.create with an explicit sessionId."
@@ -981,13 +998,16 @@ fn workflow_steps(intent: &str, tool_ids: &[&str], catalog: &[Value]) -> Vec<Val
     })).collect()
 }
 
-/// 根据工具和任务意图说明替代路径，不从自由文本拼接命令或目标参数。
+/// 只提供固定步骤说明，右栏路由由 live 提示决定，避免自由文本干预目标选择。
+///
+/// @author kongweiguang
 fn step_description(intent: &str, tool_id: &str) -> &'static str {
     match tool_id {
         "terminal.create" => "创建一个无需 UI Tab 的后台终端并记录返回 sessionId。",
         "terminal.write" => "只向显式 sessionId 写入已授权的终端输入。",
         "terminal.snapshot" => "读取已选 session 的有界文本快照。",
         "terminal.close" => "完成任务后关闭同一 sessionId 创建的后台终端。",
+        "kerminal.agent.target_context" => "核对绑定目标并按 nextHints 选择执行路径。",
         "ssh.command" if intent == "container" => {
             "通过保存的 SSH 目标执行容器运行时命令；文件写入结果未知时先回读。"
         }

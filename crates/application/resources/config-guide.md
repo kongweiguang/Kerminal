@@ -33,7 +33,7 @@
 
 `cursorStyle` 可为 `block`、`bar` 或 `underline`，`cursorBlink` 控制默认光标闪烁。`rightClickBehavior` 可为 `none`、`paste` 或 `menu`；`selectionCopy`、`showTabNumbers`、`confirmCloseTab` 和 `autoReconnect` 分别控制选中复制、标签序号、关闭确认和自动重连。`macOptionIsMeta` 只用于 macOS。旧 `showCommandBlockRail` 字段保留兼容，设置界面不再提供该选项。
 
-`[terminal].agentCommandsInTerminal` 是布尔值，默认 `true`。设置界面位于「终端 → 操作与连接」。开启时右栏助手可通过自己的 Kerminal MCP 会话向可见终端写入，Shell 的命令回显和输出会出现在对应标签页。关闭后，该会话的命令改用后台 SSH 或显式创建的后台终端。保存后，后续 MCP 调用读取新值；此设置只作用于右栏助手的 Kerminal 执行路径。
+`[terminal].agentCommandsInTerminal` 是布尔值，默认 `true`。设置界面位于「终端 → 操作与连接」。开启时，右栏助手对绑定终端使用 `terminal.write`，Shell 回显和输出显示在对应标签页。该会话通过 `ssh.command` 向绑定的 SSH 主机发送后台命令时，会收到引导它核对绑定的错误。关闭后可使用后台 SSH 或显式创建的后台终端。后续 MCP 调用读取已保存的新值。全局 MCP 和显式指向其他主机的 SSH 命令按原规则执行。
 
 `[terminal.inlineSuggestion]` 复用既有命令提示设置。`enabled` 默认 `true`；`presentation` 可为 `off`、`inline`、`inlineAndMenu`，默认 `inlineAndMenu`。关闭总开关会同步为 `off`，选择 `off` 也会关闭总开关。`acceptKey` 为 `rightArrow`（默认）或 `disabled`；`partialAccept` 默认 `true`，控制 Alt+右方向键的分段接受。`menuShortcut` 保留 `ctrlSpace`；Ctrl+Space 和 Alt+/ 均可主动打开候选菜单。`tabOpensMenu` 默认 `false`，只有显式启用时才将 Tab 用于候选菜单。菜单 Enter 和点击只补全，不执行命令。启用设置不代表当前 Shell 已提供可信编辑状态；不支持或集成失败的会话保留普通终端输入。
 
