@@ -7,6 +7,39 @@ use gpui_kit::Focusable as _;
 use super::super::super::local_hosts::LocalHostEditorSection;
 use super::*;
 
+/// 短表单没有可滚动范围，换到长分类后仍由同一个正文视口承接溢出。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn host_editor_scroll_range_follows_the_visible_form(app: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+
+    let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    visual.simulate_resize(size(px(800.), px(600.)));
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.create_host_with_protocol(RemoteProtocol::Rdp, window, cx);
+        panel.select_editor_section(HostEditorSection::Display, window, cx);
+    });
+    visual.update(|_, app| {
+        let editor = panel.read(app).editor.as_ref().unwrap();
+        assert_eq!(editor.scroll_handle.max_offset().y, px(0.), "RDP 显示");
+    });
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.activate_remote_protocol(RemoteProtocol::Ssh, window, cx);
+        panel.set_authentication_mode(HostAuthenticationMode::PrivateKey, window, cx);
+    });
+    visual.update(|_, app| {
+        let editor = panel.read(app).editor.as_ref().unwrap();
+        assert!(editor.scroll_handle.max_offset().y > px(0.), "SSH 私钥表单");
+    });
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_local_host(None, window, cx);
+    });
+    visual.update(|_, app| {
+        let editor = panel.read(app).local_hosts.editor.as_ref().unwrap();
+        assert_eq!(editor.scroll_handle.max_offset().y, px(0.), "本地常规");
+    });
+}
+
 /// 用真实控件边界检查端口对齐与窄窗宽度，确保字段错误也不会挤压表单。
 /// @author kongweiguang
 #[gpui_kit::test]

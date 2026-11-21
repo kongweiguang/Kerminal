@@ -341,7 +341,23 @@ fn render_plugin_host_editor(
     }
 }
 
-/// 状态反馈位于固定操作栏，统一动作尺寸并避免测试或校验结果改变字段起点。
+/// 将滚动条叠在正文视口外侧，避免滚动句柄把全高的滚动条和正文内边距一起计入滚动范围。
+/// @author kongweiguang
+fn editor_scroll_viewport(
+    page: impl IntoElement,
+    scroll: &gpui_kit::ScrollHandle,
+) -> impl IntoElement {
+    div()
+        .relative()
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .child(page)
+        .vertical_scrollbar(scroll)
+}
+
+/// 状态反馈位于固定操作栏，正文独立滚动，测试或校验结果不改变字段起点。
 /// @author kongweiguang
 fn render_remote_host_editor(
     panel: &mut ConnectionsPanel,
@@ -397,7 +413,6 @@ fn render_remote_host_editor(
         .min_w(px(0.))
         .overflow_y_scroll()
         .track_scroll(&editor.scroll_handle)
-        .vertical_scrollbar(&editor.scroll_handle)
         .flex()
         .flex_col()
         .gap_3();
@@ -414,7 +429,7 @@ fn render_remote_host_editor(
     if let Some(readback) = render_host_save_readback_summary(panel, theme) {
         page = page.child(readback);
     }
-    editor_content = editor_content.child(page);
+    editor_content = editor_content.child(editor_scroll_viewport(page, &editor.scroll_handle));
     let content = div()
         .id("connections-editor-section-scroll")
         .flex_1()
@@ -593,7 +608,7 @@ fn render_remote_host_editor(
     }
 }
 
-/// 本地主机保留稳定底栏；Profile 读取期间只阻止提交，继续允许编辑和取消，不提交尚未投影的参数。
+/// 本地主机沿用远端正文滚动层和固定底栏；Profile 读取期间允许编辑和取消，避免提交未投影的参数。
 /// @author kongweiguang
 fn render_local_host_editor(
     panel: &mut ConnectionsPanel,
@@ -631,7 +646,6 @@ fn render_local_host_editor(
         .min_w(px(0.))
         .track_scroll(&editor.scroll_handle)
         .overflow_y_scroll()
-        .vertical_scrollbar(&editor.scroll_handle)
         .p_5()
         .flex()
         .flex_col()
@@ -774,7 +788,7 @@ fn render_local_host_editor(
             compact,
             cx,
         ));
-    editor_content = editor_content.child(page);
+    editor_content = editor_content.child(editor_scroll_viewport(page, &editor.scroll_handle));
     let content = div()
         .id("connections-local-editor-scroll")
         .flex_1()
