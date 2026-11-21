@@ -9,14 +9,14 @@ use gpui_kit::{
 
 use crate::theme::ThemeTokens;
 
-const EDITOR_WIDTH_REM: f32 = 64.0;
-const EDITOR_HEIGHT_REM: f32 = 46.0;
+const EDITOR_WIDTH_REM: f32 = 54.0;
+const EDITOR_HEIGHT_REM: f32 = 38.0;
 const COMPACT_WINDOW_WIDTH_REM: f32 = 54.0;
 
 /// 标签轴按 8 个全角字符预留，避免“默认目录（可选）”等中文标签在固定列内折行。
 pub(super) const FORM_FIELD_LABEL_WIDTH_REM: f32 = 8.0;
-/// 表单控件保留可读行长，不随宽弹层无限拉伸；单行与多行字段共享同一条右缘。
-pub(super) const FORM_FIELD_CONTROL_MAX_WIDTH_REM: f32 = 34.0;
+/// 控件列与侧栏、标签列和校验槽共同约束弹框宽度，单行与多行字段共享右缘。
+pub(super) const FORM_FIELD_CONTROL_MAX_WIDTH_REM: f32 = 30.0;
 /// 标签与控件间距；提示卡复用该值，使正文右缘和输入右缘落在同一条线上。
 pub(super) const FORM_FIELD_GAP_REM: f32 = 0.75;
 
@@ -30,7 +30,7 @@ pub(crate) fn host_editor_size(window: &Window) -> Size<Pixels> {
     host_editor_dimensions(window.viewport_size(), window.rem_size())
 }
 
-/// 纯尺寸运算可验证极窄窗口与缩放边界，不需要创建系统窗口或依赖特定 DPI。
+/// 弹框大小由同一组上限约束，切换分区时固定外框，长表单把溢出交给正文滚动。
 fn host_editor_dimensions(viewport: Size<Pixels>, base: Pixels) -> Size<Pixels> {
     size(
         (viewport.width - base * 2.0)
@@ -91,7 +91,7 @@ impl EditorField {
 }
 
 impl RenderOnce for EditorField {
-    /// 使用相对尺寸保持缩放下的节奏；多行字段顶对齐，普通字段沿同一控件中线排列。
+    /// 宽窗两列限制输入行长，窄窗标签上置后则让控件用足剩余宽度，避免留下空白列。
     fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let compact = compact_editor(window);
         let label = div()
@@ -105,7 +105,9 @@ impl RenderOnce for EditorField {
         let content = div()
             .flex_1()
             .min_w_0()
-            .max_w(rems(FORM_FIELD_CONTROL_MAX_WIDTH_REM))
+            .when(!compact, |content| {
+                content.max_w(rems(FORM_FIELD_CONTROL_MAX_WIDTH_REM))
+            })
             .child(self.input);
         let row = div()
             .w_full()

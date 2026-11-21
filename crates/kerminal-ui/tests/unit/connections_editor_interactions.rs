@@ -7,6 +7,108 @@ use gpui_kit::Focusable as _;
 use super::super::super::local_hosts::LocalHostEditorSection;
 use super::*;
 
+/// 用真实控件边界检查端口对齐与窄窗宽度，确保字段错误也不会挤压表单。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn endpoint_port_aligns_with_general_fields_in_wide_and_compact_editors(app: &mut TestAppContext) {
+    use crate::features::connections::form::{HostEditorField, HostEditorValidationIssue};
+    use gpui_kit::{ElementId, px, size};
+
+    let (_runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    for width in [1360., 800.] {
+        visual.simulate_resize(size(px(width), px(800.)));
+        for protocol in [
+            RemoteProtocol::Ssh,
+            RemoteProtocol::Sftp,
+            RemoteProtocol::Rdp,
+            RemoteProtocol::Telnet,
+        ] {
+            update_panel(&panel, visual, |panel, window, cx| {
+                panel.create_host_with_protocol(protocol, window, cx);
+            });
+            let bounds = |visual: &mut VisualTestContext, identity: &'static str| {
+                visual.update(|window, _| {
+                    gpui_kit::base::test_support::find(window, &[], &ElementId::from(identity))
+                        .expect("常规页必须渲染真实输入框")
+                        .bounds()
+                })
+            };
+            let name = bounds(visual, "connections-editor-name-input");
+            let port = bounds(visual, "connections-editor-port-input");
+            let group = visual
+                .debug_bounds("connections-editor-create-group")
+                .expect("分组行必须保留新建按钮");
+            assert_eq!(port.right(), name.right(), "{protocol:?} at {width}");
+            assert_eq!(group.right(), name.right(), "{protocol:?} at {width}");
+            assert_eq!(group.size.width, name.size.height);
+            assert_eq!(group.size.height, name.size.height);
+            if width == 800. {
+                let page = visual.debug_bounds("connections-editor-viewport").unwrap();
+                assert!(page.right() - name.right() <= px(72.), "{name:?} {page:?}");
+            }
+
+            update_panel(&panel, visual, |panel, _, cx| {
+                panel.editor.as_mut().unwrap().validation_issue = Some(HostEditorValidationIssue {
+                    field: HostEditorField::Port,
+                    section: HostEditorSection::Properties,
+                    message: "请输入有效的端口。".to_owned(),
+                });
+                cx.notify();
+            });
+            assert_eq!(bounds(visual, "connections-editor-port-input"), port);
+        }
+    }
+}
+
+/// 本地两页应和远端共用标题位置，切换分类时首行起点和固定底栏保持稳定。
+/// @author kongweiguang
+#[gpui_kit::test]
+fn local_and_remote_share_section_heading_and_footer_geometry(app: &mut TestAppContext) {
+    let (runtime, panel, visual) = fixture(app, Vec::new(), Vec::new());
+    visual.simulate_resize(gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(900.)));
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.begin_create_host(window, cx);
+    });
+    let heading = "connections-editor-section-heading";
+    let remote_heading = visual.debug_bounds(heading).expect("远端分类标题应可见");
+    let remote_save = visual.debug_bounds("connections-editor-save").unwrap();
+    let remote_cancel = visual
+        .debug_bounds("connections-editor-footer-cancel")
+        .unwrap();
+    assert_eq!(remote_cancel.size, remote_save.size);
+
+    update_panel(&panel, visual, |panel, window, cx| {
+        panel.activate_local_host_editor(window, cx);
+    });
+    pump_runtime(&runtime, visual);
+    let local_save = visual
+        .debug_bounds("connections-local-editor-save")
+        .unwrap();
+    let local_cancel = visual
+        .debug_bounds("connections-local-editor-cancel")
+        .unwrap();
+    assert_eq!(local_save, remote_save);
+    assert_eq!(local_cancel.size, remote_cancel.size);
+    assert_eq!(visual.debug_bounds(heading), Some(remote_heading));
+
+    let terminal = visual
+        .debug_bounds("connections-local-editor-section-Terminal")
+        .unwrap();
+    visual.simulate_click(terminal.center(), Default::default());
+    draw(visual);
+    visual.update(|_, app| {
+        assert_eq!(
+            panel.read(app).local_hosts.editor.as_ref().unwrap().section,
+            LocalHostEditorSection::Terminal
+        );
+    });
+    assert_eq!(visual.debug_bounds(heading), Some(remote_heading));
+    assert_eq!(
+        visual.debug_bounds("connections-local-editor-save"),
+        Some(local_save)
+    );
+}
+
 /// 五种远端协议共用标签投影；既有逗号、引号及空标签在仅改名称后必须保持同一数组。
 /// @author kongweiguang
 #[gpui_kit::test]

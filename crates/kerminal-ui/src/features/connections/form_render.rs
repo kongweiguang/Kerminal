@@ -5,7 +5,7 @@
 use gpui_kit::{
     ClickEvent, Context, Focusable as _, IntoElement, Window,
     component::{
-        Disableable, IconName, Sizable as _,
+        Disableable, Icon, IconName, Sizable as _,
         button::{Button, ButtonVariants},
         checkbox::Checkbox,
         input::{Input, InputContentType, Textarea},
@@ -44,6 +44,40 @@ const FORM_FIELD_GAP_PX: f32 = 12.0;
 const ENDPOINT_PORT_INPUT_MIN_WIDTH_PX: f32 = 80.0;
 const NETWORK_FIELD_LABEL_WIDTH_PX: f32 = FORM_FIELD_LABEL_WIDTH_REM * 16.0;
 const NETWORK_FIELD_CONTROL_MAX_WIDTH_PX: f32 = 192.0;
+const EDITOR_ACTION_WIDTH_REM: f32 = 10.0;
+
+/// 主要底栏动作共享固定宽高，状态文案变化不会推动相邻按钮。
+/// @author kongweiguang
+fn editor_action_button(button: Button, theme: ThemeTokens) -> Button {
+    button
+        .compact()
+        .w(rems(EDITOR_ACTION_WIDTH_REM))
+        .h(theme.metrics.control_height)
+        .flex_shrink_0()
+}
+
+/// 字段行尾操作使用统一的方形描边，并保留 Button 的原生焦点与禁用态。
+/// @author kongweiguang
+fn editor_icon_button(id: impl Into<gpui_kit::ElementId>, theme: ThemeTokens) -> Button {
+    Button::new(id)
+        .compact()
+        .size(theme.metrics.control_height)
+        .outline()
+}
+
+/// 侧栏图标占固定槽位，标签在两种编辑器中从同一基线开始。
+/// @author kongweiguang
+fn editor_navigation_content(icon: IconName, label: gpui_kit::SharedString) -> impl IntoElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .child(Icon::new(icon).size(px(16.)))
+        .child(div().min_w_0().text_ellipsis().child(label))
+}
 
 /// 端口列至少容纳内联端口标签、字段间距和可读的端口输入；地址列承担剩余伸缩。
 /// @author kongweiguang
@@ -177,6 +211,9 @@ fn render_plugin_host_editor(
         )
         .child(
             editor_cancel_button("connections-plugin-editor-cancel", blocked, cx)
+                .w(rems(10.0))
+                .h(theme.metrics.control_height)
+                .flex_shrink_0()
                 .label(crate::locale::text("取消", "Cancel")),
         );
     if unknown {
@@ -212,6 +249,8 @@ fn render_plugin_host_editor(
         footer = footer.child(
             Button::new("connections-plugin-test")
                 .compact()
+                .w(rems(10.0))
+                .h(theme.metrics.control_height)
                 .label(if testing {
                     crate::locale::text("取消测试", "Cancel test")
                 } else {
@@ -228,6 +267,8 @@ fn render_plugin_host_editor(
             Button::new("connections-plugin-save")
                 .debug_selector(|| "connections-plugin-save".to_owned())
                 .compact()
+                .w(rems(10.0))
+                .h(theme.metrics.control_height)
                 .label(if panel.saving {
                     crate::locale::text("保存中…", "Saving…")
                 } else {
@@ -282,7 +323,7 @@ fn render_plugin_host_editor(
     }
 }
 
-/// 状态反馈位于固定操作栏上方，避免测试或校验结果改变字段起点；未知保存仍需显式读回。
+/// 状态反馈位于固定操作栏，统一动作尺寸并避免测试或校验结果改变字段起点。
 /// @author kongweiguang
 fn render_remote_host_editor(
     panel: &mut ConnectionsPanel,
@@ -349,6 +390,7 @@ fn render_remote_host_editor(
         active_section,
         disabled,
         theme,
+        compact,
         cx,
     ));
     if let Some(readback) = render_host_save_readback_summary(panel, theme) {
@@ -398,8 +440,12 @@ fn render_remote_host_editor(
                 ),
         )
         .child(
-            editor_cancel_button("connections-editor-footer-cancel", saving || reloading, cx)
-                .label(crate::locale::text("取消", "Cancel")),
+            editor_action_button(
+                editor_cancel_button("connections-editor-footer-cancel", saving || reloading, cx),
+                theme,
+            )
+            .outline()
+            .label(crate::locale::text("取消", "Cancel")),
         )
         .when(panel.save_outcome_unknown, |footer| {
             footer
@@ -440,12 +486,8 @@ fn render_remote_host_editor(
             cx,
         ))
         .child(
-            Button::new("connections-editor-save")
+            editor_action_button(Button::new("connections-editor-save"), theme)
                 .debug_selector(|| "connections-editor-save".to_owned())
-                .compact()
-                .w(rems(8.0))
-                .h(theme.metrics.control_height)
-                .flex_shrink_0()
                 .label(if saving {
                     crate::locale::text("保存中…", "Saving…")
                 } else if panel.save_outcome_unknown {
@@ -575,7 +617,13 @@ fn render_local_host_editor(
         .p_5()
         .flex()
         .flex_col()
-        .gap_3();
+        .gap_3()
+        .when(!compact, |page| {
+            page.child(editor_section_heading(
+                local_section_label(editor.section),
+                theme,
+            ))
+        });
     let local_status = if panel.local_hosts.save_outcome_unknown {
         None
     } else if editor.external_conflict {
@@ -629,7 +677,7 @@ fn render_local_host_editor(
             ))
             .child(field(
                 "Profile",
-                local_profile_picker(panel, disabled, cx),
+                local_profile_picker(panel, disabled, theme, cx),
                 theme,
                 &field_scope,
             ))
@@ -682,8 +730,8 @@ fn render_local_host_editor(
             ))
             .child(authentication_note(
                 crate::locale::text(
-                    "每行一项，环境变量用 NAME=value；空值或多行项用双引号包裹，项内双引号写成两个。",
-                    "One item per line; use NAME=value for environment variables. Quote empty or multiline items; double quotes inside an item.",
+                    "空值或多行项用双引号包裹，项内双引号写成两个。",
+                    "Quote empty or multiline items; double quotes inside an item.",
                 ),
                 theme,
             ));
@@ -743,17 +791,17 @@ fn render_local_host_editor(
                 )),
         )
         .child(
-            editor_cancel_button("connections-local-editor-cancel", saving || reloading, cx)
-                .label(crate::locale::text("取消", "Cancel")),
+            editor_action_button(
+                editor_cancel_button("connections-local-editor-cancel", saving || reloading, cx),
+                theme,
+            )
+            .outline()
+            .label(crate::locale::text("取消", "Cancel")),
         )
         .children(render_conflict_reload_action(panel, cx))
         .child(
-            Button::new("connections-local-editor-save")
+            editor_action_button(Button::new("connections-local-editor-save"), theme)
                 .debug_selector(|| "connections-local-editor-save".to_owned())
-                .compact()
-                .w(rems(8.0))
-                .h(theme.metrics.control_height)
-                .flex_shrink_0()
                 .label(if saving {
                     crate::locale::text("保存中…", "Saving…")
                 } else if panel.local_hosts.save_outcome_unknown {
@@ -808,7 +856,7 @@ fn render_local_host_editor(
     }
 }
 
-/// 候选按程序与 argv 共同标识，避免普通 cmd 和开发者环境共享程序时显示错误的选中项。
+/// 候选按程序与 argv 标识；菜单由弹性容器定宽，内容变化不挤动相邻操作。
 /// @author kongweiguang
 fn render_local_shell_picker(
     panel: &ConnectionsPanel,
@@ -876,54 +924,55 @@ fn render_local_shell_picker(
         .child(field(
             crate::locale::text("检测到的 Shell", "Detected shells"),
             div()
+                .w_full()
                 .flex()
-                .flex_1()
                 .min_w(px(0.))
                 .items_center()
                 .gap_2()
                 .child(
-                    Button::new("connections-local-shell-candidates")
-                        .debug_selector(|| "connections-local-shell-candidates".to_owned())
-                        .w_full()
-                        .h(theme.metrics.control_height)
-                        .compact()
-                        .secondary()
-                        .dropdown_caret(true)
-                        .label(current_label)
-                        .disabled(disabled || candidates.is_empty())
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for (id, label, selected) in &candidate_options {
-                                let id = id.clone();
-                                let label = label.clone();
-                                let owner = owner.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(label).checked(*selected).on_click(
-                                        move |_, window, app| {
-                                            owner.update(app, |panel, cx| {
-                                                panel.select_local_shell_candidate(&id, window, cx);
-                                            });
-                                        },
-                                    ),
-                                );
-                            }
-                            if candidates.is_empty() {
-                                menu = menu.item(
-                                    PopupMenuItem::new(crate::locale::text(
-                                        "暂无候选",
-                                        "No candidates",
-                                    ))
-                                    .disabled(true),
-                                );
-                            }
-                            menu
-                        }),
+                    div().flex_1().min_w_0().child(
+                        Button::new("connections-local-shell-candidates")
+                            .debug_selector(|| "connections-local-shell-candidates".to_owned())
+                            .w_full()
+                            .h(theme.metrics.control_height)
+                            .compact()
+                            .outline()
+                            .dropdown_caret(true)
+                            .label(current_label)
+                            .disabled(disabled || candidates.is_empty())
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for (id, label, selected) in &candidate_options {
+                                    let id = id.clone();
+                                    let label = label.clone();
+                                    let owner = owner.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(label).checked(*selected).on_click(
+                                            move |_, window, app| {
+                                                owner.update(app, |panel, cx| {
+                                                    panel.select_local_shell_candidate(
+                                                        &id, window, cx,
+                                                    );
+                                                });
+                                            },
+                                        ),
+                                    );
+                                }
+                                if candidates.is_empty() {
+                                    menu = menu.item(
+                                        PopupMenuItem::new(crate::locale::text(
+                                            "暂无候选",
+                                            "No candidates",
+                                        ))
+                                        .disabled(true),
+                                    );
+                                }
+                                menu
+                            }),
+                    ),
                 )
                 .child(
-                    Button::new("connections-local-shell-refresh")
+                    editor_icon_button("connections-local-shell-refresh", theme)
                         .debug_selector(|| "connections-local-shell-refresh".to_owned())
-                        .size(theme.metrics.control_height)
-                        .compact()
-                        .ghost()
                         .icon(if loading {
                             IconName::LoaderCircle
                         } else {
@@ -952,17 +1001,15 @@ fn render_local_shell_picker(
             theme,
             field_scope,
         ))
-        .child(
-            div()
-                .w_full()
-                .h(rems(1.0))
-                .overflow_hidden()
-                .text_xs()
-                .whitespace_nowrap()
-                .text_color(state_color)
-                .text_ellipsis()
-                .child(state_text),
-        )
+        .when(!state_text.is_empty(), |content| {
+            content.child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(state_color)
+                    .child(state_text),
+            )
+        })
 }
 
 /// 未知保存只允许读取目标当前版本；只有稳定 ID 匹配的读回可显式接纳或据此重新比较。
@@ -1189,6 +1236,8 @@ fn render_local_host_editor_load(
         .bg(theme.panel)
         .child(
             editor_cancel_button("connections-local-editor-load-cancel", false, cx)
+                .w(rems(10.0))
+                .h(theme.metrics.control_height)
                 .label(crate::locale::text("取消", "Cancel")),
         );
     div()
@@ -1233,6 +1282,7 @@ fn local_host_editor_navigation(
     if compact {
         let panel_entity = cx.entity().clone();
         return div()
+            .debug_selector(|| "connections-editor-section-heading".to_owned())
             .px_4()
             .py_1()
             .border_b_1()
@@ -1274,17 +1324,21 @@ fn local_host_editor_navigation(
         .border_color(theme.border)
         .bg(theme.sidebar)
         .children(sections.into_iter().map(|section| {
+            let label = local_section_label(section);
             Button::new(format!("connections-local-editor-section-{section:?}"))
                 .debug_selector(move || format!("connections-local-editor-section-{section:?}"))
                 .w_full()
                 .h(rems(2.5))
                 .compact()
-                .icon(if section == LocalHostEditorSection::Properties {
-                    IconName::Settings2
-                } else {
-                    IconName::SquareTerminal
-                })
-                .label(local_section_label(section))
+                .accessibility_label(label.clone())
+                .child(editor_navigation_content(
+                    if section == LocalHostEditorSection::Properties {
+                        IconName::Settings2
+                    } else {
+                        IconName::SquareTerminal
+                    },
+                    label,
+                ))
                 .disabled(disabled)
                 .ghost()
                 .when(section == selected, |button| {
@@ -1309,7 +1363,7 @@ fn local_section_label(section: LocalHostEditorSection) -> gpui_kit::SharedStrin
     }
 }
 
-/// 分组创建复用已有 CAS 与未知结果恢复流程，主机草稿仍由编辑器所有者保管。
+/// 分组创建复用已有 CAS，方形边框按钮与相邻输入等高且始终可辨认。
 fn group_field(
     select: impl IntoElement,
     theme: ThemeTokens,
@@ -1326,8 +1380,8 @@ fn group_field(
             .gap_2()
             .child(div().flex_1().min_w_0().child(select))
             .child(
-                Button::new("connections-editor-create-group")
-                    .ghost()
+                editor_icon_button("connections-editor-create-group", theme)
+                    .debug_selector(|| "connections-editor-create-group".to_owned())
                     .icon(IconName::Plus)
                     .tooltip(crate::locale::text("新建分组…", "New group…"))
                     .accessibility_label(crate::locale::text("新建分组", "New group"))
@@ -1341,7 +1395,7 @@ fn group_field(
     )
 }
 
-/// 手动路径始终可编辑，原生选择器只回填当前请求所属草稿，不成为必需依赖。
+/// 手动路径始终可编辑；等高按钮提示原生选择器可选使用，不成为必需依赖。
 /// @author kongweiguang
 fn path_field(
     label: impl Into<gpui_kit::SharedString>,
@@ -1366,8 +1420,7 @@ fn path_field(
                     .child(input.h(theme.metrics.control_height)),
             )
             .child(
-                Button::new(format!("host-path-picker-{target:?}"))
-                    .ghost()
+                editor_icon_button(format!("host-path-picker-{target:?}"), theme)
                     .icon(IconName::FolderOpen)
                     .tooltip(crate::locale::text("选择路径…", "Choose path…"))
                     .accessibility_label(crate::locale::text("选择路径", "Choose path"))
@@ -1381,12 +1434,13 @@ fn path_field(
     )
 }
 
-/// 菜单按 ID 读回最新值；固定入口宽度避免加载或名称改变推挤编辑按钮，读取时仍可改选。
+/// 菜单占据字段剩余宽度并为编辑按钮保留固定空间，读取期间仍可改选。
 ///
 /// @author kongweiguang
 fn local_profile_picker(
     panel: &ConnectionsPanel,
     disabled: bool,
+    theme: ThemeTokens,
     cx: &mut Context<ConnectionsPanel>,
 ) -> impl IntoElement {
     let profiles = panel
@@ -1416,34 +1470,35 @@ fn local_profile_picker(
         .items_center()
         .gap_2()
         .child(
-            Button::new("connections-local-profile-picker")
-                .w_80()
-                .max_w_full()
-                .secondary()
-                .dropdown_caret(true)
-                .label(selected_label)
-                .when(resolving, |button| button.child(Spinner::new().small()))
-                .disabled(disabled || !has_profiles)
-                .dropdown_menu(move |mut menu, _, _| {
-                    for (id, name) in &profiles {
-                        let panel_entity = panel_entity.clone();
-                        let id = id.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(name.clone())
-                                .checked(Some(id.as_str()) == selected_profile.as_deref())
-                                .on_click(move |_, _, app| {
-                                    panel_entity.update(app, |panel, cx| {
-                                        panel.use_local_profile(id.clone(), cx)
-                                    });
-                                }),
-                        );
-                    }
-                    menu
-                }),
+            div().flex_1().min_w_0().child(
+                Button::new("connections-local-profile-picker")
+                    .w_full()
+                    .h(theme.metrics.control_height)
+                    .outline()
+                    .dropdown_caret(true)
+                    .label(selected_label)
+                    .when(resolving, |button| button.child(Spinner::new().small()))
+                    .disabled(disabled || !has_profiles)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for (id, name) in &profiles {
+                            let panel_entity = panel_entity.clone();
+                            let id = id.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(Some(id.as_str()) == selected_profile.as_deref())
+                                    .on_click(move |_, _, app| {
+                                        panel_entity.update(app, |panel, cx| {
+                                            panel.use_local_profile(id.clone(), cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            ),
         )
         .child(
-            Button::new("connections-local-profile-edit")
-                .ghost()
+            editor_icon_button("connections-local-profile-edit", theme)
                 .icon(gpui_kit::assets::IconName::Pencil)
                 .accessibility_label(crate::locale::text("编辑 Profile", "Edit profiles"))
                 .tooltip(crate::locale::text("编辑 Profile", "Edit profiles"))
@@ -1520,6 +1575,7 @@ fn editor_cancel_button(
     cx: &mut Context<ConnectionsPanel>,
 ) -> Button {
     Button::new(id)
+        .debug_selector(move || id.to_owned())
         .compact()
         .disabled(saving)
         .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
@@ -1544,13 +1600,9 @@ fn render_probe_action(
         .as_ref()
         .is_some_and(|editor| !panel.hosts.protocol_enabled(editor.protocol));
     Some(
-        Button::new("connections-editor-probe")
+        editor_action_button(Button::new("connections-editor-probe"), theme)
             .debug_selector(|| "connections-editor-probe".to_owned())
-            .compact()
-            .secondary()
-            .w(rems(10.0))
-            .h(theme.metrics.control_height)
-            .flex_shrink_0()
+            .outline()
             .when(running, |button| {
                 button.child(Spinner::new().with_size(px(14.)).color(theme.muted))
             })
@@ -1580,6 +1632,7 @@ fn render_editor_section(
     section: HostEditorSection,
     disabled: bool,
     theme: ThemeTokens,
+    compact: bool,
     cx: &mut Context<ConnectionsPanel>,
 ) -> gpui_kit::AnyElement {
     let content = match section {
@@ -1642,16 +1695,12 @@ fn render_editor_section(
         .flex()
         .flex_col()
         .gap_3()
-        .child(
-            div()
-                .pb_3()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(section_title(
-                    protocol_section_label(editor.protocol, section),
-                    theme,
-                )),
-        )
+        .when(!compact, |section_content| {
+            section_content.child(editor_section_heading(
+                protocol_section_label(editor.protocol, section),
+                theme,
+            ))
+        })
         .child(content)
         .into_any_element()
 }
@@ -1675,6 +1724,7 @@ fn render_editor_navigation(
     if compact {
         let panel_entity = cx.entity().clone();
         return div()
+            .debug_selector(|| "connections-editor-section-heading".to_owned())
             .px_4()
             .py_1()
             .border_b_1()
@@ -1726,8 +1776,11 @@ fn render_editor_navigation(
                 .w_full()
                 .h(rems(2.5))
                 .compact()
-                .icon(editor_section_icon(section))
-                .label(label)
+                .accessibility_label(label.clone())
+                .child(editor_navigation_content(
+                    editor_section_icon(section),
+                    label,
+                ))
                 .tooltip(detail)
                 .disabled(disabled);
             let button = if section == selected {
@@ -1792,7 +1845,10 @@ fn render_properties(
         .child(with_validation_issue(
             input_field(
                 crate::locale::text("名称", "Name"),
-                Input::new(&editor.inputs.name).disabled(disabled).w_full(),
+                Input::new(&editor.inputs.name)
+                    .id("connections-editor-name-input")
+                    .disabled(disabled)
+                    .w_full(),
                 theme,
                 &field_scope,
             ),
@@ -2643,61 +2699,70 @@ fn choice_button(
     }
 }
 
-/// 地址与端口共用一个字段组，避免端口再次占用完整标签列；串口设备由独立串口分类编辑。
+/// 地址与端口共用一个校验槽和字段右缘；错误仍按真实字段身份打开详情。
 /// @author kongweiguang
 fn render_endpoint(editor: &HostEditor, disabled: bool, theme: ThemeTokens) -> impl IntoElement {
     let field_scope = host_editor_scope(editor, "endpoint");
     let mut fields = div().w_full().flex().flex_col().gap_2().min_w(px(0.));
     if editor.protocol != RemoteProtocol::Serial {
-        fields = fields.child(field(
-            crate::locale::text("主机地址", "Host address"),
-            div()
-                .w_full()
-                .flex()
-                .items_start()
-                .gap_3()
-                .child(
-                    div().flex_1().min_w(px(0.)).child(with_validation_issue(
-                        Input::new(&editor.inputs.host)
-                            .h(theme.metrics.control_height)
-                            .disabled(disabled)
-                            .w_full(),
-                        editor,
-                        HostEditorField::Host,
-                        theme,
-                    )),
-                )
-                .child(
-                    div()
-                        .w(rems(endpoint_port_column_min_width_px() / 16.0))
-                        .min_w(rems(4.0))
-                        .flex_shrink_0()
-                        .child(with_validation_issue(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted)
-                                        .child(crate::locale::text("端口", "Port")),
-                                )
-                                .child(
-                                    Input::new(&editor.inputs.port)
-                                        .h(theme.metrics.control_height)
-                                        .disabled(disabled)
-                                        .w_full()
-                                        .aria_label(crate::locale::text("端口", "Port")),
-                                ),
-                            editor,
-                            HostEditorField::Port,
-                            theme,
-                        )),
-                ),
+        let issue_field = if editor
+            .validation_issue
+            .as_ref()
+            .is_some_and(|issue| issue.field == HostEditorField::Port)
+        {
+            HostEditorField::Port
+        } else {
+            HostEditorField::Host
+        };
+        fields = fields.child(with_validation_issue(
+            field(
+                crate::locale::text("主机地址", "Host address"),
+                div()
+                    .w_full()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(
+                            Input::new(&editor.inputs.host)
+                                .h(theme.metrics.control_height)
+                                .disabled(disabled)
+                                .w_full(),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .w(rems(endpoint_port_column_min_width_px() / 16.0))
+                            .min_w(rems(4.0))
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted)
+                                            .child(crate::locale::text("端口", "Port")),
+                                    )
+                                    .child(
+                                        Input::new(&editor.inputs.port)
+                                            .id("connections-editor-port-input")
+                                            .h(theme.metrics.control_height)
+                                            .disabled(disabled)
+                                            .w_full()
+                                            .aria_label(crate::locale::text("端口", "Port")),
+                                    ),
+                            ),
+                    ),
+                theme,
+                &field_scope,
+            ),
+            editor,
+            issue_field,
             theme,
-            &field_scope,
         ));
         if editor.protocol != RemoteProtocol::Telnet {
             fields = fields.child(with_validation_issue(
@@ -2754,7 +2819,7 @@ fn render_ssh_auth(
         .w_full()
         .h(theme.metrics.control_height)
         .compact()
-        .secondary()
+        .outline()
         .dropdown_caret(true)
         .label(selected_label)
         .accessibility_label(crate::locale::text("认证方式", "Authentication method"))
@@ -3211,44 +3276,34 @@ fn render_rdp_display(
             theme,
             &field_scope,
         ))
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .gap_3()
-                .child(
-                    div().flex_1().min_w(px(0.)).child(with_validation_issue(
-                        network_option_input_field(
-                            crate::locale::text("窗口宽度", "Window width"),
-                            crate::locale::text("像素", "Pixels"),
-                            Input::new(&editor.inputs.rdp_width)
-                                .disabled(disabled || editor.rdp_fullscreen)
-                                .w_full(),
-                            theme,
-                            &field_scope,
-                        ),
-                        editor,
-                        HostEditorField::RdpWidth,
-                        theme,
-                    )),
-                )
-                .child(
-                    div().flex_1().min_w(px(0.)).child(with_validation_issue(
-                        network_option_input_field(
-                            crate::locale::text("窗口高度", "Window height"),
-                            crate::locale::text("像素", "Pixels"),
-                            Input::new(&editor.inputs.rdp_height)
-                                .disabled(disabled || editor.rdp_fullscreen)
-                                .w_full(),
-                            theme,
-                            &field_scope,
-                        ),
-                        editor,
-                        HostEditorField::RdpHeight,
-                        theme,
-                    )),
-                ),
-        )
+        .child(with_validation_issue(
+            network_option_input_field(
+                crate::locale::text("窗口宽度（像素）", "Width (px)"),
+                "",
+                Input::new(&editor.inputs.rdp_width)
+                    .disabled(disabled || editor.rdp_fullscreen)
+                    .w_full(),
+                theme,
+                &field_scope,
+            ),
+            editor,
+            HostEditorField::RdpWidth,
+            theme,
+        ))
+        .child(with_validation_issue(
+            network_option_input_field(
+                crate::locale::text("窗口高度（像素）", "Height (px)"),
+                "",
+                Input::new(&editor.inputs.rdp_height)
+                    .disabled(disabled || editor.rdp_fullscreen)
+                    .w_full(),
+                theme,
+                &field_scope,
+            ),
+            editor,
+            HostEditorField::RdpHeight,
+            theme,
+        ))
         .child(
             div()
                 .max_w(rems(form_field_row_max_width_rems()))
@@ -3325,10 +3380,7 @@ fn render_serial_connection(
                             .child(Input::new(&editor.inputs.host).disabled(disabled).w_full()),
                     )
                     .child(
-                        Button::new("connections-serial-device-picker")
-                            .size(theme.metrics.control_height)
-                            .compact()
-                            .secondary()
+                        editor_icon_button("connections-serial-device-picker", theme)
                             .icon(IconName::ChevronDown)
                             .tooltip(if state_text.is_empty() {
                                 crate::locale::text(
@@ -3383,10 +3435,7 @@ fn render_serial_connection(
                     .child(
                         field_scope.wrap(
                             "serial-refresh",
-                            Button::new("connections-serial-refresh")
-                                .size(theme.metrics.control_height)
-                                .compact()
-                                .ghost()
+                            editor_icon_button("connections-serial-refresh", theme)
                                 .icon(if panel.serial_ports_loading {
                                     IconName::LoaderCircle
                                 } else if matches!(
@@ -3446,7 +3495,7 @@ fn render_serial_connection(
         ))
 }
 
-/// 线制组合项只保留驱动支持的固定枚举，设备与波特率留在常规连接页。
+/// 线制枚举沿同一字段轴排列，避免窄窗口中双列标签挤压输入。
 /// @author kongweiguang
 fn render_serial_line_options(
     editor: &HostEditor,
@@ -3459,66 +3508,46 @@ fn render_serial_line_options(
         .flex()
         .flex_col()
         .gap_2()
-        .child(
-            div()
+        .child(field(
+            crate::locale::text("数据位", "Data bits"),
+            Select::new(&editor.serial_data_bits_select)
                 .w_full()
-                .flex()
-                .gap_3()
-                .child(
-                    div().flex_1().min_w(px(0.)).child(field(
-                        crate::locale::text("数据位", "Data bits"),
-                        Select::new(&editor.serial_data_bits_select)
-                            .w_full()
-                            .h(theme.metrics.control_height)
-                            .disabled(disabled)
-                            .accessibility_label(crate::locale::text("数据位", "Data bits")),
-                        theme,
-                        &field_scope,
-                    )),
-                )
-                .child(
-                    div().flex_1().min_w(px(0.)).child(field(
-                        crate::locale::text("停止位", "Stop bits"),
-                        Select::new(&editor.serial_stop_bits_select)
-                            .w_full()
-                            .h(theme.metrics.control_height)
-                            .disabled(disabled)
-                            .accessibility_label(crate::locale::text("停止位", "Stop bits")),
-                        theme,
-                        &field_scope,
-                    )),
-                ),
-        )
-        .child(
-            div()
+                .h(theme.metrics.control_height)
+                .disabled(disabled)
+                .accessibility_label(crate::locale::text("数据位", "Data bits")),
+            theme,
+            &field_scope,
+        ))
+        .child(field(
+            crate::locale::text("停止位", "Stop bits"),
+            Select::new(&editor.serial_stop_bits_select)
                 .w_full()
-                .flex()
-                .gap_3()
-                .child(
-                    div().flex_1().min_w(px(0.)).child(field(
-                        crate::locale::text("校验", "Parity"),
-                        Select::new(&editor.serial_parity_select)
-                            .w_full()
-                            .h(theme.metrics.control_height)
-                            .disabled(disabled)
-                            .accessibility_label(crate::locale::text("校验方式", "Parity")),
-                        theme,
-                        &field_scope,
-                    )),
-                )
-                .child(
-                    div().flex_1().min_w(px(0.)).child(field(
-                        crate::locale::text("流控", "Flow control"),
-                        Select::new(&editor.serial_flow_select)
-                            .w_full()
-                            .h(theme.metrics.control_height)
-                            .disabled(disabled)
-                            .accessibility_label(crate::locale::text("流控方式", "Flow control")),
-                        theme,
-                        &field_scope,
-                    )),
-                ),
-        )
+                .h(theme.metrics.control_height)
+                .disabled(disabled)
+                .accessibility_label(crate::locale::text("停止位", "Stop bits")),
+            theme,
+            &field_scope,
+        ))
+        .child(field(
+            crate::locale::text("校验", "Parity"),
+            Select::new(&editor.serial_parity_select)
+                .w_full()
+                .h(theme.metrics.control_height)
+                .disabled(disabled)
+                .accessibility_label(crate::locale::text("校验方式", "Parity")),
+            theme,
+            &field_scope,
+        ))
+        .child(field(
+            crate::locale::text("流控", "Flow control"),
+            Select::new(&editor.serial_flow_select)
+                .w_full()
+                .h(theme.metrics.control_height)
+                .disabled(disabled)
+                .accessibility_label(crate::locale::text("流控方式", "Flow control")),
+            theme,
+            &field_scope,
+        ))
 }
 
 /// 空快照、失败与未注入服务必须有不同反馈，避免把驱动故障伪装成“没有设备”。
@@ -3580,7 +3609,7 @@ fn render_proxy_route(
         .w_full()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap_3()
         .child(host_option_toggle(
             "connections-proxy-toggle",
             crate::locale::text("使用代理", "Enable proxy"),
@@ -3661,7 +3690,7 @@ fn render_proxy_route(
     section
 }
 
-/// 跳板使用单一工具行和有序子卡片，避免重复标题与外层卡片嵌套；原顺序和凭据槽位不变。
+/// 工具行与有序跳板卡共用右缘，原顺序和凭据槽位保持不变。
 /// @author kongweiguang
 fn render_jump_hosts(
     editor: &HostEditor,
@@ -3672,18 +3701,24 @@ fn render_jump_hosts(
     let field_scope = host_editor_scope(editor, "jump-hosts");
     let mut section = div().w_full().flex().flex_col().gap_3();
     section = section.child(
-        div().w_full().flex().items_center().justify_end().child(
-            field_scope.wrap(
-                "jump-add",
-                Button::new("connections-add-jump")
-                    .compact()
-                    .label(crate::locale::text("添加跳板", "Add jump host"))
-                    .disabled(disabled || editor.jumps.len() >= 8)
-                    .on_click(
-                        cx.listener(|panel, _: &ClickEvent, window, cx| panel.add_jump(window, cx)),
-                    ),
+        div()
+            .w_full()
+            .max_w(rems(form_field_row_max_width_rems()))
+            .flex()
+            .items_center()
+            .justify_end()
+            .child(
+                field_scope.wrap(
+                    "jump-add",
+                    Button::new("connections-add-jump")
+                        .compact()
+                        .label(crate::locale::text("添加跳板", "Add jump host"))
+                        .disabled(disabled || editor.jumps.len() >= 8)
+                        .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
+                            panel.add_jump(window, cx)
+                        })),
+                ),
             ),
-        ),
     );
     if editor.jumps.is_empty() {
         section = section.child(note_card(
@@ -3735,7 +3770,7 @@ fn proxy_protocol_picker(
     )
 }
 
-/// 跳板凭据独立占用槽位；切换认证先交接到保留的地址字段，避免秘密输入卸载后丢失按键。
+/// 跳板身份字段沿同一标签轴排列；认证切换保留可见焦点与独立凭据槽位。
 /// @author kongweiguang
 fn render_jump(
     editor: &HostEditor,
@@ -3758,6 +3793,7 @@ fn render_jump(
     let mut card = div()
         .id(("connections-jump-card", jump.host.entity_id()))
         .w_full()
+        .max_w(rems(form_field_row_max_width_rems()))
         .flex()
         .flex_col()
         .gap_2()
@@ -3782,10 +3818,7 @@ fn render_jump(
                 .child(
                     field_scope.wrap(
                         "move-up",
-                        Button::new(format!("connections-jump-move-up-{jump_id}"))
-                            .compact()
-                            .size(theme.metrics.control_height)
-                            .ghost()
+                        editor_icon_button(format!("connections-jump-move-up-{jump_id}"), theme)
                             .icon(IconName::ArrowUp)
                             .accessibility_label(crate::locale::text(
                                 "上移跳板",
@@ -3801,10 +3834,7 @@ fn render_jump(
                 .child(
                     field_scope.wrap(
                         "move-down",
-                        Button::new(format!("connections-jump-move-down-{jump_id}"))
-                            .compact()
-                            .size(theme.metrics.control_height)
-                            .ghost()
+                        editor_icon_button(format!("connections-jump-move-down-{jump_id}"), theme)
                             .icon(IconName::ArrowDown)
                             .accessibility_label(crate::locale::text(
                                 "下移跳板",
@@ -3836,40 +3866,30 @@ fn render_jump(
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(div().flex_1().min_w_0().child(input_field(
-                            crate::locale::text("名称", "Name"),
-                            Input::new(&jump.name).disabled(disabled).w_full(),
-                            theme,
-                            &field_scope,
-                        )))
-                        .child(div().flex_1().min_w_0().child(input_field(
-                            crate::locale::text("地址", "Address"),
-                            Input::new(&jump.host).disabled(disabled).w_full(),
-                            theme,
-                            &field_scope,
-                        ))),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(div().flex_1().min_w_0().child(input_field(
-                            crate::locale::text("端口", "Port"),
-                            Input::new(&jump.port).disabled(disabled).w_full(),
-                            theme,
-                            &field_scope,
-                        )))
-                        .child(div().flex_1().min_w_0().child(input_field(
-                            crate::locale::text("用户名", "Username"),
-                            Input::new(&jump.username).disabled(disabled).w_full(),
-                            theme,
-                            &field_scope,
-                        ))),
-                ),
+                .child(input_field(
+                    crate::locale::text("名称", "Name"),
+                    Input::new(&jump.name).disabled(disabled).w_full(),
+                    theme,
+                    &field_scope,
+                ))
+                .child(input_field(
+                    crate::locale::text("地址", "Address"),
+                    Input::new(&jump.host).disabled(disabled).w_full(),
+                    theme,
+                    &field_scope,
+                ))
+                .child(input_field(
+                    crate::locale::text("端口", "Port"),
+                    Input::new(&jump.port).disabled(disabled).w_full(),
+                    theme,
+                    &field_scope,
+                ))
+                .child(input_field(
+                    crate::locale::text("用户名", "Username"),
+                    Input::new(&jump.username).disabled(disabled).w_full(),
+                    theme,
+                    &field_scope,
+                )),
         );
     let mode = jump.authentication_mode;
     let options = [
@@ -4165,8 +4185,7 @@ fn input_field(
     field(label, input, theme, scope)
 }
 
-/// 网络超时与心跳的主标签独立可读，范围/单位降为说明，数字控件不再铺满整行。
-/// 输入保留弹性以适应窄视口，宽度不足时由控件收缩而不挤压标签或固定 footer。
+/// 数字字段的标签对齐输入框而非下方提示，短控件仍可随窄窗口收缩。
 /// @author kongweiguang
 fn network_option_input_field(
     label: impl Into<gpui_kit::SharedString>,
@@ -4176,7 +4195,8 @@ fn network_option_input_field(
     scope: &EditorFieldScope,
 ) -> impl IntoElement {
     let (_, control_max_width) = network_field_widths_px();
-    field(
+    let hint: gpui_kit::SharedString = hint.into();
+    multiline_field(
         label,
         div()
             .w_full()
@@ -4189,13 +4209,31 @@ fn network_option_input_field(
                     .max_w(rems(control_max_width / 16.0))
                     .child(input.h(theme.metrics.control_height)),
             )
-            .child(authentication_note(hint, theme)),
+            .when(!hint.is_empty(), |content| {
+                content.child(authentication_note(hint, theme))
+            }),
         theme,
         scope,
     )
 }
 
 /// 绘制表单分区的次级标题，让平面布局仍有清楚且一致的层级。
+/// @author kongweiguang
+fn editor_section_heading(
+    label: impl Into<gpui_kit::SharedString>,
+    theme: ThemeTokens,
+) -> impl IntoElement {
+    div()
+        .debug_selector(|| "connections-editor-section-heading".to_owned())
+        .w_full()
+        .max_w(rems(form_field_row_max_width_rems()))
+        .pb_3()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(section_title(label, theme))
+}
+
+/// 各分区与内部凭据组共用标题字重，避免新增视觉层级。
 /// @author kongweiguang
 fn section_title(
     label: impl Into<gpui_kit::SharedString>,

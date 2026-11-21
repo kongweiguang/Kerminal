@@ -443,7 +443,7 @@ fn pasted_key_does_not_fall_back_to_hidden_file_after_clear_or_duplicate(app: &m
     }
 }
 
-/// 测试期间只改变局部反馈，保留正文几何与输入实体；编辑会取消旧请求且迟到成功不能复活。
+/// 底栏三个动作共享尺寸，探测期间仅替换局部状态；编辑会取消旧请求且迟到成功不能复活。
 /// @author kongweiguang
 #[gpui_kit::test]
 fn pending_probe_keeps_form_stable_and_input_edits_cancel_old_result(app: &mut TestAppContext) {
@@ -472,6 +472,14 @@ fn pending_probe_keeps_form_stable_and_input_edits_cancel_old_result(app: &mut T
     let save_bounds = visual
         .debug_bounds("connections-editor-save")
         .expect("保存按钮可见");
+    let cancel_bounds = visual
+        .debug_bounds("connections-editor-footer-cancel")
+        .expect("取消按钮可见");
+    let probe_bounds = visual
+        .debug_bounds("connections-editor-probe")
+        .expect("测试按钮可见");
+    assert_eq!(save_bounds.size, cancel_bounds.size);
+    assert_eq!(save_bounds.size, probe_bounds.size);
     let viewport_bounds = visual
         .debug_bounds("connections-editor-viewport")
         .expect("正文视口可见");
@@ -491,6 +499,14 @@ fn pending_probe_keeps_form_stable_and_input_edits_cancel_old_result(app: &mut T
     assert_eq!(
         visual.debug_bounds("connections-editor-save"),
         Some(save_bounds)
+    );
+    assert_eq!(
+        visual.debug_bounds("connections-editor-probe"),
+        Some(probe_bounds)
+    );
+    assert_eq!(
+        visual.debug_bounds("connections-editor-footer-cancel"),
+        Some(cancel_bounds)
     );
     assert_eq!(
         visual.debug_bounds("connections-editor-viewport"),

@@ -770,9 +770,27 @@ fn fixture_environment() -> &'static str {
 }
 
 impl Render for HostEditorAcceptanceState {
-    /// 验收窗口嵌入生产持有的面板实体，避免截图与用户实际编辑路径分叉。
+    /// 沿用生产弹框尺寸和面板实体，避免测试窗口把对话框撑满后掩盖真实留白。
     /// @author kongweiguang
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.panel.clone())
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_size = super::form_layout::host_editor_size(window);
+        let theme = crate::theme::ThemeTokens::current(window, cx);
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.dialog_scrim)
+            .child(
+                div()
+                    .w(editor_size.width)
+                    .h(editor_size.height)
+                    .overflow_hidden()
+                    .rounded(theme.radius_dialog)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.panel)
+                    .child(self.panel.clone()),
+            )
     }
 }
