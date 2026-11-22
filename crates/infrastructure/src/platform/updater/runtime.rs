@@ -83,7 +83,6 @@ pub struct CargoPackagerUpdater {
     current_target: Option<String>,
     current_version: String,
     availability: UpdateAvailability,
-    retire_superseded_windows_install: bool,
     startup_target_path: Option<PathBuf>,
     startup_target_snapshot: Arc<Mutex<StartupTargetSnapshot>>,
     candidates: Arc<Mutex<HashMap<UpdateCandidateId, CandidateRecord>>>,
@@ -142,7 +141,6 @@ impl CargoPackagerUpdater {
             current_target,
             current_version,
             availability,
-            retire_superseded_windows_install: cfg!(windows) && runtime_supported,
             startup_target_path,
             startup_target_snapshot: Arc::new(Mutex::new(StartupTargetSnapshot::default())),
             candidates: Arc::new(Mutex::new(HashMap::new())),
@@ -152,41 +150,29 @@ impl CargoPackagerUpdater {
         })
     }
 
-    /// 启动快照锁同时保护恢复扫描与安装边界，避免把本进程正在安装的记录当作历史材料。
+    /// 恢复扫描在阻塞池执行摘要计算和目录同步，应用 task 收到取消时仍等待其落盘边界。
     async fn load_recoveries(&self) -> AppResult<Vec<UpdateRecoveryRecord>> {
         let recovery = self.recovery.clone();
         let current_version = self.current_version.clone();
         let current_target = self.current_target.clone();
         let startup_target_path = self.startup_target_path.clone();
         let startup_target_snapshot = Arc::clone(&self.startup_target_snapshot);
-        let retire_superseded_windows_install = self.retire_superseded_windows_install;
         tokio::task::spawn_blocking(move || {
             let target = current_target.as_deref().unwrap_or("");
-            let mut snapshot = startup_target_snapshot
-                .lock()
-                .map_err(|_| AppError::infrastructure("更新目标回读状态不可用"))?;
-            let retire_old_windows_install =
-                retire_superseded_windows_install && !snapshot.installation_started;
-            let initial =
-                recovery.list(&current_version, target, None, retire_old_windows_install)?;
+            let initial = recovery.list(&current_version, target, None)?;
             if initial.is_empty() {
                 return Ok(initial);
             }
-            if startup_target_path.is_none() || snapshot.installation_started {
-                return Ok(initial);
-            }
+            let mut snapshot = startup_target_snapshot
+                .lock()
+                .map_err(|_| AppError::infrastructure("更新目标回读状态不可用"))?;
             if !snapshot.digest_computed && !snapshot.installation_started {
                 snapshot.digest = startup_target_path
                     .as_deref()
                     .and_then(|path| recovery.target_sha256(path).ok());
                 snapshot.digest_computed = true;
             }
-            recovery.list(
-                &current_version,
-                target,
-                snapshot.digest.as_deref(),
-                retire_old_windows_install,
-            )
+            recovery.list(&current_version, target, snapshot.digest.as_deref())
         })
         .await
         .map_err(|error| {

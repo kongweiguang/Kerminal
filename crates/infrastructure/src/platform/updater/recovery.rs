@@ -195,13 +195,12 @@ impl RecoveryStore {
         }
     }
 
-    /// 校验收据与包后才清理已验证目标或被当前 Windows 安装版本取代的历史事务。
+    /// 启动时校验收据和 artifact；只有 SDK 成功返回且目标摘要完全吻合才自动清理。
     pub(super) fn list(
         &self,
         current_version: &str,
         current_target: &str,
         current_target_sha256: Option<&str>,
-        retire_superseded_windows_install: bool,
     ) -> AppResult<Vec<UpdateRecoveryRecord>> {
         let entries = fs::read_dir(&self.root)
             .map_err(|error| AppError::infrastructure_with_source("读取更新恢复目录失败", error))?;
@@ -213,14 +212,6 @@ impl RecoveryStore {
             let entry = entry.map_err(|error| {
                 AppError::infrastructure_with_source("读取更新恢复记录失败", error)
             })?;
-            if entry.file_name().to_str().is_some_and(|name| {
-                name.strip_prefix(".retired-")
-                    .and_then(parse_record_id)
-                    .is_some()
-            }) {
-                self.cleanup_retired(&entry.path());
-                continue;
-            }
             let file_type = entry.file_type().map_err(|error| {
                 AppError::infrastructure_with_source("检查更新恢复记录失败", error)
             })?;
@@ -267,22 +258,13 @@ impl RecoveryStore {
             let version_matches =
                 Version::parse(&receipt.version).is_ok_and(|version| version == current_version);
             let target_matches = receipt.target == current_target;
-            if retire_superseded_windows_install
-                && receipt.state == ReceiptState::Installing
-                && target_matches
-                && current_target.starts_with("windows-")
-                && Version::parse(&receipt.version).is_ok_and(|version| current_version >= version)
-                && self.try_remove_automatically(id)?
-            {
-                continue;
-            }
             if receipt.state == ReceiptState::AwaitingConfirmation
                 && version_matches
                 && target_matches
                 && receipt.installed_target_sha256.as_deref() == current_target_sha256
                 && receipt.installed_target_sha256.is_some()
-                && self.try_remove_automatically(id)?
             {
+                self.remove(id)?;
                 continue;
             }
 
@@ -316,19 +298,7 @@ impl RecoveryStore {
         Ok(records)
     }
 
-    /// 明确未移出时继续展示原记录；提交未知时必须让调用方回读而非猜测结果。
-    fn try_remove_automatically(&self, id: UpdateRecoveryId) -> AppResult<bool> {
-        match self.remove(id) {
-            Ok(()) => Ok(true),
-            Err(AppError::Infrastructure { .. }) => {
-                tracing::warn!("更新恢复记录未能自动移出，保留给用户处理");
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// 先原子移出活动命名空间，再尽力清理残片；清理中断不会留下损坏的活动收据。
+    /// 仅由用户显式确认或安全的安装前放弃路径调用，绝不跟随目录符号链接删除。
     pub(super) fn remove(&self, id: UpdateRecoveryId) -> AppResult<()> {
         let directory = self.record_dir(id);
         match fs::symlink_metadata(&directory) {
@@ -336,40 +306,18 @@ impl RecoveryStore {
                 Err(AppError::invalid("更新恢复记录路径不安全"))
             }
             Ok(_) => {
-                let retired = self.root.join(format!(".retired-{}", id.as_uuid()));
-                commit_staged_file(&directory, &retired, CommitMode::MoveNoReplace).map_err(
-                    |error| {
-                        map_recovery_commit_error(
-                            error,
-                            "移出已确认的更新恢复材料失败",
-                            "移出更新恢复材料的结果未知",
-                        )
-                    },
-                )?;
-                self.cleanup_retired(&retired);
-                Ok(())
+                fs::remove_dir_all(&directory).map_err(|error| {
+                    AppError::infrastructure_with_source("清理已确认的更新恢复材料失败", error)
+                })?;
+                sync_directory(&self.root).map_err(|error| {
+                    AppError::infrastructure_with_source("同步更新恢复清理结果失败", error)
+                })
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(AppError::infrastructure_with_source(
                 "读取更新恢复记录失败",
                 error,
             )),
-        }
-    }
-
-    /// 已移出的目录不再参与安装门禁，清理失败保留残片并在下次扫描重试。
-    fn cleanup_retired(&self, path: &Path) {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                if let Err(error) = fs::remove_dir_all(path) {
-                    tracing::warn!(kind = ?error.kind(), "更新恢复残片清理失败，将在下次扫描重试");
-                }
-            }
-            Ok(_) => tracing::warn!("更新恢复残片路径不安全，保留原材料"),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(kind = ?error.kind(), "无法读取更新恢复残片，将在下次扫描重试");
-            }
         }
     }
 

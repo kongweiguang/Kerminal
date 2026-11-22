@@ -101,60 +101,6 @@ async fn missing_update_source_keeps_recovery_available() {
     );
 }
 
-/// 真实历史收据的版本已运行时解除下载门禁；本进程正在安装时仍保留记录。
-#[tokio::test]
-async fn windows_historical_receipt_unblocks_download_but_active_install_does_not() {
-    for installation_started in [false, true] {
-        let root = tempfile::tempdir().expect("create isolated updater root");
-        let mut adapter = CargoPackagerUpdater::new(None, root.path().join("recovery"))
-            .expect("construct isolated updater");
-        adapter.current_target = Some("windows-x86_64".to_owned());
-        adapter.current_version = "0.4.3".to_owned();
-        adapter.retire_superseded_windows_install = true;
-        adapter
-            .startup_target_snapshot
-            .lock()
-            .expect("snapshot lock")
-            .installation_started = installation_started;
-        let recovery_id = UpdateRecoveryId::new();
-        let directory = adapter
-            .recovery
-            .persist_pending_bytes(
-                recovery_id,
-                "0.4.3",
-                "windows-x86_64",
-                b"isolated verified update",
-            )
-            .expect("persist historical update");
-        adapter
-            .recovery
-            .mark_installing(recovery_id)
-            .expect("persist installing receipt");
-
-        let result = adapter.ensure_no_unresolved_recovery().await;
-        assert_eq!(result.is_err(), installation_started);
-        assert_eq!(directory.exists(), installation_started);
-    }
-}
-
-/// 清理中断只留下已退出活动命名空间的目录时，新下载仍可继续。
-#[tokio::test]
-async fn partial_retired_cleanup_does_not_block_download_gate() {
-    let root = tempfile::tempdir().expect("create isolated updater root");
-    let recovery_root = root.path().join("recovery");
-    let adapter =
-        CargoPackagerUpdater::new(None, recovery_root.clone()).expect("construct isolated updater");
-    let retired = recovery_root.join(format!(".retired-{}", UpdateRecoveryId::new().as_uuid()));
-    std::fs::create_dir(&retired).expect("seed interrupted cleanup");
-    std::fs::write(retired.join("partial.bin"), b"leftover").expect("seed partial artifact");
-
-    adapter
-        .ensure_no_unresolved_recovery()
-        .await
-        .expect("allow new download");
-    assert!(!retired.exists());
-}
-
 /// 目标快照未改变时 SDK 错误可安全归类为无副作用，保留同一包供重试。
 #[cfg(target_os = "linux")]
 #[test]
