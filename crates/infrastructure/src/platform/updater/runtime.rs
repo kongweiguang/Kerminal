@@ -33,6 +33,10 @@ use cargo_packager_updater::UpdateFormat;
 
 use super::{download::download_update, metadata, settings::UpdaterSettings};
 
+#[cfg(any(target_os = "linux", test))]
+#[path = "appimage_payload.rs"]
+mod appimage_payload;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CandidatePhase {
     Available,
@@ -656,6 +660,17 @@ fn mark_install_unknown(
 fn perform_install(plan: InstallPlan, bytes: Vec<u8>) -> InstallOutcome {
     #[cfg(target_os = "linux")]
     {
+        let bytes = match appimage_payload::prepare(bytes, 1024 * 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return InstallOutcome {
+                    result: UpdateInstallResult::NotStarted(AppError::infrastructure_with_source(
+                        "更新包不是有效的 AppImage，安装器未启动",
+                        error,
+                    )),
+                };
+            }
+        };
         let before = match appimage_snapshot(&plan.update.extract_path) {
             Ok(snapshot) => snapshot,
             Err(error) => {

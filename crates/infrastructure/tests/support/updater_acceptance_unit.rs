@@ -31,18 +31,40 @@ use super::super::{CargoPackagerUpdater, settings::UpdaterSettings};
 
 use super::super::tls_test_support as tls;
 
-const TEST_PUBLIC_KEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+const TEST_PUBLIC_KEY: &str = "RWR0ZXN0LWtleQOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4";
 const TEST_SIGNATURE: &str = concat!(
     "untrusted comment: signature from minisign secret key\n",
-    "RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/",
-    "z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\n",
-    "trusted comment: timestamp:1556193335\tfile:test\n",
-    "y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg=="
+    "RUR0ZXN0LWtlefe9t+LANcw5cBELcaWPJFckYUNHmJo0W9h6q5HUdXv+xlCRoR6AkYK+HXGc1PpETr3NARBrxDJOoyfyO6j39wk=\n",
+    "trusted comment: test fixture\n",
+    "yuKKvfxMbqoUBJVT947R97M3qRRZLH7Tz2MOdk6AvpTmrVA1I8hPcxu+ZF8rlCP74HyfsvEs4pzq2KFeZA3UAg=="
 );
-const TEST_ARTIFACT: &[u8] = b"test";
+
+/// 固定测试包是签名后的 tar.gz，保持验签覆盖压缩数据而不是解压结果。
+fn test_artifact() -> Vec<u8> {
+    STANDARD.decode("H4sIAAAAAAAC/+3NOwrCQBDG8dl4kZwgbMzDTjaFQiCXSBG0EaK7gp0ePctWogEfYCD4/zXz4GPGddYlVd/Xh3bXyW9ob1UUoXqPVed3fdinOluWEmuZwNm69uTfy3+6bpptpJRUdRTmhaxFjeTMU29Gc5/a26N9J3f78v7lBQEAAAAAAAAAAAAAAACAmRoAFhdIFAAoAAA=").expect("decode signed AppImage archive")
+}
+
+/// 分离原始 AppImage 与带签名归档，防止回归时再次把压缩包写入目标。
+#[cfg(target_os = "linux")]
+fn expected_appimage() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 256];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[8..11].copy_from_slice(b"AI\x02");
+    bytes[18..20].copy_from_slice(&[0x3e, 0]);
+    bytes[16] = 3;
+    bytes[20] = 1;
+    bytes[40] = 64;
+    bytes[52] = 64;
+    bytes[58] = 64;
+    bytes[60] = 1;
+    bytes[128..132].copy_from_slice(b"hsqs");
+    bytes[168] = 128;
+    bytes[224..].fill(b'x');
+    bytes
+}
 
 /// 复用 SDK 公开 target 键改写冻结 manifest，避免为测试扩大 metadata 私有 API。
-fn local_sdk_manifest(artifact_url: &Url) -> Vec<u8> {
+fn local_sdk_manifest(artifact_url: &Url, signature: &str) -> Vec<u8> {
     let fixture = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/updater/cargo-packager-updater-0.2.3.json"
@@ -56,17 +78,25 @@ fn local_sdk_manifest(artifact_url: &Url) -> Vec<u8> {
     platform.insert("url".to_owned(), Value::String(artifact_url.to_string()));
     platform.insert(
         "signature".to_owned(),
-        Value::String(STANDARD.encode(TEST_SIGNATURE)),
+        Value::String(STANDARD.encode(signature)),
     );
     serde_json::to_vec(&manifest).expect("encode SDK-compatible local manifest")
 }
 
 /// 在隔离 loopback HTTPS listener 上响应 SDK metadata 和制品请求。
 async fn local_feed_server(artifact: Vec<u8>) -> (Url, JoinHandle<()>) {
+    local_feed_server_with_signature(artifact, TEST_SIGNATURE).await
+}
+
+/// 允许固定异常样本使用独立测试签名，仍走完整 HTTPS 和验签路径。
+async fn local_feed_server_with_signature(
+    artifact: Vec<u8>,
+    signature: &str,
+) -> (Url, JoinHandle<()>) {
     let (listener, address) = tls::bind_loopback().await;
     let acceptor = tls::test_tls_acceptor();
     let artifact_url = tls::https_url(address, "/candidate");
-    let manifest = local_sdk_manifest(&artifact_url);
+    let manifest = local_sdk_manifest(&artifact_url, signature);
     let server = tokio::spawn(async move {
         for _ in 0..2 {
             let Ok(Ok((stream, _))) =
@@ -124,8 +154,13 @@ async fn serve_local_request(stream: TlsStream<TcpStream>, manifest: &[u8], arti
 
 /// 测试 feed 保留生产 HTTPS 和验签策略，只注入隔离公钥和端点。
 fn local_settings(feed_url: Url) -> UpdaterSettings {
+    local_settings_with_key(feed_url, TEST_PUBLIC_KEY)
+}
+
+/// 测试密钥仅用于隔离 feed，不能改变生产信任根。
+fn local_settings_with_key(feed_url: Url, key: &str) -> UpdaterSettings {
     let test_public_key = STANDARD.encode(format!(
-        "untrusted comment: isolated updater acceptance key\n{TEST_PUBLIC_KEY}"
+        "untrusted comment: isolated updater acceptance key\n{key}"
     ));
     UpdaterSettings::new(
         "0.3.9",
@@ -137,11 +172,85 @@ fn local_settings(feed_url: Url) -> UpdaterSettings {
     .expect("construct strict HTTPS updater settings")
 }
 
+/// 即使包签名有效，非 AppImage 内容也必须在替换目标前被拒绝。
+#[cfg(target_os = "linux")]
+#[test]
+fn signed_invalid_appimage_preserves_target() {
+    use std::process::Command;
+    let root = tempfile::tempdir().expect("create isolated test root");
+    let target = root.path().join("invalid-test.AppImage");
+    std::fs::write(&target, b"original").expect("seed target");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("set mode");
+    let status = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "platform::updater::runtime::acceptance_tests::signed_invalid_appimage_child",
+            "--nocapture",
+        ])
+        .env("APPIMAGE", &target)
+        .env("KERMINAL_TEST_UPDATER_ROOT", root.path())
+        .status()
+        .expect("start child");
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read(target).expect("read retained target"),
+        b"original"
+    );
+}
+
+/// 旧公开验签样本内容为 test，确认签名通过后才由格式校验拒绝。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn signed_invalid_appimage_child() {
+    let Some(root) = std::env::var_os("KERMINAL_TEST_UPDATER_ROOT") else {
+        return;
+    };
+    let signature = concat!(
+        "untrusted comment: signature from minisign secret key\n",
+        "RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/",
+        "z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\n",
+        "trusted comment: timestamp:1556193335\tfile:test\n",
+        "y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg=="
+    );
+    let (url, server) = local_feed_server_with_signature(b"test".to_vec(), signature).await;
+    let settings = local_settings_with_key(
+        url,
+        "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+    );
+    let adapter = CargoPackagerUpdater::from_settings(
+        Some(settings),
+        PathBuf::from(root).join("recovery"),
+        vec![tls::trusted_test_root()],
+    )
+    .expect("construct updater");
+    let service = UpdateService::new(std::sync::Arc::new(adapter));
+    let candidate = service
+        .check(CancellationToken::new())
+        .await
+        .expect("check feed")
+        .expect("candidate");
+    let (reporter, _) = UpdateService::progress_channel();
+    let downloaded = service
+        .download_with_cancellation(
+            candidate.id,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            reporter,
+        )
+        .await
+        .expect("verify signed invalid artifact");
+    assert!(matches!(
+        service.install(downloaded.id).await,
+        UpdateInstallResult::NotStarted(_)
+    ));
+    server.await.expect("join fixture server");
+}
+
 /// 启动后仍存在的损坏收据不能拦住最新签名包，同会话重复下载仍由句柄保护。
 #[tokio::test]
 async fn latest_signed_download_ignores_previous_receipt() {
     let root = tempfile::tempdir().expect("create isolated recovery root");
-    let (feed_url, server) = local_feed_server(TEST_ARTIFACT.to_vec()).await;
+    let (feed_url, server) = local_feed_server(test_artifact()).await;
     let mut adapter = CargoPackagerUpdater::from_settings(
         Some(local_settings(feed_url)),
         root.path().join("recovery"),
@@ -228,7 +337,7 @@ fn linux_appimage_upgrade_uses_real_runtime_path_in_subprocess() {
         assert!(status.success(), "isolated updater child failed for {case}");
         assert_eq!(
             std::fs::read(&install_path).expect("read child-updated temporary target"),
-            TEST_ARTIFACT,
+            expected_appimage(),
             "SDK should replace only the child's APPIMAGE target"
         );
     }
@@ -246,7 +355,7 @@ async fn linux_appimage_install_child() {
     );
     let install_path = PathBuf::from(std::env::var_os("APPIMAGE").expect("child APPIMAGE path"));
     let original = b"previous test payload";
-    let (feed_url, server) = local_feed_server(TEST_ARTIFACT.to_vec()).await;
+    let (feed_url, server) = local_feed_server(test_artifact()).await;
     let adapter = CargoPackagerUpdater::from_settings(
         Some(local_settings(feed_url)),
         root.join("recovery"),
@@ -292,7 +401,7 @@ async fn linux_appimage_install_child() {
             .await
             .expect("observe completed download progress")
             .received_bytes,
-        TEST_ARTIFACT.len() as u64
+        test_artifact().len() as u64
     );
 
     if case == "preflight-retry" {
@@ -316,7 +425,7 @@ async fn linux_appimage_install_child() {
     ));
     assert_eq!(
         std::fs::read(&install_path).expect("read isolated SDK install target"),
-        TEST_ARTIFACT
+        expected_appimage()
     );
     assert!(
         !current_cache.exists(),

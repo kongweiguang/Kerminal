@@ -127,6 +127,54 @@ fn appimage_sdk_error_with_identical_target_is_retryable() {
     );
 }
 
+/// 损坏归档在真实 SDK 接管前被拒绝，原 AppImage 字节与执行权限均不得变化。
+#[cfg(target_os = "linux")]
+#[test]
+fn malformed_appimage_archive_never_reaches_sdk_install() {
+    use cargo_packager_updater::{
+        Config, Update, UpdateFormat,
+        reqwest::{Url, header::HeaderMap},
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let root = tempfile::tempdir().expect("create isolated install root");
+    let target = root.path().join("current.AppImage");
+    fs::write(&target, b"old executable").expect("seed old target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("mark executable");
+    let before = appimage_snapshot(&target).expect("snapshot original target");
+    let update = Update {
+        config: Config::default(),
+        body: None,
+        current_version: "0.4.3".to_owned(),
+        version: "0.4.5".to_owned(),
+        date: None,
+        target: "linux".to_owned(),
+        extract_path: target.clone(),
+        download_url: Url::parse("https://updates.invalid/test").expect("test URL"),
+        signature: String::new(),
+        timeout: None,
+        headers: HeaderMap::new(),
+        format: UpdateFormat::AppImage,
+    };
+    let plan = super::InstallPlan {
+        update,
+        recovery_id: UpdateRecoveryId::new(),
+    };
+    let result = super::perform_install(plan, vec![0x1f, 0x8b, 0x08]);
+    assert!(matches!(
+        result.result,
+        kerminal_application::UpdateInstallResult::NotStarted(_)
+    ));
+    assert_eq!(
+        appimage_snapshot(&target).expect("read retained target"),
+        before
+    );
+    assert_eq!(
+        fs::read(target).expect("read retained bytes"),
+        b"old executable"
+    );
+}
+
 /// SDK 成功后目标必须仍是可执行普通文件，才能交给宿主重启。
 #[cfg(target_os = "linux")]
 #[test]
