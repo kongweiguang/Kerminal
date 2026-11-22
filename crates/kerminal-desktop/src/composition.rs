@@ -265,9 +265,10 @@ impl DesktopComposition {
     }
 
     /// 工厂只在所有应用服务准备后注入 UI；扫描前先核对工厂的声明与唯一身份。
+    /// 该入口只服务右栏验收进程，普通测试构建不会引用，避免验收专用代码进入默认链路。
     ///
     /// @author kongweiguang
-    #[cfg(any(test, feature = "right-rail-acceptance"))]
+    #[cfg(feature = "right-rail-acceptance")]
     pub async fn build_with_plugin_factories(
         runtime: Handle,
         config_root: impl AsRef<Path>,
