@@ -87,7 +87,10 @@ fn cancelled_download_success_is_discarded_and_cleanup_can_retry(app: &mut TestA
     };
     visual.update(|_, cx| {
         panel.update(cx, |panel, cx| {
-            panel.state = UpdatePanelState::Available(candidate.clone());
+            panel.state = UpdatePanelState::Checking;
+            panel.active_check_generation = Some(1);
+            panel.finish_check(Ok(Some(candidate.clone())), false, 1, cx);
+            assert_eq!(panel.settings_projection().detail, "v0.4.6");
             panel.status_is_error = true;
             assert!(panel.settings_projection().failed);
             panel.state = UpdatePanelState::Checking;

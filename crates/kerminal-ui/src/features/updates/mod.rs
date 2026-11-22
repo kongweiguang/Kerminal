@@ -523,7 +523,7 @@ impl UpdatesPanel {
         )
     }
 
-    /// 只消费匹配代次一次；取消与回执竞争时以用户意图为准，避免发出过期通知。
+    /// 只消费匹配代次一次；取消优先，可用更新的文案由各入口按候选版本呈现。
     fn finish_check(
         &mut self,
         result: kerminal_application::AppResult<Option<UpdateCandidate>>,
@@ -551,7 +551,7 @@ impl UpdatesPanel {
             }
             Ok(Some(candidate)) => {
                 self.state = UpdatePanelState::Available(candidate);
-                self.status = Some(localized("发现可用更新。", "An update is available."));
+                self.status = None;
                 self.status_is_error = false;
             }
             Ok(None) => {

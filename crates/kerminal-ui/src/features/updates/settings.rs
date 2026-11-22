@@ -35,7 +35,7 @@ pub(crate) enum AboutUpdateAction {
 }
 
 impl UpdatesPanel {
-    /// 将更新事务与取消能力投影到关于页，失败状态保留真实操作反馈。
+    /// 在关于页保留版本、进度与可操作的失败信息，详情不重复状态标签。
     pub(crate) fn settings_projection(&self) -> AboutUpdateState {
         let mut projection = AboutUpdateState {
             status: localized("可检查", "Ready to check"),
@@ -92,13 +92,10 @@ impl UpdatesPanel {
                 } else {
                     localized("可更新", "Update available")
                 };
-                projection.detail = self.status.clone().unwrap_or_else(|| {
-                    format!(
-                        "{} {}。",
-                        localized("发现版本", "Version available:"),
-                        version_label(&candidate.version)
-                    )
-                });
+                projection.detail = self
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| version_label(&candidate.version));
                 projection.can_install = true;
                 projection.failed = self.status_is_error;
             }
@@ -232,7 +229,7 @@ fn version_label(version: &str) -> String {
     }
 }
 
-/// 下载详情只读取当前最新进度快照，不引入第二个轮询或后台任务。
+/// 状态标签已经标明下载阶段，详情只补充目标版本和当前进度。
 fn download_detail(
     progress: kerminal_application::updates::UpdateProgress,
     version: &str,
@@ -249,11 +246,7 @@ fn download_detail(
         ),
         None => format!("{} B", progress.received_bytes),
     };
-    format!(
-        "{} {} · {progress_text}",
-        localized("正在下载并验证", "Downloading and verifying"),
-        version_label(version)
-    )
+    format!("{} · {progress_text}", version_label(version))
 }
 
 /// 文案在调用时按当前界面语言生成，切换语言后不保留旧语言缓存。
