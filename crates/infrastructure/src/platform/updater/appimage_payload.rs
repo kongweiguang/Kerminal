@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Read};
 
 use flate2::read::MultiGzDecoder;
 
-/// 发布源签名覆盖完整压缩包，因此仅在验签后提取单个文件并限制解压体积。
+/// 发布签名覆盖完整压缩包，因此只在验签后提取单个有界文件，再读到 gzip 结尾以检查校验和和尾部填充。
 pub(super) fn prepare(bytes: Vec<u8>, maximum: u64) -> io::Result<Vec<u8>> {
     if bytes.starts_with(b"\x1f\x8b") {
         let decoder = MultiGzDecoder::new(Cursor::new(bytes));
@@ -35,7 +35,6 @@ pub(super) fn prepare(bytes: Vec<u8>, maximum: u64) -> io::Result<Vec<u8>> {
         if entries.next().is_some() {
             return Err(invalid());
         }
-        drop(entries);
         let mut rest = archive.into_inner();
         let mut padding = [0_u8; 8192];
         let mut padding_bytes = 0_u64;
