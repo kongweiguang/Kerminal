@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use tokio_util::io::SyncIoBridge;
 use tokio_util::sync::CancellationToken;
 
-mod appimage_env;
+use crate::platform::appimage as appimage_env;
 mod reader;
 use reader::{PtyReaderStats, output_reader_channel, spawn_pty_reader};
 

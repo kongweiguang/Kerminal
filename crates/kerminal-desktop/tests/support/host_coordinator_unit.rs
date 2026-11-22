@@ -133,6 +133,87 @@ fn restart_arguments_preserve_only_valid_plugin_startup_options() {
     );
 }
 
+/// 核对 AppImage 重启命令的入口和环境，避免在并行单实例测试期间 fork 继承监听器。
+#[cfg(target_os = "linux")]
+#[test]
+fn appimage_restart_targets_the_replaced_outer_file() {
+    use kerminal_infrastructure::platform::appimage::restart_command;
+    use std::{fs, path::Path};
+
+    let sandbox = tempfile::tempdir().expect("创建隔离目录");
+    let appdir = sandbox.path().join("old AppDir");
+    let executable = appdir.join("usr/bin/kerminal");
+    fs::create_dir_all(executable.parent().expect("bin 目录")).expect("创建 AppDir 布局");
+    fs::write(appdir.join("AppRun"), "old").expect("写入 AppRun 标记");
+    let appimage = sandbox.path().join("Kerminal 中文.AppImage");
+    let command = restart_command(&executable, Some(appimage.as_os_str()), &appdir)
+        .expect("合法重启入口")
+        .expect("识别 AppImage");
+    assert_eq!(command.get_program(), appimage.as_os_str());
+    assert_eq!(command.get_current_dir(), Some(sandbox.path()));
+    for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_none())
+        );
+    }
+    assert!(
+        restart_command(&executable, None, &appdir)
+            .expect("无外层包")
+            .is_none()
+    );
+    assert!(
+        restart_command(
+            Path::new("/usr/bin/kerminal"),
+            Some(appimage.as_os_str()),
+            &appdir
+        )
+        .expect("普通二进制")
+        .is_none()
+    );
+    assert!(restart_command(&executable, Some(executable.as_os_str()), &appdir).is_err());
+    assert!(
+        restart_command(
+            &executable,
+            Some(Path::new("relative").as_os_str()),
+            &appdir
+        )
+        .is_err()
+    );
+}
+
+/// 成功安装后的重启必须先释放单实例入口，避免新版被误判成第二实例后立即退出。
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn update_restart_releases_the_listener_before_spawning() {
+    use super::{UpdateHostAction, restart_after_install};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let instance_id = format!("kerminal-update-restart-test-{}", std::process::id());
+    let SingleApplication::PrimaryInstance(primary) =
+        SingleApplication::<String>::new(&instance_id)
+    else {
+        panic!("隔离测试实例必须能监听");
+    };
+    let (activation_sender, _activation_receiver) = activation_queue();
+    let listener = Arc::new(Mutex::new(PrimaryListener::new(
+        instance_id,
+        activation_sender,
+        tokio::runtime::Handle::current(),
+        primary,
+    )));
+    let action = restart_after_install(&listener, || {
+        let closed = listener.try_lock().expect("启动前应释放 listener 锁");
+        assert!(closed.task.is_none());
+        assert!(closed.package_listener.is_none());
+        Ok(())
+    })
+    .await;
+    assert!(matches!(action, UpdateHostAction::Quit));
+}
+
 /// 验证恢复超时保留其错误分类，并在原 instance ID 上恢复投递队列而不并行留旧 listener。
 ///
 /// @author kongweiguang

@@ -4,6 +4,7 @@
 //! 路径前插到 PATH、LD_LIBRARY_PATH、PYTHONPATH 等变量。Kerminal 在 AppImage 内
 //! 运行时确实需要这些值加载打包依赖，但新建的本地 PTY 属于宿主 shell；继续继承
 //! 挂载目录会让宿主 python3 等程序在 AppDir 缺少标准库或卸载后直接失效。
+//! 重新运行外层 AppImage 时也要恢复宿主环境，让新版启动器只注入自己的 AppDir。
 //!
 //! @author kongweiguang
 
@@ -98,19 +99,71 @@ fn restore_path_list(value: &OsStr, appdir: &Path) -> Option<OsString> {
 ///
 /// @author kongweiguang
 pub(crate) fn restore_host_environment(command: &mut portable_pty::CommandBuilder, appdir: &Path) {
-    for name in APPIMAGE_PATH_LIST_VARIABLES {
-        let Some(value) = command.get_env(name).map(OsStr::to_os_string) else {
-            continue;
-        };
-        match restore_path_list(&value, appdir) {
+    let changes = host_environment_changes(appdir, |name| {
+        command.get_env(name).map(OsStr::to_os_string)
+    });
+    for (name, value) in changes {
+        match value {
             Some(restored) => command.env(name, restored),
             None => command.env_remove(name),
         }
     }
-    if command
-        .get_env("PYTHONHOME")
-        .is_some_and(|value| Path::new(value) == appdir.join("usr"))
-    {
-        command.env_remove("PYTHONHOME");
+}
+
+/// 统一 PTY 和重启的恢复规则，调用方提供各自的继承快照，避免修改父进程环境。
+fn host_environment_changes(
+    appdir: &Path,
+    mut get: impl FnMut(&str) -> Option<OsString>,
+) -> Vec<(&'static str, Option<OsString>)> {
+    let mut changes = Vec::new();
+    for &name in APPIMAGE_PATH_LIST_VARIABLES {
+        if let Some(value) = get(name) {
+            let restored = restore_path_list(&value, appdir);
+            if restored.as_deref() != Some(value.as_os_str()) {
+                changes.push((name, restored));
+            }
+        }
     }
+    if get("PYTHONHOME").is_some_and(|value| Path::new(&value) == appdir.join("usr")) {
+        changes.push(("PYTHONHOME", None));
+    }
+    changes
+}
+
+/// AppImage 安装替换外层文件，重启必须走该入口。只信任已识别 AppDir 之外的绝对路径，
+/// 并让新版启动器重建挂载相关环境，避免新进程继续依赖旧挂载或临时解包目录。
+#[cfg(target_os = "linux")]
+pub fn restart_command(
+    executable: &Path,
+    appimage: Option<&OsStr>,
+    working_directory: &Path,
+) -> std::io::Result<Option<std::process::Command>> {
+    let Some((appdir, appimage)) = appdir_from_executable(executable).zip(appimage.map(Path::new))
+    else {
+        return Ok(None);
+    };
+    if !appimage.is_absolute() || appimage.starts_with(&appdir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AppImage 重启入口必须是旧 AppDir 之外的绝对路径",
+        ));
+    }
+
+    let mut command = std::process::Command::new(appimage);
+    let directory = if working_directory.starts_with(&appdir) {
+        appimage.parent().unwrap_or(Path::new("/"))
+    } else {
+        working_directory
+    };
+    command.current_dir(directory);
+    for (name, value) in host_environment_changes(&appdir, |name| std::env::var_os(name)) {
+        match value {
+            Some(restored) => command.env(name, restored),
+            None => command.env_remove(name),
+        };
+    }
+    for name in ["APPIMAGE", "APPDIR", "ARGV0", "OWD"] {
+        command.env_remove(name);
+    }
+    Ok(Some(command))
 }

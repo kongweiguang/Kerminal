@@ -2,6 +2,7 @@
 //!
 //! @author kongweiguang
 
+pub mod appimage;
 pub mod color_sampler;
 pub mod configuration_directory;
 pub mod default_shell;

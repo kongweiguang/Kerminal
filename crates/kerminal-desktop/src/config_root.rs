@@ -10,7 +10,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const CONFIG_ROOT_ENV: &str = "KERMINAL_CONFIG_ROOT";
+pub(crate) const CONFIG_ROOT_ENV: &str = "KERMINAL_CONFIG_ROOT";
 
 /// 已解析的数据根；保留类型边界，避免调用方把工作目录误当成持久化目录。
 #[derive(Clone, Debug, Eq, PartialEq)]

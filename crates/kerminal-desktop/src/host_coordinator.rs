@@ -26,6 +26,8 @@ use crate::external_activation::{ActivationQueueSender, decode_message};
 use crate::plugins::arguments::PluginStartupOptions;
 
 const HOST_QUEUE_CAPACITY: usize = 8;
+#[cfg(not(target_os = "windows"))]
+const UPDATE_RESTART_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(feature = "acceptance-metrics")]
 pub(crate) mod quit_diagnostics;
@@ -622,7 +624,7 @@ struct InstallUpdateContext<'a> {
     restart_options: &'a PluginStartupOptions,
 }
 
-/// 安装重试复用已收尾宿主；直接重启时只继承冻结的启动选项，Windows 仍由安装器安排新版启动。
+/// 安装重试复用已收尾宿主；Unix 保留单实例入口到安装确认成功，Windows 由安装器安排新版启动。
 /// @author kongweiguang
 async fn install_update(
     update_id: DownloadedUpdateId,
@@ -708,17 +710,7 @@ async fn install_update(
             }
             #[cfg(not(target_os = "windows"))]
             {
-                match stop_listener_until(listener, deadline).await {
-                    Ok(()) if restart_current_process(restart_options).is_ok() => {
-                        UpdateHostAction::Quit
-                    }
-                    Ok(()) => UpdateHostAction::RestartFailed(
-                        "安装已完成，但新版进程未能启动；请手动重新打开 Kerminal。",
-                    ),
-                    Err(_) => UpdateHostAction::RestartFailed(
-                        "安装已完成，但单实例监听器未能关闭；请确认进程退出后重新打开 Kerminal。",
-                    ),
-                }
+                restart_after_install(listener, || restart_current_process(restart_options)).await
             }
         }
     };
@@ -729,6 +721,31 @@ async fn install_update(
         version,
         result,
         action,
+    }
+}
+
+/// 安装和提权等待可能耗尽旧收尾预算。确认安装后为重启单独计时，关闭监听器后才启动新版。
+#[cfg(not(target_os = "windows"))]
+async fn restart_after_install(
+    listener: &std::sync::Arc<AsyncMutex<PrimaryListener>>,
+    spawn: impl FnOnce() -> std::io::Result<()>,
+) -> UpdateHostAction {
+    if stop_listener_until(listener, Instant::now() + UPDATE_RESTART_BUDGET)
+        .await
+        .is_err()
+    {
+        return UpdateHostAction::RestartFailed(
+            "安装已完成，但单实例监听器未能关闭；请确认进程退出后重新打开 Kerminal。",
+        );
+    }
+    match spawn() {
+        Ok(()) => UpdateHostAction::Quit,
+        Err(error) => {
+            tracing::warn!(event = "UPDATE_RESTART_SPAWN_FAILED", kind = ?error.kind());
+            UpdateHostAction::RestartFailed(
+                "安装已完成，但新版进程未能启动；请手动重新打开 Kerminal。",
+            )
+        }
     }
 }
 
@@ -772,12 +789,28 @@ fn restart_extensions_until(deadline: Instant, options: &PluginStartupOptions) -
 }
 
 /// 旧 listener 已同步关闭且应用资源已回收才调用；Windows 同样显式 spawn，再由 GPUI 有序退出。
-/// 下一进程继承隔离配置根与合法插件开关，工作区从持久化恢复，不重放文件、URL 或验收参数。
+/// AppImage 从外层包启动新版，其他安装形态沿用原入口。只传递冻结的插件参数，不重放外部激活。
 fn restart_current_process(options: &PluginStartupOptions) -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
     let working_directory = std::env::current_dir()?;
+    let arguments = restart_arguments(options)?;
+    #[cfg(target_os = "linux")]
+    if let Some(mut command) = kerminal_infrastructure::platform::appimage::restart_command(
+        &executable,
+        std::env::var_os("APPIMAGE").as_deref(),
+        &working_directory,
+    )? {
+        let config_root_variable = crate::config_root::CONFIG_ROOT_ENV;
+        if let Some(config_root) =
+            std::env::var_os(config_root_variable).map(std::path::PathBuf::from)
+            && config_root.is_relative()
+        {
+            command.env(config_root_variable, config_root.canonicalize()?);
+        }
+        return command.args(arguments).spawn().map(|_| ());
+    }
     Command::new(executable)
-        .args(restart_arguments(options)?)
+        .args(arguments)
         .current_dir(working_directory)
         .spawn()
         .map(|_| ())

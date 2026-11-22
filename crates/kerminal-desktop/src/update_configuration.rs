@@ -9,7 +9,7 @@ use kerminal_infrastructure::platform::updater::UpdaterSettings;
 const RELEASE_ENDPOINT: &str =
     "https://github.com/kongweiguang/Kerminal/releases/latest/download/kerminal-updater.json";
 
-/// 只接受构建时注入的公钥；未配置的开发候选保留明确的不可用状态与恢复入口。
+/// 只接受构建时注入的公钥；开发构建缺少公钥时不访问更新源。
 ///
 /// @author kongweiguang
 pub(crate) fn production_updater_settings() -> AppResult<Option<UpdaterSettings>> {
