@@ -180,14 +180,6 @@ impl CargoPackagerUpdater {
         })?
     }
 
-    /// 确认没有遗留恢复包后才允许新下载，避免覆盖尚未人工处理的 Unknown 事务。
-    async fn ensure_no_unresolved_recovery(&self) -> AppResult<()> {
-        if !self.load_recoveries().await?.is_empty() {
-            return Err(AppError::conflict("存在待人工核实的更新恢复材料"));
-        }
-        Ok(())
-    }
-
     /// 删除显式放弃的 Pending 包；文件系统清理放入 blocking pool，避免堵住异步 worker。
     async fn remove_recovery(&self, recovery_id: UpdateRecoveryId) -> AppResult<()> {
         let recovery = self.recovery.clone();
@@ -260,7 +252,7 @@ impl UpdatePort for CargoPackagerUpdater {
         Ok(Some(candidate))
     }
 
-    /// 下载 API 只返回验签通过的字节；取消、下载失败和过大包都会释放或复位状态。
+    /// 只用本次会话的候选和安装句柄做门禁，历史缓存不会阻塞最新候选下载。
     async fn download(
         &self,
         candidate_id: UpdateCandidateId,
@@ -276,7 +268,6 @@ impl UpdatePort for CargoPackagerUpdater {
         if cancel.is_cancelled() {
             return Err(AppError::cancelled("下载更新已取消"));
         }
-        self.ensure_no_unresolved_recovery().await?;
         if !self
             .downloaded
             .lock()

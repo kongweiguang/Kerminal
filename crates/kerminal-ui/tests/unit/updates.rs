@@ -13,7 +13,7 @@ use std::{
 
 use kerminal_application::updates::{
     DownloadedUpdate, DownloadedUpdateId, UpdateCandidate, UpdateCandidateId, UpdateInstallResult,
-    UpdateProgress, UpdateRecoveryId, UpdateRecoveryRecord, UpdateRecoveryState,
+    UpdateProgress,
 };
 use kerminal_application::{
     AppError, AppResult,
@@ -27,10 +27,9 @@ use kerminal_application::{
 use super::{
     SettingsInstallStep, UpdatePanelState,
     about::{APP_VERSION, LICENSE_SPDX, LICENSE_TEXT, PROJECT_REPOSITORY, repository_url},
-    can_acknowledge_recovery, can_check_for_updates, can_exit_after_install_failure,
-    can_retry_host_install, format_progress, listener_recovery_failure_matches, localized,
-    notification_candidate_for_check, notify_update_available, recovery_state_label,
-    restart_failure_matches,
+    can_check_for_updates, can_exit_after_install_failure, can_retry_host_install, format_progress,
+    listener_recovery_failure_matches, localized, notification_candidate_for_check,
+    notify_update_available, restart_failure_matches,
     settings::{idle_update_status_label, settings_check_allowed},
     settings_install_step, take_check_operation, take_settings_auto_install_after_download,
     update_notification_diagnostic,
@@ -108,18 +107,6 @@ fn update_candidate(version: &str) -> UpdateCandidate {
     }
 }
 
-/// 恢复项 fixture 只含 UI 可见元数据，不引用真实配置路径或安装包。
-fn recovery_record(id: UpdateRecoveryId) -> UpdateRecoveryRecord {
-    UpdateRecoveryRecord {
-        id,
-        version: "0.4.2".to_owned(),
-        target: "windows-x86_64".to_owned(),
-        artifact_sha256: "a".repeat(64),
-        state: UpdateRecoveryState::OutcomeUnknown,
-        recovery_path: std::path::PathBuf::from("isolated/recovery"),
-    }
-}
-
 /// 构造不触发安装动作的已下载句柄，用来验证宿主回执身份绑定。
 fn downloaded_update(id: DownloadedUpdateId) -> DownloadedUpdate {
     DownloadedUpdate {
@@ -155,59 +142,6 @@ fn unknown_or_zero_total_uses_received_bytes_only() {
             total_bytes: Some(0),
         }),
         format!("{} 512 B", localized("已接收", "Received"))
-    );
-}
-
-#[test]
-/// 恢复清理必须绑定确认中的同一条记录，重复点击和陈旧身份不能发起删除。
-fn recovery_acknowledgement_requires_matching_confirmation_and_record() {
-    let selected_id = UpdateRecoveryId::new();
-    let other_id = UpdateRecoveryId::new();
-    let records = vec![recovery_record(selected_id)];
-
-    assert!(!can_acknowledge_recovery(
-        None,
-        None,
-        &records,
-        selected_id,
-        false
-    ));
-    assert!(can_acknowledge_recovery(
-        Some(selected_id),
-        None,
-        &records,
-        selected_id,
-        false
-    ));
-    assert!(!can_acknowledge_recovery(
-        Some(selected_id),
-        Some(selected_id),
-        &records,
-        selected_id,
-        false
-    ));
-    assert!(!can_acknowledge_recovery(
-        Some(other_id),
-        None,
-        &records,
-        selected_id,
-        false
-    ));
-    assert!(!can_acknowledge_recovery(
-        Some(selected_id),
-        None,
-        &records,
-        selected_id,
-        true
-    ));
-}
-
-#[test]
-/// Unknown 恢复状态使用明确人工核实文案，避免被误解成可自动重装。
-fn unknown_recovery_label_is_manual_review_only() {
-    assert_eq!(
-        recovery_state_label(UpdateRecoveryState::OutcomeUnknown),
-        localized("安装结果未知", "Installation result unknown")
     );
 }
 

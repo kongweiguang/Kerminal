@@ -10,8 +10,7 @@ use kerminal_application::{
     platform::{DesktopNotificationEvent, DesktopNotificationService, NotificationDisposition},
     updates::{
         DownloadedUpdate, DownloadedUpdateId, UpdateAvailability, UpdateCandidate,
-        UpdateInstallDisposition, UpdateInstallResult, UpdateProgress, UpdateRecoveryId,
-        UpdateRecoveryRecord, UpdateRecoveryState, UpdateService,
+        UpdateInstallDisposition, UpdateInstallResult, UpdateProgress, UpdateService,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -79,13 +78,6 @@ pub struct UpdatesPanel {
     settings_auto_install: bool,
     check_generation: u64,
     active_check_generation: Option<u64>,
-    recovery_records: Vec<UpdateRecoveryRecord>,
-    recovery_loaded: bool,
-    recovery_loading: bool,
-    recovery_error: Option<String>,
-    recovery_status: Option<String>,
-    recovery_confirmation: Option<UpdateRecoveryId>,
-    recovery_acknowledging: Option<UpdateRecoveryId>,
     about_license_expanded: bool,
 }
 
@@ -110,13 +102,12 @@ impl UpdatesPanel {
             }
             None => (
                 Some(localized(
-                    "更新服务尚未装配，恢复记录也无法读取。",
-                    "The update service is not composed, so recovery records cannot be read.",
+                    "更新服务尚未装配。",
+                    "The update service is unavailable.",
                 )),
                 true,
             ),
         };
-        let recovery_loaded = service.is_none();
         Self {
             service,
             notifications,
@@ -132,166 +123,8 @@ impl UpdatesPanel {
             settings_auto_install: false,
             check_generation: 0,
             active_check_generation: None,
-            recovery_records: Vec::new(),
-            recovery_loaded,
-            recovery_loading: false,
-            recovery_error: None,
-            recovery_status: None,
-            recovery_confirmation: None,
-            recovery_acknowledging: None,
             about_license_expanded: false,
         }
-    }
-
-    /// 首次进入面板时异步读取恢复记录；磁盘校验始终经 application executor 执行。
-    pub fn load_recoveries_if_needed(&mut self, cx: &mut Context<Self>) {
-        if self.is_host_terminal() || self.recovery_loaded || self.recovery_loading {
-            return;
-        }
-        let Some(service) = &self.service else {
-            return;
-        };
-        let service = service.clone();
-        let executor = self.executor.clone();
-        self.recovery_loading = true;
-        self.recovery_error = None;
-
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |_| async move { service.recoveries().await })
-                .await;
-            let _ = this.update(cx, |panel, cx| panel.finish_recovery_load(result, cx));
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 读取失败时保留错误并提供显式重试，不把损坏或不可读恢复目录当作空列表。
-    pub fn retry_recovery_load(&mut self, cx: &mut Context<Self>) {
-        if self.is_host_terminal() || self.recovery_loading {
-            return;
-        }
-        self.recovery_loaded = false;
-        self.load_recoveries_if_needed(cx);
-    }
-
-    /// 选择单条恢复材料后再显示二次确认，防止列表点击直接删除已验签 artifact。
-    pub fn request_recovery_acknowledgement(
-        &mut self,
-        recovery_id: UpdateRecoveryId,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_host_terminal()
-            || self.recovery_acknowledging.is_some()
-            || !self
-                .recovery_records
-                .iter()
-                .any(|record| record.id == recovery_id)
-        {
-            return;
-        }
-        self.recovery_confirmation = Some(recovery_id);
-        self.recovery_status = None;
-        cx.notify();
-    }
-
-    /// 用户取消二次确认时不触碰持久化记录或其 artifact。
-    pub fn cancel_recovery_acknowledgement(
-        &mut self,
-        recovery_id: UpdateRecoveryId,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.is_host_terminal()
-            && self.recovery_confirmation == Some(recovery_id)
-            && self.recovery_acknowledging.is_none()
-        {
-            self.recovery_confirmation = None;
-            cx.notify();
-        }
-    }
-
-    /// 只有二次确认选中的恢复身份可进入 application 清理用例，操作不调用安装器。
-    pub fn acknowledge_recovery(&mut self, recovery_id: UpdateRecoveryId, cx: &mut Context<Self>) {
-        if self.is_host_terminal() {
-            return;
-        }
-        if !can_acknowledge_recovery(
-            self.recovery_confirmation,
-            self.recovery_acknowledging,
-            &self.recovery_records,
-            recovery_id,
-            self.is_host_terminal(),
-        ) {
-            return;
-        }
-        let Some(service) = &self.service else {
-            return;
-        };
-        let service = service.clone();
-        let executor = self.executor.clone();
-        self.recovery_acknowledging = Some(recovery_id);
-        self.recovery_status = Some(localized(
-            "正在清理已确认的恢复材料…",
-            "Clearing the confirmed recovery material…",
-        ));
-
-        cx.spawn(async move |this, cx| {
-            let result = executor
-                .run(move |_| async move { service.acknowledge_recovery(recovery_id).await })
-                .await;
-            let _ = this.update(cx, |panel, cx| {
-                panel.finish_recovery_acknowledgement(recovery_id, result, cx);
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// 只更新持久化读取结果；失败记录仍可见为错误并允许再次读取。
-    fn finish_recovery_load(
-        &mut self,
-        result: kerminal_application::AppResult<Vec<UpdateRecoveryRecord>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.recovery_loading = false;
-        match result {
-            Ok(records) => {
-                self.recovery_records = records;
-                self.recovery_loaded = true;
-                self.recovery_error = None;
-            }
-            Err(error) => {
-                self.recovery_loaded = false;
-                self.recovery_error = Some(localized_error(&error));
-            }
-        }
-        cx.notify();
-    }
-
-    /// 成功清理只移除所选卡片；失败保留记录、确认上下文和可读错误供用户处理。
-    fn finish_recovery_acknowledgement(
-        &mut self,
-        recovery_id: UpdateRecoveryId,
-        result: kerminal_application::AppResult<()>,
-        cx: &mut Context<Self>,
-    ) {
-        self.recovery_acknowledging = None;
-        match result {
-            Ok(()) => {
-                self.recovery_records
-                    .retain(|record| record.id != recovery_id);
-                self.recovery_confirmation = None;
-                self.recovery_status = Some(localized(
-                    "已清理所选恢复记录；没有重放安装。",
-                    "The selected recovery record was cleared; no installation was replayed.",
-                ));
-                self.recovery_error = None;
-            }
-            Err(error) => {
-                self.recovery_status = Some(localized_error(&error));
-            }
-        }
-        cx.notify();
     }
 
     /// 每轮检查分配独立代次；仅空闲或候选状态可检查，避免替换已验签安装句柄。
@@ -521,8 +354,8 @@ impl UpdatesPanel {
                     "{} {}",
                     localized_error(&error),
                     localized(
-                        "应用后台服务已停止；已验签安装包仍保留，可安全重试或退出后手动恢复。",
-                        "Application services are stopped. The verified package is retained; retry safely or exit for manual recovery."
+                        "应用后台服务已停止；可重试安装，或退出并重新打开应用。",
+                        "Application services are stopped. Retry installation, or exit and reopen the app."
                     )
                 ));
                 self.status_is_error = true;
@@ -536,8 +369,8 @@ impl UpdatesPanel {
                     "{} {}",
                     localized_error(&error),
                     localized(
-                        "应用后台服务已停止；更新结果未知，已保留诊断材料。请退出并人工核实安装状态，不要重放此更新。",
-                        "Application services are stopped. The update result is unknown and diagnostic material is retained. Exit and verify the installation manually; do not replay this update."
+                        "应用后台服务已停止，更新结果未知。请退出应用，重新打开后检查更新。",
+                        "Application services are stopped and the update result is unknown. Exit, reopen the app, and check for updates."
                     )
                 ));
                 self.status_is_error = true;
@@ -889,41 +722,22 @@ fn localized(zh_cn: &str, en_us: &str) -> String {
     crate::locale::text(zh_cn, en_us).to_string()
 }
 
-/// 把 adapter 的固定不可用原因映射成当前界面的双语提示，不把源地址或密钥写进状态。
+/// 把 adapter 的不可用原因映射成简洁双语提示，不暴露源地址或密钥。
 fn localized_unavailable(reason: &'static str) -> String {
     match reason {
         "此构建没有有效的更新源或签名公钥" => localized(
-            "此构建没有有效的更新源或签名公钥；恢复记录仍可查看。",
-            "This build has no valid update feed or signing key; recovery records remain available.",
+            "此构建没有有效的更新源或签名公钥。",
+            "This build has no valid update feed or signing key.",
         ),
         "当前安装形态不支持应用内自动更新" => localized(
             "当前安装形态不支持应用内更新；可使用正式安装包或系统包管理器。",
             "Use an official installer or system package manager to update this installation.",
         ),
         "当前系统无法确定更新目标" => localized(
-            "当前系统无法确定更新目标；恢复记录仍可查看。",
-            "The updater cannot determine this platform target; recovery records remain available.",
+            "当前系统无法确定更新目标。",
+            "The updater cannot determine this platform target.",
         ),
-        _ => localized(
-            "当前更新能力不可用；恢复记录仍可查看。",
-            "Updates are currently unavailable; recovery records remain available.",
-        ),
-    }
-}
-
-/// 让恢复状态的文案明确要求人工核实，不暗示 Unknown 可安全重试或自动恢复。
-fn recovery_state_label(state: UpdateRecoveryState) -> String {
-    match state {
-        UpdateRecoveryState::PendingConfirmation => {
-            localized("等待人工核实", "Awaiting manual review")
-        }
-        UpdateRecoveryState::OutcomeUnknown => {
-            localized("安装结果未知", "Installation result unknown")
-        }
-        UpdateRecoveryState::VersionMatchedAwaitingConfirmation => localized(
-            "版本已匹配，仍需确认",
-            "Version matches; confirmation required",
-        ),
+        _ => localized("当前更新能力不可用。", "Updates are currently unavailable."),
     }
 }
 
@@ -985,20 +799,6 @@ fn update_notification_diagnostic(
         .as_ref()
         .err()
         .map(|error| error.public_message().to_owned())
-}
-
-/// 清理入口只接受当前二次确认身份，且不允许并发清理或对已消失记录重放请求。
-fn can_acknowledge_recovery(
-    confirmation: Option<UpdateRecoveryId>,
-    acknowledging: Option<UpdateRecoveryId>,
-    records: &[UpdateRecoveryRecord],
-    requested: UpdateRecoveryId,
-    host_terminal: bool,
-) -> bool {
-    !host_terminal
-        && confirmation == Some(requested)
-        && acknowledging.is_none()
-        && records.iter().any(|record| record.id == requested)
 }
 
 /// 只接收当前正在重启的下载身份，忽略宿主迟到或重复的旧安装回执。

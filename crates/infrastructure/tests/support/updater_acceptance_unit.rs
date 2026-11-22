@@ -4,39 +4,34 @@
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(any(target_os = "linux", windows))]
+use std::path::PathBuf;
+use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
-#[cfg(any(target_os = "linux", windows))]
-use std::{path::PathBuf, time::Duration};
 
-#[cfg(target_os = "linux")]
 use base64::{Engine, engine::general_purpose::STANDARD};
-#[cfg(any(target_os = "linux", windows))]
 use cargo_packager_updater::reqwest::Url;
 #[cfg(target_os = "linux")]
-use kerminal_application::{UpdateInstallDisposition, UpdateInstallResult, UpdateService};
-#[cfg(target_os = "linux")]
+use kerminal_application::{UpdateInstallDisposition, UpdateInstallResult};
+use kerminal_application::{
+    UpdateService,
+    updates::{UpdateAvailability, UpdateRecoveryId},
+};
 use serde_json::Value;
-#[cfg(target_os = "linux")]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     task::JoinHandle,
 };
-#[cfg(target_os = "linux")]
 use tokio_rustls::server::TlsStream;
-#[cfg(target_os = "linux")]
 use tokio_util::sync::CancellationToken;
 
-#[cfg(target_os = "linux")]
 use super::super::{CargoPackagerUpdater, settings::UpdaterSettings};
 
-#[cfg(target_os = "linux")]
 use super::super::tls_test_support as tls;
 
-#[cfg(target_os = "linux")]
 const TEST_PUBLIC_KEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
-#[cfg(target_os = "linux")]
 const TEST_SIGNATURE: &str = concat!(
     "untrusted comment: signature from minisign secret key\n",
     "RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/",
@@ -44,11 +39,9 @@ const TEST_SIGNATURE: &str = concat!(
     "trusted comment: timestamp:1556193335\tfile:test\n",
     "y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg=="
 );
-#[cfg(target_os = "linux")]
 const TEST_ARTIFACT: &[u8] = b"test";
 
 /// 复用 SDK 公开 target 键改写冻结 manifest，避免为测试扩大 metadata 私有 API。
-#[cfg(target_os = "linux")]
 fn local_sdk_manifest(artifact_url: &Url) -> Vec<u8> {
     let fixture = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -69,11 +62,10 @@ fn local_sdk_manifest(artifact_url: &Url) -> Vec<u8> {
 }
 
 /// 在隔离 loopback HTTPS listener 上响应 SDK metadata 和制品请求。
-#[cfg(target_os = "linux")]
 async fn local_feed_server(artifact: Vec<u8>) -> (Url, JoinHandle<()>) {
     let (listener, address) = tls::bind_loopback().await;
     let acceptor = tls::test_tls_acceptor();
-    let artifact_url = tls::https_url(address, "/candidate.AppImage");
+    let artifact_url = tls::https_url(address, "/candidate");
     let manifest = local_sdk_manifest(&artifact_url);
     let server = tokio::spawn(async move {
         for _ in 0..2 {
@@ -97,7 +89,6 @@ async fn local_feed_server(artifact: Vec<u8>) -> (Url, JoinHandle<()>) {
 }
 
 /// 按路径返回 SDK feed 或 Minisign 已签名制品，不记录请求头或外部身份数据。
-#[cfg(target_os = "linux")]
 async fn serve_local_request(stream: TlsStream<TcpStream>, manifest: &[u8], artifact: &[u8]) {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
@@ -118,7 +109,7 @@ async fn serve_local_request(stream: TlsStream<TcpStream>, manifest: &[u8], arti
     };
     let (content_type, body) = match path {
         "/feed.json" => ("application/json", manifest),
-        "/candidate.AppImage" => ("application/octet-stream", artifact),
+        "/candidate" => ("application/octet-stream", artifact),
         _ => ("text/plain", b"not found".as_slice()),
     };
     let response = format!(
@@ -131,8 +122,7 @@ async fn serve_local_request(stream: TlsStream<TcpStream>, manifest: &[u8], arti
     let _ = stream.flush().await;
 }
 
-/// 用真实策略构造 HTTPS feed；目标路径由子进程的 APPIMAGE 运行态解析。
-#[cfg(target_os = "linux")]
+/// 测试 feed 保留生产 HTTPS 和验签策略，只注入隔离公钥和端点。
 fn local_settings(feed_url: Url) -> UpdaterSettings {
     let test_public_key = STANDARD.encode(format!(
         "untrusted comment: isolated updater acceptance key\n{TEST_PUBLIC_KEY}"
@@ -145,6 +135,70 @@ fn local_settings(feed_url: Url) -> UpdaterSettings {
         1024 * 1024,
     )
     .expect("construct strict HTTPS updater settings")
+}
+
+/// 启动后仍存在的损坏收据不能拦住最新签名包，同会话重复下载仍由句柄保护。
+#[tokio::test]
+async fn latest_signed_download_ignores_previous_receipt() {
+    let root = tempfile::tempdir().expect("create isolated recovery root");
+    let (feed_url, server) = local_feed_server(TEST_ARTIFACT.to_vec()).await;
+    let mut adapter = CargoPackagerUpdater::from_settings(
+        Some(local_settings(feed_url)),
+        root.path().join("recovery"),
+        vec![tls::trusted_test_root()],
+    )
+    .expect("initialize strict updater for the download-only fixture");
+    adapter.availability = UpdateAvailability::Configured;
+    let recovery_id = UpdateRecoveryId::new();
+    let target = adapter.current_target.as_deref().expect("SDK target");
+    let previous_record = adapter
+        .recovery
+        .persist_pending_bytes(recovery_id, "0.3.9", target, b"previous package")
+        .expect("seed old package remaining after startup");
+    adapter
+        .recovery
+        .mark_installing(recovery_id)
+        .expect("mark old handoff");
+    std::fs::write(
+        previous_record.join("receipt.installing.json"),
+        b"interrupted",
+    )
+    .expect("simulate a damaged old receipt");
+
+    let service = UpdateService::new(std::sync::Arc::new(adapter));
+    let candidate = service
+        .check(CancellationToken::new())
+        .await
+        .expect("read latest feed")
+        .expect("new version is available");
+    let (reporter, _) = UpdateService::progress_channel();
+    let downloaded = service
+        .download_with_cancellation(
+            candidate.id,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            reporter,
+        )
+        .await
+        .expect("download and verify the latest version despite stale cache");
+    assert_eq!(downloaded.version, candidate.version);
+    let (reporter, _) = UpdateService::progress_channel();
+    assert!(matches!(
+        service
+            .download_with_cancellation(
+                candidate.id,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                reporter,
+            )
+            .await,
+        Err(kerminal_application::AppError::Conflict { .. })
+    ));
+    service
+        .discard(downloaded.id)
+        .await
+        .expect("discard the isolated downloaded fixture");
+    server.await.expect("join local HTTPS feed");
 }
 
 /// 以真实 APPIMAGE 环境变量在子进程验证平台探测和安装路径，不修改测试进程环境。

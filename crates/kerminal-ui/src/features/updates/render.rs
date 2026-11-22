@@ -17,16 +17,15 @@ use kerminal_application::updates::UpdateCandidate;
 use super::{
     UpdatePanelState, UpdatesPanel, about::APP_VERSION, about::LICENSE_SPDX, about::LICENSE_TEXT,
     about::repository_url, can_check_for_updates, can_exit_after_install_failure, format_progress,
-    install_result_summary, localized, recovery_state_label,
+    install_result_summary, localized,
 };
 use crate::theme::ThemeTokens;
 
 impl Render for UpdatesPanel {
-    /// 使用 Kit 0.7.3 按钮和语义令牌表达真实状态，不把未配置 feed 绘成“没有更新”。
+    /// 使用 Kit 按钮和语义令牌表达当前更新操作，不把未配置 feed 绘成“没有更新”。
     ///
     /// @author kongweiguang
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.load_recoveries_if_needed(cx);
         let theme = ThemeTokens::current(window, cx);
         let busy = self.is_busy();
         let host_terminal = self.is_host_terminal();
@@ -49,13 +48,6 @@ impl Render for UpdatesPanel {
         let status = self.status.clone();
         let notification_error = self.notification_error.clone();
         let progress = self.progress;
-        let recovery_records = self.recovery_records.clone();
-        let recovery_loading = self.recovery_loading;
-        let recovery_loaded = self.recovery_loaded;
-        let recovery_error = self.recovery_error.clone();
-        let recovery_status = self.recovery_status.clone();
-        let recovery_confirmation = self.recovery_confirmation;
-        let recovery_acknowledging = self.recovery_acknowledging;
         let status_color = if self.status_is_error {
             theme.error
         } else {
@@ -144,7 +136,7 @@ impl Render for UpdatesPanel {
             actions = actions.child(
                 Button::new("updates-exit-after-failure")
                     .compact()
-                    .label(localized("退出并人工恢复", "Exit for manual recovery"))
+                    .label(localized("退出应用", "Exit app"))
                     .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
                         panel.exit_after_update_failure(cx)
                     })),
@@ -279,83 +271,6 @@ impl Render for UpdatesPanel {
                 error,
                 theme.error,
                 theme,
-            ));
-        }
-        if recovery_loading {
-            content = content.child(message_card(
-                localized("正在读取恢复记录", "Reading recovery records"),
-                localized(
-                    "正在校验本地收据与已验签安装包…",
-                    "Validating local receipts and verified update packages…",
-                ),
-                theme.accent,
-                theme,
-            ));
-        }
-        if let Some(error) = recovery_error {
-            content = content.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(message_card(
-                        localized("恢复记录读取失败", "Could not read recovery records"),
-                        error,
-                        theme.error,
-                        theme,
-                    ))
-                    .child(
-                        Button::new("updates-recovery-retry")
-                            .compact()
-                            .label(localized("重试读取", "Retry reading"))
-                            .disabled(recovery_loading || host_terminal)
-                            .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
-                                panel.retry_recovery_load(cx)
-                            })),
-                    ),
-            );
-        }
-        if let Some(status) = recovery_status {
-            content = content.child(message_card(
-                localized("恢复材料", "Recovery material"),
-                status,
-                if recovery_acknowledging.is_some() {
-                    theme.accent
-                } else {
-                    theme.muted
-                },
-                theme,
-            ));
-        }
-        if self.service.is_some() && recovery_loaded && recovery_records.is_empty() {
-            content = content.child(message_card(
-                localized("恢复记录", "Recovery records"),
-                localized(
-                    "没有待人工核实的更新记录。",
-                    "There are no update records awaiting manual review.",
-                ),
-                theme.muted,
-                theme,
-            ));
-        }
-        if !recovery_records.is_empty() {
-            content = content.child(
-                div()
-                    .w_full()
-                    .text_size(px(14.))
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(localized("更新恢复记录", "Update recovery records")),
-            );
-        }
-        for record in recovery_records {
-            content = content.child(recovery_record_card(
-                record,
-                recovery_confirmation,
-                recovery_acknowledging,
-                host_terminal,
-                theme,
-                cx,
             ));
         }
         if let Some(candidate) = candidate {
@@ -503,128 +418,6 @@ fn about_card(
                 .text_size(theme.text_xs)
                 .text_color(theme.foreground)
                 .child(LICENSE_TEXT),
-        );
-    }
-    card
-}
-
-/// 将单条恢复信息、状态和二次确认动作放在同一卡片，避免清理操作绕开用户确认。
-///
-/// @author kongweiguang
-fn recovery_record_card(
-    record: kerminal_application::updates::UpdateRecoveryRecord,
-    confirmation: Option<kerminal_application::updates::UpdateRecoveryId>,
-    acknowledging: Option<kerminal_application::updates::UpdateRecoveryId>,
-    host_terminal: bool,
-    theme: ThemeTokens,
-    cx: &mut Context<UpdatesPanel>,
-) -> impl IntoElement {
-    let recovery_id = record.id;
-    let state_label = recovery_state_label(record.state);
-    let state_color =
-        if record.state == kerminal_application::updates::UpdateRecoveryState::OutcomeUnknown {
-            theme.error
-        } else {
-            theme.accent
-        };
-    let mut card = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_3()
-        .rounded_md()
-        .bg(theme.panel)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(13.))
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .child(format!(
-                            "{} {}",
-                            localized("版本", "Version"),
-                            record.version
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .text_color(state_color)
-                        .child(state_label),
-                ),
-        )
-        .child(
-            div()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(format!("{} {}", localized("目标", "Target"), record.target)),
-        )
-        .child(
-            div()
-                .text_size(px(10.))
-                .text_color(theme.muted)
-                .child(format!("SHA-256 {}", record.artifact_sha256)),
-        );
-    if confirmation == Some(recovery_id) {
-        card = card
-            .child(message_card(
-                localized("确认清理所选记录？", "Clear this recovery record?"),
-                localized(
-                    "这只会删除此记录和保留的安装包，不会重试或执行安装。请先确认已人工核实状态。",
-                    "This only deletes this record and its retained package. It will not retry or install anything. Confirm that you manually checked the update state.",
-                ),
-                theme.accent,
-                theme,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new(format!(
-                            "updates-recovery-confirm-{}",
-                            recovery_id.as_uuid()
-                        ))
-                        .compact()
-                        .primary()
-                        .label(if acknowledging == Some(recovery_id) {
-                            localized("正在清理…", "Clearing…")
-                        } else {
-                            localized("确认清理", "Confirm clear")
-                        })
-                        .disabled(host_terminal || acknowledging.is_some())
-                        .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                            panel.acknowledge_recovery(recovery_id, cx)
-                        })),
-                    )
-                    .child(
-                        Button::new(format!(
-                            "updates-recovery-cancel-{}",
-                            recovery_id.as_uuid()
-                        ))
-                        .compact()
-                        .label(localized("取消", "Cancel"))
-                        .disabled(host_terminal || acknowledging.is_some())
-                        .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                            panel.cancel_recovery_acknowledgement(recovery_id, cx)
-                        })),
-                    ),
-            );
-    } else {
-        card = card.child(
-            Button::new(format!("updates-recovery-review-{}", recovery_id.as_uuid()))
-                .compact()
-                .label(localized("人工核实后清理…", "Review and clear…"))
-                .disabled(host_terminal || acknowledging.is_some())
-                .on_click(cx.listener(move |panel, _: &ClickEvent, _, cx| {
-                    panel.request_recovery_acknowledgement(recovery_id, cx)
-                })),
         );
     }
     card

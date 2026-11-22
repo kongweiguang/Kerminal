@@ -32,7 +32,7 @@ pub(crate) enum AboutUpdateAction {
 }
 
 impl UpdatesPanel {
-    /// 把事务状态压缩成关于页需要的显示字段，保留原更新面板作为唯一状态所有者。
+    /// 把当前事务状态压缩成关于页字段，保留原更新面板作为唯一状态所有者。
     pub(crate) fn settings_projection(&self) -> AboutUpdateState {
         let mut projection = AboutUpdateState {
             status: localized("可检查", "Ready to check"),
@@ -149,7 +149,7 @@ impl UpdatesPanel {
                 projection.failed = true;
             }
             UpdatePanelState::HostRecoveryFailed { safe_message, .. } => {
-                projection.status = localized("需要人工恢复", "Manual recovery required");
+                projection.status = localized("需要重新打开", "Reopen required");
                 projection.detail = safe_message.clone();
                 projection.failed = true;
             }
