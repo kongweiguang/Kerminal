@@ -334,6 +334,82 @@ fn safe_mode_counts_only_post_freeze_crashes() {
 }
 
 #[test]
+/// 过期启动身份的阶段推进必须整笔失败：旧窗口回执既不能推进 revision，
+/// 也不能扰动当前启动的冻结阶段或崩溃计数。
+fn stale_boot_identity_update_leaves_state_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let first = store.begin_startup(&FixtureValidator, false).unwrap();
+    store
+        .mark_boot_phase(&first.boot_id, PluginBootPhase::RegistryFrozen)
+        .unwrap();
+    let second = store.begin_startup(&FixtureValidator, false).unwrap();
+    let before = store.load().unwrap();
+    assert!(matches!(
+        store.mark_boot_phase(&first.boot_id, PluginBootPhase::FirstFrame),
+        Err(PluginStoreError::Conflict)
+    ));
+    let after = store.load().unwrap();
+    assert_eq!(after.state, before.state);
+    let boot = after.state.boot.as_ref().unwrap();
+    assert_eq!(boot.id, second.boot_id);
+    assert_eq!(boot.phase, PluginBootPhase::Starting);
+}
+
+#[test]
+/// 阶段推进基于读取到的最新状态做单次 CAS：此前写入的内置开关不能丢失，
+/// 一次成功推进只增加一个 revision。
+fn phase_update_commits_on_latest_state_with_single_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let boot = store.begin_startup(&FixtureValidator, false).unwrap();
+    let current = store.load().unwrap();
+    let mut next = current.state.clone();
+    let ssh = PluginId::parse("kerminal.ssh").unwrap();
+    next.builtins.insert(ssh.clone(), false);
+    let updated = store.compare_and_swap(&current, next).unwrap();
+
+    let marked = store
+        .mark_boot_phase(&boot.boot_id, PluginBootPhase::RegistryFrozen)
+        .unwrap();
+    assert_eq!(marked.state.revision, updated.state.revision + 1);
+    assert_eq!(marked.state.builtins.get(&ssh), Some(&false));
+    assert_eq!(
+        marked.state.boot.as_ref().map(|boot| boot.phase),
+        Some(PluginBootPhase::RegistryFrozen)
+    );
+}
+
+#[test]
+/// 正式启动共享同一协调器时，长事务只会让阶段写入排队，不会耗尽跨协调器的
+/// 约 1 秒重试上限；这正是插件存储与配置仓储必须使用同一协调器的原因。
+fn shared_coordinator_queues_boot_phase_instead_of_lock_timeout() {
+    use std::{sync::mpsc, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = StorageCoordinator::new(root.path());
+    let store = PluginStore::new(storage.clone()).unwrap();
+    let boot = store.begin_startup(&FixtureValidator, false).unwrap();
+    let (locked, locked_rx) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let guard = storage.lock().unwrap();
+        locked.send(()).unwrap();
+        // 超过跨协调器的 100 次 * 10ms 上限，验证共享协调器不会把它报成 Lock。
+        std::thread::sleep(Duration::from_millis(1200));
+        drop(guard);
+    });
+    locked_rx.recv().unwrap();
+    let marked = store
+        .mark_boot_phase(&boot.boot_id, PluginBootPhase::RegistryFrozen)
+        .unwrap();
+    holder.join().unwrap();
+    assert_eq!(
+        marked.state.boot.as_ref().map(|boot| boot.phase),
+        Some(PluginBootPhase::RegistryFrozen)
+    );
+}
+
+#[test]
 /// 卸载只移除活动目录，独立数据目录必须保留。
 fn uninstall_keeps_plugin_data() {
     let root = tempfile::tempdir().unwrap();

@@ -112,14 +112,34 @@ impl ConfigurationStore {
         root: impl AsRef<Path>,
         host_types: Arc<HostConfigurationCatalog>,
     ) -> Result<Self, ConfigurationStoreInitError> {
+        let root = root.as_ref().to_path_buf();
+        let storage = StorageCoordinator::new(root.clone());
+        Self::initialize_with_host_types_and_storage(root, host_types, storage)
+    }
+
+    /// 正式启动由组合根提前创建唯一存储协调器再传入，让插件启动事务、配置仓储与
+    /// vault/SQLite 共用同一把进程内根锁；否则同进程多个协调器只能靠带约 1 秒
+    /// 上限的跨进程锁重试衔接，首帧等后台写入可能被误判为锁不可用。
+    /// 协调器根必须与配置根一致，避免锁住另一个目录却写入当前根。
+    ///
+    /// @author kongweiguang
+    pub fn initialize_with_host_types_and_storage(
+        root: impl AsRef<Path>,
+        host_types: Arc<HostConfigurationCatalog>,
+        storage: StorageCoordinator,
+    ) -> Result<Self, ConfigurationStoreInitError> {
+        let root = root.as_ref().to_path_buf();
+        if storage.root() != root.as_path() {
+            return Err(ConfigurationStoreInitError {
+                source: io::Error::other("配置存储协调器根目录不一致"),
+            });
+        }
         host_types::ensure_builtin_types(&host_types).map_err(|source| {
             ConfigurationStoreInitError {
                 source: io::Error::other(source.to_string()),
             }
         })?;
-        let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| ConfigurationStoreInitError { source })?;
-        let storage = StorageCoordinator::new(root.clone());
         let guide_status = ensure_config_guide(&root, &storage);
         // 首次启动尽力补齐托管忽略规则：离线 validator 在 hosts 范围要求密钥规则已存在，
         // 而 Git 提交路径只在用户显式提交时才补写。这里不能因规则写入失败阻断启动：

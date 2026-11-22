@@ -327,16 +327,40 @@ pub trait PluginPackageStore: Send + Sync + 'static {
     async fn delete_data(&self, id: PluginId) -> AppResult<()>;
 }
 
+/// 本次运行的模式独立于磁盘上的插件启用偏好；显式安全模式会随受管重启保留。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalPluginStartupMode {
+    Normal,
+    AutomaticSafeMode,
+    ExplicitSafeMode,
+}
+
 /// 应用层只编排受信端口；网络、磁盘和重启均由组合根提供。
 pub struct ExtensionsService {
     catalog: Arc<dyn CatalogSource>,
     packages: Arc<dyn PluginPackageStore>,
+    startup_mode: ExternalPluginStartupMode,
 }
 
 impl ExtensionsService {
-    /// 注入共享仓储和目录，避免界面构造另一套信任配置。
+    /// 注入共享仓储和目录，避免界面构造另一套信任配置。未注入启动模式的调用方按普通启动处理。
     pub fn new(catalog: Arc<dyn CatalogSource>, packages: Arc<dyn PluginPackageStore>) -> Self {
-        Self { catalog, packages }
+        Self {
+            catalog,
+            packages,
+            startup_mode: ExternalPluginStartupMode::Normal,
+        }
+    }
+
+    /// 构建时接收冻结的实际启动模式，扩展页无需根据可变安装状态猜测运行许可。
+    pub fn with_startup_mode(mut self, startup_mode: ExternalPluginStartupMode) -> Self {
+        self.startup_mode = startup_mode;
+        self
+    }
+
+    /// 返回整个进程保持不变的加载模式，让刷新、筛选和网络失败都不会清除恢复提示。
+    pub fn startup_mode(&self) -> ExternalPluginStartupMode {
+        self.startup_mode
     }
 
     /// 回显当前实际目录地址；官方默认来源也返回完整 URL，界面据此展示当前来源。

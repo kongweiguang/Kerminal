@@ -547,28 +547,34 @@ impl PluginStore {
     }
 
     /// 只有当前启动身份可以推进标记；旧窗口的首帧回执不能清除新的崩溃证据。
+    /// 读取和 CAS 共用同一次根锁：分开取锁会让启动期间的并发写入推进 revision，
+    /// 把合法首帧提交误报为 Conflict，进而被下次启动误判成冻结后崩溃并进入安全模式。
+    /// 未知提交仍保留恢复材料和读回义务，真实崩溃计数逻辑不变。
+    ///
+    /// @author kongweiguang
     pub fn mark_boot_phase(
         &self,
         boot_id: &str,
         next_phase: PluginBootPhase,
     ) -> Result<PluginStoreSnapshot, PluginStoreError> {
-        let current = self.load()?;
-        let mut next = current.state.clone();
-        let marker = next.boot.as_mut().ok_or(PluginStoreError::Conflict)?;
-        if marker.id != boot_id
-            || !matches!(
-                (marker.phase, next_phase),
-                (PluginBootPhase::Starting, PluginBootPhase::RegistryFrozen)
-                    | (PluginBootPhase::RegistryFrozen, PluginBootPhase::FirstFrame)
-            )
-        {
-            return Err(PluginStoreError::Conflict);
-        }
-        marker.phase = next_phase;
-        if next_phase == PluginBootPhase::FirstFrame {
-            marker.consecutive_early_crashes = 0;
-        }
-        self.compare_and_swap(&current, next)
+        self.with_recovery_guarded_write_lock(|current| {
+            let mut next = current.state.clone();
+            let marker = next.boot.as_mut().ok_or(PluginStoreError::Conflict)?;
+            if marker.id != boot_id
+                || !matches!(
+                    (marker.phase, next_phase),
+                    (PluginBootPhase::Starting, PluginBootPhase::RegistryFrozen)
+                        | (PluginBootPhase::RegistryFrozen, PluginBootPhase::FirstFrame)
+                )
+            {
+                return Err(PluginStoreError::Conflict);
+            }
+            marker.phase = next_phase;
+            if next_phase == PluginBootPhase::FirstFrame {
+                marker.consecutive_early_crashes = 0;
+            }
+            self.compare_and_swap_locked(current, next)
+        })
     }
 }
 

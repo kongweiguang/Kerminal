@@ -32,7 +32,7 @@ use gpui_kit::{
     px,
 };
 use kerminal_application::extensions::{
-    CatalogPlugin, CatalogSelection, ExtensionChange, InstallProgress,
+    CatalogPlugin, CatalogSelection, ExtensionChange, ExternalPluginStartupMode, InstallProgress,
 };
 use kerminal_domain::plugins::{
     PendingPluginChange, PluginId, PluginInstallStatus, PluginSource, PluginStoreState,
@@ -180,6 +180,8 @@ impl ExtensionsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending_count = self.state.as_ref().map_or(0, |state| state.pending.len());
+        let mode = self.service.startup_mode();
+        let can_restart_normally = mode == ExternalPluginStartupMode::AutomaticSafeMode;
         // 目录失败不再新增错误条或独立感叹号：同一刷新按钮保持固定尺寸，
         // 失败原因进入 tooltip 与无障碍名，点击即重新请求目录。这样失败与重试
         // 共用唯一入口，页头高度和下方列表位置都不随错误出现而跳动。
@@ -302,6 +304,9 @@ impl ExtensionsPage {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(crate::locale::text("扩展", "Extensions")),
                     )
+                    .when_some(self.render_startup_mode(mode, theme), |title, status| {
+                        title.child(status)
+                    })
                     .when_some(self.render_header_status(theme, cx), |title, status| {
                         title.child(status)
                     }),
@@ -312,11 +317,17 @@ impl ExtensionsPage {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .when(pending_count > 0, |actions| {
+                    .when(pending_count > 0 || can_restart_normally, |actions| {
+                        let label = if can_restart_normally {
+                            crate::locale::text("正常重启", "Restart normally")
+                        } else {
+                            crate::locale::text("立即重启", "Restart now")
+                        };
                         actions.child(
                             Button::new("extensions-restart")
                                 .h(theme.metrics.control_height)
-                                .label(crate::locale::text("立即重启", "Restart now"))
+                                .label(label)
+                                .disabled(source_disabled)
                                 .on_click(cx.listener(|_, _, _, cx| {
                                     cx.emit(ExtensionsEvent::RestartRequested)
                                 })),
@@ -524,6 +535,32 @@ impl ExtensionsPage {
                 ),
         );
         toolbar.into_any_element()
+    }
+
+    /// 停用原因只在例外会话出现，并独立于目录错误和持久启用状态，避免刷新时提示消失。
+    fn render_startup_mode(
+        &self,
+        mode: ExternalPluginStartupMode,
+        theme: ThemeTokens,
+    ) -> Option<AnyElement> {
+        let message = match mode {
+            ExternalPluginStartupMode::Normal => return None,
+            ExternalPluginStartupMode::AutomaticSafeMode => crate::locale::text(
+                "安全模式下未加载外部插件。",
+                "External plugins are paused in safe mode.",
+            ),
+            ExternalPluginStartupMode::ExplicitSafeMode => crate::locale::text(
+                "安全模式下未加载外部插件。请退出后正常打开 Kerminal。",
+                "External plugins are paused in safe mode. Quit and open Kerminal normally to load them.",
+            ),
+        };
+        Some(
+            div()
+                .text_size(theme.text_sm)
+                .text_color(theme.warning)
+                .child(message)
+                .into_any_element(),
+        )
     }
 
     /// 页头副标题只承载当前不可忽略的状态：普通状态用文字说明，带恢复动作的状态

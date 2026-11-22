@@ -72,3 +72,50 @@ fn automatic_safe_mode_disables_development_package_and_reloader_target() {
     assert!(startup.options.dev_plugin.is_none());
     assert!(startup.enabled.is_empty());
 }
+
+/// 自动安全模式只是本次恢复状态：受管重启不能把它固化成显式 `--safe-mode`，
+/// 否则首帧恢复后仍会以安全模式重启；恢复期间的开发插件也必须继续抑制。
+#[test]
+fn automatic_safe_mode_is_not_persisted_as_explicit_restart_option() {
+    let root = tempfile::tempdir().expect("isolated plugin startup root");
+    for _ in 0..2 {
+        let startup = StartupPlugins::load(root.path(), PluginStartupOptions::default())
+            .expect("begin startup");
+        startup
+            .store
+            .mark_boot_phase(&startup.snapshot.boot_id, PluginBootPhase::RegistryFrozen)
+            .expect("persist pre-frame crash marker");
+    }
+    let dev_plugin = root.path().join("missing-development-package");
+    let startup = StartupPlugins::load(
+        root.path(),
+        PluginStartupOptions {
+            safe_mode: false,
+            dev_plugin: Some(dev_plugin),
+        },
+    )
+    .expect("automatic safe mode begins startup");
+    assert!(startup.snapshot.safe_mode && startup.options.safe_mode);
+    assert!(startup.options.dev_plugin.is_none());
+    let restart = startup.restart_options();
+    assert!(!restart.safe_mode);
+    assert!(restart.dev_plugin.is_none());
+}
+
+/// 用户显式请求的安全模式与开发插件在普通启动中必须原样交给受管重启，
+/// 只有自动恢复状态需要区分。
+#[test]
+fn explicit_startup_request_is_preserved_for_restart() {
+    let root = tempfile::tempdir().expect("isolated plugin startup root");
+    let startup = StartupPlugins::load(
+        root.path(),
+        PluginStartupOptions {
+            safe_mode: true,
+            dev_plugin: None,
+        },
+    )
+    .expect("begin explicit safe mode startup");
+    let restart = startup.restart_options();
+    assert!(restart.safe_mode);
+    assert!(restart.dev_plugin.is_none());
+}

@@ -97,6 +97,7 @@ use kerminal_infrastructure::{
     sessions::{
         CompositeSessionTransportFactory, SessionManager, SessionRuntimeConfig, SessionTargetKind,
     },
+    storage::StorageCoordinator,
     vault::VaultStore,
     workspace::WorkspaceSessionStore,
 };
@@ -218,8 +219,10 @@ impl DesktopComposition {
     /// 配置、会话和 UI 继续共享原来的运行服务，目录本身不拥有后台资源。
     /// 恢复仓储与主机信任共用 coordinator；连接测试复用正式认证与 transport。
     /// 命令历史、建议反馈和片段偏好共享 SQLite，本地建议缓存不创建第二套执行器。
+    /// 该入口只为测试与验收从路径创建隔离协调器；正式启动使用共享协调器版本。
     ///
     /// @author kongweiguang
+    #[cfg(any(test, feature = "right-rail-acceptance"))]
     pub async fn build_with_plugin_catalogs(
         runtime: Handle,
         config_root: impl AsRef<Path>,
@@ -227,13 +230,36 @@ impl DesktopComposition {
         plugins: Arc<PluginRegistry>,
         host_types: Arc<HostConfigurationCatalog>,
     ) -> AppResult<Self> {
-        Self::build_with_plugin_factories(
+        let storage = StorageCoordinator::new(config_root.as_ref());
+        Self::build_with_plugin_catalogs_and_storage(
             runtime,
-            config_root,
+            update_service,
+            plugins,
+            host_types,
+            storage,
+        )
+        .await
+    }
+
+    /// 正式启动由主入口先创建唯一存储协调器，使插件启动事务与配置仓储共享同一把
+    /// 进程内根锁；否则同进程两个协调器只能依靠有等待上限的跨进程锁重试衔接，
+    /// 后台首帧写入可能被误报为锁定失败。根目录直接取自协调器，避免路径与锁根漂移。
+    ///
+    /// @author kongweiguang
+    pub async fn build_with_plugin_catalogs_and_storage(
+        runtime: Handle,
+        update_service: Option<UpdateService>,
+        plugins: Arc<PluginRegistry>,
+        host_types: Arc<HostConfigurationCatalog>,
+        storage: StorageCoordinator,
+    ) -> AppResult<Self> {
+        Self::build_with_plugin_factories_and_storage(
+            runtime,
             update_service,
             plugins,
             host_types,
             PluginFactories::default(),
+            storage,
         )
         .await
     }
@@ -241,6 +267,7 @@ impl DesktopComposition {
     /// 工厂只在所有应用服务准备后注入 UI；扫描前先核对工厂的声明与唯一身份。
     ///
     /// @author kongweiguang
+    #[cfg(any(test, feature = "right-rail-acceptance"))]
     pub async fn build_with_plugin_factories(
         runtime: Handle,
         config_root: impl AsRef<Path>,
@@ -249,15 +276,42 @@ impl DesktopComposition {
         host_types: Arc<HostConfigurationCatalog>,
         factories: PluginFactories,
     ) -> AppResult<Self> {
+        let storage = StorageCoordinator::new(config_root.as_ref());
+        Self::build_with_plugin_factories_and_storage(
+            runtime,
+            update_service,
+            plugins,
+            host_types,
+            factories,
+            storage,
+        )
+        .await
+    }
+
+    /// 存储协调器与工厂一起注入，保证输入校验、配置恢复与后续仓储使用同一根锁。
+    ///
+    /// @author kongweiguang
+    pub async fn build_with_plugin_factories_and_storage(
+        runtime: Handle,
+        update_service: Option<UpdateService>,
+        plugins: Arc<PluginRegistry>,
+        host_types: Arc<HostConfigurationCatalog>,
+        factories: PluginFactories,
+        storage: StorageCoordinator,
+    ) -> AppResult<Self> {
         crate::plugin_catalogs::validate_host_catalog(&plugins, &host_types)?;
         builtin_plugins::validate_content_factories(&plugins, &factories.content)?;
         builtin_plugins::validate_tool_factories(&plugins, &factories.tools)?;
         let host_forms = Arc::new(HostFormFactories::new(&host_types, factories.host_forms)?);
-        let config_root = config_root.as_ref().to_path_buf();
-        let configuration =
-            ConfigurationStore::initialize_with_host_types(&config_root, host_types).map_err(
-                |source| AppError::infrastructure_with_source("初始化 Kerminal 配置根失败", source),
-            )?;
+        let config_root = storage.root().to_path_buf();
+        let configuration = ConfigurationStore::initialize_with_host_types_and_storage(
+            &config_root,
+            host_types,
+            storage,
+        )
+        .map_err(|source| {
+            AppError::infrastructure_with_source("初始化 Kerminal 配置根失败", source)
+        })?;
         let update_service = match update_service {
             Some(service) => service,
             None => {
@@ -801,7 +855,19 @@ impl DesktopComposition {
             crate::plugins::startup::HOST_API.into(),
             platform,
         ));
-        self.app_services.extensions = Some(Arc::new(ExtensionsService::new(catalog, installer)));
+        use kerminal_application::extensions::ExternalPluginStartupMode;
+        // 安装偏好不会随安全模式改变，界面需要本次冻结的实际加载状态。
+        let startup_mode = match (
+            startup.snapshot.safe_mode,
+            startup.restart_options().safe_mode,
+        ) {
+            (false, _) => ExternalPluginStartupMode::Normal,
+            (true, false) => ExternalPluginStartupMode::AutomaticSafeMode,
+            (true, true) => ExternalPluginStartupMode::ExplicitSafeMode,
+        };
+        self.app_services.extensions = Some(Arc::new(
+            ExtensionsService::new(catalog, installer).with_startup_mode(startup_mode),
+        ));
         self.app_services.plugin_ui = Some(plugins.ui.clone());
         self.app_services.external_plugin_runtime = Some(plugins.runtime.clone());
         self.app_services.external_plugin_settings = Some(plugins.settings.clone());

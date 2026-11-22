@@ -256,6 +256,22 @@ impl PluginStore {
         operation(&current)
     }
 
+    /// 启动标记的读改必须持同一把根锁并经过完整恢复门禁。旧实现先 `load` 再
+    /// `compare_and_swap`，两次取锁之间任何并发写入都会推进 revision，把本应成功的
+    /// 首帧提交误报为 Conflict；这里保留未知提交的读回义务，也拒绝在存在未处理
+    /// 恢复材料时写入。
+    ///
+    /// @author kongweiguang
+    pub(super) fn with_recovery_guarded_write_lock<T>(
+        &self,
+        operation: impl FnOnce(&PluginStoreSnapshot) -> Result<T, PluginStoreError>,
+    ) -> Result<T, PluginStoreError> {
+        let _guard = self.storage.lock().map_err(|_| PluginStoreError::Lock)?;
+        self.require_no_recovery_unlocked()?;
+        let current = self.read_unlocked()?;
+        operation(&current)
+    }
+
     /// 已持有写锁时的内容与 revision 联合 CAS；调用方负责在失败后还原目录。
     pub(super) fn compare_and_swap_locked(
         &self,

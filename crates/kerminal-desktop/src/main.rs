@@ -493,8 +493,12 @@ fn run_application(
                     io::Error::other(format!("Kerminal 无法初始化诊断日志：{error}"))
                 })?);
                 let (options, _) = plugins::arguments::PluginStartupOptions::current()?;
-                let startup_plugins = Arc::new(plugins::startup::StartupPlugins::load(
-                    config_root.as_path(),
+                // 组合根先建立唯一存储协调器并传给插件启动与配置装配，避免同进程
+                // 两个协调器各自抢根锁；跨协调器等待有上限，后台写入可能因此失败。
+                let storage =
+                    kerminal_infrastructure::storage::StorageCoordinator::new(config_root.as_path());
+                let startup_plugins = Arc::new(plugins::startup::StartupPlugins::load_with_storage(
+                    storage.clone(),
                     options,
                 )?);
                 #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
@@ -505,7 +509,7 @@ fn run_application(
                 };
                 #[cfg(not(all(feature = "acceptance-metrics", feature = "right-rail-acceptance")))]
                 let catalogs = startup_plugins.catalogs("zh-CN")?;
-                run_primary_instance(runtime, instance_id, primary, config_root, activation, catalogs, startup_plugins,
+                run_primary_instance(runtime, instance_id, primary, activation, catalogs, startup_plugins, storage,
                     #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
                     host_list_acceptance)
             })
@@ -613,20 +617,21 @@ fn run_primary_instance(
     runtime: &ApplicationRuntime,
     instance_id: String,
     primary: PrimaryInstance<String>,
-    config_root: config_root::ConfigRoot,
     initial_activation: Option<ExternalActivation>,
     catalogs: plugin_catalogs::PluginCatalogs,
     startup_plugins: Arc<plugins::startup::StartupPlugins>,
+    storage: kerminal_infrastructure::storage::StorageCoordinator,
     #[cfg(all(feature = "acceptance-metrics", feature = "right-rail-acceptance"))]
     host_list_acceptance: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let mut composition = runtime.block_on(DesktopComposition::build_with_plugin_catalogs(
-        runtime.handle(),
-        config_root.as_path(),
-        None,
-        catalogs.0,
-        catalogs.1,
-    ))?;
+    let mut composition =
+        runtime.block_on(DesktopComposition::build_with_plugin_catalogs_and_storage(
+            runtime.handle(),
+            None,
+            catalogs.0,
+            catalogs.1,
+            storage,
+        ))?;
     if let Err(error) =
         runtime.block_on(composition.install_external_plugins(startup_plugins.clone()))
     {
@@ -720,7 +725,7 @@ fn run_primary_instance(
         composition,
         update_service,
         listener,
-        startup_plugins.options.clone(),
+        startup_plugins.restart_options(),
     );
     let startup_error = Arc::new(Mutex::new(None));
     let ui_result = catch_unwind(AssertUnwindSafe(|| {

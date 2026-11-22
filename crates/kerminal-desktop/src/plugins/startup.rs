@@ -1,7 +1,9 @@
 //! 单实例取得所有权后冻结插件版本；开发目录不进入正式安装状态。
 //! @author kongweiguang
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+#[cfg(any(test, feature = "right-rail-acceptance"))]
+use std::path::Path;
+use std::{collections::BTreeMap, sync::Arc};
 
 use kerminal_application::{
     AppError, AppResult, external_contributions::PreparedPlugin,
@@ -32,10 +34,24 @@ pub struct StartupPlugins {
     pub store: PluginStore,
     pub snapshot: BootSnapshot<PreparedPlugin>,
     pub enabled: Vec<Arc<PreparedPlugin>>,
+    /// 本次实际生效的选项：自动安全模式会打开 safe_mode 并抑制开发插件。
     pub options: PluginStartupOptions,
+    /// 用户显式请求的选项；受管重启据此恢复原意，不能把自动恢复固化成参数。
+    requested_options: PluginStartupOptions,
 }
 
 impl StartupPlugins {
+    /// 受管重启只重放用户显式请求的安全模式：自动安全模式是本次恢复状态，写成
+    /// `--safe-mode` 会让一次误入跨重启永久保留。恢复期间开发插件目标继续省略，
+    /// 因此从自动安全模式发起的重启不会带回原开发插件参数，需下次显式指定。
+    ///
+    /// @author kongweiguang
+    pub fn restart_options(&self) -> PluginStartupOptions {
+        let mut options = self.options.clone();
+        options.safe_mode = self.requested_options.safe_mode;
+        options
+    }
+
     /// 持久状态以领域 `PluginId` 保存，目录冻结用应用层贡献身份；两层类型刻意分离，
     /// 是因为前者受存储格式约束、后者受静态贡献校验约束。这里逐项转换而不静默丢弃：
     /// 状态文件里出现目录无法表达的键代表已停用单元不会再被尊重，宁可让启动失败。
@@ -89,8 +105,23 @@ impl StartupPlugins {
 
     /// 调用前必须取得主实例身份；实际安全模式也冻结开发入口，防止崩溃恢复又加载同一开发插件。
     /// 失败保留状态文件，不能退回空目录继续写入。
-    pub fn load(root: &Path, mut options: PluginStartupOptions) -> AppResult<Self> {
-        let store = PluginStore::new(StorageCoordinator::new(root))
+    /// 该入口为测试、验收和离线工具自行创建协调器；正式启动使用 `load_with_storage`。
+    #[cfg(any(test, feature = "right-rail-acceptance"))]
+    pub fn load(root: &Path, options: PluginStartupOptions) -> AppResult<Self> {
+        Self::load_with_storage(StorageCoordinator::new(root), options)
+    }
+
+    /// 正式启动由组合根先创建唯一存储协调器再传入，使插件启动事务与配置、vault、
+    /// SQLite 共用同一把进程内根锁；否则同进程各协调器只能靠有等待上限的跨进程
+    /// 锁重试衔接，首帧提交等后台写入可能被误报为锁不可用而留下过期的冻结标记。
+    ///
+    /// @author kongweiguang
+    pub fn load_with_storage(
+        storage: StorageCoordinator,
+        mut options: PluginStartupOptions,
+    ) -> AppResult<Self> {
+        let requested_options = options.clone();
+        let store = PluginStore::new(storage)
             .map_err(|source| AppError::infrastructure_with_source("初始化插件存储失败", source))?;
         let validator = ProtocolBootValidator {
             host_api: HOST_API.into(),
@@ -134,6 +165,7 @@ impl StartupPlugins {
             snapshot,
             enabled: enabled.into_values().collect(),
             options,
+            requested_options,
         })
     }
 }
