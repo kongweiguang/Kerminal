@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 /// SDK 未声明请求超时时，仍以有限时长保护更新下载。
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 限制重定向跳数，避免受控下载端点引入循环或过长链路。
 const MAX_REDIRECTS: usize = 10;
@@ -70,7 +71,7 @@ pub(super) async fn download_update(
     download_verified(request, control).await
 }
 
-/// 请求数据与运行控制分组传递；网络、取消、限额和 Minisign 验证流程保持原顺序。
+/// 总时限保护下载资源，读超时尽快结束无进展的连接；只有完整且验签成功的字节可以暂存。
 ///
 /// @author kongweiguang
 async fn download_verified(
@@ -126,11 +127,12 @@ async fn download_verified(
     for certificate in additional_trust_roots {
         builder = builder.add_root_certificate(certificate.clone());
     }
+    let request_timeout = timeout.unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT);
     let client = builder
         .redirect(redirect_policy)
+        .read_timeout(DOWNLOAD_IDLE_TIMEOUT.min(request_timeout))
         .build()
         .map_err(|error| AppError::infrastructure_with_source("无法初始化更新下载连接", error))?;
-    let request_timeout = timeout.unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT);
     let response = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(AppError::cancelled("更新下载已取消")),
@@ -139,7 +141,7 @@ async fn download_verified(
             .headers(headers)
             .timeout(request_timeout)
             .send() => response.map_err(|error| {
-                AppError::infrastructure_with_source("更新包下载失败", error)
+                transfer_error("更新包下载失败", error)
             })?,
     };
     ensure_not_cancelled(&cancellation)?;
@@ -173,7 +175,7 @@ async fn download_verified(
             _ = cancellation.cancelled() => return Err(AppError::cancelled("更新下载已取消")),
             chunk = response.chunk() => chunk
                 .map_err(|error| {
-                    AppError::infrastructure_with_source("更新包下载中断", error)
+                    transfer_error("更新包下载中断", error)
                 })?,
         };
         let Some(chunk) = chunk else {
@@ -223,6 +225,15 @@ async fn download_verified(
     .map_err(|_| AppError::infrastructure("更新签名验证任务异常退出"))?;
     ensure_not_cancelled(&cancellation)?;
     verification
+}
+
+/// 连接或正文超时统一走已有的超时反馈，其他网络错误保留内部原因链。
+fn transfer_error(context: &'static str, error: reqwest::Error) -> AppError {
+    if error.is_timeout() {
+        AppError::timeout("下载更新")
+    } else {
+        AppError::infrastructure_with_source(context, error)
+    }
 }
 
 /// 与 SDK 相同地解开外层 Base64 后交给 minisign-verify 解析，不实现密码算法或格式兼容层。

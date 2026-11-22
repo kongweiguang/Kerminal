@@ -87,7 +87,11 @@ impl UpdatesPanel {
             }
             UpdatePanelState::Available(candidate) => {
                 projection.available = true;
-                projection.status = localized("可更新", "Update available");
+                projection.status = if self.status_is_error {
+                    localized("下载失败", "Download failed")
+                } else {
+                    localized("可更新", "Update available")
+                };
                 projection.detail = self.status.clone().unwrap_or_else(|| {
                     format!(
                         "{} {}。",

@@ -28,7 +28,7 @@ pub struct UpdaterSettings {
 }
 
 impl UpdaterSettings {
-    /// 正式构建在装配时验证嵌入公钥，避免无效信任根让更新入口看似可用却永远验签失败。
+    /// 正式构建预验信任根，并给大安装包留出完整下载预算。清单检查有自己的短时限。
     ///
     /// @author kongweiguang
     pub fn from_release_config(
@@ -48,7 +48,7 @@ impl UpdaterSettings {
             current_version,
             vec![endpoint],
             public_key.to_owned(),
-            Duration::from_secs(120),
+            Duration::from_secs(300),
             MAX_UPDATE_BYTES,
         )
     }

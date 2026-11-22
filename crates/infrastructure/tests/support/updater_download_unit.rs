@@ -132,6 +132,19 @@ fn start_download(
     JoinHandle<Result<Vec<u8>, AppError>>,
     tokio::sync::watch::Receiver<UpdateProgress>,
 ) {
+    start_download_with_timeout(url, cancellation, max_bytes, Duration::from_secs(30))
+}
+
+/// 指定短时限复现传输超时，其他下载测试继续为 TLS 握手保留足够余量。
+fn start_download_with_timeout(
+    url: Url,
+    cancellation: CancellationToken,
+    max_bytes: u64,
+    timeout: Duration,
+) -> (
+    JoinHandle<Result<Vec<u8>, AppError>>,
+    tokio::sync::watch::Receiver<UpdateProgress>,
+) {
     use super::{DownloadControl, VerifiedDownloadRequest, download_verified};
 
     let (public_key, signature) = signature_material();
@@ -144,7 +157,7 @@ fn start_download(
                 public_key,
                 signature,
                 headers: HeaderMap::new(),
-                timeout: Some(Duration::from_secs(30)),
+                timeout: Some(timeout),
                 max_bytes,
                 additional_trust_roots: &trust_roots,
             },
@@ -316,6 +329,29 @@ async fn cancels_while_waiting_for_next_body_chunk() {
             .expect_err("canceled response must not produce installable bytes")
             .public_message(),
         "更新下载已取消"
+    );
+}
+
+/// 正文停滞应映射成可重试的超时类别，且未完成验签的正文不能进入暂存。
+#[tokio::test]
+async fn reports_timeout_while_waiting_for_update_body() {
+    let (url, server) = local_server(|mut stream| async move {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nt";
+        stream.write_all(head).await.expect("发送部分正文");
+        stream.flush().await.expect("提交部分正文");
+        std::future::pending::<()>().await;
+    })
+    .await;
+    let (download_task, _) =
+        start_download_with_timeout(url, CancellationToken::new(), 16, Duration::from_secs(1));
+    let error = download_task
+        .await
+        .expect("等待下载任务")
+        .expect_err("不完整的响应不能用于安装");
+    server.abort();
+    assert_eq!(
+        error.public_code(),
+        kerminal_application::PublicErrorCode::Timeout
     );
 }
 
