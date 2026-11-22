@@ -645,7 +645,7 @@ fn runtime_select_tracks_patched_options_and_commits_confirmed_value(
         gpui_kit::base::Root::new(renderer, window, cx)
     });
     let renderer = slot.borrow_mut().take().expect("renderer mounted");
-    visual.update(|window, cx| {
+    visual.update(|_, cx| {
         renderer.update(cx, |renderer, cx| {
             let state = match &renderer.fields["root"] {
                 super::FieldControl::Select { state, .. } => state.clone(),

@@ -853,19 +853,21 @@ impl NativeRenderer {
                     let text = self.projection.text(text);
                     state.update(cx, |state, cx| state.set_placeholder(text, window, cx));
                 }
-                FieldControl::Select { state, source, .. } => {
+                FieldControl::Select {
+                    state,
+                    source: SelectSource::Static(options),
+                    ..
+                } => {
                     // 静态选项文案来自本地化键，需要重建；运行时选项已经是插件给出的
                     // 展示文本，语言切换后由图中的字段标签和无障碍名称更新。
-                    if let SelectSource::Static(options) = source {
-                        let choices = self.static_choices(options);
-                        let selected = state.read(cx).selected_value().cloned();
-                        state.update(cx, |state, cx| {
-                            state.set_items(choices, window, cx);
-                            if let Some(selected) = selected {
-                                state.set_selected_value(&selected, window, cx);
-                            }
-                        });
-                    }
+                    let choices = self.static_choices(options);
+                    let selected = state.read(cx).selected_value().cloned();
+                    state.update(cx, |state, cx| {
+                        state.set_items(choices, window, cx);
+                        if let Some(selected) = selected {
+                            state.set_selected_value(&selected, window, cx);
+                        }
+                    });
                 }
                 _ => {}
             }
