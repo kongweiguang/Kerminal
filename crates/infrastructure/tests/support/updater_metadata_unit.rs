@@ -197,6 +197,41 @@ async fn maps_no_content_to_no_update() {
     assert!(result.is_none());
 }
 
+/// 复现正式源超过原先三秒时限的响应，确保正常的慢连接仍可完成检查。
+#[tokio::test]
+async fn check_waits_for_a_slow_metadata_response() {
+    let (listener, address) = tls::bind_loopback().await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept metadata connection");
+        let mut stream = tls::test_tls_acceptor()
+            .accept(stream)
+            .await
+            .expect("complete HTTPS fixture handshake");
+        read_request_head(&mut stream)
+            .await
+            .expect("read check request");
+        tokio::time::sleep(Duration::from_millis(3250)).await;
+        write_response(stream, "204 No Content", "Content-Length: 0", &[], false).await;
+    });
+    let settings = super::UpdaterSettings::new(
+        "0.4.4",
+        vec![tls::https_url(address, "/metadata")],
+        "unused-for-no-content".into(),
+        Duration::from_secs(30),
+        MAX_BODY_BYTES,
+    )
+    .expect("initialize isolated metadata check");
+    let result = super::check(
+        &settings,
+        CancellationToken::new(),
+        &[tls::trusted_test_root()],
+    )
+    .await
+    .expect("slow metadata request should complete");
+    assert!(result.is_none());
+    server.await.expect("join slow metadata fixture");
+}
+
 /// metadata client 必须在网络层停止 HTTPS 到 HTTP 的跳转，不能请求降级目标。
 #[tokio::test]
 async fn metadata_client_does_not_follow_loopback_http_redirect() {

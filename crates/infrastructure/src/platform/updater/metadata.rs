@@ -25,8 +25,8 @@ use super::settings::UpdaterSettings;
 /// 单个 release manifest 足以描述全部受支持平台，不接受无界的远端 JSON 响应。
 const MAX_METADATA_BODY_BYTES: u64 = 1024 * 1024;
 
-/// 单次检查所有 endpoint 共用绝对期限，为应用关闭清理留下时间。
-const METADATA_CHECK_DEADLINE: Duration = Duration::from_secs(3);
+/// GitHub Releases 需要跨域跳转，单次可取消的检查仍共用一个总期限。
+const METADATA_CHECK_DEADLINE: Duration = Duration::from_secs(15);
 
 /// 限制重定向次数，并拒绝从 HTTPS feed 跳转到不安全地址。
 const MAX_METADATA_REDIRECTS: usize = 10;
