@@ -523,7 +523,7 @@ impl UpdatesPanel {
         )
     }
 
-    /// 只消费匹配代次一次；通知发送失败单独记录，不回滚成功候选或改写检查结果。
+    /// 只消费匹配代次一次；取消与回执竞争时以用户意图为准，避免发出过期通知。
     fn finish_check(
         &mut self,
         result: kerminal_application::AppResult<Option<UpdateCandidate>>,
@@ -539,10 +539,16 @@ impl UpdatesPanel {
             return;
         }
 
+        let was_cancelled = was_cancelled || self.cancel_requested;
         let notification_candidate = notification_candidate_for_check(&result, was_cancelled);
         self.active_cancel = None;
         self.cancel_requested = false;
         match result {
+            Ok(_) if was_cancelled => {
+                self.state = UpdatePanelState::Idle;
+                self.status = Some(localized("更新检查已取消。", "Update check cancelled."));
+                self.status_is_error = false;
+            }
             Ok(Some(candidate)) => {
                 self.state = UpdatePanelState::Available(candidate);
                 self.status = Some(localized("发现可用更新。", "An update is available."));
@@ -637,7 +643,7 @@ impl UpdatesPanel {
         }
     }
 
-    /// 下载只接受 application/infra 验签句柄；设置单步安装随后仍通过 Root 的安装保护。
+    /// 取消与成功回执竞争时释放已验签句柄，确保不会自动进入安装保护。
     fn finish_download(
         &mut self,
         candidate: UpdateCandidate,
@@ -645,6 +651,7 @@ impl UpdatesPanel {
         was_cancelled: bool,
         cx: &mut Context<Self>,
     ) {
+        let was_cancelled = was_cancelled || self.cancel_requested;
         let continue_to_install = take_settings_auto_install_after_download(
             &mut self.settings_auto_install,
             was_cancelled,
@@ -654,6 +661,10 @@ impl UpdatesPanel {
         self.cancel_requested = false;
         self.progress = UpdateProgress::default();
         match result {
+            Ok(update) if was_cancelled => {
+                self.state = UpdatePanelState::ReadyToInstall(update);
+                self.discard_download(cx);
+            }
             Ok(update) => {
                 self.state = UpdatePanelState::ReadyToInstall(update);
                 self.status = Some(localized(
@@ -963,3 +974,7 @@ fn format_bytes(value: u64) -> String {
 #[cfg(test)]
 #[path = "../../../tests/unit/updates.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/unit/updates_cancel.rs"]
+mod cancel_tests;

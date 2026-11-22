@@ -22,6 +22,8 @@ pub(crate) struct AboutUpdateState {
     pub(crate) restarting: bool,
     pub(crate) failed: bool,
     pub(crate) up_to_date: bool,
+    pub(crate) can_cancel: bool,
+    pub(crate) cancelling: bool,
 }
 
 /// 关于页仅请求更新面板已经支持的事务；重启由现有宿主安装流程负责。
@@ -29,10 +31,11 @@ pub(crate) struct AboutUpdateState {
 pub(crate) enum AboutUpdateAction {
     Check,
     Install,
+    Cancel,
 }
 
 impl UpdatesPanel {
-    /// 把当前事务状态压缩成关于页字段，保留原更新面板作为唯一状态所有者。
+    /// 将更新事务与取消能力投影到关于页，失败状态保留真实操作反馈。
     pub(crate) fn settings_projection(&self) -> AboutUpdateState {
         let mut projection = AboutUpdateState {
             status: localized("可检查", "Ready to check"),
@@ -44,6 +47,15 @@ impl UpdatesPanel {
             restarting: false,
             failed: false,
             up_to_date: false,
+            can_cancel: matches!(
+                &self.state,
+                UpdatePanelState::Checking
+                    | UpdatePanelState::Downloading(_)
+                    | UpdatePanelState::ReadyToInstall(_)
+                    | UpdatePanelState::Discarding(_)
+            ),
+            cancelling: self.cancel_requested
+                || matches!(&self.state, UpdatePanelState::Discarding(_)),
         };
         let updater_configured = self
             .service
@@ -84,11 +96,18 @@ impl UpdatesPanel {
                     )
                 });
                 projection.can_install = true;
+                projection.failed = self.status_is_error;
             }
             UpdatePanelState::Downloading(candidate) => {
                 projection.available = true;
                 projection.status = localized("下载中", "Downloading");
-                projection.detail = download_detail(self.progress, &candidate.version);
+                projection.detail = if self.cancel_requested {
+                    self.status
+                        .clone()
+                        .unwrap_or_else(|| localized("正在取消…", "Cancelling…"))
+                } else {
+                    download_detail(self.progress, &candidate.version)
+                };
             }
             UpdatePanelState::ReadyToInstall(update) => {
                 projection.available = true;
@@ -101,6 +120,7 @@ impl UpdatesPanel {
                     )
                 });
                 projection.can_install = true;
+                projection.failed = self.status_is_error;
             }
             UpdatePanelState::AwaitingInstallGuard(update) => {
                 projection.status = localized("准备安装", "Preparing install");
@@ -171,10 +191,17 @@ impl UpdatesPanel {
         projection
     }
 
-    /// About 保持单击安装；候选先由同一下载服务验签，再交给 Root 安装保护。
+    /// 单击安装沿用原流程；取消只影响检查、下载或尚未交接的验签包。
     pub(crate) fn settings_action(&mut self, action: AboutUpdateAction, cx: &mut Context<Self>) {
         match action {
             AboutUpdateAction::Check => self.check_for_updates(cx),
+            AboutUpdateAction::Cancel => match self.state {
+                UpdatePanelState::Checking | UpdatePanelState::Downloading(_) => {
+                    self.cancel_active_operation(cx)
+                }
+                UpdatePanelState::ReadyToInstall(_) => self.discard_download(cx),
+                _ => {}
+            },
             AboutUpdateAction::Install => match settings_install_step(&self.state) {
                 SettingsInstallStep::DownloadThenInstall => {
                     let updater_configured = self.service.as_ref().is_some_and(|service| {

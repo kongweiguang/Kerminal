@@ -523,7 +523,7 @@ impl PreferencesPanel {
             .child(self.render_save_notice(theme))
     }
 
-    /// 关于页共用行布局，让元数据和更新状态对齐，同时用原按钮忙态避免刷新时位移。
+    /// 关于页按当前事务提供取消动作，沿用行布局与按钮忙态避免误操作。
     pub(super) fn render_about_settings(
         &mut self,
         theme: ThemeTokens,
@@ -579,6 +579,19 @@ impl PreferencesPanel {
                         .icon(IconName::Download)
                         .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
                             panel.run_inline_update_action(AboutUpdateAction::Install, cx)
+                        })),
+                );
+            }
+            if state.can_cancel {
+                actions = actions.child(
+                    Button::new("settings-about-cancel-update")
+                        .compact()
+                        .outline()
+                        .disabled(state.cancelling)
+                        .loading(state.cancelling)
+                        .label(crate::locale::text("取消", "Cancel"))
+                        .on_click(cx.listener(|panel, _: &ClickEvent, _, cx| {
+                            panel.run_inline_update_action(AboutUpdateAction::Cancel, cx)
                         })),
                 );
             }
