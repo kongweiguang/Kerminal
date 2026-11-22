@@ -156,10 +156,12 @@ fn icon_resolution_stays_inside_builtin_and_frozen_resources() {
     }
 }
 
-/// 挂起打开请求模拟进程缓慢启动，记录其他请求以检查是否发生抢先关闭。
+/// 挂起打开请求模拟进程缓慢启动，记录其他请求以检查是否发生抢先关闭；动作参数
+/// 单独记录，用来核对运行时下拉的选中值确实进入动作快照。
 #[derive(Default)]
 struct PendingOpenRuntime {
     requests: std::sync::Mutex<Vec<String>>,
+    actions: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
 struct PendingSubscription;
@@ -183,7 +185,10 @@ impl super::AsyncViewRuntime for PendingOpenRuntime {
         &self,
         request: super::RuntimeRequest,
     ) -> super::super::runtime::RuntimeFuture<super::RuntimeReply> {
-        self.requests.lock().unwrap().push(request.method);
+        self.requests.lock().unwrap().push(request.method.clone());
+        if request.method == "view.action" {
+            self.actions.lock().unwrap().push(request.params.clone());
+        }
         Box::pin(async move {
             request.cancellation.cancelled().await;
             Err(kerminal_application::AppError::cancelled("测试请求已取消"))
@@ -586,6 +591,164 @@ fn native_content_restart_restores_two_drafts_without_saving_plugin_action(
         }
     });
     runtime_guard.block_on(async { tokio::task::yield_now().await });
+}
+
+/// 输入节点声明运行时选项后投影为原生 Select；补丁替换选项时只保留仍匹配的选择，
+/// 确认事件直接写回真实字符串值，不再依赖装载时捕获的选项索引。
+#[gpui_kit::test]
+fn runtime_select_tracks_patched_options_and_commits_confirmed_value(
+    app: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::component::select::SelectEvent;
+    use kerminal_application::{ApplicationTaskExecutor, plugin_ports::PluginViewIdentity};
+    use serde_json::json;
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    let runtime_guard = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let prepared = pending_open_plugin();
+    let identity = PluginViewIdentity {
+        plugin: prepared.id.clone(),
+        view: "main".into(),
+        instance: "runtime-select".into(),
+        generation: 1,
+    };
+    let view = Arc::new(
+        kerminal_plugin_protocol::native::parse_native_view(
+            br#"{"schema":1,"data":{"address":"192.168.1.10","address_options":[{"label":"Ethernet","value":"192.168.1.10"},{"label":"Wi-Fi","value":"10.0.0.2"}]},"root":{"type":"input","bind":"address","label":"Listen address","placeholder":"Select an address","x-kerminal-select-options":"$address_options"}}"#,
+        )
+        .unwrap(),
+    );
+    let backend = Arc::new(PendingOpenRuntime::default());
+    let runtime = backend.clone();
+    let config = super::NativeRendererConfig {
+        prepared,
+        view,
+        identity: identity.clone(),
+        scope: json!({}),
+        saved_state: None,
+        initial_data: None,
+        runtime,
+        executor: ApplicationTaskExecutor::new(runtime_guard.handle().clone()),
+        locale: "en".into(),
+        content_identity: None,
+        embedded_form: None,
+    };
+    app.update(crate::init);
+    let slot = Rc::new(RefCell::new(None));
+    let mounted = slot.clone();
+    let (_, visual) = app.add_window_view(move |window, cx| {
+        let renderer = super::NativeRenderer::mount(config, window, cx).unwrap();
+        *mounted.borrow_mut() = Some(renderer.clone());
+        gpui_kit::base::Root::new(renderer, window, cx)
+    });
+    let renderer = slot.borrow_mut().take().expect("renderer mounted");
+    visual.update(|window, cx| {
+        renderer.update(cx, |renderer, cx| {
+            let state = match &renderer.fields["root"] {
+                super::FieldControl::Select { state, .. } => state.clone(),
+                _ => panic!("runtime select was not projected"),
+            };
+            assert_eq!(
+                state.read(cx).selected_value().map(String::as_str),
+                Some("192.168.1.10")
+            );
+            state.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("10.0.0.2".to_owned())))
+            });
+        });
+    });
+    // 事件通过待处理效果分发，先让测试窗口跑完这一拍再检查草稿。
+    visual.run_until_parked();
+
+    visual.update(|window, cx| {
+        renderer.update(cx, |renderer, cx| {
+            assert_eq!(renderer.field_value("address"), Some(&json!("10.0.0.2")));
+            renderer.process_generation = Some(1);
+            renderer.status = super::OpenStatus::Ready;
+            renderer.event(
+                super::RuntimeEvent::ViewUpdate {
+                    identity: identity.clone(),
+                    process_generation: 1,
+                    patch: json!({"address_options":[{"label":"Ethernet","value":"192.168.1.10"}]}),
+                },
+                window,
+                cx,
+            );
+            let super::FieldControl::Select { state, .. } = &renderer.fields["root"] else {
+                panic!("runtime select was not projected");
+            };
+            assert_eq!(state.read(cx).selected_value(), None);
+            assert_eq!(renderer.field_value("address"), Some(&json!("10.0.0.2")));
+            assert!(renderer.is_stale_runtime_binding("address"));
+            // 失效下拉不阻断动作，但动作快照中该绑定必须是 null，不能把已经
+            // 从下拉消失的旧值继续交给插件。
+            assert_eq!(renderer.action_data()["address"], json!(null));
+
+            // 候选暂时清空同样不能把旧值当成仍然有效；等待下一次补丁再恢复。
+            renderer.event(
+                super::RuntimeEvent::ViewUpdate {
+                    identity: identity.clone(),
+                    process_generation: 1,
+                    patch: json!({"address_options":[]}),
+                },
+                window,
+                cx,
+            );
+            assert!(renderer.is_stale_runtime_binding("address"));
+            assert_eq!(renderer.action_data()["address"], json!(null));
+        });
+    });
+
+    visual.update(|window, cx| {
+        renderer.update(cx, |renderer, cx| {
+            renderer.event(
+                super::RuntimeEvent::ViewUpdate {
+                    identity: identity.clone(),
+                    process_generation: 1,
+                    patch: json!({"address_options":[{"label":"Ethernet","value":"192.168.1.10"},{"label":"Wi-Fi 6","value":"10.0.0.2"}]}),
+                },
+                window,
+                cx,
+            );
+            let super::FieldControl::Select { state, .. } = &renderer.fields["root"] else {
+                panic!("runtime select was not projected");
+            };
+            assert!(!renderer.is_stale_runtime_binding("address"));
+            assert_eq!(
+                state.read(cx).selected_value().map(String::as_str),
+                Some("10.0.0.2")
+            );
+            state.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("192.168.1.10".to_owned())))
+            });
+        });
+    });
+    visual.run_until_parked();
+
+    visual.update(|_, cx| {
+        renderer.update(cx, |renderer, cx| {
+            assert_eq!(
+                renderer.field_value("address"),
+                Some(&json!("192.168.1.10"))
+            );
+            assert_eq!(renderer.action_data()["address"], json!("192.168.1.10"));
+            renderer.action("start".into(), "start".into(), None, cx);
+        });
+    });
+    // 动作任务先由 GPUI 执行器轮询，再交给应用 runtime 记录请求参数。
+    visual.run_until_parked();
+    runtime_guard.block_on(async { tokio::task::yield_now().await });
+    let actions = backend.actions.lock().unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["action"], json!("start"));
+    assert_eq!(actions[0]["data"]["address"], json!("192.168.1.10"));
+    drop(actions);
+    visual.update(|_, cx| {
+        renderer.update(cx, |renderer, _| renderer.cancellation.cancel());
+    });
 }
 
 /// 静区固定四个模块，模块尺寸与原点按设备像素取整；矩阵内容只影响深浅，不参与尺寸计算。

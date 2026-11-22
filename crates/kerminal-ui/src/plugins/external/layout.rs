@@ -4,7 +4,7 @@
 
 use super::{
     collections::NativeCollection,
-    inputs::FieldControl,
+    inputs::{FieldControl, SelectSource},
     renderer::{
         CollectionEvent, CollectionQuery, NativeCollectionConfig, NativeRenderer, OpenStatus,
         collection_cache_key,
@@ -642,9 +642,11 @@ impl NativeRenderer {
                     .and_then(Value::as_str)
                     .and_then(|binding| binding.strip_prefix('$'))
                     .is_some_and(|binding| {
-                        self.field_value(binding)
-                            .and_then(Value::as_str)
-                            .is_none_or(str::is_empty)
+                        self.is_stale_runtime_binding(binding)
+                            || self
+                                .field_value(binding)
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty)
                     });
                 let busy = busy
                     .as_deref()
@@ -826,8 +828,40 @@ impl NativeRenderer {
                     field.child(row)
                 }
                 FieldControl::Textarea { state, .. } => field.child(Textarea::new(state).w_full()),
-                FieldControl::Select { state, .. } => field.child(Select::new(state).w_full()),
+                FieldControl::Select { state, .. } => {
+                    // 名称和当前值分开声明，验收探针可以按本地化字段标签定位控件，
+                    // 不需要猜测像素坐标；普通输入节点升级为下拉时仍沿用原 placeholder。
+                    let select = Select::new(state)
+                        .w_full()
+                        .when_some(label.clone(), |select, label| {
+                            select.accessibility_label(label)
+                        });
+                    let select = match &node.kind {
+                        NativeNodeKind::Input {
+                            placeholder: Some(placeholder),
+                            ..
+                        } => select.placeholder(self.projection.text(placeholder)),
+                        _ => select,
+                    };
+                    field.child(select)
+                }
             };
+            if matches!(
+                control,
+                FieldControl::Select {
+                    source: SelectSource::Runtime { stale: true, .. },
+                    ..
+                }
+            ) {
+                // 补丁可能移除用户已选中的值；保留草稿并提示重新选择。动作快照会
+                // 把该绑定投影为 null，显式声明依赖的按钮被禁用，其他动作不受影响。
+                field = field.child(div().text_sm().text_color(cx.theme().danger).child(
+                    crate::locale::text(
+                        "所选选项已不可用，请重新选择",
+                        "The selected option is no longer available; choose another",
+                    ),
+                ));
+            }
         }
         if let Ok(path) = BindingPath::parse(bind)
             && self.projection.state().has_new_value(&path)

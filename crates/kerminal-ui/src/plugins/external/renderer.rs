@@ -1007,7 +1007,7 @@ impl NativeRenderer {
             identity: self.identity.clone(),
             process_generation: generation,
             method: "view.action".into(),
-            params: json!({"action":action,"item_key":item_key,"data":self.projection.state().data()}),
+            params: json!({"action":action,"item_key":item_key,"data":self.action_data()}),
             deadline: Instant::now() + ACTION_TIMEOUT,
             cancellation: self.operation_cancellation.child_token(),
         };
