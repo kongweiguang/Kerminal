@@ -9,10 +9,23 @@ use kerminal_application::updates::{UpdateRecoveryId, UpdateRecoveryState};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-use super::RecoveryStore;
+use super::{ReceiptState, RecoveryStore};
 
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024;
 const VERIFIED_ARTIFACT: &[u8] = b"verified package bytes";
+
+/// 保留旧版成功收据夹具，验证新版仍能读取已落盘的历史格式。
+fn mark_awaiting_confirmation(
+    store: &RecoveryStore,
+    id: UpdateRecoveryId,
+    installed_target_sha256: String,
+) -> AppResult<()> {
+    store.transition_receipt(
+        id,
+        ReceiptState::AwaitingConfirmation,
+        Some(installed_target_sha256),
+    )
+}
 
 /// 失败时输出有限深度的 source 链与 I/O 分类，定位 Windows OS 错误且不打印路径或包正文。
 fn expect_recovery<T>(result: AppResult<T>, operation: &str) -> T {
@@ -238,7 +251,7 @@ fn matching_returned_target_digest_confirms_and_removes_record() {
     );
     expect_recovery(store.mark_installing(id), "persist install boundary");
     expect_recovery(
-        store.mark_awaiting_confirmation(id, Some(digest(b"installed executable bytes"))),
+        mark_awaiting_confirmation(&store, id, digest(b"installed executable bytes")),
         "persist SDK returned target digest",
     );
 
@@ -269,7 +282,7 @@ fn mismatched_returned_target_digest_stays_unknown() {
     );
     expect_recovery(store.mark_installing(id), "persist install boundary");
     expect_recovery(
-        store.mark_awaiting_confirmation(id, Some(digest(b"new AppImage bytes"))),
+        mark_awaiting_confirmation(&store, id, digest(b"new AppImage bytes")),
         "persist target digest",
     );
 

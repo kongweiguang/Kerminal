@@ -163,23 +163,6 @@ impl RecoveryStore {
         self.transition_receipt(id, ReceiptState::Installing, None)
     }
 
-    /// 保留旧版成功收据夹具，确保历史格式的恢复读取仍可验证。
-    #[cfg(test)]
-    pub(super) fn mark_awaiting_confirmation(
-        &self,
-        id: UpdateRecoveryId,
-        installed_target_sha256: Option<String>,
-    ) -> AppResult<()> {
-        if let Some(digest) = installed_target_sha256.as_deref() {
-            validate_digest(digest)?;
-        }
-        self.transition_receipt(
-            id,
-            ReceiptState::AwaitingConfirmation,
-            installed_target_sha256,
-        )
-    }
-
     /// SDK 明确未产生副作用时恢复 pending 状态，保留原句柄供同进程安全重试。
     pub(super) fn restore_pending(&self, id: UpdateRecoveryId) -> AppResult<()> {
         let directory = self.checked_record_dir(id)?;
