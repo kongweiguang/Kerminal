@@ -280,6 +280,12 @@ async fn linux_appimage_install_child() {
         pending[0].state,
         kerminal_application::updates::UpdateRecoveryState::PendingConfirmation
     );
+    let current_cache = pending[0].recovery_path.clone();
+    let unrelated = root.join("recovery").join("unrelated-cache");
+    std::fs::create_dir(&unrelated).expect("seed unrelated cache directory");
+    std::fs::write(unrelated.join("sentinel"), b"preserve").expect("seed unrelated cache sentinel");
+    let malformed_history = root.join("recovery").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&malformed_history).expect("seed malformed historical directory");
     assert_eq!(
         progress
             .next(CancellationToken::new())
@@ -312,16 +318,17 @@ async fn linux_appimage_install_child() {
         std::fs::read(&install_path).expect("read isolated SDK install target"),
         TEST_ARTIFACT
     );
-    let unresolved = service
-        .recoveries()
-        .await
-        .expect("read retained post-install recovery");
-    assert_eq!(unresolved.len(), 1);
     assert!(
-        unresolved[0]
-            .recovery_path
-            .join("verified-update.bin")
-            .is_file()
+        !current_cache.exists(),
+        "successful install releases its own cache"
+    );
+    assert_eq!(
+        std::fs::read(unrelated.join("sentinel")).expect("read sentinel"),
+        b"preserve"
+    );
+    assert!(
+        malformed_history.is_dir(),
+        "successful cleanup must not scan history"
     );
 }
 /// 在隔离子进程检查旧宿主退出及实际安装参数，避免只因 PowerShell 启动就认为更新会重启。

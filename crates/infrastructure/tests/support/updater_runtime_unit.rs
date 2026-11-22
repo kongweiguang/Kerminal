@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use super::{CargoPackagerUpdater, lock_or_cancel};
+use super::{CargoPackagerUpdater, finalize_install_outcome, lock_or_cancel};
 use kerminal_application::updates::{
     UpdateAvailability, UpdateCandidateId, UpdatePort, UpdateProgress, UpdateRecoveryId,
     UpdateRecoveryState,
@@ -127,10 +127,10 @@ fn appimage_sdk_error_with_identical_target_is_retryable() {
     );
 }
 
-/// 成功的 AppImage SDK 调用只记录实际目标摘要，不把压缩下载包摘要当作安装文件摘要。
+/// SDK 成功后目标必须仍是可执行普通文件，才能交给宿主重启。
 #[cfg(target_os = "linux")]
 #[test]
-fn appimage_success_records_replaced_target_digest() {
+fn appimage_success_requires_executable_target() {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     let root = tempfile::tempdir().expect("create isolated AppImage target");
@@ -142,8 +142,6 @@ fn appimage_success_records_replaced_target_digest() {
     fs::write(&target, b"new appimage bytes").expect("simulate SDK replacement");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
         .expect("preserve executable mode");
-    let after = appimage_snapshot(&target).expect("capture updated target");
-
     let result = reconcile_appimage_install::<std::io::Error>(Ok(()), &target, before);
 
     assert!(matches!(
@@ -152,10 +150,37 @@ fn appimage_success_records_replaced_target_digest() {
             kerminal_application::UpdateInstallDisposition::RestartRequired
         )
     ));
-    assert_eq!(
-        result.installed_target_sha256,
-        Some(super::hex_sha256(&after.sha256))
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+        .expect("remove target execution permission");
+    let invalid = reconcile_appimage_install::<std::io::Error>(Ok(()), &target, before);
+    assert!(matches!(
+        invalid.result,
+        kerminal_application::UpdateInstallResult::OutcomeUnknown(_)
+    ));
+}
+
+/// 缓存路径异常导致清理失败时，已确认的安装结果仍须交给宿主重启。
+#[test]
+fn successful_install_remains_successful_when_cache_cleanup_fails() {
+    use kerminal_application::{UpdateInstallDisposition, UpdateInstallResult};
+
+    let root = tempfile::tempdir().expect("create isolated updater root");
+    let recovery = super::super::recovery::RecoveryStore::new(root.path().join("recovery"), 1024)
+        .expect("create isolated recovery store");
+    let id = UpdateRecoveryId::new();
+    let invalid_path = root.path().join("recovery").join(id.as_uuid().to_string());
+    std::fs::write(&invalid_path, b"not a directory").expect("block cache removal safely");
+
+    let result = finalize_install_outcome(
+        &recovery,
+        id,
+        UpdateInstallResult::Installed(UpdateInstallDisposition::RestartRequired),
     );
+    assert!(matches!(
+        result,
+        UpdateInstallResult::Installed(UpdateInstallDisposition::RestartRequired)
+    ));
+    assert!(invalid_path.is_file());
 }
 
 /// SDK 已报错而目标文件发生变化时必须保留 Unknown，禁止按可重试失败处理。

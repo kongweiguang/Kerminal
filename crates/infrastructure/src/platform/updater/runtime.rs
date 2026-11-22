@@ -65,7 +65,6 @@ struct InstallPlan {
 
 struct InstallOutcome {
     result: UpdateInstallResult,
-    installed_target_sha256: Option<String>,
 }
 
 #[derive(Default)]
@@ -411,10 +410,9 @@ impl UpdatePort for CargoPackagerUpdater {
         let recovery = self.recovery.clone();
         let startup_target_snapshot = Arc::clone(&self.startup_target_snapshot);
         let install_task = tokio::task::spawn_blocking(move || {
-            let mut outcome = match recovery.read_verified_artifact(recovery_id) {
+            let outcome = match recovery.read_verified_artifact(recovery_id) {
                 Err(error) => InstallOutcome {
                     result: UpdateInstallResult::NotStarted(error),
-                    installed_target_sha256: None,
                 },
                 Ok(bytes) => {
                     let snapshot_started = startup_target_snapshot
@@ -424,24 +422,21 @@ impl UpdatePort for CargoPackagerUpdater {
                     match snapshot_started {
                         Err(error) => InstallOutcome {
                             result: UpdateInstallResult::NotStarted(error),
-                            installed_target_sha256: None,
                         },
                         Ok(()) => match recovery.mark_installing(recovery_id) {
-                            Ok(()) => catch_unwind(AssertUnwindSafe(|| {
-                                perform_install(plan, bytes, &recovery)
-                            }))
-                            .unwrap_or_else(|_| InstallOutcome {
-                                result: UpdateInstallResult::OutcomeUnknown(
-                                    AppError::outcome_unknown(
-                                        "安装器执行异常，目标状态需要人工核实",
-                                    ),
-                                ),
-                                installed_target_sha256: None,
-                            }),
+                            Ok(()) => {
+                                catch_unwind(AssertUnwindSafe(|| perform_install(plan, bytes)))
+                                    .unwrap_or_else(|_| InstallOutcome {
+                                        result: UpdateInstallResult::OutcomeUnknown(
+                                            AppError::outcome_unknown(
+                                                "安装器执行异常，目标状态需要人工核实",
+                                            ),
+                                        ),
+                                    })
+                            }
                             Err(error) => match recovery.restore_pending(recovery_id) {
                                 Ok(()) => InstallOutcome {
                                     result: UpdateInstallResult::NotStarted(error),
-                                    installed_target_sha256: None,
                                 },
                                 Err(restore_error) => InstallOutcome {
                                     result: UpdateInstallResult::OutcomeUnknown(
@@ -450,7 +445,6 @@ impl UpdatePort for CargoPackagerUpdater {
                                             restore_error,
                                         ),
                                     ),
-                                    installed_target_sha256: None,
                                 },
                             },
                         },
@@ -458,31 +452,9 @@ impl UpdatePort for CargoPackagerUpdater {
                 }
             };
 
-            if matches!(&outcome.result, UpdateInstallResult::Installed(_))
-                && let Err(error) = recovery.mark_awaiting_confirmation(
-                    recovery_id,
-                    outcome.installed_target_sha256.clone(),
-                )
-            {
-                outcome.result =
-                    UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
-                        "安装器已返回，但无法保存目标文件确认状态",
-                        error,
-                    ));
-                outcome.installed_target_sha256 = None;
-            } else if matches!(
-                &outcome.result,
-                UpdateInstallResult::NotStarted(_) | UpdateInstallResult::FailedNoEffect(_)
-            ) && let Err(error) = recovery.restore_pending(recovery_id)
-            {
-                outcome.result =
-                    UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
-                        "安装无副作用，但恢复收据状态无法回退",
-                        error,
-                    ));
-            }
-            finish_install_record(&downloaded, update_id, &outcome.result);
-            outcome.result
+            let result = finalize_install_outcome(&recovery, recovery_id, outcome.result);
+            finish_install_record(&downloaded, update_id, &result);
+            result
         });
         match install_task.await {
             Ok(result) => result,
@@ -600,6 +572,29 @@ impl UpdatePort for CargoPackagerUpdater {
     }
 }
 
+/// 安装成功后缓存清理不能阻止重启，失败时仍须保留安全重试的持久化边界。
+fn finalize_install_outcome(
+    recovery: &super::recovery::RecoveryStore,
+    id: UpdateRecoveryId,
+    result: UpdateInstallResult,
+) -> UpdateInstallResult {
+    if matches!(&result, UpdateInstallResult::Installed(_)) {
+        if let Err(error) = recovery.remove(id) {
+            tracing::warn!(error = %error, "更新安装已完成，但本次缓存清理失败");
+        }
+    } else if matches!(
+        &result,
+        UpdateInstallResult::NotStarted(_) | UpdateInstallResult::FailedNoEffect(_)
+    ) && let Err(error) = recovery.restore_pending(id)
+    {
+        return UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
+            "安装无副作用，但恢复收据状态无法回退",
+            error,
+        ));
+    }
+    result
+}
+
 impl Drop for DownloadResetGuard {
     /// 只在下载租约仍由本 guard 持有时回退状态；同步锁不跨异步边界。
     ///
@@ -658,12 +653,7 @@ fn mark_install_unknown(
 }
 
 /// 保留 SDK 原生错误类型；panic 转成同一错误边界后再用文件快照判定实际替换结果。
-fn perform_install(
-    plan: InstallPlan,
-    bytes: Vec<u8>,
-    recovery: &super::recovery::RecoveryStore,
-) -> InstallOutcome {
-    let _ = recovery;
+fn perform_install(plan: InstallPlan, bytes: Vec<u8>) -> InstallOutcome {
     #[cfg(target_os = "linux")]
     {
         let before = match appimage_snapshot(&plan.update.extract_path) {
@@ -674,7 +664,6 @@ fn perform_install(
                         "无法确认当前 AppImage，安装器未启动",
                         error,
                     )),
-                    installed_target_sha256: None,
                 };
             }
         };
@@ -693,7 +682,6 @@ fn perform_install(
                 result: UpdateInstallResult::NotStarted(AppError::unsupported(
                     "当前只允许通过 NSIS 安装更新",
                 )),
-                installed_target_sha256: None,
             };
         }
         return match plan.update.install(bytes) {
@@ -704,43 +692,28 @@ fn perform_install(
                     "NSIS 安装器未启动",
                     error,
                 )),
-                installed_target_sha256: None,
             },
             // 固定 SDK 在成功启动后应退出进程；若未来返回，不能据此假定安装已完成。
             Ok(()) => InstallOutcome {
                 result: UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown(
                     "NSIS 安装器已返回但应用仍在运行，安装状态需要确认",
                 )),
-                installed_target_sha256: None,
             },
         };
     }
 
     #[cfg(target_os = "macos")]
     {
-        let installed_target = plan.update.extract_path.join("Contents/MacOS/kerminal");
-        let before = recovery.target_sha256(&installed_target).ok();
         return match plan.update.install(bytes) {
-            Ok(()) => {
-                let after = recovery.target_sha256(&installed_target).ok();
-                let digest = match (before.as_deref(), after.as_deref()) {
-                    (Some(before), Some(after)) if before != after => Some(after.to_owned()),
-                    _ => None,
-                };
-                InstallOutcome {
-                    result: UpdateInstallResult::Installed(
-                        UpdateInstallDisposition::RestartRequired,
-                    ),
-                    installed_target_sha256: digest,
-                }
-            }
+            Ok(()) => InstallOutcome {
+                result: UpdateInstallResult::Installed(UpdateInstallDisposition::RestartRequired),
+            },
             // SDK 会先解包并替换 .app；任何错误都不能证明备份回滚已经完整。
             Err(error) => InstallOutcome {
                 result: UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
                     "macOS 应用替换结果需要人工核实",
                     error,
                 )),
-                installed_target_sha256: None,
             },
         };
     }
@@ -748,7 +721,6 @@ fn perform_install(
     #[allow(unreachable_code)]
     InstallOutcome {
         result: UpdateInstallResult::NotStarted(AppError::unsupported("当前平台不支持应用内更新")),
-        installed_target_sha256: None,
     }
 }
 
@@ -816,55 +788,39 @@ where
     let sdk_error = sdk_result.err();
     let after = appimage_snapshot(target);
     match (sdk_error, after) {
-        (None, Ok(after)) => {
-            let digest = (after.sha256 != before.sha256 && after.mode & 0o111 != 0)
-                .then(|| hex_sha256(&after.sha256));
-            InstallOutcome {
-                result: UpdateInstallResult::Installed(UpdateInstallDisposition::RestartRequired),
-                installed_target_sha256: digest,
-            }
-        }
+        (None, Ok(after)) if after.mode & 0o111 != 0 => InstallOutcome {
+            result: UpdateInstallResult::Installed(UpdateInstallDisposition::RestartRequired),
+        },
+        (None, Ok(_)) => InstallOutcome {
+            result: UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown(
+                "AppImage 更新后缺少执行权限，目标状态需要人工核实",
+            )),
+        },
         (Some(error), Ok(after)) if after == before => InstallOutcome {
             result: UpdateInstallResult::FailedNoEffect(AppError::infrastructure_with_source(
                 "AppImage 更新失败，原文件完整保留",
                 error,
             )),
-            installed_target_sha256: None,
         },
         (Some(error), Ok(_)) => InstallOutcome {
             result: UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
                 "AppImage 替换结果需要人工核实",
                 error,
             )),
-            installed_target_sha256: None,
         },
         (None, Err(error)) => InstallOutcome {
             result: UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
                 "无法读取 AppImage 替换结果",
                 error,
             )),
-            installed_target_sha256: None,
         },
         (Some(error), Err(_read_error)) => InstallOutcome {
             result: UpdateInstallResult::OutcomeUnknown(AppError::outcome_unknown_with_source(
                 "AppImage 替换结果需要人工核实",
                 error,
             )),
-            installed_target_sha256: None,
         },
     }
-}
-
-/// 将 SDK 提供的 SHA-256 字节摘要转成恢复收据要求的小写十六进制文本。
-#[cfg(target_os = "linux")]
-fn hex_sha256(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut digest = String::with_capacity(64);
-    for byte in bytes {
-        digest.push(HEX[(byte >> 4) as usize] as char);
-        digest.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    digest
 }
 
 /// 只在启动期定位可更新运行形态的真实目标文件，macOS 按 bundle 组件精确匹配。

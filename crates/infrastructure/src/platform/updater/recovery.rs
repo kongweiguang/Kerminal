@@ -163,7 +163,8 @@ impl RecoveryStore {
         self.transition_receipt(id, ReceiptState::Installing, None)
     }
 
-    /// 只有 SDK 成功返回后才记录目标文件摘要；artifact 保留到重启核验或用户明确确认。
+    /// 保留旧版成功收据夹具，确保历史格式的恢复读取仍可验证。
+    #[cfg(test)]
     pub(super) fn mark_awaiting_confirmation(
         &self,
         id: UpdateRecoveryId,
