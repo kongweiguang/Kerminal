@@ -79,7 +79,7 @@ fn pending_artifact_and_receipt_are_committed_together() {
         "persist verified package and receipt",
     );
     let visible = expect_recovery(
-        store.list("0.4.1", "windows-x86_64", None),
+        store.list("0.4.1", "windows-x86_64", None, false),
         "list pending recovery",
     );
 
@@ -117,7 +117,7 @@ fn verified_bytes_commit_as_a_readable_recovery_record() {
     assert_eq!(recovered, bytes);
     assert_eq!(
         expect_recovery(
-            store.list("0.4.1", "windows-x86_64", None),
+            store.list("0.4.1", "windows-x86_64", None, false),
             "list durable record",
         )[0]
         .artifact_sha256,
@@ -156,7 +156,7 @@ fn installing_receipt_never_claims_windows_install_from_archive_digest() {
     expect_recovery(store.mark_installing(id), "persist install boundary");
 
     let visible = expect_recovery(
-        store.list("0.4.2", "windows-x86_64", None),
+        store.list("0.4.2", "windows-x86_64", None, false),
         "list version-matched recovery",
     );
 
@@ -167,6 +167,128 @@ fn installing_receipt_never_claims_windows_install_from_archive_digest() {
     );
     assert!(record_dir.join("verified-update.bin").is_file());
     assert!(record_dir.join("receipt.installing.json").is_file());
+}
+
+#[test]
+/// 只按更新器的版本排序和相同目标判断可被当前安装取代的历史材料。
+fn superseded_windows_installing_records_require_exact_target_and_version_order() {
+    let cases = [
+        (
+            "0.4.3",
+            "windows-x86_64",
+            "0.4.3",
+            "windows-x86_64",
+            true,
+            true,
+        ),
+        (
+            "0.4.5",
+            "windows-x86_64",
+            "0.4.3",
+            "windows-x86_64",
+            true,
+            true,
+        ),
+        (
+            "0.4.3+local",
+            "windows-x86_64",
+            "0.4.3+release",
+            "windows-x86_64",
+            true,
+            false,
+        ),
+        (
+            "0.4.3-beta.1",
+            "windows-x86_64",
+            "0.4.3",
+            "windows-x86_64",
+            true,
+            false,
+        ),
+        (
+            "0.4.2",
+            "windows-x86_64",
+            "0.4.3",
+            "windows-x86_64",
+            true,
+            false,
+        ),
+        (
+            "0.4.3",
+            "windows-aarch64",
+            "0.4.3",
+            "windows-x86_64",
+            true,
+            false,
+        ),
+        (
+            "0.4.3",
+            "linux-x86_64",
+            "0.4.3",
+            "linux-x86_64",
+            true,
+            false,
+        ),
+        (
+            "0.4.3",
+            "macos-aarch64",
+            "0.4.3",
+            "macos-aarch64",
+            true,
+            false,
+        ),
+        (
+            "0.4.3",
+            "windows-x86_64",
+            "0.4.3",
+            "windows-x86_64",
+            false,
+            false,
+        ),
+    ];
+    for (current_version, current_target, receipt_version, receipt_target, allowed, retired) in
+        cases
+    {
+        let root = tempdir().expect("create isolated recovery root");
+        let store = store_at(root.path());
+        let id = UpdateRecoveryId::new();
+        let directory = expect_recovery(
+            store.persist_pending_bytes(id, receipt_version, receipt_target, VERIFIED_ARTIFACT),
+            "persist historical update",
+        );
+        expect_recovery(store.mark_installing(id), "persist install boundary");
+        let records = expect_recovery(
+            store.list(current_version, current_target, None, allowed),
+            "reconcile historical install",
+        );
+        assert_eq!(
+            records.is_empty(),
+            retired,
+            "case {current_version} {current_target} {receipt_version} {receipt_target} {allowed}"
+        );
+        assert_eq!(directory.exists(), !retired);
+    }
+}
+
+#[test]
+/// 未进入安装的包和损坏的历史材料不能因版本较新而被静默删除。
+fn windows_retirement_preserves_pending_or_corrupt_records() {
+    let root = tempdir().expect("create isolated recovery root");
+    let store = store_at(root.path());
+    let pending = UpdateRecoveryId::new();
+    let directory = expect_recovery(
+        store.persist_pending_bytes(pending, "0.4.3", "windows-x86_64", VERIFIED_ARTIFACT),
+        "persist pending update",
+    );
+    let records = expect_recovery(
+        store.list("0.4.5", "windows-x86_64", None, true),
+        "list pending update",
+    );
+    assert_eq!(records[0].state, UpdateRecoveryState::PendingConfirmation);
+    expect_recovery(store.mark_installing(pending), "persist install boundary");
+    fs::write(directory.join("verified-update.bin"), b"corrupt").expect("corrupt artifact");
+    assert!(store.list("0.4.5", "windows-x86_64", None, true).is_err());
+    assert!(directory.exists());
 }
 
 #[test]
@@ -188,7 +310,7 @@ fn failed_no_effect_restores_pending_receipt_for_safe_retry() {
     expect_recovery(store.mark_installing(id), "persist install boundary");
     expect_recovery(store.restore_pending(id), "restore safe retry receipt");
     let visible = expect_recovery(
-        store.list("0.4.1", "windows-x86_64", None),
+        store.list("0.4.1", "windows-x86_64", None, false),
         "list pending recovery",
     );
 
@@ -216,7 +338,7 @@ fn unknown_install_material_survives_restart_listing() {
     expect_recovery(store.mark_installing(id), "persist install boundary");
 
     let visible = expect_recovery(
-        store.list("0.4.1", "windows-x86_64", None),
+        store.list("0.4.1", "windows-x86_64", None, false),
         "list unresolved recovery",
     );
 
@@ -249,6 +371,7 @@ fn matching_returned_target_digest_confirms_and_removes_record() {
                 "0.4.2",
                 "macos-aarch64",
                 Some(&digest(b"installed executable bytes")),
+                false,
             ),
             "reconcile installed target",
         ),
@@ -274,7 +397,12 @@ fn mismatched_returned_target_digest_stays_unknown() {
     );
 
     let visible = expect_recovery(
-        store.list("0.4.2", "linux-x86_64", Some(&digest(b"different file"))),
+        store.list(
+            "0.4.2",
+            "linux-x86_64",
+            Some(&digest(b"different file")),
+            false,
+        ),
         "list target mismatch",
     );
 
@@ -304,11 +432,86 @@ fn explicit_acknowledgement_removes_only_the_selected_record() {
     assert!(!record_dir.exists());
     assert!(
         expect_recovery(
-            store.list("0.4.2", "windows-x86_64", None),
+            store.list("0.4.2", "windows-x86_64", None, false),
             "refresh recovery list",
         )
         .is_empty()
     );
+}
+
+#[test]
+/// 先移出后的残片允许下一次扫描幂等收尾，不应再阻止新更新。
+fn retired_partial_directory_does_not_block_recovery_scan() {
+    let root = tempdir().expect("create isolated recovery root");
+    let store = store_at(root.path());
+    let id = UpdateRecoveryId::new();
+    let retired = root.path().join(format!(".retired-{}", id.as_uuid()));
+    fs::create_dir(&retired).expect("seed interrupted cleanup");
+    fs::write(retired.join("partial.bin"), b"leftover").expect("seed partial artifact");
+
+    let records = expect_recovery(
+        store.list("0.4.3", "windows-x86_64", None, true),
+        "scan after interrupted cleanup",
+    );
+    assert!(records.is_empty());
+    assert!(!retired.exists());
+}
+
+#[test]
+/// 原子移出失败时保留完整活动记录，不把失败报告成已经清理。
+fn failed_retirement_keeps_original_record_readable() {
+    let root = tempdir().expect("create isolated recovery root");
+    let store = store_at(root.path());
+    let id = UpdateRecoveryId::new();
+    let directory = expect_recovery(
+        store.persist_pending_bytes(id, "0.4.3", "windows-x86_64", VERIFIED_ARTIFACT),
+        "persist recovery",
+    );
+    let conflicting = root.path().join(format!(".retired-{}", id.as_uuid()));
+    fs::create_dir(&conflicting).expect("seed conflicting retirement target");
+    fs::write(conflicting.join("keep"), b"existing material").expect("protect target");
+
+    assert!(store.remove(id).is_err());
+    assert_eq!(
+        expect_recovery(store.read_verified_artifact(id), "read original"),
+        VERIFIED_ARTIFACT
+    );
+    assert!(directory.exists());
+    let records = expect_recovery(
+        store.list("0.4.3", "windows-x86_64", None, true),
+        "list original",
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, id);
+}
+
+#[test]
+/// 自动移出明确失败时保留已校验记录，使用户仍能看到并处理原安装状态。
+fn failed_automatic_retirement_remains_visible() {
+    let root = tempdir().expect("create isolated recovery root");
+    let store = store_at(root.path());
+    let id = UpdateRecoveryId::new();
+    let directory = expect_recovery(
+        store.persist_pending_bytes(id, "0.4.3", "windows-x86_64", VERIFIED_ARTIFACT),
+        "persist recovery",
+    );
+    expect_recovery(store.mark_installing(id), "persist install boundary");
+    let conflicting = root.path().join(format!(".retired-{}", id.as_uuid()));
+    fs::write(&conflicting, b"conflicting file").expect("block no-clobber move");
+
+    let records = expect_recovery(
+        store.list("0.4.3", "windows-x86_64", None, true),
+        "retain record after automatic move failure",
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, id);
+    assert_eq!(
+        records[0].state,
+        UpdateRecoveryState::VersionMatchedAwaitingConfirmation
+    );
+    assert!(directory.join("receipt.installing.json").exists());
+    assert!(directory.join("verified-update.bin").exists());
+    assert!(conflicting.exists());
 }
 
 #[test]
@@ -323,7 +526,7 @@ fn corrupt_receipt_fails_closed_without_removing_artifact() {
     );
     fs::write(record_dir.join("receipt.pending.json"), b"{broken").expect("corrupt test receipt");
 
-    assert!(store.list("0.4.2", "windows-x86_64", None).is_err());
+    assert!(store.list("0.4.2", "windows-x86_64", None, false).is_err());
     assert!(record_dir.join("verified-update.bin").is_file());
     assert!(record_dir.exists());
 }
