@@ -2,7 +2,8 @@
 //!
 //! @author kongweiguang
 
-use super::ssh_terminal_open_request;
+use super::{SshPtyReaderEnd, ssh_terminal_open_request, ssh_terminal_reader_end_result};
+use kerminal_application::AppError;
 use kerminal_application::connections::management::HostTerminalOptions;
 use kerminal_domain::{
     identity::HostId,
@@ -39,4 +40,41 @@ fn terminal_options_apply_only_when_target_has_no_explicit_directory() {
     );
     assert_eq!(default.term, "xterm-256color");
     assert!(default.working_directory.is_none());
+}
+
+/// 明确关闭且收到 channel 结束才能完成回收，不能把取消或意外断线伪装成已退出。
+///
+/// @author kongweiguang
+#[test]
+fn reader_end_distinguishes_confirmed_local_close_from_cancellation_and_disconnect() {
+    for end in [
+        SshPtyReaderEnd::RemoteChannelClosed,
+        SshPtyReaderEnd::RemoteTransportEnded,
+    ] {
+        let status = ssh_terminal_reader_end_result(end, true, false).expect("confirmed close");
+        assert_eq!(status.code, None);
+        assert_eq!(status.signal, None);
+        assert!(!status.success);
+        assert!(matches!(
+            ssh_terminal_reader_end_result(end, true, true),
+            Err(AppError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            ssh_terminal_reader_end_result(end, false, false),
+            Err(AppError::RetryableRemoteDisconnect { .. })
+        ));
+    }
+    for end in [
+        SshPtyReaderEnd::Cancelled,
+        SshPtyReaderEnd::OutputConsumerClosed,
+    ] {
+        assert!(matches!(
+            ssh_terminal_reader_end_result(end, true, false),
+            Err(AppError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            ssh_terminal_reader_end_result(end, false, false),
+            Err(AppError::Cancelled { .. })
+        ));
+    }
 }

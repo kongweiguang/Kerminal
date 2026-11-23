@@ -21,23 +21,28 @@ use kerminal_application::{
         KnownHostsRepository, RemoteConnectionLease, RemoteConnectionService, ResolvedCredential,
         ShellScriptRequest, TerminalOpenRequest,
     },
-    sessions::{SessionTransport, SessionTransportControl},
+    sessions::{
+        CreateSessionRequest, PlainTextSnapshotRequest, SessionService, SessionTransport,
+        SessionTransportControl, UiSessionBinding, ZmodemDecision, ZmodemPhase,
+    },
 };
 use kerminal_domain::{
     connections::{
         CredentialRef, HostConnectionProfile, HostEndpoint, RemoteProtocol, RemoteShellDialect,
         SshAuthentication, SshJumpHost, SshRoute,
     },
-    identity::HostId,
-    sessions::TerminalSize,
+    identity::{HostId, PaneId, TabId},
+    sessions::{SessionOwner, SessionTarget, SshSessionTarget, TerminalSize},
 };
 use kerminal_infrastructure::{
     connections::{
         KnownHostsStore, RusshRemoteConnectionDependencies, RusshRemoteConnectionService,
+        SshSessionTransportFactory,
     },
+    sessions::{SessionManager, SessionRuntimeConfig},
     storage::StorageCoordinator,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -494,5 +499,195 @@ async fn openssh_routes_exec_pty_isolation_and_cancellation() -> Result<(), Box<
     );
     command_close?;
     lease_close?;
+    Ok(())
+}
+
+/// 前台进程占用 PTY 时确认重启和重建后输入；可用 KERMINAL_TEST_RZ_PATH 指定远端 rz。
+///
+/// @author kongweiguang
+#[tokio::test]
+#[ignore = "requires a task-private direct OpenSSH fixture"]
+async fn openssh_active_pty_close_and_lease_retire() -> Result<(), Box<dyn Error>> {
+    let fixture = OpenSshFixtureConfig {
+        target: std::env::var("KERM_ACCEPT_SSH_TARGET")?.parse()?,
+        jumps: Vec::new(),
+        username: std::env::var("KERM_ACCEPT_SSH_USERNAME")?,
+        private_key_file: required_path("KERM_ACCEPT_SSH_PRIVATE_KEY_FILE")?,
+        known_hosts_file: required_path("KERM_ACCEPT_SSH_KNOWN_HOSTS_FILE")?,
+    };
+    let credentials: Arc<dyn CredentialResolver> = Arc::new(FixtureKeyResolver {
+        reference: CredentialRef::new(KEY_REFERENCE)?,
+        private_key: Zeroizing::new(std::fs::read(&fixture.private_key_file)?),
+    });
+    let root = tempfile::tempdir()?;
+    std::fs::copy(
+        &fixture.known_hosts_file,
+        root.path().join(KNOWN_HOSTS_FILE),
+    )?;
+    let known_hosts: Arc<dyn KnownHostsRepository> = Arc::new(KnownHostsStore::new(
+        StorageCoordinator::new(root.path()),
+        false,
+    ));
+    let (service, host_id) = connection_service(&fixture, 0, credentials, known_hosts);
+    let lease = service
+        .connect(
+            host_id.clone(),
+            ConnectionIntent::Terminal,
+            CancellationToken::new(),
+        )
+        .await?;
+    let mut transport = lease
+        .open_terminal(
+            TerminalOpenRequest {
+                term: "xterm-256color".to_owned(),
+                size: TerminalSize::default(),
+                environment: BTreeMap::new(),
+                command: Some("yes KERMINAL_BACKPRESSURE".to_owned()),
+                program: None,
+                args: Vec::new(),
+                working_directory: None,
+            },
+            CancellationToken::new(),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    transport.writer.shutdown().await?;
+    let first_close = transport
+        .control
+        .close_until(Instant::now() + Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(
+            first_close,
+            Err(AppError::Timeout {
+                operation: "SSH PTY reader shutdown"
+            })
+        ),
+        "expected reader backpressure timeout: {first_close:?}"
+    );
+    let mut reader = transport.reader;
+    let drain =
+        tokio::spawn(async move { tokio::io::copy(&mut reader, &mut tokio::io::sink()).await });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    transport
+        .control
+        .close_until(deadline)
+        .await
+        .map_err(|error| format!("channel close: {error:?}"))?;
+    transport
+        .control
+        .wait_exit()
+        .await
+        .map_err(|error| format!("wait exit: {error:?}"))?;
+    drain.await??;
+    lease
+        .close_until(deadline, "acceptance")
+        .await
+        .map_err(|error| format!("lease close: {error:?}"))?;
+    let manager = SessionManager::new(
+        Arc::new(SshSessionTransportFactory::new(service)),
+        tokio::runtime::Handle::current(),
+        SessionRuntimeConfig::default(),
+    );
+    let owner = SessionOwner::Ui {
+        tab_id: TabId::new(),
+        pane_id: PaneId::new(),
+    };
+    let info = manager
+        .create(CreateSessionRequest {
+            target: SessionTarget::Ssh(SshSessionTarget {
+                host_id,
+                working_directory: None,
+                command: None,
+            }),
+            owner: owner.clone(),
+            size: TerminalSize::default(),
+            initial_palette: None,
+        })
+        .await?;
+    let context = manager
+        .terminal_command_context(info.session_id.clone())
+        .await?;
+    let binding = UiSessionBinding {
+        session_id: info.session_id.clone(),
+        owner,
+        session_generation: context.session_generation,
+    };
+    let rz = std::env::var("KERMINAL_TEST_RZ_PATH").unwrap_or_else(|_| "rz".to_owned());
+    if !rz
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
+    {
+        return Err("invalid test rz executable path".into());
+    }
+    manager
+        .write(
+            info.session_id.clone(),
+            format!("{rz} -b; sleep 30\n").into_bytes(),
+        )
+        .await?;
+    let start = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(status) = manager.zmodem_status(binding.clone()).await?
+                && status.phase == ZmodemPhase::WaitingForSelection
+            {
+                break Ok::<_, AppError>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    manager
+        .respond_zmodem(binding.clone(), start.id, ZmodemDecision::Cancel)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = manager.zmodem_status(binding.clone()).await?
+                && status.phase == ZmodemPhase::NeedsReconnect
+            {
+                break Ok::<_, AppError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    manager
+        .restart_cancellable(info.session_id.clone(), CancellationToken::new())
+        .await
+        .map_err(|error| match error {
+            AppError::Timeout { operation } => format!("manager reconnect timeout: {operation}"),
+            AppError::TimeoutDetail { operation } => {
+                format!("manager reconnect timeout detail: {operation}")
+            }
+            AppError::DiagnosticSource { source, .. } => match source.downcast_ref::<AppError>() {
+                Some(AppError::Timeout { operation }) => {
+                    format!("manager reconnect secondary timeout: {operation}")
+                }
+                Some(AppError::TimeoutDetail { operation }) => {
+                    format!("manager reconnect secondary timeout detail: {operation}")
+                }
+                _ => format!("manager reconnect source: {source}"),
+            },
+            other => format!("manager reconnect: {other:?}"),
+        })?;
+    manager
+        .write(
+            info.session_id.clone(),
+            b"printf 'RECON%s\\n' NECTED_OK\n".to_vec(),
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = manager
+                .plaintext_snapshot(info.session_id.clone(), PlainTextSnapshotRequest::default())
+                .await?;
+            if snapshot.text.contains("RECONNECTED_OK") {
+                break Ok::<_, AppError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    manager.close(info.session_id).await?;
     Ok(())
 }

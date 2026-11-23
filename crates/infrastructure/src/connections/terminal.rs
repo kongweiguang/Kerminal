@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use kerminal_application::{
     AppError, AppResult,
     connections::{
-        ConnectionIntent, ExecRequest, LeasedSessionTransportControl, RemoteConnectionLease,
-        RemoteConnectionService, RemoteShellDialect, RemoteShellKind, TerminalOpenRequest,
+        ConnectionIntent, ExecRequest, RemoteConnectionLease, RemoteConnectionService,
+        RemoteShellDialect, RemoteShellKind, TerminalOpenRequest,
     },
     sessions::{
         SessionOpenCleanupOwner, SessionTransport, SessionTransportControl,
@@ -125,12 +125,51 @@ async fn open_ssh_target(
         Err(error) => return Err(close_failed_ssh_lease(lease, error).await),
     };
     let channel_control = Arc::clone(&transport.control);
-    transport.control = Arc::new(LeasedSessionTransportControl::new(
-        channel_control,
+    transport.control = Arc::new(OwnedSshTerminalControl {
+        channel: channel_control,
         lease,
-        "SSH terminal session closed",
-    ));
+    });
     Ok(transport)
+}
+
+/// 当前终端独占 SSH lease；并行结束 channel 和父连接，避免忙碌远端等待双方互相退出。
+struct OwnedSshTerminalControl {
+    channel: Arc<dyn SessionTransportControl>,
+    lease: RemoteConnectionLease,
+}
+
+#[async_trait]
+impl SessionTransportControl for OwnedSshTerminalControl {
+    /// 尺寸只属于当前终端通道，不改变独占连接的其他行为。
+    ///
+    /// @author kongweiguang
+    async fn resize(&self, size: TerminalSize) -> AppResult<()> {
+        self.channel.resize(size).await
+    }
+
+    /// 在同一截止时间内同时回收两个 owner，只有双方确认后才允许发布新连接。
+    ///
+    /// @author kongweiguang
+    async fn close_until(&self, deadline: tokio::time::Instant) -> AppResult<()> {
+        let (channel, lease) = tokio::join!(
+            biased;
+            self.channel.close_until(deadline),
+            self.lease
+                .close_until(deadline, "SSH terminal session closed")
+        );
+        match (channel, lease) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(lease_error)) => Err(error.with_source(lease_error)),
+        }
+    }
+
+    /// 退出结果仍由 channel 提供，lease 回收不伪造远端进程退出码。
+    ///
+    /// @author kongweiguang
+    async fn wait_exit(&self) -> AppResult<SessionExitStatus> {
+        self.channel.wait_exit().await
+    }
 }
 
 /// 显式启动/恢复目录优先于主机默认；集中纯投影以防重连和首开采用两套解释规则。
@@ -382,7 +421,7 @@ pub(super) async fn make_ssh_terminal_transport(
             exit: exit_tx,
             writer: Arc::clone(&write_half),
             close_sent: Arc::clone(&close_sent),
-            cancel: pump_cancel.clone(),
+            cancel: pump_cancel,
             local_close_requested: Arc::clone(&local_close_requested),
             remote_channel_end_confirmed: Arc::clone(&remote_channel_end_confirmed),
             initial_messages,
@@ -402,7 +441,6 @@ pub(super) async fn make_ssh_terminal_transport(
         close_sent,
         local_close_requested,
         remote_channel_end_confirmed,
-        cancel: pump_cancel,
         _peer: peer,
     };
     Ok(SessionTransport::new(reader, channel_writer, control)
@@ -584,24 +622,37 @@ impl std::fmt::Display for SshPtyDisconnectSource {
 
 impl std::error::Error for SshPtyDisconnectSource {}
 
-/// 只把无退出消息的远端关闭标记为可重连；本地 close/cancel 和消费端收尾保持非重试。
+/// 只有本地关闭后确证 channel 结束才返回未知退出状态；取消和非预期断线仍保留错误语义。
 ///
 /// @author kongweiguang
-fn ssh_terminal_reader_end_error(
+fn ssh_terminal_reader_end_result(
     end: SshPtyReaderEnd,
     local_close_requested: bool,
     cancelled: bool,
-) -> AppError {
-    if local_close_requested || cancelled || matches!(end, SshPtyReaderEnd::Cancelled) {
-        return AppError::cancelled("SSH PTY 会话已关闭或取消");
+) -> AppResult<SessionExitStatus> {
+    if local_close_requested
+        && !cancelled
+        && matches!(
+            end,
+            SshPtyReaderEnd::RemoteChannelClosed | SshPtyReaderEnd::RemoteTransportEnded
+        )
+    {
+        return Ok(SessionExitStatus {
+            code: None,
+            signal: None,
+            success: false,
+        });
     }
-    match end {
+    if local_close_requested || cancelled || matches!(end, SshPtyReaderEnd::Cancelled) {
+        return Err(AppError::cancelled("SSH PTY 会话已关闭或取消"));
+    }
+    Err(match end {
         SshPtyReaderEnd::RemoteChannelClosed | SshPtyReaderEnd::RemoteTransportEnded => {
             AppError::retryable_remote_disconnect(SshPtyDisconnectSource { kind: end })
         }
         SshPtyReaderEnd::OutputConsumerClosed => AppError::cancelled("SSH PTY 输出消费者已关闭"),
         SshPtyReaderEnd::Cancelled => AppError::cancelled("SSH PTY 会话已关闭或取消"),
-    }
+    })
 }
 
 /// 单个 PTY 读泵的有界通道与退出、取消、关闭状态，作为一个任务上下文交接。
@@ -700,12 +751,12 @@ fn spawn_ssh_terminal_reader(
             remote_channel_end_confirmed.store(true, Ordering::Release);
         }
         if observed_exit.is_none() {
-            let error = ssh_terminal_reader_end_error(
+            let result = ssh_terminal_reader_end_result(
                 end,
                 local_close_requested.load(Ordering::Acquire),
                 cancel.is_cancelled(),
             );
-            let _ = exit.send(Some(Err(error)));
+            let _ = exit.send(Some(result));
         }
         drop(output);
     })
@@ -756,7 +807,6 @@ struct SshSessionTransportControl {
     close_sent: Arc<Mutex<bool>>,
     local_close_requested: Arc<AtomicBool>,
     remote_channel_end_confirmed: Arc<AtomicBool>,
-    cancel: CancellationToken,
     _peer: Arc<RusshPeer>,
 }
 
@@ -782,13 +832,11 @@ impl SessionTransportControl for SshSessionTransportControl {
     async fn close_until(&self, deadline: tokio::time::Instant) -> AppResult<()> {
         self.local_close_requested.store(true, Ordering::Release);
         if tokio::time::Instant::now() >= deadline {
-            self.cancel.cancel();
             return Err(AppError::timeout("SSH PTY channel close deadline"));
         }
         let _close_guard = match tokio::time::timeout_at(deadline, self.close_lock.lock()).await {
             Ok(guard) => guard,
             Err(_) => {
-                self.cancel.cancel();
                 return Err(AppError::timeout("SSH PTY channel close lock"));
             }
         };
@@ -796,20 +844,23 @@ impl SessionTransportControl for SshSessionTransportControl {
         {
             Ok(task) => task,
             Err(_) => {
-                self.cancel.cancel();
                 return Err(AppError::timeout("SSH PTY reader task lock"));
             }
         };
         if reader_task.is_none() {
-            return Ok(());
+            return if self.remote_channel_end_confirmed.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(AppError::cancelled("SSH PTY 读泵未确认通道结束"))
+            };
         }
-        if !self.remote_channel_end_confirmed.load(Ordering::Acquire)
-            && let Err(error) =
-                close_ssh_channel_writer_until(&self.write_half, &self.close_sent, deadline).await
-        {
-            self.cancel.cancel();
-            return Err(error);
-        }
+        let close_error = if !self.remote_channel_end_confirmed.load(Ordering::Acquire) {
+            close_ssh_channel_writer_until(&self.write_half, &self.close_sent, deadline)
+                .await
+                .err()
+        } else {
+            None
+        };
         let join_result = match reader_task.as_mut() {
             Some(task) => tokio::time::timeout_at(deadline, task).await,
             None => return Ok(()),
@@ -817,6 +868,10 @@ impl SessionTransportControl for SshSessionTransportControl {
         match join_result {
             Ok(Ok(())) => {
                 reader_task.take();
+                if !self.remote_channel_end_confirmed.load(Ordering::Acquire) {
+                    return Err(close_error
+                        .unwrap_or_else(|| AppError::cancelled("SSH PTY 读泵未确认通道结束")));
+                }
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -826,10 +881,7 @@ impl SessionTransportControl for SshSessionTransportControl {
                     error,
                 ))
             }
-            Err(_) => {
-                self.cancel.cancel();
-                Err(AppError::timeout("SSH PTY reader shutdown"))
-            }
+            Err(_) => Err(AppError::timeout("SSH PTY reader shutdown")),
         }
     }
 
