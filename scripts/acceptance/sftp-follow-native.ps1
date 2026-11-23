@@ -276,7 +276,7 @@ try {
         throw 'The report does not prove the expected isolated native process and desktop.'
     }
     $expected = if ($ZmodemOnly) {
-        @('zmodem-rz-prompt', 'zmodem-rz-cancel', 'zmodem-rz-upload', 'zmodem-sz-prompt', 'zmodem-sz-download')
+        @('zmodem-rz-prompt-light', 'zmodem-rz-prompt-dark', 'zmodem-rz-prompt', 'zmodem-rz-cancel', 'zmodem-rz-upload', 'zmodem-sz-prompt', 'zmodem-sz-download', 'zmodem-reconnect-prompt', 'zmodem-reconnect')
     } elseif ($IncludeTransferChecks) {
         @('sftp-file-tabs', 'sftp-file-dirty-close', 'sftp-file-close-cancelled',
           'sftp-file-saved', 'sftp-file-save-conflict', 'sftp-file-reloaded', 'sftp-directory-successor', 'sftp-terminal-successor',

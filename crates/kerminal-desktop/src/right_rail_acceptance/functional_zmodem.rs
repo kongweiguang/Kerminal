@@ -8,16 +8,17 @@ use gpui_kit::{
     AnyWindowHandle, AsyncApp, Entity, InputEvent, KeyDownEvent, KeyUpEvent, Keystroke,
 };
 use kerminal_application::sessions::{
-    UiSessionBinding, ZmodemDecision, ZmodemDirection, ZmodemPhase,
+    UiSessionBinding, ZMODEM_INPUT_BUSY, ZmodemDecision, ZmodemDirection, ZmodemPhase,
 };
 use kerminal_ui::{AppServices, RootView};
 
 use super::{
-    RightRailCaptureContext, frame_signature,
+    RIGHT_RAIL_THEMES, RightRailCaptureContext, frame_signature,
     functional::{FunctionalRecord, checkpoint, poll_root},
+    functional_transfer_workspace::click_visible_element,
 };
 
-/// 只使用本轮 fixture 的 SSH 会话与路径；键盘中断走真实窗口输入路径。
+/// 只使用本轮 fixture 的 SSH 会话与路径，取消和恢复后的回车都走窗口输入路径。
 pub(super) async fn run(
     cx: &mut AsyncApp,
     root: &Entity<RootView>,
@@ -62,16 +63,27 @@ pub(super) async fn run(
     .await?;
     assert_prompt(cx, window, &binding)?;
     let mut records = Vec::new();
-    checkpoint(
-        cx,
-        window,
-        capture,
-        &mut records,
+    for ((mode, _), operation) in RIGHT_RAIL_THEMES.into_iter().zip([
+        "zmodem-rz-prompt-light",
+        "zmodem-rz-prompt-dark",
         "zmodem-rz-prompt",
-        "same_pane_upload_prompt",
-    )
-    .await?;
-    press_escape(cx, window)?;
+    ]) {
+        window.update(cx, |_, _, app| {
+            root.update(app, |root, cx| {
+                root.set_right_rail_acceptance_theme(mode, cx);
+            });
+        })?;
+        checkpoint(
+            cx,
+            window,
+            capture,
+            &mut records,
+            operation,
+            "same_pane_upload_prompt",
+        )
+        .await?;
+    }
+    press_terminal_key(cx, window, "escape")?;
     poll_root(cx, root, window, "rz 键盘取消", |root, _, _| {
         let Some((actual, Some(status), _)) = root.right_rail_acceptance_zmodem_observe(host)?
         else {
@@ -86,7 +98,8 @@ pub(super) async fn run(
         Ok((status.phase == ZmodemPhase::Cancelled).then_some(()))
     })
     .await?;
-    send(services, &binding, "printf 'KERM_ZMOD_%s\\n' 'RECOVERED'\r").await?;
+    send(services, &binding, "printf 'KERM_ZMOD_%s\\n' 'RECOVERED'").await?;
+    press_terminal_key(cx, window, "enter")?;
     poll_root(
         cx,
         root,
@@ -277,7 +290,155 @@ pub(super) async fn run(
         "downloaded_bytes_match",
     )
     .await?;
+    verify_reconnect(
+        cx,
+        root,
+        window,
+        capture,
+        services,
+        &binding,
+        &rz,
+        &mut records,
+    )
+    .await?;
     Ok(records)
+}
+
+/// 用仍在执行的前台命令阻止新提示符，验证取消超时后可经生产按钮重连到同一个分屏。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "隔离验收需要同一窗口、fixture、会话和结果"
+)]
+async fn verify_reconnect(
+    cx: &mut AsyncApp,
+    root: &Entity<RootView>,
+    window: AnyWindowHandle,
+    capture: &RightRailCaptureContext,
+    services: &AppServices,
+    binding: &UiSessionBinding,
+    rz: &str,
+    records: &mut Vec<FunctionalRecord>,
+) -> Result<(), Box<dyn Error>> {
+    let host = &capture.fixture_host_id;
+    send(services, binding, &format!("{rz}; sleep 30\r")).await?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "等待需要重连的上传",
+        |root, window, cx| {
+            let Some((actual, Some(status), _)) =
+                root.right_rail_acceptance_zmodem_observe(host)?
+            else {
+                return Ok(None);
+            };
+            if actual != *binding {
+                return Err("取消前会话意外变化".to_owned());
+            }
+            Ok((status.direction == ZmodemDirection::Upload
+                && status.phase == ZmodemPhase::WaitingForSelection
+                && root.right_rail_acceptance_zmodem_focus(host, binding, window, cx)?)
+            .then_some(()))
+        },
+    )
+    .await?;
+    press_terminal_key(cx, window, "escape")?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "未确认退出时显示重连",
+        |root, _, _| {
+            let Some((actual, Some(status), _)) =
+                root.right_rail_acceptance_zmodem_observe(host)?
+            else {
+                return Ok(None);
+            };
+            if actual != *binding {
+                return Err("重连前会话意外变化".to_owned());
+            }
+            Ok((status.phase == ZmodemPhase::NeedsReconnect).then_some(()))
+        },
+    )
+    .await?;
+    let blocked = send(services, binding, "printf 'KERM_ZMOD_%s\\n' 'UNEXPECTED'\r").await;
+    if !blocked.is_err_and(|error| error.to_string().contains(ZMODEM_INPUT_BUSY)) {
+        return Err(io::Error::other("未确认退出时仍可写入终端").into());
+    }
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "zmodem-reconnect-prompt",
+        "input_held_until_reconnect",
+    )
+    .await?;
+    click_visible_element(
+        cx,
+        window,
+        &format!("zmodem-reconnect-{}", binding.session_id.as_str()),
+    )?;
+    let replacement = poll_root(
+        cx,
+        root,
+        window,
+        "重连后同一分屏获得新会话",
+        |root, _, _| {
+            if let Some(error) = root.right_rail_acceptance_reconnect_error(binding) {
+                return Err(format!("ZMODEM 同分屏重连失败：{error}"));
+            }
+            let Some((actual, status, _)) = root.right_rail_acceptance_zmodem_observe(host)? else {
+                return Ok(None);
+            };
+            if actual.owner != binding.owner {
+                return Err("重连切换了分屏".to_owned());
+            }
+            Ok((actual != *binding && status.is_none()).then_some(actual))
+        },
+    )
+    .await;
+    if replacement.is_err() {
+        checkpoint(
+            cx,
+            window,
+            capture,
+            records,
+            "zmodem-reconnect-timeout",
+            "replacement_not_observed",
+        )
+        .await?;
+    }
+    let replacement = replacement?;
+    send(
+        services,
+        &replacement,
+        "printf 'KERM_ZMOD_%s\\n' 'RECONNECTED'",
+    )
+    .await?;
+    press_terminal_key(cx, window, "enter")?;
+    poll_root(
+        cx,
+        root,
+        window,
+        "重连后新 shell 继续执行",
+        |root, _, _| {
+            let Some((actual, _, text)) = root.right_rail_acceptance_zmodem_observe(host)? else {
+                return Ok(None);
+            };
+            Ok((actual == replacement && text.contains("KERM_ZMOD_RECONNECTED")).then_some(()))
+        },
+    )
+    .await?;
+    checkpoint(
+        cx,
+        window,
+        capture,
+        records,
+        "zmodem-reconnect",
+        "same_pane_shell_after_reconnect",
+    )
+    .await
 }
 
 /// 默认使用远端 PATH；自定义路径仅接受安全绝对目录，避免拼接出 shell 语法。
@@ -334,9 +495,14 @@ async fn send(
     Ok(())
 }
 
-/// 向私有窗口分发完整按键事件，使生产焦点和键盘处理决定取消行为。
-fn press_escape(cx: &mut AsyncApp, window: AnyWindowHandle) -> Result<(), Box<dyn Error>> {
-    let keystroke = Keystroke::parse("escape").map_err(io::Error::other)?;
+/// 向私有窗口分发完整按键事件，由生产焦点和键盘处理决定按键去向。
+fn press_terminal_key(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    key: &str,
+) -> Result<(), Box<dyn Error>> {
+    let _ = frame_signature(cx, window)?;
+    let keystroke = Keystroke::parse(key).map_err(io::Error::other)?;
     window.update(cx, |_, window, app| {
         let _ = window.dispatch_event(
             KeyDownEvent {

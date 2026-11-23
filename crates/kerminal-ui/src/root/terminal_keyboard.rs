@@ -420,8 +420,18 @@ impl RootView {
         input_handler.update(cx, |handler, _| {
             handler.note_plain_keydown_after_focus_loss(None);
         });
+        let enter_key = event.keystroke.key.eq_ignore_ascii_case("enter");
+        if enter_key && !event.is_held && self.zmodem_ui.take_enter().is_some() {
+            self.keybinding_runtime
+                .release_terminal_shortcut_key(&event.keystroke);
+        }
         if keybinding_focus::pane_key_is_owned_by_ime(ime_composing) {
             self.suspend_suggestions_for_ime(&binding, cx);
+            return;
+        }
+        if enter_key && event.is_held && self.zmodem_ui.enter_is_pending() {
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
         if let Some(text) = platform_preferred_terminal_text(event) {
@@ -487,6 +497,17 @@ impl RootView {
         let has_selection =
             snapshot_has_selection || selection_gesture_active || selection_update_pending;
         if plain_escape_press && self.cancel_zmodem_for_binding(&binding, cx) {
+            self.consume_local_terminal_key(event, window, cx);
+            return;
+        }
+        if !event.prefer_character_input
+            && !event.keystroke.modifiers.modified()
+            && enter_key
+            && self.zmodem_ui.selection(&binding).is_some()
+        {
+            if !event.is_held {
+                self.zmodem_ui.claim_enter(&binding);
+            }
             self.consume_local_terminal_key(event, window, cx);
             return;
         }

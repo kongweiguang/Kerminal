@@ -6342,10 +6342,30 @@ impl RootView {
         &mut self,
         input_handler: Entity<PaneTerminalInputHandler>,
         event: &KeyUpEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let binding = input_handler.read(cx).binding().clone();
+        if event.keystroke.key.eq_ignore_ascii_case("enter")
+            && let Some((original, id, direction)) = self.zmodem_ui.take_enter()
+        {
+            self.keybinding_runtime
+                .release_terminal_shortcut_key(&event.keystroke);
+            if binding == original
+                && !input_handler.read(cx).is_composing()
+                && !self.quick_open_modal_open
+                && window.is_window_active()
+                && self.pane_input_binding_is_focused(&binding, window, cx)
+                && self
+                    .pane_input_handlers
+                    .get(&binding.session_id)
+                    .is_some_and(|registered| registered.binding == binding)
+            {
+                self.select_zmodem_paths(original, id, direction, window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if !self
             .pane_input_handlers
             .get(&binding.session_id)

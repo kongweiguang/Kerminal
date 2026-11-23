@@ -538,6 +538,21 @@ impl SessionReconnectController {
 }
 
 impl RootView {
+    /// 原生验收只读取重连结果文案，遇到真实失败时尽早报告而不是等到回读超时。
+    #[cfg(feature = "right-rail-acceptance")]
+    pub fn right_rail_acceptance_reconnect_error(
+        &self,
+        binding: &UiSessionBinding,
+    ) -> Option<&str> {
+        let SessionOwner::Ui { pane_id, .. } = &binding.owner else {
+            return None;
+        };
+        match &self.session_reconnect.panes.get(pane_id)?.result {
+            ReconnectResultState::Failed(message) => Some(message),
+            _ => None,
+        }
+    }
+
     /// 查询可重连目标的真实 session 与 generation；旧查询不能覆盖 pane 替换结果。
     ///
     /// @author kongweiguang

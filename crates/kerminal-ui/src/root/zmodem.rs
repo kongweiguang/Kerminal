@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, IntoElement, PathPromptOptions, Window,
+    AnyElement, ClickEvent, Context, IntoElement, PathPromptOptions, Task, Window,
     component::button::{Button, ButtonVariants as _},
     div,
     prelude::*,
@@ -25,20 +25,15 @@ use crate::{locale, theme::ThemeTokens};
 #[derive(Default)]
 pub(super) struct ZmodemUiState {
     statuses: HashMap<SessionId, (UiSessionBinding, ZmodemStatus)>,
-    pickers: HashSet<(SessionId, u64, u64)>,
+    pickers: HashMap<(SessionId, u64, u64), Task<()>>,
+    pending_enter: Option<(UiSessionBinding, u64, ZmodemDirection)>,
 }
 
 impl ZmodemUiState {
     /// 关闭分屏时释放对应投影；仍打开的后台标签保留自己的传输状态。
     pub(super) fn retain_panes(&mut self, panes: &HashSet<PaneId>) {
         self.statuses.retain(|_, (binding, _)| matches!(&binding.owner, SessionOwner::Ui { pane_id, .. } if panes.contains(pane_id)));
-        self.pickers.retain(|(session_id, generation, id)| {
-            self.statuses
-                .get(session_id)
-                .is_some_and(|(binding, status)| {
-                    binding.session_generation == *generation && status.id == *id
-                })
-        });
+        self.cancel_stale_pickers();
     }
 
     /// 状态来源于同一快照请求，消失时移除旧投影以免显示已结束传输。
@@ -66,7 +61,23 @@ impl ZmodemUiState {
         {
             self.statuses.remove(&binding.session_id);
         }
+        self.cancel_stale_pickers();
         finished
+    }
+
+    /// Windows 原生选择器支持丢弃 receiver 关闭；其他平台保留任务直到用户关闭，避免重开。
+    fn cancel_stale_pickers(&mut self) {
+        if cfg!(target_os = "windows") {
+            self.pickers.retain(|(session_id, generation, id), _| {
+                self.statuses
+                    .get(session_id)
+                    .is_some_and(|(binding, status)| {
+                        binding.session_generation == *generation
+                            && status.id == *id
+                            && status.phase == ZmodemPhase::WaitingForSelection
+                    })
+            });
+        }
     }
 
     /// 只暴露精确匹配的代次，重连之后立即隐藏旧传输。
@@ -81,6 +92,32 @@ impl ZmodemUiState {
         self.status(binding).is_some_and(|status| {
             status.id == id && status.phase == ZmodemPhase::WaitingForSelection
         })
+    }
+
+    /// 仅等待选择时把 Enter 解释为本地操作，避免改变普通终端输入。
+    pub(super) fn selection(&self, binding: &UiSessionBinding) -> Option<(u64, ZmodemDirection)> {
+        self.status(binding)
+            .filter(|status| status.phase == ZmodemPhase::WaitingForSelection)
+            .map(|status| (status.id, status.direction))
+    }
+
+    /// 在物理 Enter 释放后再打开系统窗口，防止原按键被对话框接收。
+    pub(super) fn claim_enter(&mut self, binding: &UiSessionBinding) -> bool {
+        let Some((id, direction)) = self.selection(binding) else {
+            return false;
+        };
+        self.pending_enter = Some((binding.clone(), id, direction));
+        true
+    }
+
+    /// 焦点切换不撤销按键归属；迟到的释放仍须吞掉，不能变成另一个终端的孤立 keyup。
+    pub(super) fn take_enter(&mut self) -> Option<(UiSessionBinding, u64, ZmodemDirection)> {
+        self.pending_enter.take()
+    }
+
+    /// 用于吞掉已认领物理按键的重复事件，即使焦点已离开原分屏。
+    pub(super) fn enter_is_pending(&self) -> bool {
+        self.pending_enter.is_some()
     }
 
     /// Esc 和无选区 Ctrl+C 共用同一阶段门，避免拦截普通 shell 输入。
@@ -120,7 +157,7 @@ impl RootView {
         .detach();
     }
 
-    /// 传输浮层绝对定位在所属画布内，不改变终端网格或其他分屏几何。
+    /// 按所属画布定位以保持终端网格稳定；表面不透明，避免终端文字干扰提示和按钮。
     pub(super) fn render_zmodem_overlay(
         &mut self,
         binding: &UiSessionBinding,
@@ -146,15 +183,9 @@ impl RootView {
             }
         };
         let detail = match status.phase {
-            ZmodemPhase::WaitingForSelection => match status.direction {
-                ZmodemDirection::Upload => {
-                    locale::text("选择要上传到远端的文件", "Choose files to upload")
-                }
-                ZmodemDirection::Download => {
-                    locale::text("选择本机保存位置", "Choose a local destination")
-                }
+            ZmodemPhase::WaitingForSelection => {
+                locale::text("Enter 选择 · Esc 取消", "Enter to choose · Esc to cancel").to_string()
             }
-            .to_string(),
             ZmodemPhase::Transferring => {
                 let progress = status.total.map_or_else(
                     || format!("{} B", status.bytes),
@@ -168,16 +199,30 @@ impl RootView {
             ZmodemPhase::Cancelling => {
                 locale::text("正在等待远端退出…", "Waiting for the remote to stop…").to_string()
             }
+            ZmodemPhase::Cancelled if status.error.is_some() => {
+                status.error.unwrap_or_default().to_owned()
+            }
             ZmodemPhase::Finished | ZmodemPhase::Cancelled => format!(
                 "{} {}",
                 locale::text("已完成文件：", "Files completed:"),
                 status.completed
             ),
-            ZmodemPhase::Failed | ZmodemPhase::NeedsReconnect => {
-                status.error.unwrap_or("请检查连接并重试。").to_owned()
-            }
+            ZmodemPhase::NeedsReconnect => status
+                .error
+                .unwrap_or(&locale::text(
+                    "重新连接即可继续使用此分屏。",
+                    "Reconnect to keep using this pane.",
+                ))
+                .to_owned(),
+            ZmodemPhase::Failed => status
+                .error
+                .unwrap_or(&locale::text(
+                    "请检查连接并重试。",
+                    "Check the connection and try again.",
+                ))
+                .to_owned(),
         };
-        let mut actions = div().flex().items_center().gap_2();
+        let mut actions = div().flex().flex_wrap().items_center().gap_2();
         if status.phase == ZmodemPhase::WaitingForSelection {
             let selected_binding = binding.clone();
             let id = status.id;
@@ -191,8 +236,14 @@ impl RootView {
                             locale::text("选择保存位置…", "Choose destination…")
                         }
                     })
-                    .on_click(cx.listener(move |root, _: &ClickEvent, _, cx| {
-                        root.select_zmodem_paths(selected_binding.clone(), id, direction, cx);
+                    .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+                        root.select_zmodem_paths(
+                            selected_binding.clone(),
+                            id,
+                            direction,
+                            window,
+                            cx,
+                        );
                     })),
             );
         }
@@ -267,55 +318,68 @@ impl RootView {
         let key_binding = binding.clone();
         Some(
             div()
-                .id(format!("zmodem-overlay-{}", binding.session_id.as_str()))
                 .absolute()
                 .top_2()
                 .right_2()
-                .max_w_full()
-                .p_3()
-                .gap_2()
+                .left_2()
+                .bottom_2()
                 .flex()
-                .flex_col()
-                .rounded(theme.radius)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.floating_surface)
-                .text_color(theme.foreground)
-                .on_key_down(cx.listener(
-                    move |root, event: &gpui_kit::KeyDownEvent, window, cx| {
-                        if !event.is_held
-                            && !event.keystroke.modifiers.modified()
-                            && event.keystroke.key.eq_ignore_ascii_case("escape")
-                            && root.cancel_zmodem_for_binding(&key_binding, cx)
-                        {
-                            root.restore_zmodem_focus(&key_binding, window, cx);
-                            cx.stop_propagation();
-                        }
-                    },
-                ))
+                .items_start()
+                .justify_end()
                 .child(
                     div()
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .child(title),
+                        .id(format!("zmodem-overlay-{}", binding.session_id.as_str()))
+                        .max_w_full()
+                        .max_w(gpui_kit::rems(22.))
+                        .max_h_full()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .occlude()
+                        .p_3()
+                        .gap_2()
+                        .flex()
+                        .flex_col()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.floating_surface.alpha(1.0))
+                        .text_color(theme.foreground)
+                        .on_key_down(cx.listener(
+                            move |root, event: &gpui_kit::KeyDownEvent, window, cx| {
+                                if !event.is_held
+                                    && !event.keystroke.modifiers.modified()
+                                    && event.keystroke.key.eq_ignore_ascii_case("escape")
+                                    && root.cancel_zmodem_for_binding(&key_binding, cx)
+                                {
+                                    root.restore_zmodem_focus(&key_binding, window, cx);
+                                    cx.stop_propagation();
+                                }
+                            },
+                        ))
+                        .child(
+                            div()
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(div().text_color(theme.muted).child(detail))
+                        .child(actions),
                 )
-                .child(div().text_color(theme.muted).child(detail))
-                .child(actions)
                 .into_any_element(),
         )
     }
 
-    /// 系统选择器只由显式点击打开；重复点击和迟到结果都不能抢占另一代会话。
-    fn select_zmodem_paths(
+    /// 按钮和键盘共享选择器，重复触发与迟到结果不能抢占另一代会话。
+    pub(super) fn select_zmodem_paths(
         &mut self,
         binding: UiSessionBinding,
         id: u64,
         direction: ZmodemDirection,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = (binding.session_id.clone(), binding.session_generation, id);
-        if !self.zmodem_ui.accepts_selection(&binding, id)
-            || !self.zmodem_ui.pickers.insert(key.clone())
-        {
+        if !self.zmodem_ui.accepts_selection(&binding, id) || !self.zmodem_ui.pickers.is_empty() {
             return;
         }
         let selected = cx.prompt_for_paths(PathPromptOptions {
@@ -329,9 +393,11 @@ impl RootView {
                 ZmodemDirection::Download => locale::text("选择保存位置", "Choose a destination"),
             }),
         });
-        cx.spawn(async move |this, cx| {
+        let original_focus = window.focused(cx);
+        let task_key = key.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
             let result = selected.await;
-            let _ = this.update(cx, |root, cx| {
+            let _ = this.update_in(cx, |root, window, cx| {
                 root.zmodem_ui.pickers.remove(&key);
                 if root.terminal_view_bindings.get(&binding.session_id) != Some(&binding)
                     || !root.zmodem_ui.accepts_selection(&binding, id)
@@ -352,10 +418,13 @@ impl RootView {
                         ZmodemDecision::Cancel
                     }
                 };
-                root.respond_zmodem(binding, id, decision, cx);
+                root.respond_zmodem(binding.clone(), id, decision, cx);
+                if window.focused(cx) == original_focus {
+                    root.restore_zmodem_focus(&binding, window, cx);
+                }
             });
-        })
-        .detach();
+        });
+        self.zmodem_ui.pickers.insert(task_key, task);
     }
 
     /// 同一按钮和键盘路径都向后端提交带代次的意图，结果不能写回其他分屏。
