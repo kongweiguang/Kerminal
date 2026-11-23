@@ -331,7 +331,6 @@ if ($CandidateRunId -notmatch '^[0-9]+$') {
 }
 
 $newAssetName = "windows-x86_64-kerminal_${version}_x64-setup.exe"
-$oldAssetName = "Kerminal_${oldVersion}_x64-setup.exe"
 
 if ($env:GITHUB_REPOSITORY -and $env:GITHUB_REPOSITORY -ne $ExpectedRepository) {
     throw "工作流仓库 $env:GITHUB_REPOSITORY 与固定仓库 $ExpectedRepository 不一致"
@@ -442,8 +441,16 @@ if ($AssetSource -eq 'candidate-artifact') {
 $oldRelease = Invoke-GhJson -Arguments @('release', 'view', $OldReleaseTag, '--json', 'tagName,isDraft,isPrerelease,assets')
 Assert-True ([string]$oldRelease.tagName -eq $OldReleaseTag) "旧 Release tag 不匹配：$($oldRelease.tagName)"
 Assert-True ($oldRelease.isDraft -eq $false) "旧发布 $OldReleaseTag 不应是草稿"
-$oldAsset = @($oldRelease.assets | Where-Object { [string]$_.name -eq $oldAssetName })
-Assert-True ($oldAsset.Count -eq 1) "旧发布中 $oldAssetName 不存在或不唯一"
+# 旧版安装包命名沿用过 0.3.x 的 Kerminal_<版本>_x64-setup.exe，0.4.x 起改为
+# windows-x86_64-kerminal_<版本>_x64-setup.exe；只认其中一种会把升级基线锁死在 0.3.x，
+# 因此按旧发布实际资产解析，避免脚本自身限制可验证的升级路径。
+$oldAssetCandidates = @(
+    "windows-x86_64-kerminal_${oldVersion}_x64-setup.exe",
+    "Kerminal_${oldVersion}_x64-setup.exe"
+)
+$oldAsset = @($oldRelease.assets | Where-Object { $oldAssetCandidates -contains [string]$_.name })
+Assert-True ($oldAsset.Count -eq 1) "旧发布 $OldReleaseTag 中找不到唯一的 Windows 安装器（候选：$($oldAssetCandidates -join '、')）"
+$oldAssetName = [string]$oldAsset[0].name
 Assert-ReleaseAssetDigest -Asset $oldAsset[0] -ExpectedSha256 $script:OldInstallerHash -Label '旧发布安装器'
 
 $oldDownload = New-EmptyDirectory -Path (Join-Path $download 'old')
