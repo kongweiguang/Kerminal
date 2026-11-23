@@ -32,7 +32,9 @@ use kerminal_domain::{
         credentials::{CredentialKind, CredentialMaterial, CredentialReference, CredentialScope},
     },
     identity::HostId,
-    sessions::{SessionTarget, SshInitialCommand, SshSessionTarget, TerminalSize},
+    sessions::{
+        SessionExitStatus, SessionTarget, SshInitialCommand, SshSessionTarget, TerminalSize,
+    },
 };
 #[allow(
     dead_code,
@@ -1658,11 +1660,14 @@ async fn exec_reports_streams_and_exit_without_closing_parent_lease() {
     )
     .await
     .expect("explicit channel close resolves wait_exit")
-    .expect_err("manual close without remote status is not a successful process exit");
-    assert!(!terminal_exit.is_retryable_remote_disconnect());
+    .expect("confirmed local close returns an unknown process exit");
     assert_eq!(
-        terminal_exit.public_code(),
-        kerminal_application::PublicErrorCode::Cancelled
+        terminal_exit,
+        SessionExitStatus {
+            code: None,
+            signal: None,
+            success: false,
+        }
     );
     drop(terminal);
 

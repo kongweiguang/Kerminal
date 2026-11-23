@@ -213,15 +213,13 @@ async fn wait_status(
                 .zmodem_status(binding.clone())
                 .await
                 .expect("read status")
-            {
-                if predicate(status.phase)
+                && (predicate(status.phase)
                     || matches!(
                         status.phase,
                         ZmodemPhase::Failed | ZmodemPhase::NeedsReconnect
-                    )
-                {
-                    return status;
-                }
+                    ))
+            {
+                return status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
