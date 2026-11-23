@@ -858,3 +858,16 @@ fn agent_view_binding_change_rejects_only_its_old_receipt() {
     );
     queues.complete(&session_id);
 }
+/// 自动焦点报告只静默传输占用冲突，保留用户输入和其他错误的反馈。
+#[test]
+fn zmodem_busy_suppresses_only_automatic_focus_report() {
+    use kerminal_application::{AppError, sessions::ZMODEM_INPUT_BUSY};
+
+    let busy = AppError::conflict(ZMODEM_INPUT_BUSY);
+    assert!(super::zmodem_focus_busy_is_silent(true, &busy));
+    assert!(!super::zmodem_focus_busy_is_silent(false, &busy));
+    assert!(!super::zmodem_focus_busy_is_silent(
+        true,
+        &AppError::conflict("其他冲突")
+    ));
+}

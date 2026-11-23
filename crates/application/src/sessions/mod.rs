@@ -10,6 +10,7 @@ pub mod command_blocks;
 pub mod logging;
 pub mod shell_editing;
 mod transport;
+mod zmodem;
 
 pub use agent_input::{AgentTerminalSubmissionRequest, MAX_AGENT_TERMINAL_SUBMISSION_BYTES};
 pub use command_blocks::{
@@ -25,6 +26,7 @@ pub use shell_editing::{
     SHELL_EDITING_MAX_SUFFIX_BYTES, ShellEditingAvailability, ShellEditingShell,
     ShellEditingSnapshot, ShellEditingUnavailableReason,
 };
+pub use zmodem::{ZMODEM_INPUT_BUSY, ZmodemDecision, ZmodemDirection, ZmodemPhase, ZmodemStatus};
 
 pub use kerminal_terminal::input::TerminalInputEvent;
 pub use kerminal_terminal::snapshot::{
@@ -591,6 +593,25 @@ pub trait SessionService: Send + Sync {
         Err(AppError::unsupported(
             "当前会话不支持安全追加 Shell 编辑缓冲",
         ))
+    }
+
+    /// 读取当前分屏的传输投影。默认 adapter 没有桌面传输能力，返回空投影。
+    ///
+    /// @author kongweiguang
+    async fn zmodem_status(&self, _binding: UiSessionBinding) -> AppResult<Option<ZmodemStatus>> {
+        Ok(None)
+    }
+
+    /// 选择器结果和取消操作必须与原分屏和握手一一对应，防止旧回调写入新连接。
+    ///
+    /// @author kongweiguang
+    async fn respond_zmodem(
+        &self,
+        _binding: UiSessionBinding,
+        _transfer_id: u64,
+        _decision: ZmodemDecision,
+    ) -> AppResult<()> {
+        Err(AppError::unsupported("当前终端不支持 ZMODEM 传输"))
     }
 
     /// 向显式会话写入协议字节；调用方应把输入编码交给 terminal engine。

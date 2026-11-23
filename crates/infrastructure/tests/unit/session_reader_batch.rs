@@ -129,6 +129,7 @@ async fn test_session() -> (
         cancellation: Mutex::new(CancellationToken::new()),
         changes,
         input_gate: Mutex::new(()),
+        zmodem: Mutex::default(),
         shell_integration: Mutex::new(Default::default()),
         shell_editing: Arc::new(StdMutex::new(editing_runtime::EditingRuntime::new(
             1,

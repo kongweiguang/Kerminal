@@ -5,6 +5,7 @@
 //! @author kongweiguang
 
 use super::editing_runtime::BashProbeGate;
+use super::zmodem_protocol::{Handshake, HandshakeDetector};
 use kerminal_application::sessions::{SessionTransport, TerminalResizeCapability};
 use kerminal_domain::{connections::RemoteShellDialect, sessions::SessionTarget};
 use kerminal_terminal::{
@@ -25,6 +26,8 @@ pub(super) const CURSOR_HOLD_DEADLINE: Duration = Duration::from_millis(32);
 ///
 /// 32ms 与光标合批一致：覆盖一次本机或局域网往返，超过后放行擦除，避免拖慢普通输出。
 pub(super) const BASH_REDRAW_HOLD_DEADLINE: Duration = Duration::from_millis(32);
+
+const ZMODEM_PREFIX_DEADLINE: Duration = Duration::from_millis(250);
 
 /// readline 在调用按键绑定函数前擦除整行；真正闪动来自擦除先于提示符恢复被发布。
 const BASH_REDRAW_ERASE: &[u8] = b"\r\x1b[K";
@@ -64,6 +67,9 @@ pub(super) struct SessionOutputReader {
     /// 擦除序列可能被 transport 拆到两次读取，必须跨批保留匹配进度。
     erase: EraseScanner,
     terminated: Option<ReaderEvent>,
+    zmodem: Option<HandshakeDetector>,
+    zmodem_detected: Option<(Handshake, Vec<u8>)>,
+    resumed_bytes: Vec<u8>,
 }
 
 impl SessionOutputReader {
@@ -83,6 +89,43 @@ impl SessionOutputReader {
             bash_probe: None,
             erase: EraseScanner::default(),
             terminated: None,
+            zmodem: None,
+            zmodem_detected: None,
+            resumed_bytes: Vec::new(),
+        }
+    }
+
+    /// 只有正常的桌面 SSH reader 识别协议，其它 reader 保持直通。
+    pub(super) fn enable_zmodem(&mut self) {
+        self.zmodem = Some(HandshakeDetector::default());
+    }
+
+    /// 本批普通输出先交付，再把同一 transport 的原始字节交给协议状态机。
+    pub(super) fn take_zmodem(&mut self) -> Option<(Handshake, Vec<u8>)> {
+        self.zmodem_detected.take()
+    }
+
+    /// 协议驱动借用原 reader；不存在第二个读取者，也不经过 Shell OSC 过滤器。
+    pub(super) fn zmodem_reader(&mut self) -> &mut Pin<Box<dyn AsyncRead + Send + 'static>> {
+        &mut self.reader
+    }
+
+    /// 结束帧后的字节仍通过正常过滤器，随后按既有路径处理 EOF 或读错误。
+    pub(super) fn resume_zmodem(&mut self, terminal: Vec<u8>, end: Option<ReaderEvent>) {
+        self.resumed_bytes = terminal;
+        self.terminated = end;
+    }
+
+    /// 统一处理新读块和上次协议结束后的尾部，连续握手仍能够被识别。
+    fn filter_transport(&mut self, raw: &[u8], output: &mut FilteredShellEditingOutput) {
+        if let Some(detector) = &mut self.zmodem {
+            let detected = detector.push(raw);
+            self.filter.advance_into(&detected.visible, output);
+            if let Some(handshake) = detected.handshake {
+                self.zmodem_detected = Some((handshake, detected.remaining));
+            }
+        } else {
+            self.filter.advance_into(raw, output);
         }
     }
 
@@ -98,6 +141,16 @@ impl SessionOutputReader {
     ///
     /// @author kongweiguang
     pub(super) fn finish(&mut self) -> Vec<u8> {
+        if let Some(detector) = &mut self.zmodem {
+            let mut output = FilteredShellEditingOutput {
+                visible: Vec::new(),
+                frames: Vec::new(),
+                overflowed: false,
+            };
+            self.filter.advance_into(&detector.flush(), &mut output);
+            output.visible.extend(self.filter.finish());
+            return output.visible;
+        }
         self.filter.finish()
     }
 
@@ -107,6 +160,7 @@ impl SessionOutputReader {
     pub(super) fn disable_coalescing(&mut self) {
         self.tracker = None;
         self.bash_probe = None;
+        self.zmodem = None;
     }
 
     /// 先过滤私有帧，再用可见字节判定重绘，避免私有 OSC 正文进入 VTE 缓存。
@@ -117,16 +171,26 @@ impl SessionOutputReader {
     ///
     /// @author kongweiguang
     pub(super) async fn read(&mut self, buffer: &mut [u8]) -> ReaderEvent {
-        if let Some(event) = self.terminated.take() {
-            return event;
-        }
         let mut output = FilteredShellEditingOutput {
             visible: Vec::new(),
             frames: Vec::new(),
             overflowed: false,
         };
+        if !self.resumed_bytes.is_empty() {
+            let resumed = std::mem::take(&mut self.resumed_bytes);
+            self.filter_transport(&resumed, &mut output);
+            return ReaderEvent::Data(output);
+        }
+        if let Some(event) = self.terminated.take() {
+            return event;
+        }
         let mut filled = 0;
         let mut cursor_deadline: Option<Instant> = None;
+        let mut handshake_deadline = self
+            .zmodem
+            .as_ref()
+            .filter(|detector| detector.has_pending())
+            .map(|_| Instant::now() + ZMODEM_PREFIX_DEADLINE);
         // None 表示本批没有等待提示符恢复；Some 时保留首次擦除时刻，后续分段不能延长。
         let mut bash_hold: Option<BashRedrawHold> = None;
         loop {
@@ -148,13 +212,32 @@ impl SessionOutputReader {
                 biased;
                 _ = self.cancellation.cancelled() => ReaderEvent::Cancelled,
                 _ = hold => return ReaderEvent::Data(output),
+                _ = async {
+                    if let Some(deadline) = handshake_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if handshake_deadline.is_some() => {
+                    if let Some(detector) = &mut self.zmodem {
+                        self.filter.advance_into(&detector.flush(), &mut output);
+                    }
+                    return ReaderEvent::Data(output);
+                }
                 result = self.reader.read(&mut buffer[filled..]) => match result {
                     Ok(0) => ReaderEvent::End,
                     Err(error) => ReaderEvent::Failed(error),
                     Ok(read) => {
                         let visible_start = output.visible.len();
                         output.visible.reserve(read);
-                        self.filter.advance_into(&buffer[filled..filled + read], &mut output);
+                        let raw = &buffer[filled..filled + read];
+                        self.filter_transport(raw, &mut output);
+                        if self.zmodem_detected.is_some() {
+                            return ReaderEvent::Data(output);
+                        }
+                        if self.zmodem.as_ref().is_some_and(HandshakeDetector::has_pending) {
+                            handshake_deadline.get_or_insert(Instant::now() + ZMODEM_PREFIX_DEADLINE);
+                        } else {
+                            handshake_deadline = None;
+                        }
                         filled += read;
                         let visible = &output.visible[visible_start..];
                         let cursor_change = self
@@ -196,6 +279,10 @@ impl SessionOutputReader {
                             bash_hold = None;
                         }
                         let has_room = filled < buffer.len();
+                        if handshake_deadline.is_some() && output.visible.is_empty() && output.frames.is_empty() {
+                            filled = 0;
+                            continue;
+                        }
                         if has_room && (cursor_should_hold || bash_hold.is_some()) {
                             continue;
                         }

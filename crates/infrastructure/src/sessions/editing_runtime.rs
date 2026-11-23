@@ -481,6 +481,7 @@ pub(super) async fn request(
     if cancellation.is_cancelled() {
         return Err(AppError::cancelled("Shell 编辑快照请求已取消"));
     }
+    super::zmodem_runtime::ensure_input(&session).await?;
     wait_for_probe_slot(&session, &cancellation).await?;
     let input_gate = session
         .input_gate
@@ -490,6 +491,7 @@ pub(super) async fn request(
         .writer
         .try_lock()
         .map_err(|_| AppError::conflict("终端 writer 正忙"))?;
+    super::zmodem_runtime::ensure_input(&session).await?;
     let state = session.state.lock().await;
     let shell = session.shell_integration.lock().await;
     if !eligible(&state, &shell, &binding) {
@@ -664,6 +666,7 @@ pub(super) async fn append(
         .writer
         .try_lock()
         .map_err(|_| AppError::conflict("终端 writer 正忙"))?;
+    super::zmodem_runtime::ensure_input(&session).await?;
     let state = session.state.lock().await;
     let mut shell = session.shell_integration.lock().await;
     if !eligible(&state, &shell, &snapshot.binding) || context_version(&shell) != snapshot.context {

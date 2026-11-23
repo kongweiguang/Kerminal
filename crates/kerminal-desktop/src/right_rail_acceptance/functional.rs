@@ -672,6 +672,9 @@ pub(super) async fn run_sftp_only(
     capture: &RightRailCaptureContext,
     services: &kerminal_ui::AppServices,
 ) -> Result<Vec<FunctionalRecord>, Box<dyn Error>> {
+    if std::env::var_os("KERMINAL_RIGHT_RAIL_ZMODEM_ONLY").is_some() {
+        return super::functional_zmodem::run(cx, root, window, capture, services).await;
+    }
     if std::env::var_os("KERMINAL_RIGHT_RAIL_FOLLOW_ONLY").is_some() {
         return super::functional_follow::run(cx, root, window, capture, services).await;
     }

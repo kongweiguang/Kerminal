@@ -10,11 +10,11 @@ use super::{
 };
 use gpui_kit::Context;
 use kerminal_application::{
-    AppResult,
+    AppError, AppResult,
     sessions::{
         ScrollRequest, ShellEditingSnapshot, TerminalCommandAvailability, TerminalCommandContext,
         TerminalCommandUnavailableReason, UiInputProjection, UiSessionBinding,
-        UiTerminalCommandSubmissionRequest, UiTerminalInputRequest,
+        UiTerminalCommandSubmissionRequest, UiTerminalInputRequest, ZMODEM_INPUT_BUSY,
         command_blocks::is_plain_command_enter,
     },
 };
@@ -88,6 +88,13 @@ pub(super) fn focus_failure_is_proven_ended(
         )
         && observation.is_some_and(|observation| observation.target == *target)
         && observation_proves_session_not_running(receipt_binding, observation)
+}
+
+/// 焦点报告是自动事件，传输占用拒绝不应与已有传输面板重复提示；其他失败仍需可见。
+///
+/// @author kongweiguang
+pub(super) fn zmodem_focus_busy_is_silent(focus_report: bool, error: &AppError) -> bool {
+    focus_report && matches!(error, AppError::Conflict { context } if *context == ZMODEM_INPUT_BUSY)
 }
 
 /// 只从当前 owner 对应的 pane 读取同目标服务观测，供 resize 与焦点回执共用同一身份门禁。
@@ -1402,6 +1409,7 @@ impl RootView {
                             if direct_failure
                                 && !ended_resize_is_observed
                                 && !ended_focus_report_is_observed
+                                && !zmodem_focus_busy_is_silent(focus_report, &error)
                             {
                                 if let Some(SessionOwner::Agent { agent_session_id }) =
                                     receipt.as_ref().map(|receipt| &receipt.owner)

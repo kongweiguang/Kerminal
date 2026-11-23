@@ -27,8 +27,8 @@ use kerminal_application::sessions::{
     TerminalWriteAdmission, TerminalWriteReceipt, UiCommandLineRequest, UiInputProjection,
     UiSessionBinding, UiSnippetCommandLineRequest, UiTerminalCommandSubmissionReceipt,
     UiTerminalCommandSubmissionRequest, UiTerminalInputRequest, UiTerminalSearchRequest,
-    UiTerminalSearchResult, UiTerminalSearchViewport, classify_command_block_text,
-    io_transport_error, is_plain_command_enter,
+    UiTerminalSearchResult, UiTerminalSearchViewport, ZmodemDecision, ZmodemStatus,
+    classify_command_block_text, io_transport_error, is_plain_command_enter,
 };
 use kerminal_domain::connections::RemoteShellDialect;
 use kerminal_domain::identity::SessionId;
@@ -69,6 +69,10 @@ mod auto_reconnect;
 mod conpty_output_coalescer;
 #[path = "sessions/editing_runtime.rs"]
 mod editing_runtime;
+#[path = "sessions/zmodem_protocol.rs"]
+mod zmodem_protocol;
+#[path = "sessions/zmodem_runtime.rs"]
+mod zmodem_runtime;
 
 use auto_reconnect::{AutoReconnectContext, AutoReconnectDecision, AutoReconnectPolicy};
 use conpty_output_coalescer::{ReaderEvent, SessionOutputReader};
@@ -998,6 +1002,7 @@ impl SessionManager {
             cancellation: Mutex::new(cancellation.clone()),
             changes,
             input_gate: Mutex::new(()),
+            zmodem: Mutex::default(),
             shell_integration: Mutex::new(ShellIntegrationState::default()),
             shell_editing: Arc::new(StdMutex::new(editing_runtime::EditingRuntime::new(
                 1,
@@ -1551,6 +1556,7 @@ impl SessionManager {
     /// 在注入的 Tokio runtime 上消费有界 PTY 输出；日志、解析、响应与关闭仍顺序处理，条件合并不截断 reader。
     ///
     /// @author kongweiguang
+    /// 原始 SSH 读取与终端视图共用一个所有者，传输结束后才能交还尾随输出。
     fn spawn_reader(
         &self,
         session: Arc<ManagedSession>,
@@ -1574,6 +1580,9 @@ impl SessionManager {
             let mut reader =
                 SessionOutputReader::new(reader, cancellation.clone(), coalesce_cursor)
                     .with_bash_probe(Some(bash_probe));
+            if zmodem_runtime::enabled(&session).await {
+                reader.enable_zmodem();
+            }
             // 回写失败后留给读泵确认真实退出的绝对截止时间；Some 表示不再向坏 writer 交付。
             // 只对已识别的 SSH 当前代启用，避免把任意 I/O 错误猜成可重连的断线。
             let mut exit_confirmation_deadline: Option<Instant> = None;
@@ -1673,6 +1682,8 @@ impl SessionManager {
                         // 回写失败后继续按原顺序解析、记录日志、推进帧与发布通知，
                         // 但不再向已经失败的 writer 重试，避免背压挂住或误判断线。
                         let write_responses = exit_confirmation_deadline.is_none();
+                        let detected = reader.take_zmodem();
+                        let write_responses = write_responses && detected.is_none();
                         let editing_invalidated = filtered.overflowed
                             && editing_runtime::invalidate(&session, transport_generation);
                         let context = ReaderDeliveryContext {
@@ -1705,6 +1716,20 @@ impl SessionManager {
                                 reader.disable_coalescing();
                                 exit_confirmation_deadline = Some(Instant::now() + close_wait);
                             }
+                        }
+                        if let Some((handshake, pending)) = detected
+                            && exit_confirmation_deadline.is_none()
+                        {
+                            let (terminal, end) = zmodem_runtime::run(
+                                &session,
+                                transport_generation,
+                                &cancellation,
+                                handshake,
+                                pending,
+                                reader.zmodem_reader(),
+                            )
+                            .await;
+                            reader.resume_zmodem(terminal, end);
                         }
                     }
                 }
@@ -2710,6 +2735,23 @@ impl SessionService for SessionManager {
     /// 原样向单一 writer 队列写协议字节，锁保证同一 session 内调用顺序。
     ///
     /// @author kongweiguang
+    /// 只对持有原分屏绑定的调用方投影对应传输。
+    async fn zmodem_status(&self, binding: UiSessionBinding) -> AppResult<Option<ZmodemStatus>> {
+        let session = self.session(&binding.session_id).await?;
+        Ok(zmodem_runtime::status(&session, &binding).await)
+    }
+
+    /// 以完整代次和操作 ID 提交确认或取消，禁止过期面板操作。
+    async fn respond_zmodem(
+        &self,
+        binding: UiSessionBinding,
+        id: u64,
+        decision: ZmodemDecision,
+    ) -> AppResult<()> {
+        let session = self.session(&binding.session_id).await?;
+        zmodem_runtime::respond(&session, &binding, id, decision).await
+    }
+
     async fn write(&self, session_id: SessionId, bytes: Vec<u8>) -> AppResult<()> {
         let session = self.session(&session_id).await?;
         write_session_input_with_receipt(session, bytes)
@@ -2886,6 +2928,7 @@ impl SessionService for SessionManager {
         if cancellation.is_cancelled() {
             return Err(AppError::cancelled("Agent 终端提交已取消"));
         }
+        zmodem_runtime::ensure_input(&session).await?;
         let _input = session
             .input_gate
             .try_lock()
@@ -3789,6 +3832,7 @@ impl SessionService for SessionManager {
             ));
         }
         let session = self.session(&request.session_id).await?;
+        zmodem_runtime::ensure_input(&session).await?;
         let _operation =
             match tokio::time::timeout_at(deadline, session.operation_gate.lock()).await {
                 Ok(guard) => guard,
@@ -3865,6 +3909,7 @@ impl SessionService for SessionManager {
         command_bytes.push(b'\r');
         let write_result = tokio::time::timeout_at(deadline, async {
             let mut writer = session.writer.lock().await;
+            zmodem_runtime::ensure_input(&session).await?;
             writer
                 .write_all(&command_bytes)
                 .await
@@ -3879,6 +3924,9 @@ impl SessionService for SessionManager {
                 tracing::warn!(error = %error, "shell command input transport failed");
                 clear_active_shell_command(&session, &request.command_id).await;
                 cancel_on_drop.disarm();
+                if matches!(error, AppError::Conflict { .. }) {
+                    return Err(error);
+                }
                 return Ok(shell_command_unknown(
                     &request,
                     ShellCommandUnknownReason::Disconnected,
@@ -4623,6 +4671,7 @@ struct ManagedSession {
     cancellation: Mutex<CancellationToken>,
     changes: watch::Sender<SessionChange>,
     input_gate: Mutex<()>,
+    zmodem: Mutex<zmodem_runtime::Slot>,
     shell_integration: Mutex<ShellIntegrationState>,
     shell_editing: Arc<StdMutex<editing_runtime::EditingRuntime>>,
     shell_events: broadcast::Sender<ShellRuntimeEvent>,
@@ -5247,6 +5296,7 @@ async fn write_session_input_with_receipt(
     session: Arc<ManagedSession>,
     bytes: Vec<u8>,
 ) -> AppResult<TerminalWriteReceipt> {
+    zmodem_runtime::ensure_input(&session).await?;
     let input_gate = match session.input_gate.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -5344,6 +5394,7 @@ async fn write_ui_input_inner_with_receipt(
     session: Arc<ManagedSession>,
     request: UiInputWriteRequest,
 ) -> AppResult<UiTerminalCommandSubmissionReceipt> {
+    zmodem_runtime::ensure_input(&session).await?;
     let focus_report = matches!(
         &request.payload,
         UiInputPayload::Event(TerminalInputEvent::Focus(_))
@@ -5636,6 +5687,7 @@ async fn write_input_bytes(
         }
         writer = session.writer.lock() => writer,
     };
+    zmodem_runtime::ensure_input(session).await?;
     write_input_bytes_locked(&mut writer, bytes, cancellation, bytes_written).await
 }
 
@@ -6625,6 +6677,9 @@ async fn write_parser_responses(session: &ManagedSession, writes: Vec<Vec<u8>>) 
         }
     }
     let mut writer = session.writer.lock().await;
+    if zmodem_runtime::ensure_input(session).await.is_err() {
+        return Ok(());
+    }
     for bytes in writes {
         writer.write_all(&bytes).await.map_err(io_transport_error)?;
     }

@@ -486,6 +486,10 @@ impl RootView {
             .is_some_and(|owner| self.terminal_tools_runtime.selection_may_be_present(&owner));
         let has_selection =
             snapshot_has_selection || selection_gesture_active || selection_update_pending;
+        if plain_escape_press && self.cancel_zmodem_for_binding(&binding, cx) {
+            self.consume_local_terminal_key(event, window, cx);
+            return;
+        }
         let suggestion_anchor_available = self
             .snapshot_for_session(&binding.session_id)
             .is_some_and(|snapshot| {
@@ -682,6 +686,10 @@ impl RootView {
                         .remember_terminal_shortcut_key(&event.keystroke);
                 }
                 TerminalClipboardAction::Interrupt => {
+                    if self.cancel_zmodem_for_binding(&binding, cx) {
+                        self.consume_local_terminal_key(event, window, cx);
+                        return;
+                    }
                     if let Some(key_event) = terminal_event
                         && let Some(input) = terminal_key_input(key_event, modes, None)
                     {

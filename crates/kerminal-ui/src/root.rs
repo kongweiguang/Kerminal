@@ -113,6 +113,7 @@ mod workspace_runtime;
 mod workspace_sessions;
 mod workspace_tab_creation;
 mod workspace_transient;
+mod zmodem;
 
 pub use self::plugin_host_api::{PluginUiBridge, PluginUiRegistration};
 pub use self::quit::{QuitIntent, RootHostLifecycle, RootViewEvent};
@@ -677,6 +678,7 @@ pub struct RootView {
     terminal_wheels: terminal_wheel::TerminalWheelState,
     /// Ready pane 的 snapshot watcher 与 pane 共享取消边界；关闭开始时立即停止后续更新。
     session_watch_cancellations: HashMap<SessionId, CancellationToken>,
+    zmodem_ui: zmodem::ZmodemUiState,
     /// 只复用与真实 owner 和 generation 完全一致的输入 handler。
     pane_input_handlers: HashMap<SessionId, PaneInputRegistration>,
     /// 只读绑定在 shell 退出后保留，输入 handler 的撤销不应丢弃历史操作归属。
@@ -1582,6 +1584,7 @@ impl RootView {
             .panes()
             .map(|(pane_id, _)| pane_id.clone())
             .collect::<HashSet<_>>();
+        self.zmodem_ui.retain_panes(&live_panes);
         self.terminal_link_discovery_caches
             .retain(|pane_id, _| live_panes.contains(pane_id));
         let Some(controller) = self.workspace_controller.as_ref() else {
@@ -2672,6 +2675,11 @@ impl RootView {
                 self.terminal_metrics.clone(),
                 color.into(),
             ));
+        }
+        if let Some(binding) = active_binding.as_ref()
+            && let Some(overlay) = self.render_zmodem_overlay(binding, window, cx)
+        {
+            canvas_region = canvas_region.child(overlay);
         }
         container = container.child(canvas_region);
         container.into_any_element()
@@ -4070,6 +4078,7 @@ impl RootView {
             session_commands: session_queue::SessionCommandQueues::default(),
             terminal_wheels: terminal_wheel::TerminalWheelState::default(),
             session_watch_cancellations: HashMap::new(),
+            zmodem_ui: zmodem::ZmodemUiState::default(),
             pane_input_handlers: HashMap::new(),
             terminal_view_bindings: HashMap::new(),
             pane_input_binding_requests: HashMap::new(),

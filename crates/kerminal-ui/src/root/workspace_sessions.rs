@@ -607,8 +607,16 @@ impl RootView {
         let callback_binding = binding.clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .run(move |_| async move { sessions.render_snapshot_ui(binding, request).await })
+                .run(move |_| async move {
+                    let status = sessions.zmodem_status(binding.clone()).await;
+                    let snapshot = sessions.render_snapshot_ui(binding, request).await;
+                    Ok((snapshot, status))
+                })
                 .await;
+            let (result, zmodem_status) = match result {
+                Ok((snapshot, status)) => (snapshot, status.ok()),
+                Err(error) => (Err(error), None),
+            };
             #[cfg(feature = "acceptance-metrics")]
             if let Ok(snapshot) = &result {
                 crate::acceptance_metrics::terminal_echo_probe_registry().record_phase_for_session(
@@ -663,6 +671,13 @@ impl RootView {
                     if accepted {
                         let binding_is_current =
                             root.terminal_view_bindings.get(&session_id) == Some(&callback_binding);
+                        if binding_is_current
+                            && let Some(status) = zmodem_status
+                            && let Some(id) =
+                                root.zmodem_ui.update(callback_binding.clone(), status)
+                        {
+                            root.schedule_zmodem_finished_dismiss(callback_binding.clone(), id, cx);
+                        }
                         super::terminal_tools_runtime::reconcile_confirmed_selection_after_snapshot(
                             root,
                             selection_target.as_ref(),

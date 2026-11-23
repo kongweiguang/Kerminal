@@ -18,6 +18,7 @@ mod functional_tmux_attach;
 mod functional_transfer_restart;
 mod functional_transfer_workspace;
 mod functional_transfers;
+mod functional_zmodem;
 pub(crate) mod isolation;
 mod menus;
 mod shell;

@@ -5,11 +5,13 @@ param(
     [ValidateRange(600, 2160)][int]$Height = 900,
     [ValidateRange(30, 600)][int]$TimeoutSeconds = 360,
     # 需要工作区文件与传输闭环时显式扩大同一隔离 fixture；默认跟随专项范围不变。
-    [switch]$IncludeTransferChecks
+    [switch]$IncludeTransferChecks,
+    [switch]$ZmodemOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($IncludeTransferChecks -and $ZmodemOnly) { throw 'Choose either the SFTP transfer suite or the ZMODEM smoke.' }
 
 function Convert-ToWslPath {
     # WSL 固定输出 UTF-8，不能沿用 Windows 控制台代码页，否则中文仓库路径会损坏；独立管道也避免改动调用者编码。
@@ -186,7 +188,7 @@ $fixtureProcess = $null
 $nativeProcess = $null
 $runFailure = $null
 $cleanupFailures = [Collections.Generic.List[string]]::new()
-$environmentNames = @('KERMINAL_RIGHT_RAIL_FOLLOW_ONLY', 'KERMINAL_RIGHT_RAIL_REFRESH_ONLY', 'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_CONFIG_ROOT')
+$environmentNames = @('KERMINAL_RIGHT_RAIL_FOLLOW_ONLY', 'KERMINAL_RIGHT_RAIL_REFRESH_ONLY', 'KERMINAL_RIGHT_RAIL_ZMODEM_ONLY', 'KERMINAL_SFTP_FOLLOW_MANIFEST', 'KERMINAL_CONFIG_ROOT')
 $previousEnvironment = Get-ProcessEnvironmentSnapshot -Names $environmentNames
 
 try {
@@ -232,7 +234,8 @@ try {
         containerTargetPort = 1
     }
     Write-Utf8 -Path $manifestPath -Content ((ConvertTo-Json -InputObject $manifest) + [Environment]::NewLine)
-    Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_FOLLOW_ONLY' -Value $(if ($IncludeTransferChecks) { $null } else { '1' })
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_ZMODEM_ONLY' -Value $(if ($ZmodemOnly) { '1' } else { $null })
+    Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_FOLLOW_ONLY' -Value $(if ($IncludeTransferChecks -or $ZmodemOnly) { $null } else { '1' })
     if ($IncludeTransferChecks) {
         Set-ProcessEnvironmentValue -Name 'KERMINAL_RIGHT_RAIL_REFRESH_ONLY' -Value $null
         $childEnvironment = [Environment]::GetEnvironmentVariables('Process')
@@ -272,7 +275,9 @@ try {
         $report.nativeIsolation.inputDesktopName -ceq $desktopName) {
         throw 'The report does not prove the expected isolated native process and desktop.'
     }
-    $expected = if ($IncludeTransferChecks) {
+    $expected = if ($ZmodemOnly) {
+        @('zmodem-rz-prompt', 'zmodem-rz-cancel', 'zmodem-rz-upload', 'zmodem-sz-prompt', 'zmodem-sz-download')
+    } elseif ($IncludeTransferChecks) {
         @('sftp-file-tabs', 'sftp-file-dirty-close', 'sftp-file-close-cancelled',
           'sftp-file-saved', 'sftp-file-save-conflict', 'sftp-file-reloaded', 'sftp-directory-successor', 'sftp-terminal-successor',
           'sftp-file-workspace-theme-light', 'sftp-file-workspace-theme-dark', 'sftp-file-workspace-theme-system',
