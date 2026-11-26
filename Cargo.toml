@@ -27,7 +27,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 rust-version = "1.98"
 authors = ["kongweiguang"]
@@ -40,13 +40,13 @@ schemars = "=1.2.3"
 jsonschema = { version = "=0.37.4", default-features = false }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 flate2 = "=1.1.10"
-kerminal-domain = { path = "crates/domain", version = "0.4.7" }
-kerminal-application = { path = "crates/application", version = "0.4.7" }
-kerminal-terminal = { path = "crates/terminal", version = "0.4.7" }
-kerminal-infrastructure = { path = "crates/infrastructure", version = "0.4.7" }
-kerminal-ui = { path = "crates/kerminal-ui", version = "0.4.7" }
-kerminal-mcp = { path = "crates/kerminal-mcp", version = "0.4.7" }
-kerminal-desktop = { path = "crates/kerminal-desktop", version = "0.4.7" }
+kerminal-domain = { path = "crates/domain", version = "0.4.8" }
+kerminal-application = { path = "crates/application", version = "0.4.8" }
+kerminal-terminal = { path = "crates/terminal", version = "0.4.8" }
+kerminal-infrastructure = { path = "crates/infrastructure", version = "0.4.8" }
+kerminal-ui = { path = "crates/kerminal-ui", version = "0.4.8" }
+kerminal-mcp = { path = "crates/kerminal-mcp", version = "0.4.8" }
+kerminal-desktop = { path = "crates/kerminal-desktop", version = "0.4.8" }
 
 async-trait = "0.1"
 anyhow = "1"
