@@ -73,6 +73,38 @@ enum SelectedEntry {
     Plugin(PluginId),
 }
 
+/// 详情页签：把概览说明、权限声明和扩展元信息分栏展示，
+/// 避免把所有信息堆在顶部固定区挤占正文阅读空间。
+///
+/// @author kongweiguang
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DetailTab {
+    #[default]
+    Overview,
+    Permissions,
+    Info,
+}
+
+impl DetailTab {
+    /// TabBar 按连续下标选中；保持显式映射避免依赖枚举底层序数。
+    fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Permissions => 1,
+            Self::Info => 2,
+        }
+    }
+
+    /// 下标越界时回退概览，避免异常点击把详情带入未知页签。
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Permissions,
+            2 => Self::Info,
+            _ => Self::Overview,
+        }
+    }
+}
+
 impl SelectedEntry {
     /// 列表、README 回执与详情查询只需要稳定身份，来源由调用方另行判断。
     fn id(&self) -> &PluginId {
@@ -215,6 +247,8 @@ pub struct ExtensionsPage {
     reloading_drop_ins: bool,
     filter: Filter,
     selected: Option<SelectedEntry>,
+    /// 当前详情页签；切换扩展时重置为概览，确保先看扩展说明而不是上一项的权限或元信息。
+    detail_tab: DetailTab,
     readme: Option<String>,
     /// README 失败只影响详情正文，保留基本信息、安装与其它选择。
     readme_error: Option<String>,
@@ -344,6 +378,7 @@ impl ExtensionsPage {
             reloading_drop_ins: false,
             filter: Filter::default(),
             selected: None,
+            detail_tab: DetailTab::Overview,
             readme: None,
             readme_error: None,
             readme_cancel: None,
@@ -892,6 +927,8 @@ impl ExtensionsPage {
             return;
         }
         if !same {
+            // 切换到新扩展时回到概览页签，避免沿用上一扩展的权限/信息页签。
+            self.detail_tab = DetailTab::Overview;
             // 选择变化时旧 README 属于上一项，必须取消并清空，不能让新详情短暂
             // 显示上一项的说明，也不能让旧回执覆盖新选择。
             if let Some(previous) = self.readme_cancel.take() {
@@ -917,6 +954,18 @@ impl ExtensionsPage {
             return;
         }
         self.load_readme(cx);
+    }
+
+    /// 切换详情页签并回到顶部，避免沿用上一页签的滚动偏移。
+    ///
+    /// @author kongweiguang
+    fn select_detail_tab(&mut self, tab: DetailTab, cx: &mut Context<Self>) {
+        if self.detail_tab == tab {
+            return;
+        }
+        self.detail_tab = tab;
+        self.detail_scroll.set_offset(Default::default());
+        cx.notify();
     }
 
     /// 显式重试只针对当前选择重新读取 README；与普通选择不同，它允许覆盖
