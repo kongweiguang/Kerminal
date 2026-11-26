@@ -25,6 +25,14 @@ Kerminal 是用 Rust、GPUI 和 GPUI Kit 构建的原生终端应用。你可以
 
 Windows 安装程序未做 Authenticode 签名，macOS 安装包未做公证。遇到系统提示时，可先用发布页的 `SHA256SUMS.json` 核对下载文件。Linux 需要系统图形运行库，`.deb` 要求 glibc 2.35 或更高。macOS 安装和桌面交互仍待实机验收。
 
+**macOS 首次打开提示「已损坏」。** 由于安装包未做签名与公证，将 `Kerminal.app` 拖入 `/Applications` 后，在终端清除隔离属性即可：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Kerminal.app
+```
+
+如果权限不足可在前面加 `sudo`；若在 Apple Silicon 上仍提示签名无效或闪退，可补执行 `codesign --force --deep --sign - /Applications/Kerminal.app`。
+
 **从 0.3.x 升级。** 安装前完全退出旧版（包括托盘进程），并备份原数据目录。0.4 正式版首次启动会检查并迁移 `~/.kerminal` 中受支持的旧格式。保留 `.kerminal-migration/` 下的备份，旧版无法读取迁移后的数据。开发版和 Beta 的 `~/.kerminal-gpui` 不会自动合并。
 
 ## 快速开始

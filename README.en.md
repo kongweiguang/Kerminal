@@ -25,6 +25,14 @@ Download the package for your platform from [GitHub Releases](https://github.com
 
 The Windows installer is unsigned and the macOS packages are unnotarized. If the OS shows a warning, you can verify the download against `SHA256SUMS.json` on the release page. Linux needs system graphics libraries, and the `.deb` requires glibc 2.35 or later. Installation and desktop interaction on macOS still await testing on a Mac.
 
+**macOS shows "is damaged and can't be opened".** Because the app is unsigned and unnotarized, drag `Kerminal.app` into `/Applications` and remove the quarantine attribute in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Kerminal.app
+```
+
+Prefix with `sudo` if needed. On Apple Silicon, if it still fails to launch due to a missing signature, run `codesign --force --deep --sign - /Applications/Kerminal.app`.
+
 **Upgrade from 0.3.x.** Quit the old app completely, including its tray process, and back up the data directory before installing. On first launch, the 0.4 stable release checks and migrates supported formats in `~/.kerminal`. Keep the backup in `.kerminal-migration/` because older versions cannot read migrated data. Development builds and betas keep their separate `~/.kerminal-gpui` data.
 
 ## Quick start
