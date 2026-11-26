@@ -951,7 +951,14 @@ impl PluginPackageStore for PackageInstaller {
             let Ok(package) = package else {
                 return Ok(None);
             };
-            let Some(path) = package.manifest.icon.as_deref() else {
+            let Some(path) = package.manifest.icon.as_deref().or_else(|| {
+                package
+                    .manifest
+                    .contributes
+                    .tools
+                    .iter()
+                    .find_map(|tool| tool.icon.as_deref())
+            }) else {
                 return Ok(None);
             };
             let icon = match classify_icon_reference(path) {
@@ -965,6 +972,7 @@ impl PluginPackageStore for PackageInstaller {
                             super::boot::MAX_UI_RESOURCE_BYTES,
                         )
                         .ok()
+                        .filter(|bytes| super::catalog::valid_catalog_svg(bytes))
                         .map(|bytes| ExtensionIcon::Svg(Arc::from(bytes)))
                     })
                 }

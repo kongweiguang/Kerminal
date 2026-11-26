@@ -2031,15 +2031,9 @@ pub(super) fn render_workbench(
         let Some(presentation) = root.plugin_tools.presentation(tool) else {
             continue;
         };
-        let icon_color = if selected {
-            theme.settings_choice_foreground(true)
-        } else {
-            theme.muted
-        };
         let button = workbench_rail_button(
             tool_rail_button_id(tool),
             &presentation,
-            icon_color,
             rail_button_height,
             selected,
             Some(toggled),
@@ -2084,15 +2078,9 @@ pub(super) fn render_workbench(
         let Some(presentation) = root.plugin_tools.presentation(tool) else {
             continue;
         };
-        let icon_color = if selected {
-            theme.settings_choice_foreground(true)
-        } else {
-            theme.muted
-        };
         let button = workbench_rail_button(
             tool_rail_button_id(tool),
             &presentation,
-            icon_color,
             rail_button_height,
             selected,
             Some(toggled),
@@ -3794,13 +3782,12 @@ fn tool_is_in_panel_slots(tool: ToolRailToolId, slots: ToolRailPanelSlots) -> bo
 }
 
 /// 右栏按钮尺寸沿用 main 的 density-control-height，同时保留 Kit 的焦点和可访问名称。
-/// 内置和包内 SVG 共用主题前景色，确保选中状态与按钮变体一致。
+/// 内置和包内 SVG 都继承按钮变体的前景色，确保正常、悬停、选中与禁用态一致。
 ///
 /// @author kongweiguang
 fn workbench_rail_button(
     id: gpui_kit::SharedString,
     presentation: &crate::plugins::tools::ToolPresentation,
-    icon_color: gpui_kit::Hsla,
     button_height: f32,
     selected: bool,
     toggled: Option<bool>,
@@ -3810,7 +3797,7 @@ fn workbench_rail_button(
     let mut button = Button::new(id)
         .compact()
         .ghost()
-        .icon(presentation.icon().component(icon_color))
+        .icon(presentation.icon().to_icon())
         .w(px(button_height))
         .h(px(button_height))
         .selected(selected)

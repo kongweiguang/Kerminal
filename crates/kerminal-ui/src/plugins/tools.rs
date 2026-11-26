@@ -53,18 +53,27 @@ impl ToolIcon {
         Self::Builtin(icon)
     }
 
-    /// 按当前上下文的前景色生成组件图标。
+    /// 生成不锁定前景色的组件图标，交给 `Button` 等控件按正常/悬停/选中/禁用态着色。
+    ///
+    /// `Icon` 未显式设置 `text_color` 时会继承容器文本色；右栏按钮必须使用这个
+    /// 入口，避免显式前景色盖住按钮的 hover 与 disabled 反馈。
+    ///
+    /// @author kongweiguang
+    pub fn to_icon(&self) -> Icon {
+        match self {
+            Self::Builtin(icon) => Icon::new(*icon),
+            Self::Svg(bytes) => Icon::default().data(bytes.as_ref()),
+        }
+    }
+
+    /// 按当前上下文的前景色生成组件图标，用于非按钮的静态图标槽位。
     ///
     /// `Icon::data` 只接受借用字节并在内部复制到共享存储，因此这里仍需传
-    /// `&[u8]`；自定义 SVG 必须显式设置 `text_color`，否则 `currentColor`
-    /// 会回退到窗口默认文字色，无法跟随按钮的选中/禁用状态。
+    /// `&[u8]`；独立图标槽没有按钮变体接管文字色，必须显式设置语义前景色。
     ///
     /// @author kongweiguang
     pub fn component(&self, color: Hsla) -> Icon {
-        match self {
-            Self::Builtin(icon) => Icon::new(*icon).text_color(color),
-            Self::Svg(bytes) => Icon::default().data(bytes.as_ref()).text_color(color),
-        }
+        self.to_icon().text_color(color)
     }
 }
 

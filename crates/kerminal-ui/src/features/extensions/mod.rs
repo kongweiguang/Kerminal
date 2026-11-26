@@ -1038,7 +1038,12 @@ impl ExtensionsPage {
                     .catalog
                     .plugins
                     .iter()
-                    .filter(|plugin| !installed_ids.contains(&plugin.id))
+                    .filter(|plugin| {
+                        // 未安装条目始终按目录图标补取；已安装插件只在确认包内没有
+                        // 图标后才回退市场图标，避免覆盖本地图标或多余发网。
+                        !installed_ids.contains(&plugin.id)
+                            || matches!(self.installed_icons.get(&plugin.id), Some(None))
+                    })
                     .map(|plugin| (plugin.id.clone(), plugin.icon_url.is_some()))
                     .collect()
             })

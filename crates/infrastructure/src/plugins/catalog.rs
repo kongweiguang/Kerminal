@@ -707,7 +707,10 @@ impl CatalogSource for CatalogClient {
 }
 
 /// 只接受具备 SVG 文档边界的 UTF-8 内容，避免把错误页面交给图标渲染器。
-fn valid_catalog_svg(bytes: &[u8]) -> bool {
+/// 校验外部 SVG 字节：避免损坏文件或非 SVG HTML 页被当作图标送进渲染层。
+///
+/// @author kongweiguang
+pub(super) fn valid_catalog_svg(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };

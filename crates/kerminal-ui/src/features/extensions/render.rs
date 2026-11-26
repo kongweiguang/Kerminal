@@ -2536,9 +2536,10 @@ impl ExtensionsPage {
 fn builtin_unit_icon(id: &str) -> IconName {
     match id {
         "kerminal.core" => IconName::SquareTerminal,
-        "kerminal.ssh" => IconName::Cable,
+        "kerminal.ssh" => IconName::Server,
         "kerminal.sftp" => IconName::FolderOpen,
-        "kerminal.telnet" | "kerminal.serial" => IconName::Cable,
+        "kerminal.telnet" => IconName::Globe,
+        "kerminal.serial" => IconName::Cable,
         "kerminal.rdp" => IconName::Monitor,
         "kerminal.agents" => IconName::Bot,
         "kerminal.commands" => IconName::FileText,

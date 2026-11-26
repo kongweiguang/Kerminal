@@ -459,6 +459,9 @@ impl NativeRenderer {
                         d.text_xl().font_semibold()
                     })
                     .when(has_appearance(node, "caption"), |d| d.text_sm())
+                    .when(has_appearance(node, "centered-caption"), |d| {
+                        d.w_full().text_sm().text_center()
+                    })
                     .when(has_appearance(node, "value"), |d| {
                         d.text_sm()
                             .text_color(cx.theme().foreground)
@@ -565,54 +568,66 @@ impl NativeRenderer {
                     .role(gpui_kit::Role::Image)
                     .aria_label(accessibility)
                     .child(
-                        // 底板只负责占位与正方形比例；白底由 canvas 自己铺满整个区域（含静区），
-                        // 这样画不出二维码时不会留下一个看起来像空码的白色方块。
-                        // 用确定边长作为基准，而不是百分比宽度：百分比在自动宽度的父级里会解析
-                        // 成 auto，随后子元素 100% 高度也变 0，二维码会静默消失。确定宽度在弹性
-                        // 布局里仍可被收缩，max_w_full 再按父级宽度夹紧，正方形比例让高度跟随。
-                        // 不画边框：1px 边框会占掉内容盒，恰好够宽的二维码会被误判为画不下。
-                        div()
-                            .w(px(plate))
-                            .max_w_full()
-                            .aspect_square()
-                            .rounded(
-                                crate::theme::ThemeTokens::current(window, cx)
-                                    .for_workbench()
-                                    .control_radius,
-                            )
-                            .overflow_hidden()
-                            .child(
-                                // 布局完成后才知道真实可用宽度：画不下时给出可见失败状态，
-                                // 而不是让模块被舍入成 0 后静默画出空白码或截断图案。
-                                // 容器查询只提供尺寸，这里用零原点构造边界仅做可行性判断；
-                                // 真正的原点在绘制回调里由 GPUI 给出，并再次校验。
-                                container_query(move |area, window, cx| {
-                                    let probe = Bounds::new(point(px(0.0), px(0.0)), area);
-                                    let scale = window.scale_factor();
-                                    if qr_layout(&matrix, probe, scale).is_none() {
-                                        return div()
-                                            .size_full()
-                                            .p_2()
-                                            .text_sm()
-                                            .text_color(cx.theme().danger)
-                                            .child(crate::locale::text(
-                                                "空间不足，无法显示二维码",
-                                                "Not enough space to show the QR code",
-                                            ))
-                                            .into_any_element();
-                                    }
-                                    // 白底由 paint_qr 自己铺满整幅画布（含静区），这里不再叠样式背景：
-                                    // 万一绘制阶段再次判定不可用，宁可什么都不画，也不留下像空码的白方块。
-                                    canvas(
-                                        |_, _, _| (),
-                                        move |bounds, _, window, _| {
-                                            paint_qr(&matrix, bounds, window)
-                                        },
-                                    )
-                                    .size_full()
-                                    .into_any_element()
-                                }),
-                            ),
+                        // 外层 1px 细边框与内边距独立于二维码画布，避免在浅色卡片上白底边缘
+                        // 融进背景，同时不挤占内部 `plate` 的任何绘制像素，确保 `qr_layout` 判定不变。
+                        {
+                            let theme =
+                                crate::theme::ThemeTokens::current(window, cx).for_workbench();
+                            div()
+                                .max_w_full()
+                                .p(px(1.0))
+                                .rounded(theme.control_radius)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(white())
+                                .overflow_hidden()
+                                .child(
+                                    // 底板只负责占位与正方形比例；白底由 canvas 自己铺满整个区域（含静区），
+                                    // 这样画不出二维码时不会留下一个看起来像空码的白色方块。
+                                    // 用确定边长作为基准，而不是百分比宽度：百分比在自动宽度的父级里会解析
+                                    // 成 auto，随后子元素 100% 高度也变 0，二维码会静默消失。确定宽度在弹性
+                                    // 布局里仍可被收缩，max_w_full 再按父级宽度夹紧，正方形比例让高度跟随。
+                                    // 不画边框：1px 边框会占掉内容盒，恰好够宽的二维码会被误判为画不下。
+                                    div()
+                                        .w(px(plate))
+                                        .max_w_full()
+                                        .aspect_square()
+                                        .overflow_hidden()
+                                        .child(
+                                            // 布局完成后才知道真实可用宽度：画不下时给出可见失败状态，
+                                            // 而不是让模块被舍入成 0 后静默画出空白码或截断图案。
+                                            // 容器查询只提供尺寸，这里用零原点构造边界仅做可行性判断；
+                                            // 真正的原点在绘制回调里由 GPUI 给出，并再次校验。
+                                            container_query(move |area, window, cx| {
+                                                let probe =
+                                                    Bounds::new(point(px(0.0), px(0.0)), area);
+                                                let scale = window.scale_factor();
+                                                if qr_layout(&matrix, probe, scale).is_none() {
+                                                    return div()
+                                                        .size_full()
+                                                        .p_2()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().danger)
+                                                        .child(crate::locale::text(
+                                                            "空间不足，无法显示二维码",
+                                                            "Not enough space to show the QR code",
+                                                        ))
+                                                        .into_any_element();
+                                                }
+                                                // 白底由 paint_qr 自己铺满整幅画布（含静区），这里不再叠样式背景：
+                                                // 万一绘制阶段再次判定不可用，宁可什么都不画，也不留下像空码的白方块。
+                                                canvas(
+                                                    |_, _, _| (),
+                                                    move |bounds, _, window, _| {
+                                                        paint_qr(&matrix, bounds, window)
+                                                    },
+                                                )
+                                                .size_full()
+                                                .into_any_element()
+                                            }),
+                                        ),
+                                )
+                        },
                     );
                 if let Some(label) = label_text {
                     card = card.child(
