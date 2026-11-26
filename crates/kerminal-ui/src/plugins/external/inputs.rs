@@ -229,7 +229,7 @@ impl NativeRenderer {
         self.prepare_node_controls(&root, "root".into(), window, cx);
     }
 
-    /// 静态树使用结构路径稳定索引，重复绑定也保持各自的原生输入实体。
+    /// 静态树使用结构路径稳定索引，重复绑定也保持各自的原生输入实体；动作扩展只传给选择控件。
     fn prepare_node_controls(
         &mut self,
         node: &NativeNode,
@@ -305,6 +305,11 @@ impl NativeRenderer {
                             choices,
                             stale: false,
                         },
+                        extensions
+                            .get("x-kerminal-on-change")
+                            .and_then(Value::as_str)
+                            .filter(|action| !action.trim().is_empty())
+                            .map(str::to_owned),
                         window,
                         cx,
                     );
@@ -405,20 +410,35 @@ impl NativeRenderer {
                     },
                 );
             }
-            Select { bind, options, .. } => {
-                self.add_select(key, bind, SelectSource::Static(options.clone()), window, cx)
-            }
+            Select {
+                bind,
+                options,
+                extensions,
+                ..
+            } => self.add_select(
+                key,
+                bind,
+                SelectSource::Static(options.clone()),
+                extensions
+                    .get("x-kerminal-on-change")
+                    .and_then(Value::as_str)
+                    .filter(|action| !action.trim().is_empty())
+                    .map(str::to_owned),
+                window,
+                cx,
+            ),
             _ => {}
         }
     }
 
     /// 静态和运行时选项共用 Select 实体；运行时源只保存绑定路径和当前投影，
-    /// 确认事件直接携带真实值，避免补丁替换列表后仍按旧索引写回表单。
+    /// 确认事件直接携带真实值，避免补丁替换列表后仍按旧索引写回表单；只有成功更改才触发动作。
     fn add_select(
         &mut self,
         key: String,
         bind: &str,
         source: SelectSource,
+        on_change: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -477,7 +497,15 @@ impl NativeRenderer {
                     }
                 };
                 if let Some(value) = value {
-                    renderer.edit_field(&path, value, cx);
+                    let changed = renderer.field_value(&path) != Some(&value);
+                    renderer.edit_field(&path, value.clone(), cx);
+                    if changed
+                        && renderer.field_value(&path) == Some(&value)
+                        && !renderer.field_errors.contains_key(&path)
+                        && let Some(action) = &on_change
+                    {
+                        renderer.action(node_key.clone(), action.clone(), None, cx);
+                    }
                 }
             },
         );

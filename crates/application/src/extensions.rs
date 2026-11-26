@@ -197,6 +197,17 @@ pub struct BuiltinUnit {
     pub can_disable: bool,
 }
 
+/// 扩展页可安全消费的图标来源。
+///
+/// 应用层不依赖 GPUI，因此只区分“内置图标名”和“已验证 SVG 字节”两种事实；
+/// 图标名映射到具体 Kit 图标、SVG 如何着色和缩放都留给 UI。包内字节由基础
+/// 设施按已安装记录和包校验读取，界面线程不会直接访问插件目录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionIcon {
+    Builtin(String),
+    Svg(Arc<[u8]>),
+}
+
 /// 不同操作只表达用户意图，状态迁移由存储端核对当前权威快照。
 #[derive(Clone, Debug)]
 pub enum ExtensionChange {
@@ -280,6 +291,18 @@ pub trait CatalogSource: Send + Sync + 'static {
         id: &PluginId,
         cancellation: CancellationToken,
     ) -> AppResult<Option<String>>;
+    /// 按当前目录条目的 `icon_url` 获取并缓存图标字节。
+    ///
+    /// 只接受当前已加载目录提供的地址，界面不能传入任意 URL；实现必须限制
+    /// 响应大小、沿用共享 URL 契约并明确校验 SVG 字节，失败返回空而不是把
+    /// 不可渲染内容交给 UI。
+    ///
+    /// @author kongweiguang
+    async fn icon(
+        &self,
+        id: &PluginId,
+        cancellation: CancellationToken,
+    ) -> AppResult<Option<Arc<[u8]>>>;
     /// 刷新失败不得覆盖缓存；支持取消网络读取。
     async fn refresh(&self, cancellation: CancellationToken) -> AppResult<CatalogSnapshot>;
 }
@@ -325,6 +348,18 @@ pub trait PluginPackageStore: Send + Sync + 'static {
     ) -> AppResult<ExtensionReceipt>;
     /// 数据删除是独立的显式操作，仓储核对插件生命周期与路径安全。
     async fn delete_data(&self, id: PluginId) -> AppResult<()>;
+    /// 读取已安装插件的受验图标。
+    ///
+    /// 仅在图标请求到达时按当前安装记录重新核对目录指纹与清单，不缓存跨版本
+    /// 结果，避免更新后继续显示旧图标；内置名直接返回名称，包内 SVG 受 UI
+    /// 资源大小上限约束。读取失败应返回错误或空，不能把任意文件当图标。
+    ///
+    /// @author kongweiguang
+    async fn icon(
+        &self,
+        id: &PluginId,
+        cancellation: CancellationToken,
+    ) -> AppResult<Option<ExtensionIcon>>;
 }
 
 /// 本次运行的模式独立于磁盘上的插件启用偏好；显式安全模式会随受管重启保留。
@@ -442,6 +477,28 @@ impl ExtensionsService {
         cancellation: CancellationToken,
     ) -> AppResult<Option<String>> {
         self.catalog.readme(id, cancellation).await
+    }
+
+    /// 读取市场条目的图标；地址始终来自当前目录快照，界面只传稳定身份。
+    ///
+    /// @author kongweiguang
+    pub async fn catalog_icon(
+        &self,
+        id: &PluginId,
+        cancellation: CancellationToken,
+    ) -> AppResult<Option<Arc<[u8]>>> {
+        self.catalog.icon(id, cancellation).await
+    }
+
+    /// 读取已安装外部插件的图标；不存在的记录由实现返回空。
+    ///
+    /// @author kongweiguang
+    pub async fn installed_icon(
+        &self,
+        id: &PluginId,
+        cancellation: CancellationToken,
+    ) -> AppResult<Option<ExtensionIcon>> {
+        self.packages.icon(id, cancellation).await
     }
     /// 查询在当前已加载快照上执行，分类与文本筛选不会改变目录或触发网络。
     pub fn search<'a>(

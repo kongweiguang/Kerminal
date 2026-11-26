@@ -484,6 +484,51 @@ fn checked_in_schemas_match_generated_contracts() {
 }
 
 #[test]
+/// 内置图标名不要求包内文件，包内路径仍保持原有存在性校验。
+fn icons_accept_builtin_names_without_package_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut manifest = valid_manifest();
+    manifest["icon"] = json!("share-2");
+    manifest["contributes"] = json!({"tools":[{
+        "id": "tool",
+        "title": "Tool",
+        "view": "main",
+        "scope": "window",
+        "icon": "arrow-left-right"
+    }]});
+    manifest["views"] = json!({"main":{"kind":"native","file":"views/main.json"}});
+    write_file(
+        root,
+        MANIFEST_FILE_NAME,
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    write_file(
+        root,
+        "views/main.json",
+        br#"{"schema":1,"root":{"type":"stack","children":[]}}"#,
+    );
+    validate_package(root, ManifestPolicy::ThirdParty).expect("内置图标名不应要求包内存在同名文件");
+    assert!(
+        jsonschema::validator_for(&schema::manifest_json_schema())
+            .unwrap()
+            .is_valid(&manifest),
+        "静态 schema 必须与运行时接受同一份内置图标声明"
+    );
+
+    // 现有 `.svg` 声明继续走包内路径校验，缺失文件仍然失败。
+    manifest["icon"] = json!("assets/icon.svg");
+    write_file(
+        root,
+        MANIFEST_FILE_NAME,
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    assert!(validate_package(root, ManifestPolicy::ThirdParty).is_err());
+    write_file(root, "assets/icon.svg", b"<svg/>");
+    validate_package(root, ManifestPolicy::ThirdParty).expect("包内 SVG 存在时应保持原兼容行为");
+}
+
+#[test]
 /// 引用只来自节点契约中的资源和展示文案，插件私有数据不得被当作引用解释。
 fn package_references_ignore_extension_and_option_payloads() {
     let directory = tempfile::tempdir().unwrap();

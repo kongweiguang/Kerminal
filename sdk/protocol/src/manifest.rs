@@ -12,6 +12,43 @@ use crate::{ProtocolError, invalid, parse_json, validate_extensions, validate_pa
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MANIFEST_FILE_NAME: &str = "kerminal-plugin.json";
+/// 内置 Lucide 图标名沿用稳定的 kebab-case 文本，长度上限只用于拒绝明显的
+/// 路径或任意长字符串，不试图枚举当前宿主版本的全部图标。
+pub const MAX_BUILTIN_ICON_NAME_LEN: usize = 64;
+
+/// 图标声明只有两种来源：包内已验证的 SVG 资源，或宿主内置图标目录。
+///
+/// 这个判定必须同时被清单校验、包清点和启动资源快照复用；如果各层各自按
+/// “是否以 .svg 结尾”猜测，内置图标名会被误当成缺失文件，带点的路径又可能
+/// 被当成图标名。因此把规则集中在协议层，由调用方只消费分类结果。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IconReference {
+    Builtin,
+    PackagePath,
+}
+
+/// 区分包内路径与内置图标名；路径继续走统一的 `validate_package_path`，
+/// 内置名则只接受 ASCII 字母、数字和连字符，避免把任意 URI 或 HTML 引入渲染层。
+pub fn classify_icon_reference(value: &str) -> Result<IconReference, ProtocolError> {
+    if value.is_empty() {
+        return Err(invalid("icon", "图标声明不能为空"));
+    }
+    // 含点或斜杠的值一律按包内相对路径处理：`.svg` 是现有兼容格式，
+    // 其他扩展名同样要求包内存在，由渲染层决定是否支持，而不是在这里静默
+    // 把它降级成内置名。
+    if value.ends_with(".svg") || value.contains('/') || value.contains('.') {
+        validate_package_path(value)?;
+        return Ok(IconReference::PackagePath);
+    }
+    if value.len() <= MAX_BUILTIN_ICON_NAME_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Ok(IconReference::Builtin);
+    }
+    Err(invalid("icon", "图标只能是包内 SVG 相对路径或内置图标名"))
+}
 
 /// 命名空间信任由调用方根据经过验证的来源决定，而不是相信清单自报。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -321,7 +358,7 @@ impl PluginManifest {
             return Err(invalid("manifest", "许可、仓库或分类无效"));
         }
         if let Some(icon) = &self.icon {
-            validate_package_path(icon)?;
+            classify_icon_reference(icon)?;
         }
         if let Some(l10n) = &self.l10n {
             validate_package_path(l10n)?;
@@ -354,7 +391,7 @@ impl PluginManifest {
             validate_contribution(&tool.id, &tool.title, &tool.extensions, &mut ids)?;
             self.require_view(&tool.view, false)?;
             if let Some(icon) = &tool.icon {
-                validate_package_path(icon)?;
+                classify_icon_reference(icon)?;
             }
         }
         for tab in &contributions.tabs {

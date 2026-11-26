@@ -20,9 +20,9 @@ use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
     extensions::{
         BuiltinUnit, CatalogIdentity, CatalogSelection, CatalogSnapshot, CatalogSource,
-        DEFAULT_PLUGIN_CATALOG_URL, DropInInspection, ExtensionChange, ExtensionReceipt,
-        ExtensionsService, InstallProgress, LocalPackageInspection, PluginCatalog,
-        PluginPackageStore,
+        DEFAULT_PLUGIN_CATALOG_URL, DropInInspection, ExtensionChange, ExtensionIcon,
+        ExtensionReceipt, ExtensionsService, InstallProgress, LocalPackageInspection,
+        PluginCatalog, PluginPackageStore,
     },
 };
 use kerminal_domain::plugins::{
@@ -502,6 +502,8 @@ fn drop_in_actions_require_ready_observation_and_reserve_conflicts() {
 #[derive(Default)]
 struct FakeCatalog {
     readme_calls: Arc<AtomicUsize>,
+    /// 市场条目图标；默认没有，测试可按需注入一小段已验证 SVG 字节。
+    icon_bytes: Arc<Mutex<Option<Arc<[u8]>>>>,
     /// 显式刷新需要成功回执时注入快照；默认失败让只读激活路径保持可观察的离线状态。
     refresh_snapshot: Arc<Mutex<Option<CatalogSnapshot>>>,
     /// 激活读取的缓存快照；用于证明目录成功而状态失败时市场仍可浏览。
@@ -579,6 +581,17 @@ impl CatalogSource for FakeCatalog {
         Ok(Some(format!("readme:{}", id.as_str())))
     }
 
+    /// 图标读取同样只返回注入值；默认 None 让页面走统一占位，不触发真实网络。
+    ///
+    /// @author kongweiguang
+    async fn icon(
+        &self,
+        _id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<Arc<[u8]>>> {
+        Ok(self.icon_bytes.lock().unwrap().clone())
+    }
+
     /// 只有注入快照的用例走成功刷新；默认失败好过伪造一份可安装目录。
     async fn refresh(&self, _cancellation: CancellationToken) -> AppResult<CatalogSnapshot> {
         self.refresh_calls.fetch_add(1, Ordering::SeqCst);
@@ -608,6 +621,8 @@ enum FakeInstallOutcome {
 /// 手动投放的只读状态与确认回执都保存在内存，测试可观察每次调用参数与读回次数。
 struct FakeStore {
     state: Arc<Mutex<PluginStoreState>>,
+    /// 已安装插件图标；未注入的身份返回 None，由页面回退 Puzzle。
+    icons: Arc<Mutex<std::collections::BTreeMap<PluginId, ExtensionIcon>>>,
     inspections: Arc<Mutex<Vec<DropInInspection>>>,
     state_reads: Arc<AtomicUsize>,
     inspect_reads: Arc<AtomicUsize>,
@@ -636,6 +651,7 @@ impl FakeStore {
     fn new(state: PluginStoreState, inspections: Vec<DropInInspection>) -> Self {
         Self {
             state: Arc::new(Mutex::new(state)),
+            icons: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             inspections: Arc::new(Mutex::new(inspections)),
             state_reads: Arc::new(AtomicUsize::new(0)),
             inspect_reads: Arc::new(AtomicUsize::new(0)),
@@ -849,6 +865,18 @@ impl PluginPackageStore for FakeStore {
 
     async fn delete_data(&self, _id: PluginId) -> AppResult<()> {
         Err(AppError::invalid("测试不删除数据"))
+    }
+
+    /// 已安装图标只按测试注入的内容返回；未注入即“没有可用图标”，
+    /// 页面必须回退统一占位而不是把缺失当成错误。
+    ///
+    /// @author kongweiguang
+    async fn icon(
+        &self,
+        id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<ExtensionIcon>> {
+        Ok(self.icons.lock().unwrap().get(id).cloned())
     }
 }
 
@@ -2533,6 +2561,7 @@ fn list_entries_keep_header_and_row_indices_aligned() {
         ExtensionRow {
             element_key: id.to_owned(),
             selection: SelectedEntry::Plugin(PluginId::parse(id).unwrap()),
+            icon: crate::plugins::tools::ToolIcon::builtin(gpui_kit::assets::IconName::Puzzle),
             name: id.to_owned(),
             description: String::new(),
             progress: None,
@@ -4466,65 +4495,153 @@ fn extension_list_scrollbar_stays_at_viewport_edge(app: &mut TestAppContext) {
     }
 }
 
-/// 内置组标题是唯一折叠入口；箭头槽与行内容共用同一左 inset，搜索只临时展开。
+/// 四类组标题与列表行首图标槽共享同一条左侧脊线；内置箭头在标题右侧，
+/// 折叠仍然只由组标题按钮驱动。
 #[gpui_kit::test]
-fn builtin_group_header_toggles_collapse_and_aligns_arrow(app: &mut TestAppContext) {
-    let unit = BuiltinUnit {
-        id: PluginId::parse("kerminal.sftp").unwrap(),
-        name: "SFTP".to_owned(),
-        can_disable: true,
-    };
+fn group_headers_share_left_spine_and_builtin_toggles(app: &mut TestAppContext) {
+    let installed = PluginId::parse("acme.installed").unwrap();
+    let pending = PluginId::parse("acme.pending").unwrap();
+    let market = PluginId::parse("acme.market").unwrap();
+    let builtin = PluginId::parse("kerminal.sftp").unwrap();
+    let mut state = PluginStoreState::default();
+    state.plugins.insert(
+        installed.clone(),
+        installed_record(PluginSource::Official, PluginInstallStatus::Ready),
+    );
+    state.pending.push(PendingPluginChange::Install {
+        id: pending.clone(),
+        to: PluginVersion::parse("1.0.0").unwrap(),
+        staged: "staged".into(),
+        fingerprint: None,
+        source: PluginSource::Local,
+        installed_at: "2026-01-01".into(),
+    });
+    let snapshot = catalog_snapshot(vec![
+        catalog_plugin(installed.as_str()),
+        catalog_plugin(pending.as_str()),
+        catalog_plugin(market.as_str()),
+    ]);
     let (runtime, page, visual) = page_fixture(
         app,
-        Arc::new(FakeStore::new(PluginStoreState::default(), Vec::new())),
+        Arc::new(FakeStore::new(state.clone(), Vec::new())),
         Arc::new(FakeCatalog::default()),
     );
     visual.update(|_, app| {
         page.update(app, |page, _| {
-            page.builtin_units = vec![unit.clone()];
-            page.state = Some(PluginStoreState::default());
-            page.catalog = Some(empty_catalog_snapshot());
+            page.builtin_units = vec![BuiltinUnit {
+                id: builtin.clone(),
+                name: "SFTP".to_owned(),
+                can_disable: true,
+            }];
+            page.state = Some(state.clone());
+            page.catalog = Some(snapshot.clone());
+            // 展开内置组，让四个分组都能同时看到标题与行。
+            page.builtin_expanded = true;
             page.active = true;
-            page.builtin_expanded = false;
         });
     });
     pump(&runtime, visual);
-    visual.update(|_, app| {
+
+    let title_selectors = [
+        "extensions-group-title-installed",
+        "extensions-group-title-builtin",
+        "extensions-group-title-pending",
+        "extensions-group-title-market",
+    ];
+    let titles: Vec<_> = title_selectors
+        .iter()
+        .map(|&selector| {
+            visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("组标题 {selector} 应渲染"))
+        })
+        .collect();
+    let spine = titles[0].origin.x;
+    for (selector, title) in title_selectors.iter().zip(&titles) {
         assert!(
-            page.read(app).visible_rows(&[], "").is_empty(),
-            "默认收起时内置行不显示"
+            (title.origin.x - spine).abs() < gpui::px(0.5),
+            "{selector} 组标题必须贴同一条左侧脊线: {title:?}"
         );
-    });
+    }
+
+    // 行首固定图标槽与组标题同缘；四类行的文字列也严格同缘。
+    let row_selectors = [
+        (
+            "extension-row-icon-acme.installed",
+            "extension-row-content-acme.installed",
+        ),
+        (
+            "extension-row-icon-builtin-kerminal.sftp",
+            "extension-row-content-builtin-kerminal.sftp",
+        ),
+        (
+            "extension-row-icon-acme.pending",
+            "extension-row-content-acme.pending",
+        ),
+        (
+            "extension-row-icon-acme.market",
+            "extension-row-content-acme.market",
+        ),
+    ];
+    for (selector, _) in row_selectors {
+        let icon = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} 行图标槽应渲染"));
+        assert!(
+            (icon.origin.x - spine).abs() < gpui::px(0.5),
+            "{selector} 行图标槽必须与组标题同脊线: {icon:?}"
+        );
+    }
+    let contents: Vec<_> = row_selectors
+        .iter()
+        .map(|&(_, selector)| {
+            visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} 行文字应渲染"))
+        })
+        .collect();
+    let content_spine = contents[0].origin.x;
+    assert!(content_spine > spine, "图标槽必须为文字让出固定宽度");
+    for content in &contents {
+        assert!(
+            (content.origin.x - content_spine).abs() < gpui::px(0.5),
+            "所有行文字必须严格同缘: {content:?}"
+        );
+    }
+
     let arrow = visual
         .debug_bounds("extensions-group-arrow-builtin")
-        .expect("内置组箭头槽应渲染");
+        .expect("内置组箭头应渲染");
+    assert!(
+        arrow.origin.x > titles[1].origin.x,
+        "披露箭头应在标题右侧而不是占据标题前的空槽: arrow={:?} title={:?}",
+        arrow.origin,
+        titles[1].origin
+    );
+
+    // 点击整行标题仍能折叠内置组；搜索只临时展开，不改写用户选择。
     let header = visual
         .debug_bounds("extensions-group-builtin")
         .expect("内置组标题应可点击");
     visual.simulate_click(header.center(), Modifiers::default());
     pump(&runtime, visual);
     visual.update(|_, app| {
-        assert!(page.read(app).builtin_expanded, "点击标题必须展开内置组");
-        assert_eq!(page.read(app).visible_rows(&[], "").len(), 1);
+        assert!(!page.read(app).builtin_expanded, "点击标题必须收起内置组");
     });
-    let content = visual
-        .debug_bounds("extension-row-content-builtin-kerminal.sftp")
-        .expect("内置行内容应渲染");
     assert!(
-        (arrow.origin.x.as_f32() - content.origin.x.as_f32()).abs() < 0.5,
-        "箭头槽与行内容左缘必须对齐: arrow={:?} content={:?}",
-        arrow.origin,
-        content.origin
+        visual
+            .debug_bounds("extension-row-builtin-kerminal.sftp")
+            .is_none(),
+        "收起后内置行不应继续渲染"
     );
-    // 搜索命中临时展开，但不改写用户的折叠选择。
     visual.update(|window, app| {
         page.update(app, |page, cx| {
-            page.builtin_expanded = false;
             page.search.update(cx, |input, cx| {
                 input.set_value("sftp".to_owned(), window, cx)
             });
         });
     });
+    pump(&runtime, visual);
     visual.update(|_, app| {
         assert!(!page.read(app).builtin_expanded, "搜索不能改写折叠状态");
         assert_eq!(
@@ -4533,6 +4650,68 @@ fn builtin_group_header_toggles_collapse_and_aligns_arrow(app: &mut TestAppConte
             "搜索命中必须临时展示内置行"
         );
     });
+}
+
+/// 行首图标槽始终是固定 32px：内置映射、已安装图标、缺失图标与未知内置名
+/// 都不能改变槽尺寸或挤动文字列。
+#[gpui_kit::test]
+fn extension_rows_render_fixed_icon_slot(app: &mut TestAppContext) {
+    let good = PluginId::parse("acme.good").unwrap();
+    let bad = PluginId::parse("acme.bad").unwrap();
+    let market = PluginId::parse("acme.market").unwrap();
+    let mut state = PluginStoreState::default();
+    for id in [&good, &bad] {
+        state.plugins.insert(
+            id.clone(),
+            installed_record(PluginSource::Official, PluginInstallStatus::Ready),
+        );
+    }
+    let snapshot = catalog_snapshot(vec![
+        catalog_plugin(good.as_str()),
+        catalog_plugin(bad.as_str()),
+        catalog_plugin(market.as_str()),
+    ]);
+    let store = Arc::new(FakeStore::new(state.clone(), Vec::new()));
+    store
+        .icons
+        .lock()
+        .unwrap()
+        .insert(good.clone(), ExtensionIcon::Builtin("globe".to_owned()));
+    // 未知内置名必须安全回退 Puzzle；这里同时证明不会因解析失败让整行消失。
+    store.icons.lock().unwrap().insert(
+        bad.clone(),
+        ExtensionIcon::Builtin("not-a-kit-icon".to_owned()),
+    );
+    let (runtime, page, visual) = page_fixture(app, store, Arc::new(FakeCatalog::default()));
+    visual.update(|_, app| {
+        page.update(app, |page, _| {
+            page.builtin_units = vec![BuiltinUnit {
+                id: PluginId::parse("kerminal.sftp").unwrap(),
+                name: "SFTP".to_owned(),
+                can_disable: true,
+            }];
+            page.state = Some(state.clone());
+            page.catalog = Some(snapshot.clone());
+            page.builtin_expanded = true;
+            page.active = true;
+        });
+    });
+    pump(&runtime, visual);
+    for selector in [
+        "extension-row-icon-acme.good",
+        "extension-row-icon-acme.bad",
+        "extension-row-icon-builtin-kerminal.sftp",
+        "extension-row-icon-acme.market",
+    ] {
+        let icon = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} 行图标槽应渲染"));
+        assert!(
+            (icon.size.width.as_f32() - 32.0).abs() < 0.5
+                && (icon.size.height.as_f32() - 32.0).abs() < 0.5,
+            "{selector} 图标槽必须固定 32px: {icon:?}"
+        );
+    }
 }
 
 /// 列表已可见时 Escape 不再被页面吞掉；外层监听器必须收到冒泡事件。

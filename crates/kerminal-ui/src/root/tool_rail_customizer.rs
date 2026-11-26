@@ -658,7 +658,9 @@ impl ToolRailCustomizer {
                         .rounded_md()
                         .bg(theme.subtle_background())
                         .text_color(theme.muted)
-                        .child(icon),
+                        // 自定义 SVG 与内置图标共享同一显式前景色，避免外部插件在
+                        // 仅靠容器 text_color 时仍使用窗口默认色。
+                        .child(icon.component(theme.muted).size(theme.metrics.icon_size)),
                 )
                 .child(
                     div()

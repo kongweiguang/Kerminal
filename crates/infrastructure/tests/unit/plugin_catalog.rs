@@ -11,6 +11,46 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+/// 用真实目录缓存和本地 HTTP 响应验证图标过滤与进程内复用。
+#[tokio::test]
+async fn catalog_icon_accepts_svg_and_rejects_html() -> Result<(), Box<dyn std::error::Error>> {
+    for (body, accepted) in [("<svg></svg>", true), ("<html><svg></svg></html>", false)] {
+        let (url, server) = serve_once("200 OK", body).await;
+        let root = tempfile::tempdir()?;
+        let client = CatalogClient::new(StorageCoordinator::new(root.path()), "")?;
+        let mut cached = cache_with_readme("fixture", 1, &url);
+        let mut raw: serde_json::Value = serde_json::from_str(&cached.raw)?;
+        raw["plugins"][0]["icon_url"] = serde_json::Value::String(url);
+        cached.raw = serde_json::to_string(&raw)?;
+        client.persist(&state(&client), &cached)?;
+        let id = PluginId::parse("acme.tool")?;
+        let icon = client.icon(&id, CancellationToken::new()).await?;
+        assert_eq!(icon.is_some(), accepted);
+        server.await?;
+        if accepted {
+            assert_eq!(
+                client.icon(&id, CancellationToken::new()).await?.as_deref(),
+                Some(body.as_bytes())
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 缺少图标地址时不发网络请求，目录条目仍可正常展示。
+#[tokio::test]
+async fn catalog_icon_missing_url_returns_none() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let client = CatalogClient::new(StorageCoordinator::new(root.path()), "")?;
+    client.persist(
+        &state(&client),
+        &cache_with_readme("fixture", 1, "http://127.0.0.1/readme"),
+    )?;
+    let id = PluginId::parse("acme.tool")?;
+    assert!(client.icon(&id, CancellationToken::new()).await?.is_none());
+    Ok(())
+}
+
 /// 测试装配保留旧的三参数调用形状，避免安装流程测试为了删公钥而大改调用点。
 ///
 /// 放在外置测试模块而不是产品 impl：架构门禁只允许 src 保留指向 tests/ 的

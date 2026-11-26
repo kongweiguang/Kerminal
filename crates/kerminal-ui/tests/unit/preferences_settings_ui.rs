@@ -33,8 +33,8 @@ use kerminal_application::{
     AppError, AppResult, ApplicationTaskExecutor,
     extensions::{
         CatalogSelection, CatalogSnapshot, CatalogSource, DEFAULT_PLUGIN_CATALOG_URL,
-        DropInInspection, ExtensionChange, ExtensionReceipt, ExtensionsService, InstallProgress,
-        LocalPackageInspection, PluginPackageStore,
+        DropInInspection, ExtensionChange, ExtensionIcon, ExtensionReceipt, ExtensionsService,
+        InstallProgress, LocalPackageInspection, PluginPackageStore,
     },
     preferences::{
         ConfigurationGuideStatus, ConfigurationRepository, DefaultLocalShellProvider,
@@ -484,6 +484,17 @@ impl CatalogSource for SourceOnlyCatalog {
         Ok(None)
     }
 
+    /// 设置来源测试不展示插件图标，固定返回空让页面走统一占位。
+    ///
+    /// @author kongweiguang
+    async fn icon(
+        &self,
+        _id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<Arc<[u8]>>> {
+        Ok(None)
+    }
+
     /// 设置来源测试不访问网络；失败结果足以让页面进入可操作的离线状态。
     async fn refresh(&self, _cancellation: CancellationToken) -> AppResult<CatalogSnapshot> {
         Err(AppError::invalid("测试不请求目录"))
@@ -548,6 +559,17 @@ impl PluginPackageStore for SourceOnlyStore {
 
     async fn delete_data(&self, _id: PluginId) -> AppResult<()> {
         Err(AppError::unsupported("来源测试不删除数据"))
+    }
+
+    /// 设置来源测试不加载已安装图标；空结果让页面使用统一占位。
+    ///
+    /// @author kongweiguang
+    async fn icon(
+        &self,
+        _id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<ExtensionIcon>> {
+        Ok(None)
     }
 }
 

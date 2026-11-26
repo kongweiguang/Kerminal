@@ -10,7 +10,8 @@ use kerminal_application::{
     AppError, AppResult,
     extensions::{
         CatalogSelection, DEFAULT_PLUGIN_CATALOG_URL, DropInInspection, ExtensionChange,
-        ExtensionReceipt, InstallProgress, LocalPackageInspection, PluginPackageStore,
+        ExtensionIcon, ExtensionReceipt, InstallProgress, LocalPackageInspection,
+        PluginPackageStore,
     },
     plugin_settings::PluginSettingsService,
     plugins::{CORE_PLUGIN_ID, is_builtin_unit, is_reserved_plugin_id},
@@ -19,7 +20,7 @@ use kerminal_domain::plugins::{
     InstalledPlugin, PendingPluginChange, PluginFingerprint, PluginId, PluginInstallStatus,
     PluginSource, PluginStoreState, PluginUnsupportedReason, PluginVersion,
 };
-use kerminal_plugin_protocol::{ManifestPolicy, Platform};
+use kerminal_plugin_protocol::{IconReference, ManifestPolicy, Platform, classify_icon_reference};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -918,6 +919,66 @@ fn remove_missing_record(
 
 #[async_trait]
 impl PluginPackageStore for PackageInstaller {
+    /// 每次依据当前安装记录重验包，避免更新或损坏后显示过期图标。
+    async fn icon(
+        &self,
+        id: &PluginId,
+        cancellation: CancellationToken,
+    ) -> AppResult<Option<ExtensionIcon>> {
+        let installer = self.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("插件图标读取已取消"));
+            }
+            let snapshot = installer.store.load().map_err(store_error)?;
+            let Some(installed) = snapshot.state.plugins.get(&id) else {
+                return Ok(None);
+            };
+            if is_reserved_plugin_id(id.as_str()) {
+                return Ok(None);
+            }
+            let directory = layout::package_directory(installer.store.root(), &id);
+            let validator = ProtocolBootValidator {
+                host_api: installer.host_api,
+                platform: installer.platform,
+            };
+            let package =
+                validator.validated_package(&directory, &id, &installed.active, installed.source);
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("插件图标读取已取消"));
+            }
+            let Ok(package) = package else {
+                return Ok(None);
+            };
+            let Some(path) = package.manifest.icon.as_deref() else {
+                return Ok(None);
+            };
+            let icon = match classify_icon_reference(path) {
+                Ok(IconReference::Builtin) => Some(ExtensionIcon::Builtin(path.to_owned())),
+                Ok(IconReference::PackagePath) if path.to_ascii_lowercase().ends_with(".svg") => {
+                    package.files.get(path).and_then(|file| {
+                        super::boot::read_snapshot_file(
+                            &directory,
+                            path,
+                            file.size,
+                            super::boot::MAX_UI_RESOURCE_BYTES,
+                        )
+                        .ok()
+                        .map(|bytes| ExtensionIcon::Svg(Arc::from(bytes)))
+                    })
+                }
+                _ => None,
+            };
+            if cancellation.is_cancelled() {
+                return Err(AppError::cancelled("插件图标读取已取消"));
+            }
+            Ok(icon)
+        })
+        .await
+        .map_err(|error| AppError::infrastructure_with_source("读取插件图标任务失败", error))?
+    }
+
     /// 应用读取通过共享仓储执行，不创建第二份状态文件。
     async fn state(&self) -> AppResult<PluginStoreState> {
         let store = self.store.clone();

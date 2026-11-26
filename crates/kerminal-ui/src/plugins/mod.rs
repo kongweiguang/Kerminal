@@ -11,6 +11,7 @@ pub mod external_settings;
 pub mod external_webview;
 pub(crate) mod host_api;
 pub mod host_forms;
+pub(crate) mod icon_names;
 #[cfg(feature = "acceptance-metrics")]
 pub mod native_probe;
 pub mod tools;

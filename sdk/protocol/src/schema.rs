@@ -163,6 +163,23 @@ fn package_path_schema() -> Value {
     ]})
 }
 
+/// 图标声明允许两种互斥来源：包内相对路径或宿主内置图标名。
+///
+/// 运行时用同一分类器决定“是否需要包内文件”，静态 schema 也必须同步放宽，
+/// 否则插件作者按 schema 校验会拒绝合法的内置图标名。内置名只接受 ASCII
+/// 字母、数字和连字符，与 `classify_icon_reference` 保持同一字符集。
+fn icon_schema() -> Value {
+    json!({"anyOf": [
+        package_path_schema(),
+        {
+            "type":"string",
+            "minLength":1,
+            "maxLength":64,
+            "pattern": r"^[A-Za-z0-9-]+$"
+        }
+    ]})
+}
+
 /// RPC 请求与响应共用双向 ID 格式，发起方前缀仍由宿主按方向核验。
 fn rpc_id_schema() -> Value {
     json!({"type":"string", "minLength":3, "maxLength":128,
@@ -216,9 +233,8 @@ fn constrain_manifest_schema(schema: &mut Value) {
     let mut repository = text_schema(2048);
     repository["pattern"] = json!(r"^https://");
     set_property_schema(schema, "repository", nullable(repository));
-    for name in ["icon", "l10n"] {
-        set_property_schema(schema, name, nullable(package_path_schema()));
-    }
+    set_property_schema(schema, "icon", nullable(icon_schema()));
+    set_property_schema(schema, "l10n", nullable(package_path_schema()));
     for name in ["name", "description"] {
         set_property_schema(
             schema,
@@ -249,7 +265,14 @@ fn constrain_manifest_schema(schema: &mut Value) {
         if let Some(contribution) = definitions.get_mut(name) {
             set_property_schema(contribution, "id", local_id_schema(63));
             set_property_schema(contribution, "title", text_schema(512));
-            set_property_schema(contribution, "icon", nullable(package_path_schema()));
+            // 只有工具图标允许声明内置名；其它贡献的图标仍限定包内资源，
+            // 因为它们的渲染路径尚未接入内置图标目录。
+            let icon = if name == "ToolContribution" {
+                icon_schema()
+            } else {
+                package_path_schema()
+            };
+            set_property_schema(contribution, "icon", nullable(icon));
             set_property_schema(contribution, "schema", package_path_schema());
             set_property_schema(contribution, "keybinding", nullable(text_schema(128)));
             if name == "TabContribution" {

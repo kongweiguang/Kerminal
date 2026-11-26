@@ -19,19 +19,22 @@ use kerminal_application::{
     ApplicationTaskExecutor, PublicErrorCode,
     extensions::{
         BuiltinUnit, CatalogIdentity, CatalogPlugin, CatalogSelection, CatalogSnapshot,
-        DEFAULT_PLUGIN_CATALOG_URL, DropInInspection, ExtensionChange, ExtensionsService,
-        InstallProgress, LocalPackageInspection,
+        DEFAULT_PLUGIN_CATALOG_URL, DropInInspection, ExtensionChange, ExtensionIcon,
+        ExtensionsService, InstallProgress, LocalPackageInspection,
     },
 };
 use kerminal_domain::plugins::{
     InstalledPlugin, PendingPluginChange, PluginId, PluginInstallStatus, PluginSource,
-    PluginStoreState, PluginUnsupportedReason,
+    PluginStoreState, PluginUnsupportedReason, PluginVersion,
 };
 use kerminal_plugin_protocol::Platform;
-use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
-// 计数辅助只在测试与验收快照中保留；默认构建不引入未使用的集合类型。
-#[cfg(any(test, feature = "right-rail-acceptance"))]
-use std::collections::BTreeSet;
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 mod markdown;
@@ -135,6 +138,30 @@ struct BatchProgress {
     id: PluginId,
 }
 
+/// 单次绘制最多补取多少条市场图标。
+///
+/// 目录可能包含数千个条目，但图标只是辅助识别信息：无上限地预取会把一次滚动
+/// 变成成百上千个网络请求，并让列表长时间停留在占位图标上。安装记录始终全量
+/// 读取，目录条目只补前若干条；加载失败或超出预算的条目统一显示 Puzzle，
+/// 不会阻塞列表，也不会因图标迟到改变行高。
+const MAX_CATALOG_ICON_PREFETCH: usize = 32;
+
+/// 图标队列中的单项请求：已安装插件读取包内图标，市场条目读取目录图标。
+///
+/// 两种来源的失败语义相同（回退占位），但写回不同的缓存，所以请求种类必须
+/// 一直带到结果落地，不能在失败分支里靠猜测还原。
+#[derive(Clone)]
+enum IconJob {
+    Installed(PluginId),
+    Catalog(PluginId),
+}
+
+/// 已完成读取的图标结果；`None` 是“确认没有可渲染图标”，不是未读取。
+enum IconLoaded {
+    Installed(Option<ExtensionIcon>),
+    Catalog(Option<Arc<[u8]>>),
+}
+
 /// 实例拥有搜索焦点与异步代次；服务和 executor 由组合根注入。
 pub struct ExtensionsPage {
     service: Arc<ExtensionsService>,
@@ -166,6 +193,19 @@ pub struct ExtensionsPage {
     builtin_units: Vec<BuiltinUnit>,
     /// 手动投放记录的只读观察；确认按钮必须使用这里的指纹与修订。
     drop_ins: Vec<DropInInspection>,
+    /// 已安装外部插件的图标结果；`None` 表示已确认没有可渲染图标，统一回退 Puzzle。
+    ///
+    /// 图标属于装饰信息，读取失败不进入页面错误区：缺失或损坏只会让该行使用
+    /// 统一占位图标，列表与详情仍可正常操作。
+    installed_icons: BTreeMap<PluginId, Option<ExtensionIcon>>,
+    /// 图标结果对应的安装版本；更新后版本变化时丢弃旧图标，避免继续显示上一版本。
+    installed_icon_versions: BTreeMap<PluginId, PluginVersion>,
+    /// 市场条目图标按稳定身份缓存；`None` 表示条目没有图标或读取失败。
+    catalog_icons: BTreeMap<PluginId, Option<Arc<[u8]>>>,
+    /// 图标读取队列串行执行：一次只做一个读盘/网络请求，避免滚动列表时并发风暴。
+    icon_cancel: Option<CancellationToken>,
+    /// 离开分类或目录换代时推进，迟到的图标结果不能写回新页面状态。
+    icon_generation: u64,
     /// drop-in 观察有独立代次，不能被目录刷新或普通写入的代次推进误作废。
     drop_in_generation: u64,
     drop_in_cancel: Option<CancellationToken>,
@@ -293,6 +333,11 @@ impl ExtensionsPage {
             state: None,
             builtin_units: Vec::new(),
             drop_ins: Vec::new(),
+            installed_icons: BTreeMap::new(),
+            installed_icon_versions: BTreeMap::new(),
+            catalog_icons: BTreeMap::new(),
+            icon_cancel: None,
+            icon_generation: 0,
             drop_in_generation: 0,
             drop_in_cancel: None,
             drop_in_error: None,
@@ -541,6 +586,12 @@ impl ExtensionsPage {
         self.close_source_dialog(cx);
         // 离开分类后 drop-in 观察没有展示目标，继续读取只会占用工作线程。
         self.supersede_drop_in_inspection();
+        // 图标队列同样没有展示目标；推进代次让在途回执失效并取消剩余读取。
+        // 已落地的结果保留，重新进入时只补未完成的条目。
+        self.icon_generation = self.icon_generation.wrapping_add(1);
+        if let Some(token) = self.icon_cancel.take() {
+            token.cancel();
+        }
         // 目录与状态读取各自取消并推进代次，迟到回执不能写回已离开的页面。
         self.catalog_generation = self.catalog_generation.wrapping_add(1);
         self.state_generation = self.state_generation.wrapping_add(1);
@@ -942,6 +993,168 @@ impl ExtensionsPage {
             return;
         }
         self.load_readme(cx);
+    }
+
+    /// 为已安装记录与可浏览目录条目补取图标。
+    ///
+    /// 页面只消费应用层给出的“内置名或已验字节”，不在这里读文件或拼 URL。
+    /// 一次绘制只启动一条串行队列，已加载或已确认缺失的条目不会重复请求；
+    /// 结果到达前图标槽始终使用统一占位，所以列表与详情不会因为图标迟到跳动。
+    ///
+    /// 安装记录按当前版本做键：更新完成后旧图标立即失效并重新读取，避免列表
+    /// 继续展示上一版本的视觉身份。市场图标按 `MAX_CATALOG_ICON_PREFETCH`
+    /// 限量预取，剩余条目保持占位，这是刻意取舍而不是遗漏。
+    ///
+    /// @author kongweiguang
+    fn ensure_icons(&mut self, cx: &mut Context<Self>) {
+        // 已经有一条队列在跑时不追加任务：它结束时会重绘，下一帧再补新出现的条目。
+        if self.icon_cancel.is_some() {
+            return;
+        }
+        let installed: Vec<(PluginId, PluginVersion)> = self
+            .state
+            .as_ref()
+            .map(|state| {
+                state
+                    .plugins
+                    .iter()
+                    .filter(|(id, record)| {
+                        // 内置身份与占用内置身份的冲突记录由内置映射或 Puzzle 表达，
+                        // 不需要也不应该去读一个不属于外部包的目录。
+                        !is_reserved_identity(record)
+                            && !self.builtin_units.iter().any(|unit| &unit.id == *id)
+                    })
+                    .map(|(id, record)| (id.clone(), record.active.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let installed_ids: BTreeSet<&PluginId> =
+            installed.iter().map(|(id, _version)| id).collect();
+        let catalog: Vec<(PluginId, bool)> = self
+            .catalog
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .catalog
+                    .plugins
+                    .iter()
+                    .filter(|plugin| !installed_ids.contains(&plugin.id))
+                    .map(|plugin| (plugin.id.clone(), plugin.icon_url.is_some()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut jobs = Vec::new();
+        for (id, version) in installed {
+            let current = self.installed_icon_versions.get(&id);
+            if current == Some(&version) && self.installed_icons.contains_key(&id) {
+                continue;
+            }
+            if current != Some(&version) {
+                self.installed_icons.remove(&id);
+                self.installed_icon_versions.insert(id.clone(), version);
+            }
+            jobs.push(IconJob::Installed(id));
+        }
+        let mut budget = MAX_CATALOG_ICON_PREFETCH;
+        for (id, declares_icon) in catalog {
+            if self.catalog_icons.contains_key(&id) {
+                continue;
+            }
+            if !declares_icon {
+                // 没有声明图标是确定结果，写入 None 防止每帧重复判断。
+                self.catalog_icons.insert(id, None);
+                continue;
+            }
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            jobs.push(IconJob::Catalog(id));
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        self.icon_generation = self.icon_generation.wrapping_add(1);
+        let generation = self.icon_generation;
+        let token = CancellationToken::new();
+        self.icon_cancel = Some(token.clone());
+        let service = self.service.clone();
+        let executor = self.executor.clone();
+        cx.spawn(async move |this, cx| {
+            for job in jobs {
+                if token.is_cancelled() {
+                    break;
+                }
+                // 失败分支仍需要知道结果该写回哪一张缓存表，因此在消费请求前记录。
+                let installed_job = matches!(job, IconJob::Installed(_));
+                let (id, loaded) = match job {
+                    IconJob::Installed(id) => {
+                        let request = id.clone();
+                        let service = service.clone();
+                        let executor = executor.clone();
+                        let cancel = token.clone();
+                        let result = executor
+                            .run_cancellable(cancel, move |cancel| async move {
+                                service.installed_icon(&request, cancel).await
+                            })
+                            .await;
+                        (id, result.map(IconLoaded::Installed))
+                    }
+                    IconJob::Catalog(id) => {
+                        let request = id.clone();
+                        let service = service.clone();
+                        let executor = executor.clone();
+                        let cancel = token.clone();
+                        let result = executor
+                            .run_cancellable(cancel, move |cancel| async move {
+                                service.catalog_icon(&request, cancel).await
+                            })
+                            .await;
+                        (id, result.map(IconLoaded::Catalog))
+                    }
+                };
+                let keep_running = this.update(cx, |page, cx| {
+                    // 离开分类或目录换代后，旧结果不能再写回；直接结束队列。
+                    if page.icon_generation != generation {
+                        return false;
+                    }
+                    match loaded {
+                        Ok(IconLoaded::Installed(icon)) => {
+                            page.installed_icons.insert(id, icon);
+                        }
+                        Ok(IconLoaded::Catalog(icon)) => {
+                            page.catalog_icons.insert(id, icon);
+                        }
+                        // 取消通常是页面离开或来源切换，保持“未读取”让下次进入重试。
+                        Err(error) if error.public_code() == PublicErrorCode::Cancelled => {
+                            return false;
+                        }
+                        // 图标是装饰信息：普通失败直接落到统一占位，不制造错误条。
+                        Err(_) if installed_job => {
+                            page.installed_icons.insert(id, None);
+                        }
+                        Err(_) => {
+                            page.catalog_icons.insert(id, None);
+                        }
+                    }
+                    cx.notify();
+                    true
+                });
+                if !keep_running.unwrap_or(false) {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |page, cx| {
+                if page.icon_generation == generation {
+                    page.icon_cancel = None;
+                    // 队列结束前可能又出现了新条目或超出预算的目录项，重绘让下一帧补取。
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// 挂载面切换时把焦点交给仍可见的一侧；只在边沿执行，不按帧抢焦点。
@@ -2372,6 +2585,13 @@ impl ExtensionsPage {
         let Some(catalog) = self.catalog.as_ref() else {
             return;
         };
+        // 目录换代后旧的 icon_url 结果不再可信：清空市场图标缓存、推进代次并取消
+        // 在途队列。已安装图标按版本键控，不会被这次换代误丢。
+        self.catalog_icons.clear();
+        self.icon_generation = self.icon_generation.wrapping_add(1);
+        if let Some(token) = self.icon_cancel.take() {
+            token.cancel();
+        }
         let category_removed = self.filter.category.as_ref().is_some_and(|category| {
             !catalog
                 .catalog

@@ -13,8 +13,8 @@ use kerminal_application::{
     AppError, AppResult, PublicErrorCode,
     extensions::{
         CatalogSelection, CatalogSnapshot, CatalogSource, DEFAULT_PLUGIN_CATALOG_URL,
-        DropInInspection, ExtensionChange, ExtensionReceipt, ExtensionsService, InstallProgress,
-        LocalPackageInspection, PluginPackageStore,
+        DropInInspection, ExtensionChange, ExtensionIcon, ExtensionReceipt, ExtensionsService,
+        InstallProgress, LocalPackageInspection, PluginPackageStore,
     },
     plugins::CORE_PLUGIN_ID,
 };
@@ -27,6 +27,15 @@ struct UnavailableCatalog;
 
 #[async_trait]
 impl CatalogSource for UnavailableCatalog {
+    /// 测试目录没有远程资源，避免无关请求影响用例。
+    async fn icon(
+        &self,
+        _id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<Arc<[u8]>>> {
+        Ok(None)
+    }
+
     /// 测试替身没有可切换的运行态来源，回显官方默认地址保持类型语义完整。
     fn source_url(&self) -> String {
         DEFAULT_PLUGIN_CATALOG_URL.to_owned()
@@ -65,6 +74,15 @@ struct FakePackages {
 
 #[async_trait]
 impl PluginPackageStore for FakePackages {
+    /// 替身没有安装包，图标读取按缺失资源处理。
+    async fn icon(
+        &self,
+        _id: &PluginId,
+        _cancellation: CancellationToken,
+    ) -> AppResult<Option<ExtensionIcon>> {
+        Ok(None)
+    }
+
     async fn state(&self) -> AppResult<PluginStoreState> {
         Ok(PluginStoreState::default())
     }

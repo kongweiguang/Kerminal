@@ -56,6 +56,26 @@ impl BootPackageValidator for ProtocolBootValidator {
         version: &PluginVersion,
         source: PluginSource,
     ) -> Result<Self::Manifest, BootPackageError> {
+        let package = self.validated_package(directory, id, version, source)?;
+        prepare_plugin(directory, id, version, package)
+    }
+}
+
+impl ProtocolBootValidator {
+    /// 只完成包级校验并返回已验证内容，不提前构造 UI 资源快照。
+    ///
+    /// 扩展页图标读取只需要清单和文件清点；若复用完整 `validate`，会为每个
+    /// 已安装插件复制所有 WebView 资源。把纯校验与资源物化拆开，既保持同一
+    /// 身份/API/平台规则，又避免只为一个小图标付出整包内存。
+    ///
+    /// @author kongweiguang
+    pub(super) fn validated_package(
+        &self,
+        directory: &Path,
+        id: &PluginId,
+        version: &PluginVersion,
+        source: PluginSource,
+    ) -> Result<kerminal_plugin_protocol::ValidatedPackage, BootPackageError> {
         use kerminal_plugin_protocol::{ManifestPolicy, Platform, PluginRuntime, ProtocolError};
 
         let policy = if source == PluginSource::Official && id.as_str().starts_with("kerminal.") {
@@ -88,12 +108,12 @@ impl BootPackageValidator for ProtocolBootValidator {
         package
             .validate_for_platform(platform)
             .map_err(|_| BootPackageError::Incompatible)?;
-        prepare_plugin(directory, id, version, package)
+        Ok(package)
     }
 }
 
 const MAX_LOCALE_BYTES: u64 = 1024 * 1024;
-const MAX_UI_RESOURCE_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_UI_RESOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UI_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_UI_SNAPSHOT_FILES: usize = 1024;
 
@@ -135,11 +155,23 @@ fn prepare_plugin(
 
     let mut native_views = BTreeMap::new();
     let mut resource_paths = BTreeSet::new();
-    if let Some(icon) = &package.manifest.icon {
+    // 只有包内相对路径才进入资源快照；内置图标名由 UI 侧按内置目录解析，
+    // 若在这里无条件插入，后面的 `package.files.get` 会把合法内置名误判为损坏包。
+    if let Some(icon) = &package.manifest.icon
+        && matches!(
+            kerminal_plugin_protocol::classify_icon_reference(icon),
+            Ok(kerminal_plugin_protocol::IconReference::PackagePath)
+        )
+    {
         resource_paths.insert(icon.clone());
     }
     for tool in &package.manifest.contributes.tools {
-        if let Some(icon) = &tool.icon {
+        if let Some(icon) = &tool.icon
+            && matches!(
+                kerminal_plugin_protocol::classify_icon_reference(icon),
+                Ok(kerminal_plugin_protocol::IconReference::PackagePath)
+            )
+        {
             resource_paths.insert(icon.clone());
         }
     }
@@ -240,7 +272,7 @@ fn is_webview_resource(path: &str) -> bool {
 }
 
 /// 再次检查路径每一级及打开句柄，防止资源阶段跟随链接或读取超过清点大小。
-fn read_snapshot_file(
+pub(super) fn read_snapshot_file(
     root: &Path,
     path: &str,
     expected: u64,

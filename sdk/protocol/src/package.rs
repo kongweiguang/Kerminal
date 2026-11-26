@@ -9,9 +9,10 @@ use std::{
 };
 
 use crate::{
-    ConfigurationSchema, EmptyState, ManifestPolicy, MenuItem, NativeNode, NativeNodeKind,
-    NativeView, Platform, PluginManifest, PluginRuntime, ProtocolError, ViewDefinition, invalid,
-    parse_json, parse_manifest, parse_native_view,
+    ConfigurationSchema, EmptyState, IconReference, ManifestPolicy, MenuItem, NativeNode,
+    NativeNodeKind, NativeView, Platform, PluginManifest, PluginRuntime, ProtocolError,
+    ViewDefinition, classify_icon_reference, invalid, parse_json, parse_manifest,
+    parse_native_view,
 };
 
 pub const MAX_PACKAGE_ENTRIES: usize = 10_000;
@@ -96,7 +97,9 @@ pub fn validate_package(
         crate::MAX_MANIFEST_BYTES,
     )?;
     let manifest = parse_manifest(&manifest_bytes, policy)?;
-    if let Some(icon) = &manifest.icon {
+    if let Some(icon) = &manifest.icon
+        && classify_icon_reference(icon)? == IconReference::PackagePath
+    {
         require_file(&files, icon)?;
     }
     match &manifest.runtime {
@@ -108,7 +111,9 @@ pub fn validate_package(
         }
     }
     for tool in &manifest.contributes.tools {
-        if let Some(icon) = &tool.icon {
+        if let Some(icon) = &tool.icon
+            && classify_icon_reference(icon)? == IconReference::PackagePath
+        {
             require_file(&files, icon)?;
         }
     }
@@ -433,10 +438,13 @@ fn inspect_icon_reference(
     icon: Option<&str>,
     files: &BTreeMap<String, PackageFile>,
 ) -> Result<(), ProtocolError> {
-    if let Some(icon) = icon
-        && (icon.ends_with(".svg") || icon.contains('/'))
-    {
-        require_file(files, icon)?;
+    if let Some(icon) = icon {
+        match classify_icon_reference(icon)? {
+            IconReference::PackagePath => require_file(files, icon)?,
+            // 内置名不需要包内文件；宿主会在渲染前按内置目录安全解析，
+            // 未知名称由界面回退占位图标。
+            IconReference::Builtin => {}
+        }
     }
     Ok(())
 }

@@ -202,6 +202,36 @@ struct DropInFixture {
     id: PluginId,
 }
 
+/// 复用真实 drop-in 包和状态仓储，分别覆盖内置名与包内 SVG 的受验读取。
+#[tokio::test]
+async fn installed_icon_reads_builtin_and_package_svg() -> Result<(), Box<dyn std::error::Error>> {
+    for icon_name in ["terminal", "assets/icon.svg"] {
+        let fixture = drop_in_fixture("1.0.0");
+        let directory = fixture.root.path().join("plugins/acme.notes");
+        let mut manifest: serde_json::Value = serde_json::from_str(&drop_in_manifest("1.0.0"))?;
+        manifest["icon"] = serde_json::Value::String(icon_name.to_owned());
+        std::fs::write(
+            directory.join("kerminal-plugin.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        if icon_name.ends_with(".svg") {
+            std::fs::create_dir_all(directory.join("assets"))?;
+            std::fs::write(directory.join(icon_name), b"<svg></svg>")?;
+        }
+        fixture.store.begin_startup(&fixture.validator, false)?;
+        let icon = fixture
+            .installer
+            .icon(&fixture.id, CancellationToken::new())
+            .await?;
+        match icon {
+            Some(ExtensionIcon::Builtin(name)) => assert_eq!(name, icon_name),
+            Some(ExtensionIcon::Svg(bytes)) => assert_eq!(&*bytes, b"<svg></svg>"),
+            None => return Err("expected installed icon".into()),
+        }
+    }
+    Ok(())
+}
+
 fn drop_in_fixture(version: &str) -> DropInFixture {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("plugins/acme.notes");

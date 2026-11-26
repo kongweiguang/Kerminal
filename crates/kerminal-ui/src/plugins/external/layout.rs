@@ -44,7 +44,6 @@ use kerminal_plugin_protocol::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -277,7 +276,7 @@ impl NativeRenderer {
     }
 
     /// 节点位置沿用冻结树的索引，使条件隐藏不会改变其余控件的身份或草稿。
-    /// 布局只采用宿主主题与已知样式，插件文本不解释为 HTML。
+    /// 布局只采用宿主主题与已知样式，插件文本不解释为 HTML；隐藏节点不参与可见项布局次序。
     pub(super) fn render_node(
         &mut self,
         node: &NativeNode,
@@ -308,6 +307,9 @@ impl NativeRenderer {
             | Toolbar { children, .. } => {
                 let horizontal = matches!(&node.kind, Row { .. } | Toolbar { .. });
                 let header = horizontal && has_appearance(node, "header");
+                let stretch_first =
+                    matches!(&node.kind, Row { .. }) && has_appearance(node, "stretch-first");
+                let between = matches!(&node.kind, Row { .. }) && has_appearance(node, "between");
                 let gap = match &node.kind {
                     Stack { gap, .. }
                     | Section { gap, .. }
@@ -319,6 +321,7 @@ impl NativeRenderer {
                     .flex()
                     .when(!horizontal, |d| d.flex_col())
                     .when(horizontal, |d| d.items_center())
+                    .when(between, |d| d.justify_between())
                     .when(header, |d| d.flex_wrap())
                     .min_w_0()
                     .w_full();
@@ -331,29 +334,55 @@ impl NativeRenderer {
                     Section { title, .. } => Some(self.projection.text(title)),
                     _ => None,
                 };
-                let grouped = section_title.is_some() && has_appearance(node, "grouped");
+                // 分组外观由节点自身声明决定，不以“是否声明了标题”为条件：
+                // 无标题的分组也要渲染卡片，否则插件无法只靠间距分组而不占用标题槽。
+                let grouped =
+                    matches!(&node.kind, Section { .. }) && has_appearance(node, "grouped");
                 if let Some(title) = section_title.as_ref().filter(|_| !grouped) {
                     box_ = box_.child(div().font_medium().child(title.clone()));
                 }
+                let mut visible_index = 0;
                 for (index, child) in children.iter().enumerate() {
                     if !self.projection.is_visible(child) {
                         continue;
                     }
                     let content = self.render_node(child, format!("{path}.{index}"), window, cx);
-                    box_ = if header && index == 0 {
+                    box_ = if stretch_first && visible_index == 0 {
+                        box_.child(div().flex_1().min_w_0().child(content))
+                    } else if stretch_first {
+                        box_.child(div().flex_shrink_0().child(content))
+                    } else if header && index == 0 {
                         // 标题优先占用剩余空间；狭窄面板把动作换行，避免裁掉标题或按钮。
                         box_.child(div().flex_1().min_w(rems(7.)).max_w_full().child(content))
                     } else {
                         box_.child(content)
                     };
+                    visible_index += 1;
                 }
-                if let Some(title) = section_title.filter(|_| grouped) {
-                    GroupBox::new()
-                        .id(format!("external-group-{path}"))
-                        .fill()
-                        .title(div().text_sm().font_medium().child(title))
-                        .child(box_)
-                        .into_any_element()
+                if grouped {
+                    match section_title {
+                        Some(title) if !title.trim().is_empty() => GroupBox::new()
+                            .id(format!("external-group-{path}"))
+                            .fill()
+                            .title(div().text_sm().font_medium().child(title))
+                            .child(box_)
+                            .into_any_element(),
+                        // 标题为空或缺失时不再输出 GroupBox 的空标题槽，
+                        // 只保留圆角卡片本体，让内部控件自己承担全部留白。
+                        _ => {
+                            let theme =
+                                crate::theme::ThemeTokens::current(window, cx).for_workbench();
+                            div()
+                                .w_full()
+                                .p_4()
+                                .rounded(theme.radius_panel)
+                                .bg(cx.theme().group_box)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(box_)
+                                .into_any_element()
+                        }
+                    }
                 } else {
                     box_.into_any_element()
                 }
@@ -371,7 +400,7 @@ impl NativeRenderer {
                             .flex()
                             .justify_center()
                             .px_4()
-                            .py_5()
+                            .py_4()
                             .child(div().w_full().min_w_0().max_w(rems(36.)).child(content))
                             .into_any_element()
                     } else {
@@ -430,6 +459,16 @@ impl NativeRenderer {
                         d.text_xl().font_semibold()
                     })
                     .when(has_appearance(node, "caption"), |d| d.text_sm())
+                    .when(has_appearance(node, "value"), |d| {
+                        d.text_sm()
+                            .text_color(cx.theme().foreground)
+                            .whitespace_normal()
+                    })
+                    .when(has_appearance(node, "mono"), |d| {
+                        d.font_family(cx.theme().mono_font_family.clone())
+                            .text_sm()
+                            .font_medium()
+                    })
                     .child(self.projection.text(text))
                     .into_any_element()
             }
@@ -518,6 +557,8 @@ impl NativeRenderer {
                 let mut card = div()
                     .flex()
                     .flex_col()
+                    .w_full()
+                    .py_2()
                     .items_center()
                     .gap_2()
                     .id(format!("external-qrcode-{path}"))
@@ -530,36 +571,48 @@ impl NativeRenderer {
                         // 成 auto，随后子元素 100% 高度也变 0，二维码会静默消失。确定宽度在弹性
                         // 布局里仍可被收缩，max_w_full 再按父级宽度夹紧，正方形比例让高度跟随。
                         // 不画边框：1px 边框会占掉内容盒，恰好够宽的二维码会被误判为画不下。
-                        div().w(px(plate)).max_w_full().aspect_square().child(
-                            // 布局完成后才知道真实可用宽度：画不下时给出可见失败状态，
-                            // 而不是让模块被舍入成 0 后静默画出空白码或截断图案。
-                            // 容器查询只提供尺寸，这里用零原点构造边界仅做可行性判断；
-                            // 真正的原点在绘制回调里由 GPUI 给出，并再次校验。
-                            container_query(move |area, window, cx| {
-                                let probe = Bounds::new(point(px(0.0), px(0.0)), area);
-                                let scale = window.scale_factor();
-                                if qr_layout(&matrix, probe, scale).is_none() {
-                                    return div()
-                                        .size_full()
-                                        .p_2()
-                                        .text_sm()
-                                        .text_color(cx.theme().danger)
-                                        .child(crate::locale::text(
-                                            "空间不足，无法显示二维码",
-                                            "Not enough space to show the QR code",
-                                        ))
-                                        .into_any_element();
-                                }
-                                // 白底由 paint_qr 自己铺满整幅画布（含静区），这里不再叠样式背景：
-                                // 万一绘制阶段再次判定不可用，宁可什么都不画，也不留下像空码的白方块。
-                                canvas(
-                                    |_, _, _| (),
-                                    move |bounds, _, window, _| paint_qr(&matrix, bounds, window),
-                                )
-                                .size_full()
-                                .into_any_element()
-                            }),
-                        ),
+                        div()
+                            .w(px(plate))
+                            .max_w_full()
+                            .aspect_square()
+                            .rounded(
+                                crate::theme::ThemeTokens::current(window, cx)
+                                    .for_workbench()
+                                    .control_radius,
+                            )
+                            .overflow_hidden()
+                            .child(
+                                // 布局完成后才知道真实可用宽度：画不下时给出可见失败状态，
+                                // 而不是让模块被舍入成 0 后静默画出空白码或截断图案。
+                                // 容器查询只提供尺寸，这里用零原点构造边界仅做可行性判断；
+                                // 真正的原点在绘制回调里由 GPUI 给出，并再次校验。
+                                container_query(move |area, window, cx| {
+                                    let probe = Bounds::new(point(px(0.0), px(0.0)), area);
+                                    let scale = window.scale_factor();
+                                    if qr_layout(&matrix, probe, scale).is_none() {
+                                        return div()
+                                            .size_full()
+                                            .p_2()
+                                            .text_sm()
+                                            .text_color(cx.theme().danger)
+                                            .child(crate::locale::text(
+                                                "空间不足，无法显示二维码",
+                                                "Not enough space to show the QR code",
+                                            ))
+                                            .into_any_element();
+                                    }
+                                    // 白底由 paint_qr 自己铺满整幅画布（含静区），这里不再叠样式背景：
+                                    // 万一绘制阶段再次判定不可用，宁可什么都不画，也不留下像空码的白方块。
+                                    canvas(
+                                        |_, _, _| (),
+                                        move |bounds, _, window, _| {
+                                            paint_qr(&matrix, bounds, window)
+                                        },
+                                    )
+                                    .size_full()
+                                    .into_any_element()
+                                }),
+                            ),
                     );
                 if let Some(label) = label_text {
                     card = card.child(
@@ -1217,32 +1270,21 @@ pub(super) fn icon_source<'a>(
     resources: &'a BTreeMap<String, std::sync::Arc<[u8]>>,
     name: &str,
 ) -> Option<PluginIconSource<'a>> {
-    use gpui_kit::assets::IconName;
-    static BUILTIN: OnceLock<BTreeMap<String, IconName>> = OnceLock::new();
-    if name.ends_with(".svg") || name.contains('/') {
-        if !name.ends_with(".svg") || kerminal_plugin_protocol::validate_package_path(name).is_err()
-        {
-            return None;
-        }
-        return resources
-            .get(name)
-            .map(|bytes| PluginIconSource::Package(bytes.as_ref()));
-    }
-    let icons = BUILTIN.get_or_init(|| {
-        let mut names = BTreeMap::new();
-        for icon in IconName::ALL.iter().copied() {
-            let path = icon.path();
-            if let Some(stem) = path
-                .strip_prefix("icons/")
-                .and_then(|path| path.strip_suffix(".svg"))
-            {
-                names.insert(stem.to_owned(), icon);
+    match kerminal_plugin_protocol::classify_icon_reference(name).ok()? {
+        kerminal_plugin_protocol::IconReference::PackagePath => {
+            // 路径语义仍限定为 SVG：现有清单和按钮/空态都只承诺这一种可渲染格式，
+            // 其他扩展名即使包内存在，也不能交给 GPUI 的 SVG 加载器。
+            if !name.ends_with(".svg") {
+                return None;
             }
-            names.insert(format!("{icon:?}"), icon);
+            resources
+                .get(name)
+                .map(|bytes| PluginIconSource::Package(bytes.as_ref()))
         }
-        names
-    });
-    icons.get(name).copied().map(PluginIconSource::Builtin)
+        kerminal_plugin_protocol::IconReference::Builtin => {
+            super::super::icon_names::builtin_icon_name(name).map(PluginIconSource::Builtin)
+        }
+    }
 }
 
 /// 展示层只消费内存中的确认结果，不从插件传入的名称读取文件或网络。

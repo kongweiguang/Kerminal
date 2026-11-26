@@ -11,11 +11,11 @@ use kerminal_application::{
 use reqwest::{Client, redirect};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,8 @@ use crate::{
 /// 官方地址使用固定缓存名，保证升级后仍能读到旧签名缓存。
 const OFFICIAL_CACHE_FILE: &str = "official.json";
 const MAX_CATALOG: usize = 4 * 1024 * 1024;
+const MAX_ICON_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ICON_CACHE_ENTRIES: usize = 64;
 /// 旧签名缓存仍可能带有最多 16 KiB 的签名；只为读取兼容保留上限，新写入不再产生签名。
 const MAX_SIGNATURE: usize = 16 * 1024;
 const MAX_SOURCE_ID: usize = 128;
@@ -127,6 +129,9 @@ struct Cache {
     fetched_at: u64,
 }
 
+/// 缓存身份包含目录来源、插件 ID 和资源 URL，切换来源后不会命中旧图标。
+type CatalogIconCache = HashMap<(String, String, String), Arc<[u8]>>;
+
 /// 目录端口：来源可在运行期切换，但每次操作都使用开始时冻结的来源快照。
 pub struct CatalogClient {
     storage: StorageCoordinator,
@@ -134,6 +139,7 @@ pub struct CatalogClient {
     source: Arc<RwLock<SourceState>>,
     /// HTTP 客户端首次抓取时才建立；克隆共享同一实例，连接池才能跨调用复用。
     http: Arc<OnceLock<Client>>,
+    icons: Arc<Mutex<CatalogIconCache>>,
 }
 
 impl Clone for CatalogClient {
@@ -146,6 +152,7 @@ impl Clone for CatalogClient {
             storage: self.storage.clone(),
             source: Arc::clone(&self.source),
             http: Arc::clone(&self.http),
+            icons: Arc::clone(&self.icons),
         }
     }
 }
@@ -157,6 +164,7 @@ impl CatalogClient {
             storage,
             source: Arc::new(RwLock::new(SourceState::official())),
             http: Arc::new(OnceLock::new()),
+            icons: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -169,6 +177,7 @@ impl CatalogClient {
             storage,
             source: Arc::new(RwLock::new(source)),
             http: Arc::new(OnceLock::new()),
+            icons: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -250,6 +259,17 @@ impl CatalogClient {
         maximum: usize,
         cancellation: &CancellationToken,
     ) -> AppResult<String> {
+        let bytes = self.fetch_bytes(url, maximum, cancellation).await?;
+        String::from_utf8(bytes).map_err(|_| AppError::invalid("插件目录编码无效"))
+    }
+
+    /// 字节和文本下载共用同一套 URL、取消及大小约束，避免图标绕过目录安全边界。
+    async fn fetch_bytes(
+        &self,
+        url: &str,
+        maximum: usize,
+        cancellation: &CancellationToken,
+    ) -> AppResult<Vec<u8>> {
         if kerminal_plugin_protocol::validate_asset_url(url).is_err() {
             return Err(AppError::invalid("插件目录地址无效"));
         }
@@ -279,7 +299,7 @@ impl CatalogClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        String::from_utf8(bytes).map_err(|_| AppError::invalid("插件目录编码无效"))
+        Ok(bytes)
     }
 
     /// 在共享存储锁内复核旧缓存并原子提交；提交前关闭暂存写句柄，避免 Windows
@@ -548,6 +568,74 @@ fn safe_metadata(metadata: &fs::Metadata) -> bool {
 
 #[async_trait]
 impl CatalogSource for CatalogClient {
+    /// 图标失败不影响扩展列表，但取消和来源切换必须阻止旧结果进入界面。
+    async fn icon(
+        &self,
+        id: &kerminal_domain::plugins::PluginId,
+        cancellation: CancellationToken,
+    ) -> AppResult<Option<Arc<[u8]>>> {
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("插件图标读取已取消"));
+        }
+        let source = self.source_snapshot()?;
+        let snapshot = self.read_verified(&source).await;
+        if !self.source_unchanged(&source)? {
+            return Err(AppError::conflict("插件目录来源已切换，请重新刷新"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("插件图标读取已取消"));
+        }
+        let snapshot = match snapshot {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Err(AppError::not_found("插件目录尚未加载")),
+            Err(_) => return Ok(None),
+        };
+        let plugin = snapshot
+            .snapshot
+            .catalog
+            .plugins
+            .iter()
+            .find(|plugin| &plugin.id == id)
+            .ok_or_else(|| AppError::not_found("插件目录条目不存在"))?;
+        let Some(url) = &plugin.icon_url else {
+            return Ok(None);
+        };
+        let key = (source.url.clone(), id.as_str().to_owned(), url.clone());
+        let cached = self
+            .icons
+            .lock()
+            .ok()
+            .and_then(|icons| icons.get(&key).cloned());
+        if let Some(icon) = cached {
+            if !self.source_unchanged(&source)? {
+                return Err(AppError::conflict("插件目录来源已切换，请重新刷新"));
+            }
+            return Ok(Some(icon));
+        }
+        let result = self.fetch_bytes(url, MAX_ICON_BYTES, &cancellation).await;
+        if !self.source_unchanged(&source)? {
+            return Err(AppError::conflict("插件目录来源已切换，请重新刷新"));
+        }
+        if cancellation.is_cancelled() {
+            return Err(AppError::cancelled("插件图标读取已取消"));
+        }
+        let bytes = match result {
+            Ok(bytes) if valid_catalog_svg(&bytes) => bytes,
+            Err(error @ AppError::Cancelled { .. }) => return Err(error),
+            _ => return Ok(None),
+        };
+        let icon: Arc<[u8]> = Arc::from(bytes);
+        if let Ok(mut icons) = self.icons.lock() {
+            if icons.len() >= MAX_ICON_CACHE_ENTRIES
+                && let Some(evicted) = icons.keys().next().cloned()
+            {
+                icons.remove(&evicted);
+            }
+            icons.insert(key, Arc::clone(&icon));
+        }
+        Ok(Some(icon))
+    }
+
     /// 返回当前实际来源；锁中毒时保守回显官方默认，避免界面拿到空地址。
     fn source_url(&self) -> String {
         self.source
@@ -616,6 +704,19 @@ impl CatalogSource for CatalogClient {
     async fn refresh(&self, cancellation: CancellationToken) -> AppResult<CatalogSnapshot> {
         Ok(self.refresh_verified(cancellation).await?.snapshot)
     }
+}
+
+/// 只接受具备 SVG 文档边界的 UTF-8 内容，避免把错误页面交给图标渲染器。
+fn valid_catalog_svg(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let text = text.trim().trim_start_matches('﻿').trim();
+    let lower = text.to_ascii_lowercase();
+    (lower.starts_with("<svg") || lower.starts_with("<?xml"))
+        && lower.contains("<svg")
+        && lower.contains("</svg>")
+        && !lower.contains("<html")
 }
 
 impl CatalogClient {

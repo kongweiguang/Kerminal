@@ -459,30 +459,40 @@
         "icon": {
           "anyOf": [
             {
-              "allOf": [
+              "anyOf": [
                 {
-                  "not": {
-                    "pattern": "(^/|/$|//)"
-                  }
+                  "allOf": [
+                    {
+                      "not": {
+                        "pattern": "(^/|/$|//)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                      }
+                    }
+                  ],
+                  "minLength": 1,
+                  "type": "string"
                 },
                 {
-                  "not": {
-                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
-                  }
-                },
-                {
-                  "not": {
-                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
-                  }
-                },
-                {
-                  "not": {
-                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
-                  }
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9-]+$",
+                  "type": "string"
                 }
-              ],
-              "minLength": 1,
-              "type": "string"
+              ]
             },
             {
               "type": "null"
@@ -674,30 +684,40 @@
     "icon": {
       "anyOf": [
         {
-          "allOf": [
+          "anyOf": [
             {
-              "not": {
-                "pattern": "(^/|/$|//)"
-              }
+              "allOf": [
+                {
+                  "not": {
+                    "pattern": "(^/|/$|//)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
+                  }
+                },
+                {
+                  "not": {
+                    "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
+                  }
+                }
+              ],
+              "minLength": 1,
+              "type": "string"
             },
             {
-              "not": {
-                "pattern": "[\\\\:<>\"|?*\\u0000-\\u001F\\u007F-\\u009F]"
-              }
-            },
-            {
-              "not": {
-                "pattern": "(^|/)(?:\\.{1,2}|[^/]*[. ])(?:/|$)"
-              }
-            },
-            {
-              "not": {
-                "pattern": "(^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^/]*)?(?:/|$)"
-              }
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9-]+$",
+              "type": "string"
             }
-          ],
-          "minLength": 1,
-          "type": "string"
+          ]
         },
         {
           "type": "null"

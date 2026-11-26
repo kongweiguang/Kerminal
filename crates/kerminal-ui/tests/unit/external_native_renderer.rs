@@ -7,6 +7,88 @@ use kerminal_plugin_protocol::runtime::{ViewFetchSort, ViewSortDirection};
 
 use super::{CollectionQuery, collection_cache_key};
 
+/// 只有实际确认的新值才能产生动作；控件同步不能冒充用户交互。
+#[gpui_kit::test]
+fn select_on_change_ignores_synchronization_and_dispatches_confirmed_value(
+    app: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::component::select::SelectEvent;
+    use kerminal_application::{ApplicationTaskExecutor, plugin_ports::PluginViewIdentity};
+    use serde_json::json;
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    let runtime_guard = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let prepared = pending_open_plugin();
+    let identity = PluginViewIdentity {
+        plugin: prepared.id.clone(),
+        view: "main".into(),
+        instance: "on-change".into(),
+        generation: 1,
+    };
+    let view = Arc::new(kerminal_plugin_protocol::native::parse_native_view(
+        br#"{"schema":1,"data":{"address":"a","options":[{"label":"A","value":"a"},{"label":"B","value":"b"}]},"root":{"type":"input","bind":"address","x-kerminal-select-options":"$options","x-kerminal-on-change":"changed"}}"#,
+    ).unwrap());
+    let backend = Arc::new(PendingOpenRuntime::default());
+    let config = super::NativeRendererConfig {
+        prepared,
+        view,
+        identity,
+        scope: json!({}),
+        saved_state: None,
+        initial_data: None,
+        runtime: backend.clone(),
+        executor: ApplicationTaskExecutor::new(runtime_guard.handle().clone()),
+        locale: "en".into(),
+        content_identity: None,
+        embedded_form: None,
+    };
+    app.update(crate::init);
+    let slot = Rc::new(RefCell::new(None));
+    let mounted = slot.clone();
+    let (_, visual) = app.add_window_view(move |window, cx| {
+        let renderer = super::NativeRenderer::mount(config, window, cx).unwrap();
+        *mounted.borrow_mut() = Some(renderer.clone());
+        gpui_kit::base::Root::new(renderer, window, cx)
+    });
+    let renderer = slot.borrow_mut().take().unwrap();
+    visual.update(|window, cx| {
+        renderer.update(cx, |renderer, cx| {
+            renderer.process_generation = Some(1);
+            renderer.status = super::OpenStatus::Ready;
+            renderer.edit_field("address", json!("b"), cx);
+            renderer.sync_controls(window, cx);
+        })
+    });
+    visual.run_until_parked();
+    runtime_guard.block_on(async { tokio::task::yield_now().await });
+    assert!(backend.actions.lock().unwrap().is_empty());
+    visual.update(|_, cx| {
+        renderer.update(cx, |renderer, cx| {
+            let super::FieldControl::Select { state, .. } = &renderer.fields["root"] else {
+                panic!("expected select")
+            };
+            assert_eq!(
+                state.read(cx).selected_value().map(String::as_str),
+                Some("b")
+            );
+            state.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("a".to_owned())))
+            });
+        })
+    });
+    visual.run_until_parked();
+    runtime_guard.block_on(async { tokio::task::yield_now().await });
+    let actions = backend.actions.lock().unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["action"], json!("changed"));
+    assert_eq!(actions[0]["data"]["address"], json!("a"));
+    drop(actions);
+    visual.update(|_, cx| renderer.update(cx, |renderer, _| renderer.cancellation.cancel()));
+}
+
 /// 只有与当前业务回执一致的内联内容才能代替宿主反馈。
 #[test]
 fn inline_action_error_must_match_current_business_reply() {

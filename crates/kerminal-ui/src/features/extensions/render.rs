@@ -32,12 +32,15 @@ use gpui_kit::{
     px,
 };
 use kerminal_application::extensions::{
-    CatalogPlugin, CatalogSelection, ExtensionChange, ExternalPluginStartupMode, InstallProgress,
+    CatalogPlugin, CatalogSelection, ExtensionChange, ExtensionIcon, ExternalPluginStartupMode,
+    InstallProgress,
 };
 use kerminal_domain::plugins::{
     PendingPluginChange, PluginId, PluginInstallStatus, PluginSource, PluginStoreState,
 };
 use std::collections::BTreeSet;
+
+use crate::plugins::tools::ToolIcon;
 
 /// 将滚动条叠层固定在视口边缘，避免 GPUI 把它和内容一起平移。
 /// 保留原滚动容器及句柄，让键盘定位仍使用直接子元素的索引。
@@ -61,6 +64,9 @@ impl Render for ExtensionsPage {
         // 页面正在绘制即视为可见；退出在门禁之后被中止时下一次重绘自动恢复可操作状态。
         self.active = true;
         let theme = ThemeTokens::current(window, cx).for_settings();
+        // 图标只从应用层结果或内置映射投影；这里启动补取，但结果到达前统一用
+        // 固定尺寸占位，避免图标迟到改变列表行高或详情高度。
+        self.ensure_icons(cx);
         let query = self.search.read(cx).value().trim().to_lowercase();
         let plugins = self
             .catalog
@@ -810,10 +816,21 @@ impl ExtensionsPage {
         // 持久展开选择，否则标题说“收起”但行已经显示。
         let builtin_expanded =
             self.builtin_expanded || !self.search.read(cx).value().trim().is_empty();
+        // 首个实际出现的组贴列表顶部，后续组用更大的上间距呼吸；只看渲染顺序，
+        // 不假设某个组一定存在。
+        let mut first_group = true;
         for entry in entries {
             match entry {
                 ListEntry::Header { group, count } => {
-                    list = list.child(group_header(*group, *count, builtin_expanded, theme, cx));
+                    list = list.child(group_header(
+                        *group,
+                        *count,
+                        builtin_expanded,
+                        first_group,
+                        theme,
+                        cx,
+                    ));
+                    first_group = false;
                 }
                 ListEntry::Row(row) => {
                     list = list.child(render_extension_row(
@@ -979,21 +996,26 @@ impl ExtensionsPage {
         let mut fixed = div()
             .w_full()
             .flex_shrink_0()
-            .p_4()
+            // 头部区固定在上方，用舒展内边距与底部细分隔线划分层级；
+            // 下方正文独立滚动，长 README 不会把身份与主操作顶走。
+            .px_6()
+            .py_5()
+            .border_b_1()
+            .border_color(theme.border)
             .flex()
             .flex_col()
-            .gap_3();
+            .gap_4();
         let mut scroll = div()
             .id("extension-detail-body")
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
             .track_scroll(&self.detail_scroll)
-            .px_4()
-            .pb_4()
+            .px_6()
+            .py_5()
             .flex()
             .flex_col()
-            .gap_3();
+            .gap_5();
 
         let selected_reserved = self
             .selected_reserved_record()
@@ -1003,7 +1025,22 @@ impl ExtensionsPage {
         if let Some(id) = selected_reserved {
             let (status, tone) = drop_in_status_label(DropInState::ReservedIdentity);
             fixed = fixed
-                .child(detail_title(id.as_str().to_owned(), theme))
+                .child(detail_identity(
+                    ToolIcon::builtin(IconName::Puzzle),
+                    id.as_str().to_owned(),
+                    Some(
+                        crate::locale::text("身份冲突 · 不可加载", "Identity conflict · not loadable")
+                            .to_string(),
+                    ),
+                    Some(
+                        div()
+                            .text_size(theme.text_sm)
+                            .text_color(tone.color(theme))
+                            .child(status)
+                            .into_any_element(),
+                    ),
+                    theme,
+                ))
                 .child(
                     div()
                         .text_size(theme.text_sm)
@@ -1012,12 +1049,6 @@ impl ExtensionsPage {
                             "该记录占用了内置单元身份，不能作为扩展加载。",
                             "This record occupies a built-in identity and cannot be loaded as an extension.",
                         )),
-                )
-                .child(
-                    div()
-                        .text_size(theme.text_sm)
-                        .text_color(tone.color(theme))
-                        .child(status),
                 )
                 .child(
                     div()
@@ -1036,30 +1067,30 @@ impl ExtensionsPage {
         } else if let Some(unit) = selected_builtin {
             let enabled = builtin_enabled(self.state.as_ref(), &unit.id);
             let pending = builtin_pending(self.state.as_ref(), &unit.id);
-            fixed = fixed
-                .child(detail_title(builtin_display_name(&unit), theme))
-                .child(
-                    div()
-                        .text_size(theme.text_xs)
-                        .text_color(theme.muted)
-                        .child(unit.id.as_str().to_owned()),
+            let builtin_note = if unit.can_disable {
+                crate::locale::text(
+                    "内置插件，可在此启用或停用。",
+                    "Built-in extension; enable or disable it here.",
                 )
-                .child(
+            } else {
+                crate::locale::text(
+                    "内置插件 · 核心，始终启用。",
+                    "Built-in extension · Core, always enabled.",
+                )
+            };
+            fixed = fixed.child(detail_identity(
+                self.entry_icon(&SelectedEntry::Builtin(unit.id.clone())),
+                builtin_display_name(&unit),
+                Some(unit.id.as_str().to_owned()),
+                Some(
                     div()
                         .text_size(theme.text_sm)
                         .text_color(theme.muted)
-                        .child(if unit.can_disable {
-                            crate::locale::text(
-                                "内置插件，可在此启用或停用。",
-                                "Built-in extension; enable or disable it here.",
-                            )
-                        } else {
-                            crate::locale::text(
-                                "内置插件 · 核心，始终启用。",
-                                "Built-in extension · Core, always enabled.",
-                            )
-                        }),
-                );
+                        .child(builtin_note)
+                        .into_any_element(),
+                ),
+                theme,
+            ));
             let mut actions = div().w_full().flex().flex_col().gap_2();
             if let Some(error) = &self.state_error {
                 actions = actions.child(state_error_note(error, theme));
@@ -1147,35 +1178,34 @@ impl ExtensionsPage {
                 format!("{} · {}", plugin.publisher, plugin.id.as_str())
             };
             fixed = fixed
-                .child(detail_title(display_title, theme))
-                .when(!subtitle.is_empty(), |fixed| {
-                    fixed.child(
+                .child(detail_identity(
+                    self.entry_icon(&SelectedEntry::Plugin(plugin.id.clone())),
+                    display_title,
+                    (!subtitle.is_empty()).then_some(subtitle),
+                    Some(
                         div()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .child(subtitle),
-                    )
-                })
+                            .debug_selector(move || {
+                                if pending_failed {
+                                    "extension-detail-version-failed".into()
+                                } else {
+                                    "extension-detail-version".into()
+                                }
+                            })
+                            .text_size(theme.text_sm)
+                            .text_color(theme.foreground)
+                            .child(detail_version_line(
+                                available.as_ref(),
+                                current.as_ref(),
+                                pending_kind,
+                                pending_failed,
+                            ))
+                            .into_any_element(),
+                    ),
+                    theme,
+                ))
                 .child(
                     div()
-                        .debug_selector(move || {
-                            if pending_failed {
-                                "extension-detail-version-failed".into()
-                            } else {
-                                "extension-detail-version".into()
-                            }
-                        })
-                        .text_size(theme.text_sm)
-                        .text_color(theme.foreground)
-                        .child(detail_version_line(
-                            available.as_ref(),
-                            current.as_ref(),
-                            pending_kind,
-                            pending_failed,
-                        )),
-                )
-                .child(
-                    div()
+                        .w_full()
                         .text_size(theme.text_sm)
                         .text_color(theme.foreground)
                         .child(label(&plugin.description, "").to_owned()),
@@ -1184,15 +1214,9 @@ impl ExtensionsPage {
             if let Some(error) = &self.state_error {
                 fixed = fixed.child(state_error_note(error, theme));
             }
-            // 动作与仓库/更新日志链接放在同一行并左对齐；主按钮不再被列布局
-            // 拉满整栏，窄窗时由 flex_wrap 自然换行，保持动作语义和可读层级。
-            let mut action_bar = div()
-                .debug_selector(|| "extension-detail-actions".into())
-                .w_full()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2();
+            // 左侧是管理动作，右侧是外部链接；两组分开排列，避免“删除扩展数据…”
+            // 与仓库链接挤在一起。窄窗时两组各自换行，主按钮仍保持内容宽度。
+            let mut action_bar = div().flex().flex_wrap().items_center().gap_2();
             if installing {
                 action_bar = action_bar
                     .child(
@@ -1342,6 +1366,7 @@ impl ExtensionsPage {
                         Button::new("extension-delete-data")
                             .compact()
                             .ghost()
+                            .flex_shrink_0()
                             .text_color(theme.error)
                             .label(crate::locale::text(
                                 "删除扩展数据…",
@@ -1356,6 +1381,7 @@ impl ExtensionsPage {
                             })),
                     );
             }
+            let mut links = div().flex().flex_wrap().items_center().gap_3();
             if let Some(available) = &available
                 && let Some(url) = plugin
                     .versions
@@ -1363,17 +1389,16 @@ impl ExtensionsPage {
                     .find(|version| version.version == available.version)
                     .and_then(|version| version.changelog_url.clone())
             {
-                action_bar =
-                    action_bar.child(div().debug_selector(|| "extension-changelog".into()).child(
-                        external_link(
-                            "extension-changelog",
-                            crate::locale::text("更新日志", "Changelog"),
-                            url,
-                            cx,
-                        ),
-                    ));
+                links = links.child(div().debug_selector(|| "extension-changelog".into()).child(
+                    external_link(
+                        "extension-changelog",
+                        crate::locale::text("更新日志", "Changelog"),
+                        url,
+                        cx,
+                    ),
+                ));
             }
-            action_bar = action_bar.child(
+            links = links.child(
                 div()
                     .debug_selector(|| "extension-repository".into())
                     .child(external_link(
@@ -1383,6 +1408,17 @@ impl ExtensionsPage {
                         cx,
                     )),
             );
+            let action_bar = div()
+                .debug_selector(|| "extension-detail-actions".into())
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .pt_1()
+                .child(action_bar)
+                .child(links);
             fixed = fixed.child(action_bar);
             if self.offline && !pending_change && available.is_some() {
                 fixed = fixed.child(
@@ -1438,7 +1474,23 @@ impl ExtensionsPage {
                     || id.as_str().to_owned(),
                     |inspection| label(&inspection.name, id.as_str()).to_owned(),
                 );
-            fixed = fixed.child(detail_title(display_name, theme));
+            let subtitle = if is_drop_in {
+                crate::locale::text(
+                    format!("手动放入 · v{}", installed.active),
+                    format!("Manually added · v{}", installed.active),
+                )
+                .to_string()
+            } else {
+                crate::locale::text(
+                    format!("目录不可用 · v{}", installed.active),
+                    format!("Catalog unavailable · v{}", installed.active),
+                )
+                .to_string()
+            };
+            // 本地来源同样使用统一身份头：版本状态进副标题/版本行，磁盘指纹与
+            // 可用性说明留在正文，避免把多条短事实挤成一列小字。
+            let version_line: Option<AnyElement>;
+            let mut description_line: Option<AnyElement> = None;
             if is_drop_in {
                 let (status, tone) = drop_state.map_or_else(
                     || {
@@ -1455,54 +1507,47 @@ impl ExtensionsPage {
                         || crate::locale::text("未读取", "Not read"),
                         |_| crate::locale::text("可用", "Available"),
                     );
-                fixed = fixed
-                    .child(
-                        div()
-                            .text_size(theme.text_sm)
-                            .text_color(theme.foreground)
-                            .child(crate::locale::text(
-                                format!("当前版本 {} · 手动放入", installed.active),
-                                format!("Current version {} · Manually added", installed.active),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.text_xs)
-                            .text_color(theme.muted)
-                            .child(crate::locale::text(
-                                format!("指纹 · {fingerprint}"),
-                                format!("Fingerprint · {fingerprint}"),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.text_sm)
-                            .text_color(tone.color(theme))
-                            .child(status),
-                    );
-                if pending_change {
-                    fixed = fixed.child(pending_restart_text(theme));
-                }
+                version_line = Some(
+                    div()
+                        .text_size(theme.text_sm)
+                        .text_color(tone.color(theme))
+                        .child(status)
+                        .into_any_element(),
+                );
+                description_line = Some(
+                    div()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            format!("指纹 · {fingerprint}"),
+                            format!("Fingerprint · {fingerprint}"),
+                        ))
+                        .into_any_element(),
+                );
             } else {
-                fixed = fixed
-                    .child(
-                        div()
-                            .text_size(theme.text_sm)
-                            .text_color(theme.foreground)
-                            .child(crate::locale::text(
-                                format!("当前版本 {} · 目录不可用", installed.active),
-                                format!("Current version {} · Catalog unavailable", installed.active),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.text_sm)
-                            .text_color(theme.muted)
-                            .child(crate::locale::text(
-                                "本地安装或目录中不可用的扩展仍可管理。",
-                                "Extensions installed locally or removed from the catalog remain manageable.",
-                            )),
-                    );
+                version_line = Some(
+                    div()
+                        .text_size(theme.text_sm)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "本地安装或目录中不可用的扩展仍可管理。",
+                            "Extensions installed locally or removed from the catalog remain manageable.",
+                        ))
+                        .into_any_element(),
+                );
+            }
+            fixed = fixed.child(detail_identity(
+                self.entry_icon(&SelectedEntry::Plugin(id.clone())),
+                display_name,
+                Some(subtitle),
+                version_line,
+                theme,
+            ));
+            if let Some(description) = description_line {
+                fixed = fixed.child(description);
+            }
+            if is_drop_in && pending_change {
+                fixed = fixed.child(pending_restart_text(theme));
             }
             if let Some(error) = &self.state_error {
                 fixed = fixed.child(state_error_note(error, theme));
@@ -1568,10 +1613,11 @@ impl ExtensionsPage {
                         })),
                 );
                 let target = id.clone();
-                fixed = fixed.child(buttons).child(
+                buttons = buttons.child(
                     Button::new("extension-delete-local")
                         .compact()
                         .ghost()
+                        .flex_shrink_0()
                         .text_color(theme.error)
                         .label(crate::locale::text(
                             "删除扩展数据…",
@@ -1582,6 +1628,7 @@ impl ExtensionsPage {
                             page.open_confirmation(Confirmation::DeleteData(target.clone()), cx);
                         })),
                 );
+                fixed = fixed.child(buttons);
                 if let Some(feedback) =
                     self.feedback_block(&SelectedEntry::Plugin(id.clone()), true, theme, cx)
                 {
@@ -1604,23 +1651,46 @@ impl ExtensionsPage {
                 .state
                 .as_ref()
                 .is_some_and(|state| pending_only_failure(state, &id).is_some());
+            let status_text = if failed {
+                crate::locale::text(
+                    "安装失败，可在下方撤销失败的变更。",
+                    "The installation failed. Cancel the failed change below.",
+                )
+            } else {
+                crate::locale::text(
+                    "安装已提交 · 重启后生效",
+                    "Installation submitted · Restart required",
+                )
+            };
             fixed = fixed
-                .child(detail_title(id.as_str().to_owned(), theme))
+                .child(detail_identity(
+                    // 尚未安装完成时没有可验证图标，使用统一占位而不是猜一个身份。
+                    ToolIcon::builtin(IconName::Puzzle),
+                    id.as_str().to_owned(),
+                    Some(
+                        crate::locale::text(
+                            "待重启 · 尚无安装记录",
+                            "Pending restart · no install record yet",
+                        )
+                        .to_string(),
+                    ),
+                    Some(
+                        div()
+                            .text_size(theme.text_sm)
+                            .text_color(if failed { theme.error } else { theme.muted })
+                            .child(status_text)
+                            .into_any_element(),
+                    ),
+                    theme,
+                ))
                 .child(
                     div()
-                        .text_size(theme.text_sm)
-                        .text_color(if failed { theme.error } else { theme.muted })
-                        .child(if failed {
-                            crate::locale::text(
-                                "安装失败，可在下方撤销失败的变更。",
-                                "The installation failed. Cancel the failed change below.",
-                            )
-                        } else {
-                            crate::locale::text(
-                                "安装已提交 · 重启后生效",
-                                "Installation submitted · Restart required",
-                            )
-                        }),
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(crate::locale::text(
+                            "重启应用后，该扩展才会出现在已安装列表。",
+                            "The extension appears in the installed list after restarting.",
+                        )),
                 );
             if let Some(error) = &self.state_error {
                 fixed = fixed.child(state_error_note(error, theme));
@@ -1802,10 +1872,17 @@ impl ExtensionsPage {
                 .into_any_element();
         }
         match &self.readme {
-            Some(readme) => super::markdown::render_readme(
-                format!("extension-readme-{}", plugin.id.as_str()),
-                readme.clone(),
-            ),
+            Some(readme) => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(div().w_full().h(px(1.)).bg(theme.border))
+                .child(super::markdown::render_readme(
+                    format!("extension-readme-{}", plugin.id.as_str()),
+                    readme.clone(),
+                ))
+                .into_any_element(),
             // 加载中不插入占位块，避免 README 到达时把详情整体挤动。
             None => div().into_any_element(),
         }
@@ -2308,6 +2385,7 @@ impl ExtensionsPage {
         let mut row = ExtensionRow {
             element_key: id.as_str().to_owned(),
             selection: SelectedEntry::Plugin(id.clone()),
+            icon: self.entry_icon(&SelectedEntry::Plugin(id.clone())),
             name,
             description,
             progress: installing.then(|| self.row_progress(id)),
@@ -2374,6 +2452,7 @@ impl ExtensionsPage {
         let mut row = ExtensionRow {
             element_key: id.as_str().to_owned(),
             selection: SelectedEntry::Plugin(id.clone()),
+            icon: self.entry_icon(&SelectedEntry::Plugin(id.clone())),
             name: name.to_owned(),
             description: description.to_owned(),
             progress: installing.then(|| self.row_progress(id)),
@@ -2416,6 +2495,62 @@ impl ExtensionsPage {
     }
 }
 
+impl ExtensionsPage {
+    /// 把条目身份投影成行首与详情头共用的图标。
+    ///
+    /// 内置单元直接查静态身份表，不发任何 I/O；外部条目只读页面已缓存的
+    /// 应用层结果。未加载、没有图标或任何读取失败都落到同一个 Puzzle 占位，
+    /// 因此图标槽尺寸与行高在加载前后完全一致。
+    ///
+    /// @author kongweiguang
+    fn entry_icon(&self, selection: &SelectedEntry) -> ToolIcon {
+        match selection {
+            SelectedEntry::Builtin(id) => ToolIcon::builtin(builtin_unit_icon(id.as_str())),
+            SelectedEntry::Plugin(id) => {
+                match self.installed_icons.get(id).and_then(Option::as_ref) {
+                    // 清单声明的内置名必须能在当前 Kit 图标表中解析；未知名称
+                    // 仍回退 Puzzle，不能把插件字符串交给任意资源加载器。
+                    Some(ExtensionIcon::Builtin(name)) => {
+                        crate::plugins::icon_names::builtin_icon_name(name)
+                            .map(ToolIcon::builtin)
+                            .unwrap_or_else(|| ToolIcon::builtin(IconName::Puzzle))
+                    }
+                    Some(ExtensionIcon::Svg(bytes)) => ToolIcon::Svg(bytes.clone()),
+                    // 包内没有图标时允许退回市场条目图标；两者都没有才是占位。
+                    None => self
+                        .catalog_icons
+                        .get(id)
+                        .and_then(Option::as_ref)
+                        .map(|bytes| ToolIcon::Svg(bytes.clone()))
+                        .unwrap_or_else(|| ToolIcon::builtin(IconName::Puzzle)),
+                }
+            }
+        }
+    }
+}
+
+/// 内置单元身份到 Kit 图标的唯一映射。
+///
+/// 身份是稳定 ID，显示名会随语言变化，所以不能按名称匹配；未列出的身份
+/// 统一回退 Blocks 而不是随便借用相邻插件图标，避免制造错误的能力暗示。
+fn builtin_unit_icon(id: &str) -> IconName {
+    match id {
+        "kerminal.core" => IconName::SquareTerminal,
+        "kerminal.ssh" => IconName::Cable,
+        "kerminal.sftp" => IconName::FolderOpen,
+        "kerminal.telnet" | "kerminal.serial" => IconName::Cable,
+        "kerminal.rdp" => IconName::Monitor,
+        "kerminal.agents" => IconName::Bot,
+        "kerminal.commands" => IconName::FileText,
+        "kerminal.tmux" => IconName::PanelsTopLeft,
+        "kerminal.containers" => IconName::Container,
+        "kerminal.ports" => IconName::Network,
+        "kerminal.system" => IconName::Cpu,
+        "kerminal.logs" => IconName::RotateCcwClock,
+        _ => IconName::Blocks,
+    }
+}
+
 /// 行数据只描述当前条目，按钮动作在渲染时绑定，保证内容、筛选与安装状态共用一个来源。
 #[derive(Clone)]
 pub(super) struct ExtensionRow {
@@ -2423,6 +2558,8 @@ pub(super) struct ExtensionRow {
     pub(super) element_key: String,
     /// 选择来源与高亮共用：同 id 的内置行和记录行只能选中各自那一行。
     pub(super) selection: SelectedEntry,
+    /// 行首固定图标槽的内容；未加载或读取失败时由投影统一回退 Puzzle。
+    pub(super) icon: ToolIcon,
     pub(super) name: String,
     pub(super) description: String,
     pub(super) progress: Option<String>,
@@ -2486,6 +2623,8 @@ fn pending_only_row(state: &PluginStoreState, id: &PluginId, selected: bool) -> 
     ExtensionRow {
         element_key: id.as_str().to_owned(),
         selection: SelectedEntry::Plugin(id.clone()),
+        // 尚未安装成功的身份没有可验证图标，统一显示扩展占位而不是猜一个来源。
+        icon: ToolIcon::builtin(IconName::Puzzle),
         name: id.as_str().to_owned(),
         description: crate::locale::text(
             if failed {
@@ -2523,6 +2662,7 @@ fn pending_only_row(state: &PluginStoreState, id: &PluginId, selected: bool) -> 
 /// 内置单元行与外部记录共用行结构，但身份保持 `SelectedEntry::Builtin`，
 /// 同名冲突时仍能区分并各自选中。
 fn builtin_row(row: BuiltinRow, selected: bool) -> ExtensionRow {
+    let icon = ToolIcon::builtin(builtin_unit_icon(row.id.as_str()));
     let (status, tone) = if row.pending {
         (
             crate::locale::text("重启生效", "Restart required"),
@@ -2536,6 +2676,7 @@ fn builtin_row(row: BuiltinRow, selected: bool) -> ExtensionRow {
     ExtensionRow {
         element_key: format!("builtin-{}", row.id.as_str()),
         selection: SelectedEntry::Builtin(row.id.clone()),
+        icon,
         name: row.name,
         description: crate::locale::text(
             if row.can_disable {
@@ -2609,15 +2750,16 @@ impl RowTone {
     }
 }
 
-/// 组标题与行共用同一水平 inset：箭头放在固定宽槽里，非折叠组保留同宽空槽，
-/// 因此标题左缘、箭头左缘与行内容左缘在解析后的布局里严格对齐，不靠负 margin
-/// 抵消内边距。内置组标题本身是展开/收起入口。
+/// 组标题统一贴同一条左侧脊线：外层只用 `px_2`，与行容器的内边距一致，
+/// 因此四类标题文字和行首图标槽从同一 x 开始。非折叠组不再插入假箭头空槽，
+/// 否则 `已安装` 会被凭空右移；只有内置组在标题行右端保留披露箭头。
 ///
 /// @author kongweiguang
 fn group_header(
     group: RowGroup,
     count: usize,
     expanded: bool,
+    first: bool,
     theme: ThemeTokens,
     cx: &mut Context<ExtensionsPage>,
 ) -> AnyElement {
@@ -2638,48 +2780,46 @@ fn group_header(
     };
     let kind = group.acceptance_kind();
     let arrow_selector = format!("extensions-group-arrow-{kind}");
-    let arrow: AnyElement = if group == RowGroup::Builtin {
-        Icon::new(if expanded {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        })
-        .size(theme.metrics.icon_size)
-        .text_color(theme.muted)
-        .into_any_element()
-    } else {
-        // 非折叠组保留同宽空槽，避免标题比内置组更靠左、与行内容错位。
-        div().size(theme.metrics.icon_size).into_any_element()
-    };
-    let arrow_slot = div()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(theme.metrics.icon_size)
-        .debug_selector(move || arrow_selector.clone())
-        .child(arrow)
-        .into_any_element();
     let title = div()
         .min_w(px(0.))
         .truncate()
+        .text_size(theme.text_xs)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.muted)
         .debug_selector({
             let selector = format!("extensions-group-title-{kind}");
             move || selector.clone()
         })
         .child(label.clone())
         .into_any_element();
+    // 分组呼吸间距只由“是否首组”决定，不由组类型决定：任何组被过滤掉后，
+    // 下一组都会自然接替首组位置，不会留下顶部空洞。
+    let container = div()
+        .w_full()
+        .px_2()
+        .when(first, |header| header.pt_1().pb_1())
+        .when(!first, |header| header.pt_3().pb_1());
     if group == RowGroup::Builtin {
         // 组标题必须是真实 Button：只有可聚焦控件才保留 Tab 停靠与 Enter/Space
-        // 激活。按钮铺满整行，点击标题任意位置都能折叠，不再依赖内容宽按钮的
-        // 中心点；外层固定 px_2 与按钮零内边距让箭头槽仍与行内容共用同一左 inset。
-        // XSmall 内容默认 gap_1，比其它组的 gap_2 更紧，因此用单个 gap_2 内层
-        // 承载箭头与标题，保持四组标题的间距和基线一致。
-        return div()
-            .w_full()
-            .px_2()
-            .pt_2()
-            .pb_1()
+        // 激活。按钮铺满整行，点击标题任意位置都能折叠；文字在左、箭头在右，
+        // 文字左缘与其它三组严格同一条脊线，箭头不再占据标题前面的位置。
+        let arrow = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(theme.metrics.icon_size)
+            .debug_selector(move || arrow_selector.clone())
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(theme.metrics.icon_size)
+                .text_color(theme.muted),
+            );
+        return container
             .flex()
             .items_center()
             .child(
@@ -2703,9 +2843,10 @@ fn group_header(
                             .w_full()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .gap_2()
-                            .child(arrow_slot)
-                            .child(title),
+                            .child(title)
+                            .child(arrow),
                     )
                     .on_click(cx.listener(|page, _, _, cx| {
                         page.builtin_expanded = !page.builtin_expanded;
@@ -2714,17 +2855,9 @@ fn group_header(
             )
             .into_any_element();
     }
-    div()
-        .w_full()
-        .px_2()
-        .pt_2()
-        .pb_1()
+    container
         .flex()
         .items_center()
-        .gap_2()
-        .text_size(theme.text_xs)
-        .text_color(theme.muted)
-        .child(arrow_slot)
         .child(title)
         .into_any_element()
 }
@@ -2740,6 +2873,7 @@ fn render_extension_row(
     let ExtensionRow {
         element_key,
         selection,
+        icon,
         name,
         description,
         progress,
@@ -2837,8 +2971,8 @@ fn render_extension_row(
         .py_2()
         .rounded(theme.control_radius)
         .flex()
-        .flex_col()
-        .gap_1()
+        .items_center()
+        .gap_3()
         .when(selected, |row| row.bg(theme.surface_selected()))
         .when(!selected, |row| {
             row.hover(|style| style.bg(theme.surface_hover()))
@@ -2853,49 +2987,76 @@ fn render_extension_row(
                 window.focus(&focus, cx);
             }
         }))
+        // 固定 32px 图标槽：无论图标是否已加载，槽宽都不变，因此整列文字左缘
+        // 始终对齐；图标本身只占 16px，留出柔和底块作为视觉锚点。
         .child(
             div()
-                .w_full()
+                .size(px(32.))
+                .flex_shrink_0()
+                .rounded(theme.control_radius)
+                .bg(theme.muted_surface())
+                .border_1()
+                .border_color(theme.border)
                 .flex()
                 .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(theme.text_sm)
-                        .font_weight(theme.settings_medium_font_weight())
-                        .text_color(theme.foreground)
-                        // 行内容左缘与组标题箭头槽共用同一 inset；记录解析后的
-                        // bounds 供对齐测试核对，不靠负 padding 修补。
-                        .debug_selector({
-                            let selector = format!("extension-row-content-{id_text}");
-                            move || selector
-                        })
-                        .child(name),
-                )
-                .when_some(action_button, |line, action| {
-                    // 行内动作与纯状态共用右侧列，名称宽度变化时仍保持右对齐；
-                    // outline 让动作按钮与只读状态文字有明确边界。
-                    line.child(
-                        div()
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .child(action),
-                    )
-                }),
+                .justify_center()
+                .debug_selector({
+                    let selector = format!("extension-row-icon-{id_text}");
+                    move || selector
+                })
+                .child(icon.component(theme.muted).size(px(16.))),
         )
         .child(
             div()
-                .w_full()
+                .flex_1()
                 .min_w(px(0.))
-                .truncate()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(second_line),
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(theme.text_sm)
+                                .font_weight(theme.settings_medium_font_weight())
+                                .text_color(theme.foreground)
+                                // 固定图标槽之后的文字起点；记录解析后的 bounds，
+                                // 供对齐测试核对整列文字严格同缘。
+                                .debug_selector({
+                                    let selector = format!("extension-row-content-{id_text}");
+                                    move || selector
+                                })
+                                .child(name),
+                        )
+                        .when_some(action_button, |line, action| {
+                            // 行内动作与纯状态共用右侧列，名称宽度变化时仍保持右对齐；
+                            // outline 让动作按钮与只读状态文字有明确边界。
+                            line.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .child(action),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(theme.text_xs)
+                        .text_color(theme.muted)
+                        .child(second_line),
+                ),
         )
         .into_any_element()
 }
@@ -2996,13 +3157,67 @@ pub(super) fn installed_description(
     }
 }
 
-/// 详情标题统一使用同一层级，避免不同来源的详情高度与字号漂移。
-fn detail_title(title: String, theme: ThemeTokens) -> AnyElement {
+/// 详情身份头：固定 48px 图标容器、标题、副标题与版本状态行。
+///
+/// 内置、市场、本地/drop-in、待重启与冲突记录共用同一结构，避免不同来源的
+/// 详情在图标尺寸、字号和留白上漂移。图标无论是否已加载都占据同一容器，
+/// 因此图标迟到只替换内部图形，不改变头部高度或正文起点。
+///
+/// @author kongweiguang
+fn detail_identity(
+    icon: ToolIcon,
+    title: String,
+    subtitle: Option<String>,
+    version: Option<AnyElement>,
+    theme: ThemeTokens,
+) -> AnyElement {
     div()
-        .text_size(px(16.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.foreground)
-        .child(title)
+        .w_full()
+        .flex()
+        .items_start()
+        .gap_4()
+        .child(
+            div()
+                .size(px(48.))
+                .flex_shrink_0()
+                // 固定身份槽尺寸供原生验收与回归确认图标迟到不会改变头部高度。
+                .debug_selector(|| "extension-detail-icon".into())
+                .rounded(theme.radius_panel)
+                .bg(theme.muted_surface())
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon.component(theme.muted).size(px(24.))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(theme.text_title)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .when_some(
+                    subtitle.filter(|subtitle| !subtitle.is_empty()),
+                    |column, subtitle| {
+                        column.child(
+                            div()
+                                .text_size(theme.text_xs)
+                                .text_color(theme.muted)
+                                .child(subtitle),
+                        )
+                    },
+                )
+                .when_some(version, |column, version| column.child(version)),
+        )
         .into_any_element()
 }
 
@@ -3154,19 +3369,23 @@ pub(super) fn detail_version_line(
     }
 }
 
-/// 权限块在详情与确认中复用；完全访问始终先于逐项权限出现，不能藏在列表末尾。
+/// 权限区块：分区小标题 + 柔和卡片，完全访问摘要始终位于第一行。
+///
+/// 逐项权限用“原名 + 说明”两行表达，长权限名可以自然换行，不会被单行
+/// 拼接挤到卡片边缘；卡片内边距与正文留白共用主题语义值，不引入散落色值。
+///
+/// @author kongweiguang
 fn permissions_block(permissions: &[String], full_access: bool, theme: ThemeTokens) -> AnyElement {
-    let mut block = div()
+    let mut card = div()
         .w_full()
+        .p_4()
+        .rounded(theme.control_radius)
+        .bg(theme.muted_surface())
+        .border_1()
+        .border_color(theme.border)
         .flex()
         .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(theme.text_xs)
-                .text_color(theme.muted)
-                .child(crate::locale::text("权限", "Permissions")),
-        )
+        .gap_2()
         .child(
             div()
                 .text_size(theme.text_sm)
@@ -3184,7 +3403,7 @@ fn permissions_block(permissions: &[String], full_access: bool, theme: ThemeToke
                 }),
         );
     if permissions.is_empty() {
-        block = block.child(
+        card = card.child(
             div()
                 .text_size(theme.text_xs)
                 .text_color(theme.muted)
@@ -3195,18 +3414,40 @@ fn permissions_block(permissions: &[String], full_access: bool, theme: ThemeToke
         );
     } else {
         for permission in permissions {
-            block = block.child(
+            card = card.child(
                 div()
-                    .text_size(theme.text_xs)
-                    .text_color(theme.muted)
-                    .child(format!(
-                        "{permission} — {}",
-                        permission_description(permission)
-                    )),
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.foreground)
+                            .child(permission.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.text_xs)
+                            .text_color(theme.muted)
+                            .child(permission_description(permission)),
+                    ),
             );
         }
     }
-    block.into_any_element()
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_size(theme.text_xs)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.muted)
+                .child(crate::locale::text("权限", "Permissions")),
+        )
+        .child(card)
+        .into_any_element()
 }
 
 /// 进度属于当前安装行；下载显示百分比与 MB，避免裸字节数难以判断规模。

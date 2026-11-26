@@ -10,7 +10,10 @@ use std::{
     time::Instant,
 };
 
-use gpui_kit::{AnyView, App, EntityId, SharedString, Window, assets::IconName};
+use gpui_kit::{
+    AnyView, App, EntityId, Hsla, SharedString, Styled as _, Window, assets::IconName,
+    component::Icon,
+};
 use kerminal_application::{
     AppError, AppResult, plugins::PluginRegistry, preferences::ToolRailToolId,
     sessions::UiSessionBinding,
@@ -32,25 +35,65 @@ pub(crate) const BUILTIN_TOOLS: [ToolRailToolId; 8] = [
     ToolRailToolId::Containers,
 ];
 
+/// 工具图标既可以是内置 Lucide，也可以是插件包内已验证的 SVG 字节。
+///
+/// 工具栏和自定义器共用同一个渲染入口，避免自定义 SVG 在按钮里丢失前景色、
+/// 在普通图标槽里尺寸不一致。字节使用共享 `Arc`，每帧绘制只复制引用。
+#[derive(Clone)]
+pub enum ToolIcon {
+    Builtin(IconName),
+    Svg(Arc<[u8]>),
+}
+
+impl ToolIcon {
+    /// 内置图标保持既有构造习惯，调用方无需显式包一层枚举。
+    ///
+    /// @author kongweiguang
+    pub fn builtin(icon: IconName) -> Self {
+        Self::Builtin(icon)
+    }
+
+    /// 按当前上下文的前景色生成组件图标。
+    ///
+    /// `Icon::data` 只接受借用字节并在内部复制到共享存储，因此这里仍需传
+    /// `&[u8]`；自定义 SVG 必须显式设置 `text_color`，否则 `currentColor`
+    /// 会回退到窗口默认文字色，无法跟随按钮的选中/禁用状态。
+    ///
+    /// @author kongweiguang
+    pub fn component(&self, color: Hsla) -> Icon {
+        match self {
+            Self::Builtin(icon) => Icon::new(*icon).text_color(color),
+            Self::Svg(bytes) => Icon::default().data(bytes.as_ref()).text_color(color),
+        }
+    }
+}
+
+impl From<IconName> for ToolIcon {
+    /// 让内置工具继续用 `IconName` 直接构造展示描述。
+    fn from(icon: IconName) -> Self {
+        Self::Builtin(icon)
+    }
+}
+
 /// 工具显示名称和图标与稳定身份分离，语言变化不影响配置引用。
 #[derive(Clone)]
 pub struct ToolPresentation {
     label: SharedString,
     description: SharedString,
-    icon: IconName,
+    icon: ToolIcon,
 }
 
 impl ToolPresentation {
-    /// 由贡献者提供可访问名称与简短说明；宿主使用 Kit 图标保证主题一致。
+    /// 由贡献者提供可访问名称与简短说明；图标可以是内置 Kit 图标或已验证 SVG。
     pub fn new(
         label: impl Into<SharedString>,
         description: impl Into<SharedString>,
-        icon: IconName,
+        icon: impl Into<ToolIcon>,
     ) -> Self {
         Self {
             label: label.into(),
             description: description.into(),
-            icon,
+            icon: icon.into(),
         }
     }
 
@@ -64,9 +107,9 @@ impl ToolPresentation {
         self.description.clone()
     }
 
-    /// 图标由已安装的 Kit 资源提供，不接受任意外部路径。
-    pub fn icon(&self) -> IconName {
-        self.icon
+    /// 返回可复用的图标描述；渲染时由调用方按所在控件的前景色生成组件。
+    pub fn icon(&self) -> ToolIcon {
+        self.icon.clone()
     }
 }
 

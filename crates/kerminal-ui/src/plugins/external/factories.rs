@@ -15,7 +15,8 @@ use crate::{
             ContentKind, ContentSavedState, ContentScope,
         },
         tools::{
-            ToolCloseFuture, ToolContext, ToolFactory, ToolInstance, ToolPresentation, ToolScope,
+            ToolCloseFuture, ToolContext, ToolFactory, ToolIcon, ToolInstance, ToolPresentation,
+            ToolScope,
         },
     },
 };
@@ -288,7 +289,24 @@ impl ToolFactory for ExternalToolFactory {
     fn presentation(&self) -> ToolPresentation {
         let locale = gpui_kit::component::locale();
         let label = title(&self.prepared, &locale, &self.contribution.title);
-        ToolPresentation::new(label.clone(), label, IconName::PanelsTopLeft)
+        // 工具图标优先使用贡献声明，其次回退插件清单；两者都缺失或无法解析时
+        // 用 Puzzle 表达“外部扩展”而不是复用 tmux 的 PanelsTopLeft。这样右栏
+        // 不会把两个完全不同的入口画成同一个图标。
+        let icon = self
+            .contribution
+            .icon
+            .as_deref()
+            .and_then(|name| prepared_tool_icon(&self.prepared, name))
+            .or_else(|| {
+                self.prepared
+                    .package
+                    .manifest
+                    .icon
+                    .as_deref()
+                    .and_then(|name| prepared_tool_icon(&self.prepared, name))
+            })
+            .unwrap_or(ToolIcon::Builtin(IconName::Puzzle));
+        ToolPresentation::new(label.clone(), label, icon)
     }
     /// 标签工具不与窗口工具共享实例和草稿。
     fn scope(&self) -> ToolScope {
@@ -337,6 +355,20 @@ impl ToolFactory for ExternalToolFactory {
             renderer,
             _registration: registration,
         }))
+    }
+}
+
+/// 只消费启动时冻结的包资源或内置图标目录；插件字符串不会触发文件或网络读取。
+///
+/// 包内路径直接复用 `PreparedPlugin.resources` 的共享字节，避免每次渲染为
+/// 外部图标再复制一份；内置名经统一目录精确匹配，未知名称返回 `None` 交给
+/// 调用方回退 `Puzzle`。
+fn prepared_tool_icon(prepared: &PreparedPlugin, name: &str) -> Option<ToolIcon> {
+    match super::layout::icon_source(&prepared.resources, name)? {
+        super::layout::PluginIconSource::Builtin(icon) => Some(ToolIcon::Builtin(icon)),
+        super::layout::PluginIconSource::Package(_) => {
+            prepared.resources.get(name).cloned().map(ToolIcon::Svg)
+        }
     }
 }
 
