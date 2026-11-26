@@ -14,7 +14,7 @@ use super::{
 };
 use crate::theme::ThemeTokens;
 use gpui_kit::{
-    AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, Render,
+    Anchor, AnyElement, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, Render,
     ScrollHandle, SharedString, StatefulInteractiveElement as _, Window,
     assets::IconName,
     component::{
@@ -1546,7 +1546,7 @@ impl ExtensionsPage {
                                     );
                                 })),
                         )
-                        .dropdown_menu(move |menu, _, _| {
+                        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                             let menu = crate::ui_popup::dropdown_menu(menu, theme);
                             let uninstall_page = page_entity.clone();
                             let delete_page = page_entity.clone();
@@ -1607,7 +1607,7 @@ impl ExtensionsPage {
                                     )
                                 })),
                         )
-                        .dropdown_menu(move |menu, _, _| {
+                        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                             let menu = crate::ui_popup::dropdown_menu(menu, theme);
                             let delete_page = page_entity.clone();
                             let target = delete_target.clone();
@@ -1893,7 +1893,7 @@ impl ExtensionsPage {
                         )
                     })),
             )
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                 let menu = crate::ui_popup::dropdown_menu(menu, theme);
                 let uninstall_page = page_entity.clone();
                 let delete_page = page_entity.clone();
