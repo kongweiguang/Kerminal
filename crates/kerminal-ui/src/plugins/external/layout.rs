@@ -15,10 +15,11 @@ use super::{
 use gpui_kit::{
     AnyElement, AppContext as _, Bounds, Context, IntoElement, PathPromptOptions, Pixels, Styled,
     Window,
+    assets::IconName,
     base::{Disableable as _, StyledExt as _},
     black, canvas,
     component::{
-        ActiveTheme as _, Icon,
+        ActiveTheme as _, Icon, Sizable as _,
         button::{Button as KitButton, ButtonVariants as _},
         checkbox::Checkbox as KitCheckbox,
         group_box::{GroupBox, GroupBoxVariants as _},
@@ -28,6 +29,7 @@ use gpui_kit::{
         resizable::{ResizableState, h_resizable, resizable_panel},
         select::Select,
         switch::Switch as KitSwitch,
+        tooltip::Tooltip,
     },
     container_query, div, fill, point,
     prelude::*,
@@ -92,6 +94,7 @@ impl NativeRenderer {
                     );
                 }
             }
+            List { .. } if has_appearance(node, "flat-copy-list") => {}
             List { .. } | Table { .. } | Tree { .. } => {
                 let key = node.id.clone().unwrap_or(path);
                 let translations = self
@@ -458,6 +461,11 @@ impl NativeRenderer {
                     .when(has_appearance(node, "title"), |d| {
                         d.text_xl().font_semibold()
                     })
+                    .when(has_appearance(node, "label"), |d| {
+                        d.text_sm()
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                    })
                     .when(has_appearance(node, "caption"), |d| d.text_sm())
                     .when(has_appearance(node, "centered-caption"), |d| {
                         d.w_full().text_sm().text_center()
@@ -802,6 +810,26 @@ impl NativeRenderer {
                     })
                     .into_any_element()
             }
+            List {
+                key,
+                title,
+                subtitle,
+                items,
+                on_activate,
+                extensions,
+                ..
+            } if has_appearance(node, "flat-copy-list") => self.render_flat_copy_list(
+                &path,
+                node.id.as_deref(),
+                key,
+                title,
+                subtitle.as_deref(),
+                items.as_deref(),
+                on_activate.as_deref(),
+                extensions,
+                window,
+                cx,
+            ),
             List { .. } | Table { .. } | Tree { .. } => self
                 .collections
                 .get(node.id.as_deref().unwrap_or(&path))
@@ -838,6 +866,208 @@ impl NativeRenderer {
         }
     }
 
+    /// 将小型内联集合渲染为“左侧分组标签 + 等宽地址 + 行尾复制图标”的紧凑平铺列表。
+    ///
+    /// 用于多网卡地址、端口端点等需要一眼扫视并单点复制的场景：不套虚拟列表的固定
+    /// 高度盒，按内容自然撑开；同组标签只在首行显示一次，保持与桌面参考规范一致的
+    /// 双列对齐。点击整行触发 `on_activate`（如切换二维码），点击行尾图标按钮则以
+    /// `item_key` 直接触发 `x-kerminal-row-action`（如复制该行链接）。
+    ///
+    /// @author kongweiguang
+    #[allow(clippy::too_many_arguments)]
+    fn render_flat_copy_list(
+        &self,
+        path: &str,
+        node_id: Option<&str>,
+        key_field: &str,
+        title_field: &str,
+        subtitle_field: Option<&str>,
+        items_binding: Option<&str>,
+        on_activate: Option<&str>,
+        extensions: &BTreeMap<String, Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const MAX_FLAT_COPY_ITEMS: usize = 64;
+        let rows = items_binding
+            .and_then(|binding| self.field_value(binding))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if rows.is_empty() {
+            return div().into_any_element();
+        }
+        let theme = crate::theme::ThemeTokens::current(window, cx).for_workbench();
+        let mono_font = cx.theme().mono_font_family.clone();
+        let selected = extensions
+            .get("x-kerminal-selected-binding")
+            .and_then(Value::as_str)
+            .and_then(|binding| self.field_value(binding))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let copied = extensions
+            .get("x-kerminal-copied-binding")
+            .and_then(Value::as_str)
+            .and_then(|binding| self.field_value(binding))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let row_action = extensions
+            .get("x-kerminal-row-action")
+            .and_then(Value::as_str)
+            .filter(|action| !action.trim().is_empty())
+            .map(str::to_owned);
+        let disabled = !matches!(self.status, OpenStatus::Ready)
+            || !self.field_errors.is_empty()
+            || self.secret_write_pending();
+        let has_groups = subtitle_field.is_some_and(|field| {
+            rows.iter().take(MAX_FLAT_COPY_ITEMS).any(|row| {
+                row.get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+            })
+        });
+        let node_key = node_id.unwrap_or(path).to_owned();
+        let mut list = div().w_full().flex().flex_col().gap_1();
+        let mut last_group: Option<String> = None;
+
+        for (index, row) in rows.iter().take(MAX_FLAT_COPY_ITEMS).enumerate() {
+            let Some(item_key) = row
+                .get(key_field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let title_text = row
+                .get(title_field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| item_key.clone());
+            let group_text = subtitle_field
+                .and_then(|field| row.get(field))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let hint_text = row
+                .get("hint")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned);
+            let group_changed = last_group.as_deref() != Some(group_text.as_str());
+            let is_subsequent_group = last_group.is_some() && group_changed;
+            let visible_group = if group_changed {
+                last_group = Some(group_text.clone());
+                group_text
+            } else {
+                String::new()
+            };
+            let is_selected = selected.as_deref() == Some(item_key.as_str());
+            let is_copied = copied.as_deref() == Some(item_key.as_str());
+
+            let mut item_surface = div()
+                .id(format!("external-flat-row-{path}-{index}"))
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.control_radius)
+                .when(is_selected, |d| d.bg(theme.surface_selected()))
+                .when(!is_selected, |d| {
+                    d.hover(|style| style.bg(theme.surface_hover()))
+                })
+                .when_some(hint_text, |d, hint| {
+                    d.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(mono_font.clone())
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(title_text.clone()),
+                );
+
+            if let Some(action) = on_activate.filter(|_| !disabled) {
+                let activate_key = format!("{node_key}.select.{index}");
+                let activate_action = action.to_owned();
+                let activate_item = item_key.clone();
+                item_surface = item_surface.on_click(cx.listener(move |renderer, _, _, cx| {
+                    renderer.action(
+                        activate_key.clone(),
+                        activate_action.clone(),
+                        Some(activate_item.clone()),
+                        cx,
+                    );
+                }));
+            }
+
+            if let Some(action) = row_action.clone() {
+                let copy_key = format!("{node_key}.copy.{index}");
+                let copy_busy = self.projection.state().is_action_busy(&copy_key);
+                let copy_item = item_key.clone();
+                let tooltip = if is_copied {
+                    crate::locale::text("已复制", "Copied")
+                } else {
+                    crate::locale::text(format!("复制 {title_text}"), format!("Copy {title_text}"))
+                };
+                let icon = if is_copied {
+                    Icon::new(IconName::Check).text_color(theme.success)
+                } else {
+                    Icon::new(IconName::Copy).text_color(theme.muted)
+                };
+                item_surface = item_surface.child(
+                    KitButton::new(format!("external-flat-copy-{path}-{index}"))
+                        .compact()
+                        .ghost()
+                        .xsmall()
+                        .flex_shrink_0()
+                        .icon(icon)
+                        .accessibility_label(tooltip.clone())
+                        .tooltip(tooltip)
+                        .loading(copy_busy)
+                        .disabled(disabled || copy_busy)
+                        .on_click(cx.listener(move |renderer, _, _, cx| {
+                            cx.stop_propagation();
+                            renderer.action(
+                                copy_key.clone(),
+                                action.clone(),
+                                Some(copy_item.clone()),
+                                cx,
+                            );
+                        })),
+                );
+            }
+
+            let mut line = div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .when(is_subsequent_group, |d| d.pt_1());
+            if has_groups {
+                line = line.child(
+                    div()
+                        .w(rems(2.75))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(theme.muted)
+                        .truncate()
+                        .child(visible_group),
+                );
+            }
+            list = list.child(line.child(item_surface));
+        }
+
+        list.into_any_element()
+    }
+
     /// 视觉标签与输入的可访问名称共用文案；路径选择按钮不与长路径争抢宽度。
     fn render_field(
         &self,
@@ -850,7 +1080,7 @@ impl NativeRenderer {
         let mut field = div().flex().flex_col().gap_1().w_full();
         let label = label.map(|text| self.projection.text(text));
         if let Some(label) = &label {
-            field = field.child(div().text_sm().child(label.clone()));
+            field = field.child(div().text_sm().font_semibold().child(label.clone()));
         }
         if let Some(control) = self.fields.get(path) {
             field = match control {
@@ -1047,7 +1277,8 @@ fn has_appearance(node: &NativeNode, appearance: &str) -> bool {
         | Section { extensions, .. }
         | Text { extensions, .. }
         | Badge { extensions, .. }
-        | Notice { extensions, .. } => extensions,
+        | Notice { extensions, .. }
+        | List { extensions, .. } => extensions,
         _ => return false,
     };
     extensions
